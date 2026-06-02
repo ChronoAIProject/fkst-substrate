@@ -2,7 +2,46 @@
 
 本库是 universal SDLC substrate 的引擎 trusted base；业务 Lua package 不在本库内，由独立仓库或 host 通过 `FKST_PACKAGE_ROOT` / `--package-root` 注入。
 
-本文只描述 fkst-substrate 当前引擎事实。源码权威在 `crates/`；`README.md` 说明抽取状态；`SPEC.md` 是身份锚点；业务部门拓扑、dogfood 流程和具体研发策略不属于本文。
+本文只描述 fkst-substrate 当前引擎事实。源码权威在 `crates/`；`README.md` 说明抽取状态；`SPEC.md` 是身份锚点；业务部门拓扑、host 运行流程和具体研发策略不属于本文。
+
+## 0. 仓库目录结构(本仓库实际文件)
+
+```
+fkst-substrate/
+├── Cargo.toml / Cargo.lock                    workspace(仅 3 crate)
+├── CLAUDE.md                                  引擎治理与哲学不动点
+├── AGENTS.md  → CLAUDE.md                     软链
+├── SPEC.md                                    Tier II 身份锚点
+├── README.md                                  抽取状态 + 独立运行命令
+├── crates/
+│   ├── fkst-supervisor/src/main.rs            Tier I,进程根(≤150 LOC)
+│   ├── fkst-common/src/
+│   │   ├── lib.rs config.rs event.rs
+│   │   ├── runtime_layout.rs                  RuntimeKind / RuntimeLayout
+│   │   ├── error.rs validation.rs
+│   └── fkst-framework/src/
+│       ├── main.rs                            CLI: run / supervise / known-good / conformance / --self-test
+│       ├── path_resolver.rs raise.rs mlua_init.rs
+│       ├── sdk_basic.rs sdk_codex.rs sdk_fs.rs sdk_git.rs sdk_log.rs
+│       ├── known_good.rs host_conformance.rs self_test.rs
+│       └── supervise/
+│           ├── mod.rs graph_scan.rs source_runner.rs
+│           └── event_fanout.rs consumer.rs spawner.rs raised.rs
+├── examples/
+│   └── minimal-package/                       引擎自带最小示例包(证明 package-root 契约)
+│       ├── tunables/
+│       │   ├── queue_capacity.txt
+│       │   ├── department_default_timeout.txt
+│       │   └── codex_permit_slots.txt
+│       ├── raisers/tick.lua                   cron source → 队列 tick
+│       └── departments/
+│           ├── producer/main.lua              consume tick;produce + fanout work;raise + file witness
+│           ├── consumer_a/main.lua            consume work;写 witness
+│           └── consumer_b/main.lua            consume work;写 witness
+└── docs/architecture.md                       本文
+```
+
+业务 Lua package 不在本仓;`examples/minimal-package/` 是引擎自带的、唯一随仓发布的 package,仅用于证明 `--package-root` 能加载并跑通最小闭环,不含任何业务语义。host 注入的 package 用同样的 `departments/` + `raisers/` + `tunables/` 形状,经 `FKST_PACKAGE_ROOT` 指向。
 
 ## 1. 三层稳定性与三级公司
 
@@ -64,7 +103,7 @@ fkst-framework
   deps: fkst-common, mlua, notify, tokio, ulid, base64, nix, serde, serde_json,
         tracing, tracing-subscriber, anyhow
   provides: CLI, graph scan, source runner, fanout, consumer, spawner, RAISED parser,
-            Lua SDK, known-good, update, self-test, host conformance bridge
+            Lua SDK, known-good, self-test, host conformance bridge
 ```
 
 workspace 只包含这三个 crate。没有业务 Lua package crate,也没有 package manifest crate。
@@ -96,7 +135,7 @@ L1  common, crates/fkst-common
 
 L2a  framework CLI 与 root resolver
   files: main.rs, path_resolver.rs
-  引入概念:run, supervise, known-good, conformance, update, self-test; package root + host root
+  引入概念:run, supervise, known-good, conformance, self-test; package root + host root
   读: FKST_PACKAGE_ROOT, --package-root, --project-root, rejected env 检查
   写: CLI stdout/stderr;不写业务状态
 
@@ -134,7 +173,7 @@ L2d  Lua bridge 与 SDK
       file.write target chosen by package/host
 
 L2e  known-good 与 lifecycle
-  files: known_good.rs, update.rs, host_conformance.rs, self_test.rs
+  files: known_good.rs, host_conformance.rs, self_test.rs
   引入概念:accepted framework ref, health observation, rollback witness, self-test
   外部程序: git, cargo/bash through conformance where configured
   读: refs/known-good, integration ref, supervisor log when health gate configured,
@@ -151,7 +190,7 @@ L3  injected Lua package, not stored in this repository
   读写: 只能经 L2 SDK 触达 git, filesystem, locks, subprocesses, logs and RAISED
 ```
 
-依赖方向只能向内。supervisor 不知道 event；common 不知道 Lua；framework 不知道业务 round/gate/consensus；package 只能通过固定 SDK 请求引擎能力。
+依赖方向只能向内。supervisor 不知道 event；common 不知道 Lua；framework 不知道业务轮次、业务关卡或判断策略；package 只能通过固定 SDK 请求引擎能力。
 
 ## 4. Runtime I/O 与落点
 
@@ -183,13 +222,13 @@ host root 来自 --project-root 或 run 模式下 Lua 路径推断
 
 如果 `<PKG> == <HOST>`,graph root 只有一个 `PackageAndHost`。否则扫描顺序是 package root 后 host root。重复 Department 名或 Raiser 名直接拒绝启动。`package.lua` 是被移除的 surface,存在即拒绝启动。
 
-合法 graph 输入:
+合法 graph 输入(`<dept>` / `*.lua` 为通配;本仓内的具体实例是 `examples/minimal-package/`):
 
 ```
-<PKG>/departments/<dept>/main.lua
-<PKG>/raisers/*.lua
-<HOST>/departments/<dept>/main.lua
-<HOST>/raisers/*.lua
+<PKG>/departments/<dept>/main.lua      e.g. examples/minimal-package/departments/producer/main.lua
+<PKG>/raisers/*.lua                    e.g. examples/minimal-package/raisers/tick.lua
+<HOST>/departments/<dept>/main.lua     (host 注入,本仓不含)
+<HOST>/raisers/*.lua                   (host 注入,本仓不含)
 ```
 
 每个 Department `main.lua` 必须 return table,其中 `M.spec` 至少能解析为:
@@ -380,9 +419,9 @@ RAISED: <base64-url-encoded JSON [{queue, payload}, ...]>
 fkst-substrate 不包含:
 
 - 具体业务 Department 名单或拓扑
-- consensus/review/triage/promote/evolve 等策略部门
-- break-glass inbox 接线或 meta-evolve 通路
-- GitHub workflow、controller、refactor-loop、dogfood 自演化 SOP
+- 具体 package 的策略部门
+- 具体 package 的特殊 inbox 接线或演化通路
+- host 代码托管流程、外部协调器或自演化 SOP
 - package manifest DSL 或 package dependency graph
 - web dashboard
 - host runtime cleanup policy 的业务章节
@@ -398,7 +437,7 @@ fkst-substrate 不包含:
 - SDK 闭包:固定 Lua surface,新增函数需测试和 conformance。
 - 进程闭包:supervisor -> framework child -> codex child,process group kill 只用于 stall/timeout。
 - package 闭包:Lua/L3 来自独立 package,本库不携带业务 package。
-- 概念闭包:Rust framework 不知道业务 round/gate/consensus/retry/cooldown。
+- 概念闭包:Rust framework 不知道业务轮次、业务关卡、判断策略、重试策略或退避策略。
 
 只要一个设计需要在这些闭包之外增加第二事实源、第二 dispatcher、第二状态层或业务概念下沉,它就不是 fkst-substrate 的合格引擎设计。
 

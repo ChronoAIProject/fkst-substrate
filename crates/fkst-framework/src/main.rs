@@ -4,7 +4,6 @@
 //! CLI: `fkst-framework supervise --project-root <path> --framework-bin <path>`
 //! CLI: `fkst-framework known-good <promote|bootstrap> [options]`
 //! CLI: `fkst-framework conformance --project-root <path>`
-//! CLI: `fkst-framework update [options]`
 //! CLI: `fkst-framework --self-test`
 //! Exit codes:
 //!   0 = pipeline ok
@@ -18,7 +17,6 @@ use known_good::{HealthGateOptions, KnownGoodRef, PromotionOutcome, SwapEvidence
 use path_resolver::PackageRoots;
 use serde_json::Value as JsonValue;
 use std::path::PathBuf;
-use update::UpdateCli;
 
 mod host_conformance;
 mod known_good;
@@ -32,7 +30,6 @@ mod sdk_git;
 mod sdk_log;
 mod self_test;
 mod supervise;
-mod update;
 
 use raise::RaiseBuffer;
 
@@ -48,7 +45,6 @@ enum CliCommand {
     },
     KnownGood(KnownGoodCli),
     Conformance(HostConformanceOptions),
-    Update(UpdateCli),
     SelfTest,
 }
 
@@ -103,10 +99,6 @@ fn parse_args() -> Result<CliCommand> {
     if sub == "conformance" {
         let rest = args_iter.collect::<Vec<_>>();
         return Ok(CliCommand::Conformance(parse_conformance_args(&rest)?));
-    }
-    if sub == "update" {
-        let rest = args_iter.collect::<Vec<_>>();
-        return Ok(CliCommand::Update(UpdateCli::parse(&rest)?));
     }
     if sub == "run" {
         let lua_path: PathBuf = args_iter
@@ -365,7 +357,6 @@ fn run() -> Result<i32> {
         }
         CliCommand::KnownGood(options) => run_known_good_command(options),
         CliCommand::Conformance(options) => host_conformance::run(options),
-        CliCommand::Update(options) => Ok(update::run_update_command(options)),
         CliCommand::SelfTest => match self_test::run() {
             Ok(()) => Ok(0),
             Err(err) => {

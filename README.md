@@ -11,6 +11,22 @@ cargo build --workspace
 cargo test --workspace
 ```
 
+独立运行：
+
+本仓库内置一个通用最小 package：`examples/minimal-package`。它包含 cron source `tick`、producer、两个 fanout consumers，以及 runtime witness 文件写入，用于证明 source → route → produce → fanout → raise → file 的最小闭环。
+
+```sh
+cargo build --workspace
+target/debug/fkst-framework --self-test
+FKST_RUNTIME_ROOT=/tmp/min-rt-$$ target/debug/fkst-framework conformance \
+  --project-root /Users/auric/fkst-substrate/examples/minimal-package \
+  --package-root /Users/auric/fkst-substrate/examples/minimal-package
+FKST_RUNTIME_ROOT=/tmp/min-rt-$$ target/debug/fkst-framework run \
+  /Users/auric/fkst-substrate/examples/minimal-package/departments/producer/main.lua \
+  --package-root /Users/auric/fkst-substrate/examples/minimal-package \
+  --event '{"type":"tick","payload":{}}'
+```
+
 治理与架构：
 
 - `CLAUDE.md`（= `AGENTS.md` 软链）：引擎治理与哲学不动点。
@@ -23,14 +39,13 @@ cargo test --workspace
 
 已知 contract gap（公开消费前必读）：
 
-- **`update` 自更新子命令尚不可用**：`crates/fkst-framework/src/update.rs` 的发布/安装契约仍是旧单仓形态——默认更新源指向 `ChronoAIProject/fkst`，并假设安装 payload 含 `lib/fkst/current/share/fkst/VERSION` 等捆绑 Lua 包布局。fkst-substrate 不带该 payload，故不要对本仓库执行 `update`，直至重新打包。
+- **`update` 自更新子命令已删除**：旧实现只服务旧单仓自更新契约，未被 known-good/swap 非测试代码依赖；fkst-substrate 不提供 `update` 命令。
 - **`SPEC.md` 引用的 `conformance/run_all.sh` 尚未迁入本仓库**：SPEC 作为身份锚点先行带过，conformance gate 集的迁移/泛化为 deferred（见下）。
 
 Deferred（尚未迁入）清单：
 
-- examples/ 示例包（证明任意 package root 可加载）
 - conformance gate 迁移/泛化
-- install/release 脚本 + `update.rs` 发布/安装契约改写（去 share/fkst 捆绑假设、更新源指向本仓）
+- install/release 脚本
 - dogfood 自演化闭环
 
 ⟦AI:FKST⟧

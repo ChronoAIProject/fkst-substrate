@@ -14,7 +14,7 @@ fkst-substrate 是 universal SDLC substrate 的引擎域 trusted base。它提�
 
 核心不是写应用，而是写应用生长的衬底。framework 提供受限、可审计、可组合的运行环境；业务行为由独立 package root 或 host root 注入的 `departments/`、`raisers/` 和 Lua helper 组成。引擎不能因为某个 host 的业务方便，把业务概念下沉到 Rust。
 
-self-hosting 是 substrate 的能力要求，不是 dogfood 内容进入引擎库的理由。引擎必须能承载自演化闭环，但闭环中的具体部门、共识策略、review 策略和组织拓扑属于 package 或 host,不是 fkst-substrate 的事实。
+self-hosting 是 substrate 的能力要求，不是把某个 host 的运行内容写进引擎库的理由。引擎必须能承载自演化闭环，但闭环中的具体部门、判断策略、审查策略和组织拓扑属于 package 或 host,不是 fkst-substrate 的事实。
 
 agent 是 system call,不是合作伙伴。一次 `codex exec` 是一次 OS 子进程调用，输入来自 prompt/stdin/context/worktree,输出落到 stdout/stderr/log/exit_code；实例没有身份、记忆、连续性，也不直接互相通信。多 agent 协作只能由 Lua Department 通过事件、文件、git、lock 和 `await_all` 组织。
 
@@ -80,7 +80,7 @@ Lua SDK surface 固定为:
 
 其中 `pipeline` 与 `source` 是 graph/package 侧约定，Rust 注册的运行时 primitive 是 `raise`、codex、exec、await、lock、git/worktree、file、log、now。新增 SDK 函数就是扩 trusted base,必须走 Tier III 演化、测试和 conformance,不能顺手加入。
 
-framework 看得见的概念只有 `event`、`source`、`queue`、`pipeline`、`coroutine/Lua state`、`worktree`、`subprocess`、`git ref`、`filesystem`、`file lock`、`time`、`known-good`。framework 看不见 `round`、`gate`、`phase`、`consensus`、`review policy`、`cooldown`、`retry policy`、`heal_attempt`、`audit_session` 或任何具体业务部门名。
+framework 看得见的概念只有 `event`、`source`、`queue`、`pipeline`、`coroutine/Lua state`、`worktree`、`subprocess`、`git ref`、`filesystem`、`file lock`、`time`、`known-good`。framework 看不见业务轮次、业务关卡、业务阶段、判断策略、审查策略、退避策略、重试策略、修复尝试、审计会话或任何具体业务部门名。
 
 SDK 命名可以直接写 `codex`。不要做通用 LLM provider 抽象；别的模型或 CLI 可以由 package/host 用 `exec_sync` 组合。
 
@@ -130,6 +130,6 @@ candidate branch 前缀、integration ref、runtime hidden refs 等属于 packag
 
 一个引擎改动只有在同时满足这些条件时才算完整:它不扩大 trusted base 或者有 evidence 支撑扩张；它保持三层稳定性和三级公司边界；它的事实落点只在 git/filesystem/fcntl/log；它不引入业务概念；它的失败可分类、可 grep、可恢复；它的 runtime 产物能映射到 `RuntimeLayout` 或明确的 git ref；它有适用测试或 conformance；它不需要 dashboard、内存状态或人工记忆才能解释系统发生了什么。
 
-跨文档定位以本仓库为准:`README.md` 说明当前抽取状态和验证命令，`SPEC.md` 定义身份锚点，`docs/architecture.md` 说明引擎架构。任何引用都必须指向 fkst-substrate 自己的文档，不把外部 dogfood 仓库当成当前事实。
+跨文档定位以本仓库为准:`README.md` 说明当前抽取状态和验证命令，`SPEC.md` 定义身份锚点，`docs/architecture.md` 说明引擎架构。任何引用都必须指向 fkst-substrate 自己的文档，不把外部 host 仓库当成当前事实。
 
 ⟦AI:FKST⟧
