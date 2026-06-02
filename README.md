@@ -11,6 +11,12 @@ cargo build --workspace
 cargo test --workspace
 ```
 
+治理与架构：
+
+- `CLAUDE.md`（= `AGENTS.md` 软链）：引擎治理与哲学不动点。
+- `SPEC.md`：Tier II 身份锚点（invariant 权威定义）。
+- `docs/architecture.md`：详细引擎架构（分层 / 依赖 / I/O / SDK / 事件机制 / runtime 目录 / 并发 / known-good）。
+
 来源：从 ChronoAIProject/fkst clean-init 抽取（历史留在该 public repo）。
 
 本仓库仍在抽取过程中，尚不可作为发布版消费。验证面当前只承诺 `cargo build/test --workspace` 绿。
