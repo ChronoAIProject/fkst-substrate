@@ -13,18 +13,26 @@ cargo test --workspace
 
 独立运行：
 
-本仓库内置一个通用最小 package：`examples/minimal-package`。它包含 cron source `tick`、producer、两个 fanout consumers，以及 runtime witness 文件写入，用于证明 source → route → produce → fanout → raise → file 的最小闭环。
+本仓库内置一个通用最小 package：`examples/minimal-package`。它**声明**了 cron source `tick`、producer（consume `tick`、produce+fanout `work`、写 witness）与两个 fanout consumers（consume `work`、各写 witness），用来作为 `--package-root` 的可加载实例。
+
+下列命令**不**依赖旧库，证明的范围如下（**注意**：它们不是完整端到端闭环证明）：
+
+- `--self-test`：引擎自检通过。
+- `conformance`：minimal-package **图与 fanout 契约通过 validation**（包能被独立加载、`work` 多消费者 fanout 合法）。
+- `run producer`：**单个 producer pipeline** 独立加载并运行，发出 `RAISED: work` 并写 producer witness。
+
+完整端到端 `tick → 路由 → fanout → consumer_a/consumer_b witness` 需要常驻的 `supervise` dispatcher；其 bounded smoke（带 timeout 与 witness 轮询，避免 daemon hang）为 deferred，见下。
 
 ```sh
 cargo build --workspace
-target/debug/fkst-framework --self-test
+FKST_RUNTIME_ROOT=/tmp/min-rt-$$ target/debug/fkst-framework --self-test
 FKST_RUNTIME_ROOT=/tmp/min-rt-$$ target/debug/fkst-framework conformance \
-  --project-root /Users/auric/fkst-substrate/examples/minimal-package \
-  --package-root /Users/auric/fkst-substrate/examples/minimal-package
+  --project-root "$PWD/examples/minimal-package" \
+  --package-root "$PWD/examples/minimal-package"
 FKST_RUNTIME_ROOT=/tmp/min-rt-$$ target/debug/fkst-framework run \
-  /Users/auric/fkst-substrate/examples/minimal-package/departments/producer/main.lua \
-  --package-root /Users/auric/fkst-substrate/examples/minimal-package \
-  --event '{"type":"tick","payload":{}}'
+  "$PWD/examples/minimal-package/departments/producer/main.lua" \
+  --package-root "$PWD/examples/minimal-package" \
+  --event '{"type":"tick","payload":{}}'   # 输出含 RAISED: work
 ```
 
 治理与架构：
@@ -44,6 +52,7 @@ FKST_RUNTIME_ROOT=/tmp/min-rt-$$ target/debug/fkst-framework run \
 
 Deferred（尚未迁入）清单：
 
+- examples 端到端 supervise smoke（bounded timeout + witness 轮询，自动证明 tick→fanout→两个 consumer witness）
 - conformance gate 迁移/泛化
 - install/release 脚本
 - dogfood 自演化闭环
