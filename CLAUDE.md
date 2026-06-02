@@ -1,130 +1,135 @@
-# CLAUDE.md — fkst-substrate(引擎 / universal SDLC substrate)
+# CLAUDE.md
 
-本仓库是 fkst 的**引擎**:trusted base(Tier I supervisor + Tier III framework + common crate)。它不含任何业务 Lua 包——部门 / raiser / stdlib / tunables 由独立的 Lua package 经 `FKST_PACKAGE_ROOT` 注入。本文是引擎域治理,只写引擎与 trusted base 的不变量。
+## 工作语言
 
-## 存在意义(L0)
-fkst 是**质量强制衬底**:承认"LLM 生成代码默认不可信",所有进主线的产物必经独立检查(共识 / review / 自动验证的适用组合)。引擎的职责是**给任意 host project 提供自动研发衬底**——不写应用,写"应用生长的环境"。引擎是 universal substrate;任何具体部门拓扑、路径、sentinel、分支前缀都必须可由 host / package 配置注入,不能硬编码成单一 host 的事实。
+本仓库的源文件内部一律使用英文。`.rs`、`.lua`、`.sh`、`.py`、`.ts` 等源码里的注释、docstring、log、error、panic 文本、模板字符串和标识符都必须保持英文。这样做是因为 fkst-substrate 是 trusted base,不是面向最终用户的 UI；源码、日志与错误文本需要和 Rust/Lua 生态、命令行工具、LLM 语料保持一致。
 
-## 工作语言(L0,优先于一切)
-- **源文件内部一切英文**(`.rs` / `.lua` / `.sh` 等):注释、docstring、`log`/`error`/`panic` 字符串、标识符、代码内构造的模板字符串。理由:substrate 无 end-user UI,人读 `git log` / `journalctl` / source。
-- **源文件之外的对外产物中文**:对话、commit subject+body、PR、issue、`docs/*.md`。
-- 例外(保留英文):标识符 / 路径、第三方 API/crate/命令名、git diff/patch 原文、引用的英文文档原话、测试断言。
-- 禁止:源文件内中文自然语言;中英混杂凑通顺。
+源文件之外的对外产物使用中文，包括对话回复、文档、issue/PR/comment、变更说明、TODO 段落和治理文本。代码标识符、路径、crate 名、第三方 API、命令名、协议名、测试断言和引用的原文可以保留英文。
 
-## 架构哲学(L1)
-- **不写程序,写程序生长的环境**(substrate / harness programming):产物是衬底,不是应用。违反则退化成"又一个 workflow engine"。
-- **自托管闭环**:衬底能在自己之内演化自己。不能 self-host 的 harness 是装饰不是基础设施。
-- **agent 是 system call,不是合作伙伴**:codex 无记忆 / 身份 / 连续性,做一次决策就死;实例间不直接通信。
-- **程序是数据驱动的临时不动点**:当前 `framework Rust + package graph` 过 conformance 的集成态由 evidence + 改动 + 验证迭代收敛,非"写出来"的 artifact。trusted base 是身份不动点(SPEC + supervisor 锁定)。
-- **存在即可记录**:无独立于 `git/fs/flock` 记录的"运行时事实"。进程内觉得 X 发生了是 cache 不是事实。
-- **commit 是命名加承诺**:每个跨 pipeline 事实(commit/raise/lock/worktree)隐含五槽——触发来源 / 行为类型 / 等价语义 / 可否复用 / 失败痕迹归属,要可 grep。
-- **失败分到最窄 socket**:detector / 失败分到具体类别(timeout / permit-exhaust / conformance-fail / lock-contention),不打 general error。
-- **Trusted base 越小越好,但不为零**:fix point 定义"系统是什么",可演化部分定义"能变成什么"。比照编译器:GCC 演化,C 规范是 fix point。
-- **可审计性是硬约束**:任何设计须让 senior 工程师一周内独立 audit 整个 trusted base。效率 / 灵活性 / 性能都让位于可审计性。
-- **Surface area 就是负债**:每加一个 SDK 函数 / source 类型 / Tier II invariant 都是永久成本。增加前三问:能组合表达?能 derive?能在 Lua 写?
-- **接口增长需要 evidence**:新 SDK / source 类型 / invariant 必须证明消除了 ≥N 个真实 unhandled case。美感 / 一致性 / "更通用"都不是理由。
+不要用中英混杂凑句子。中文表达不顺时改写中文句子，不把动词切成英文。用户输入里有英文术语时，回复仍用中文，术语原样保留。
 
-## 三层稳定性(强制)(L2)
-- **Tier I `supervisor` 源码(Rust)**:`crates/fkst-supervisor`,≤150 LOC(目标值,偏离触发 audit);默认 immutable;改动经深度共识 + auto-swap + 健康观察。spawn framework 子进程、转发信号、记录 exit;不做业务。
-- **Tier II `SPEC.md` + conformance**:fix-point,定义"系统是什么";改动经深度共识 + review + conformance 验证。
-- **Tier III `framework`(Rust)+ 注入的 package graph**:`crates/fkst-framework` auto-evolved;package root 承载部门 / raiser / stdlib / tunables。
-- 信任梯度只能经共识向上流:Tier I 治理 II,II 治理 III;向上改动唯一授权是深度共识(3/3 solver + meta-judge + 多角度独立 review)。
+## 架构哲学
 
-## 三级公司(强制)(L2)
-- **Level 1** = supervisor 进程 + framework + composed graph 的路由;收事件 → 按 type 查路由 → 转给部门;不做业务。
-- **Level 2** = composed graph 中 `departments/<X>/main.lua`;暴露 `pipeline(event)`;无 lifecycle hook;无状态纯函数。
-- **Level 3** = 一次 codex CLI 子进程;做完一件事就走;实例间禁止直接通信。
-- 不变量:不能加层;Level 2 间无共享内存;Level 3 间无直接通信;Level 1 不做业务;部门无状态,共享只通过 git + filesystem。
+fkst-substrate 是 universal SDLC substrate 的引擎域 trusted base。它提供 supervisor、framework、common 类型、Lua SDK、事件调度、runtime layout、worktree/lock/codex 进程契约和 known-good 机制；它不包含业务 Lua package,不包含具体部门拓扑,不包含某个 host 的研发策略。
 
-## 状态与持久化(强制)(L2)
-- 跨 pipeline 唯一持久通道:`git refs/commits/branches`、文件系统、fcntl 文件锁。
-- **framework 不写持久状态文件**:进程内一切是 cache,进程死归零;跨 pipeline 通信只通过 git/fs/flock。
-- 派生状态从事实源派生:计数用 `count_worktrees / git_log_count`;dedup 用 `git_log_grep`;历史用 `git log`。
-- 已否决:SQLite event log、通用 KV(`state.get/set/seen`)、`.current/.next-sha/.heartbeat` 状态文件、in-flight session continuation。
-- runtime 产物经 `RuntimeKind`(`pipeline / mailbox / evolve-requests / worktrees / codex-permits / locks / logs`)挂在 `FKST_RUNTIME_ROOT` 下;root 由 host 配置注入,引擎不硬编码。
+核心不是写应用，而是写应用生长的衬底。framework 提供受限、可审计、可组合的运行环境；业务行为由独立 package root 或 host root 注入的 `departments/`、`raisers/` 和 Lua helper 组成。引擎不能因为某个 host 的业务方便，把业务概念下沉到 Rust。
 
-## 并发模型(强制)(L2)
-- 单 Lua state + 协程:同一时刻只有一个 coroutine 跑 Lua,handler 间天然无 race。
-- 协程切换只在显式 yield:`spawn_codex_sync / await_all / with_lock`。
-- 每个 codex 调用 = 独立 OS 进程,OS 调度真并发;framework 不"调度"codex。
-- codex 全局上限用 fcntl 文件 permit 池(`codex-permits/`),进程死自动释放;不靠内存计数。
-- 不引入 semaphore / mutex / rate_limiter 跨 pipeline SDK;只有 `with_lock`。
+self-hosting 是 substrate 的能力要求，不是 dogfood 内容进入引擎库的理由。引擎必须能承载自演化闭环，但闭环中的具体部门、共识策略、review 策略和组织拓扑属于 package 或 host,不是 fkst-substrate 的事实。
 
-## Pipeline / 事件 / 路由(强制)(L2)
-- 事件流:`external (cron/file_watch/raise) → dispatcher → 按 type first-match 部门 → pipeline → 可选 raise → 信回 dispatcher`。
-- 路由 first-match,按 graph 的 depts 顺序;启动 lint 检测潜在多 match 并 warn;未处理 event 记 warn + 丢弃。
-- 启动图固定来自 installed package root + host root 的 `departments/` + `raisers/`;package root 由 `FKST_PACKAGE_ROOT` 或 `--package-root` 注入;**禁止** `package.lua` / manifest / root-list DSL。
-- Source 只在 `raisers/<X>.lua` 顶层声明,启动一次性确定;禁止 runtime 动态注册。当前内置 source:`cron / file_watch`;`cron` interval 只支持 `Ns|Nm|Nh`。
-- pipeline 退出物只两种:`git commit`(部门档案)与可选 `raise`(寄信);其它都是临时副作用。
-- **raise 语义**:`raise(queue, payload)` 进程内 buffer,退出时 stdout 发一行 `RAISED: <base64-json>`,父进程解析重注入。best-effort / at-most-once / derived-only。durable 意图走文件系统(写 inbox)+ file_watch,**不靠 raise**。
+agent 是 system call,不是合作伙伴。一次 `codex exec` 是一次 OS 子进程调用，输入来自 prompt/stdin/context/worktree,输出落到 stdout/stderr/log/exit_code；实例没有身份、记忆、连续性，也不直接互相通信。多 agent 协作只能由 Lua Department 通过事件、文件、git、lock 和 `await_all` 组织。
 
-## 边界(强制)(L2)
-- 暴露给 Lua 的 SDK surface 固定:`pipeline / source / raise / spawn_codex_sync / spawn_codex / exec_sync / await_all / with_lock / git_log_count / git_log_grep / count_worktrees / list_orphan_worktrees / setup_worktree / file / log.{info,warn,error} / now`。
-- 加 SDK 函数 = 扩 trusted base = 走演化通路,需 conformance 测试覆盖;不在主线随手加。
-- framework **看不见**业务概念:`round / gate / phase / cooldown / retry_policy / consensus / heal_attempt`。这些在 Lua 层组合,永不下沉到 Rust framework。
-- framework 内部 surface(mlua context、协程 scheduler、inotify 包装、subprocess lifecycle、信号、supervisor 协议)对 Lua 不可见、不可 hook。
-- SDK 命名带 `codex`,不假装通用 LLM provider 抽象;想用别的 LLM 用 `exec_sync` 跑那个 CLI。
+程序是数据驱动的临时不动点。trusted base 回答“系统是什么”，由 `SPEC.md`、conformance 和小内核锁定；package/host 行为回答“当前能处理什么”，由真实事件、失败、commit、worktree、日志和验证结果不断推动到新的 known-good。中间态代码只是材料，不能冒充 accepted state。
 
-## Fanout / 队列(强制)(L2)
-- 队列扇出 = 显式 `Vec<mpsc::Sender>`;**禁止 `tokio::sync::broadcast`**(滞后语义与 per-consumer drop on full 不兼容)。
-- 慢消费者:`try_send` 失败只对该订阅者 drop + warn,不影响其它。
-- 启动时 schema validation:未声明队列被引用、`capacity==0`、缺 lua 文件、bad timeout、孤立队列 → refuse-to-start。
-- fanout 来自 Department `M.spec.fanout`;声明者必须在同一 `M.spec` 的 `consumes`/`produces` 引用该 queue。
+## 三层稳定性
 
-## 子进程契约(强制)(L2)
-- spawn 用 `setsid`(新 process group);timeout/kill 时 `SIGKILL -pgid` 收 codex 子孙,避免孤儿。
-- supervisor restart 不杀 in-flight framework/codex:framework 独立进程组单次跑完即退;restart 只停自己。
-- framework 向 supervisor 输出 raised events 用 stdout 单行 `RAISED: <base64-url-JSON>`;多行最后赢;malformed 当空不 crash;从末尾向前扫避免 log 内 `RAISED:` 误判。
-- worktree 隔离:framework 自动加 ULID 后缀,业务给 prefix。
-- spawn 监督是 liveness/stall window 非总时长上限:codex 持续产出就跑到自然完成,**stall(无输出)才 kill**。dept `M.spec.timeout` 语义是 stall window。
+Tier I 是 `crates/fkst-supervisor`。它是进程根，只负责定位 framework binary、spawn `fkst-framework supervise`、继承 stdout/stderr、等待退出、处理信号和 reap 子进程。它不依赖 `fkst-common` 或 `fkst-framework` Rust 类型，不做业务。目标是极小、可独立审计；`≤150 LOC` 是当前 supervisor 规模门槛，偏离必须触发 audit。
 
-## 单 repo 单实例(强制)(L2)
-- 一个 git repo = 一个 supervisor = 一个 framework binary = 一组 graph;不在同一进程跑多套。
-- 多 repo / 多业务 = 多次部署,各自独立 supervisor;跨 repo 通信走 git push/pull。
-- **web dashboard / UI 永不做**:`git log + worktrees + journalctl` 是完整可观察面。
+Tier II 是 `SPEC.md` 与 conformance。它定义引擎身份不动点和边界测试。Tier II 需要保持小、稳定、可审计；它不是 package 策略文档，也不能写入某个 host 的临时路线。
 
-## Codex 调用契约(强制)(L3)
-- 非交互入口始终 `codex exec`,禁止裸 `codex`(进 TUI,无人值守 hang)。
-- stdin 必须有确定 EOF;argv prompt 仅 ≤4KB,更大用 stdin 喂(`-` 占位 + 文件重定向)。
-- 权限 `--dangerously-bypass-approvals-and-sandbox`;`-C <worktree>` 显式工作目录;`--add-dir <repo>` 让 codex 读 repo。
-- codex 无固定 wall-clock 超时,改 liveness 监督:持续产出跑到完成,停滞(stall window 内零输出)才 `SIGKILL`。
-- prompt + log 双 file:log 必填路径,stdout+stderr+`EXIT=`+`DONE_AT=` 全进同一文件;禁止 `> /dev/null` / 纯 stdout。
-- 必须输出终止 marker(`IMPLEMENT_DONE:` / `VERIFY_DONE:` 等);用 marker 路由,不靠 exit code 单独判断。
-- codex 只自治 own branch 的 git/gh 事实;禁止 `push --force` / `merge` / `rebase` / `reset --hard` / 推 integration branch / `pr merge` / 跨 branch 操作;禁止装新依赖、disable 测试换 CI 绿、用 `sleep` 凑测试节奏。
-- AI 生成对外内容末尾带 sentinel `⟦AI:FKST⟧`。
-- **Prompt purity**:codex 任务 prompt 给抽象准则,不列举具体反例(喂答案 → 只能 pattern-match;给原则 → 才会真思考)。
+Tier III 是 `crates/fkst-framework`、`crates/fkst-common` 和由独立 package/host 注入的 Lua graph。Rust framework 与 common 是引擎代码，Lua package 是外部行为层。Tier III 可以演化，但每次进入 accepted state 必须有 build/test/conformance/self-test/review/health evidence 中适用的证据闭环。
 
-## 编码行为纪律(无人值守)(L3)
-- 不确定**不 ask user**:把假设 / tradeoff 写进 commit body / log,自主选最优解推进,演化与 conformance 兜底。
-- 最简优先:最小可解代码,零投机;200 行能压到 50 就重写。
-- 手术刀守 scope(只动任务需要的)但不守旧代码:scope 内该删的 dead code 直接 `git rm`,该重构就重构,不留 compat shim / `.bak` / `_legacy`。
-- 目标驱动:任务转可验证目标;行为变更必须留回归测试;禁 disable / `[skip]` 测试换 CI 绿,禁 `sleep` 凑测试节奏。
-- 核心语义强类型:影响路由 / 控制流 / 状态判定的语义用具名 typed 表达;禁止塞无结构 `String` blob / 通用 bag / `general` 兜底。
-- 命名表达职责与意图,禁含糊词(`mgr`/`util`/`data`/`handle`/`tmp`)。
+bootstrap seed 可以有小 LOC 口径；当前生产态 Tier III 总 LOC 不是硬 gate。硬约束是 trusted base 可审计:一名 senior 工程师必须能在合理时间内独立读懂 supervisor、Tier II anchor、SDK surface、进程边界、runtime fact boundary 和 known-good 维护逻辑。
 
-## 删除 / 卫生(L3)
-- 无遗留 / 无历史兼容 / 无迁移路径:转新设计删干净旧的,不留 compat shim;已 push 的破坏性改动 commit body 标 `BREAKING CHANGE:`。
-- 删除优先:废弃文件 `git rm`,不创建 `.deprecated/.bak/.old`;历史在 `git log`。
-- 无 amnesic GC:批量清理留显式 ledger 索引(删了什么 + 为什么 + 原文 sha)。
-- 不写历史叙述,只写当前态;保留反面示例(`❌`)。
-- 代码 / config 不硬编码版本号或阶段标签(`Stage X / vN / round-N`);round 来自 payload,版本来自 git tag。
+## 三级公司
 
-## 已拒绝的设计方向(永久)(L4)
-YAML/DSL 规则语言 · Python/.NET 实现 · SQLite/通用 KV 状态 · Pipeline ABC/WorktreeMgr/GateRunner 业务抽象入 framework · 多 project 共存一进程 · 嵌套 pipeline/sub-pipeline · agent-to-agent 直接通信 · in-flight session continuation · 状态文件 · semaphore/mutex 跨 pipeline SDK · 部门 `concurrency` 声明 · 框架级复杂 cron · web dashboard · runtime 动态注册 source · `package.lua`/manifest/root-list graph · 多 LLM provider 抽象 · fix point 为零。
+结构只有三级:Company / Department / Person。
 
-## 反模式(禁止)(L4)
-- ❌ framework Rust 里出现业务名词(`round/gate/cooldown`)→ 业务概念漏入,演化频率不匹配
-- ❌ 加 SDK 函数不走演化通路 / 不补 conformance → trusted base 静默膨胀
-- ❌ 用文件存"系统当前在做什么"(`.heartbeat/.in-flight`)→ 与 git refs 双轨
-- ❌ codex 实例间直接通信 → 状态散在多进程内存
-- ❌ 用 `tokio::sync::broadcast` 替 `Vec<mpsc::Sender>` → 滞后语义错配
-- ❌ spawn 不带 setsid + pgid kill → timeout 时孤儿 codex 吃资源
-- ❌ 用固定 wall-clock timeout 砍 codex → 砍掉正在产出的 working codex;只在 stall 时 kill
-- ❌ 部门里维护 module-level Lua 变量做跨调用状态 → 部门必须无状态
+Company 是 supervisor + framework + composed graph。它接收 source 事件、根据静态图建立 queue 和 consumer、按 queue 将事件送入 Department、spawn 一次 `fkst-framework run <lua>` 执行 pipeline,解析 `RAISED:` 后再投递事件。Company 不写业务。
 
-## 跨文档定位(L5)
-- 当前 invariant 权威定义 → `SPEC.md`(Tier II)
-- 详细引擎架构(分层 / 依赖 / I/O / SDK / runtime 目录)→ `docs/architecture.md`
-- 哲学不动点 → 本文件
+Department 是 package root 或 host root 中的 `departments/<dept>/main.lua`。它暴露 `M.spec` 和 `pipeline(event)`；`M.spec` 声明 `consumes`、`produces`、`fanout`、`timeout`。Department 无 lifecycle hook,无共享内存,同一个 `pipeline` 跑两次就是两次独立调用。
+
+Person 是一次 `codex exec` 子进程。它通过 `spawn_codex_sync` 或 `spawn_codex` 启动，做完一件事即退出。Person 之间禁止直接通信；并发 Person 只能由 Department 用 `await_all` join。
+
+不能加层。不要引入团队、科室、工作组、agent 会议、共享 context、持久 agent 记忆、第二 dispatcher 或旁路 coordinator。任何新概念必须先能映射回这三级，否则不是引擎模型的一部分。
+
+## 状态与持久化
+
+跨 pipeline 的稳定事实只允许来自 `git refs/commits/branches`、filesystem 和 fcntl 文件锁。内存是 cache,进程死后归零。没有 record 即不存在；进程内“觉得发生了”不是事实。
+
+framework 不写持久状态文件。`RuntimeLayout` 把 `FKST_RUNTIME_ROOT` 下的路径限制为 `pipeline`、`mailbox`、`evolve-requests`、`worktrees`、`codex-permits`、`locks`、`logs`。这些是运行时事实和过程日志的落点；它们不是业务 schema 数据库。
+
+禁止 SQLite、KV store、通用 event log、`.current`、`.heartbeat`、`.next-sha`、进程内计数器或状态文件承担事实源职责。派生状态从事实源重读:计数用 `git_log_count` 或 `count_worktrees`,去重用 `git_log_grep`,互斥用 `with_lock` 或 codex permit pool。
+
+失败是一等输出。pipeline 失败可以产生日志、失败 commit、失败 socket 文件或无 commit,但不能停在隐形状态。可观察性来自 git、filesystem、fcntl lock witness 和落盘日志，不来自 dashboard 或外部 telemetry。
+
+## 并发模型
+
+单次 `fkst-framework run` 使用一个 Lua state。Lua handler 内没有共享内存并发；跨 pipeline 的真实并发来自 OS 进程。
+
+`spawn_codex_sync`、`spawn_codex`、`await_all`、`exec_sync`、`with_lock`、`setup_worktree` 等 SDK 调用把阻塞、进程、文件锁或 worktree 操作显式暴露。不要在 framework 内引入按 Department 命名的 scheduler、业务 semaphore、retry policy 或 rate limiter。
+
+Codex 全局上限由 `<RT>/codex-permits/permit-*` 的 fcntl permit 池强制。拿不到 permit 就阻塞在文件锁上；进程退出或崩溃时 fd 关闭，permit 自动释放。这个机制是引擎层唯一 codex 并发权威。
+
+## Pipeline / 事件 / 路由
+
+事件流是 `source -> fanout -> route -> spawn -> RAISED`。`cron` 和 `file_watch` source 由 `raisers/*.lua` 静态声明；Department 的 `M.spec` 静态声明 consumes/produces/fanout/timeout。启动时 graph scan 一次性求值 package root 与 host root 中固定目录，构造 Config。
+
+路由按 queue 和消费者集合发生。普通 queue 只能有一个 active consumer；fanout queue 必须由相关 Department 的 `M.spec.fanout` 显式声明。重复声明幂等，未声明多消费者或同队列反馈会在启动 validation 阶段拒绝。
+
+`raise(queue, payload)` 是 best-effort、at-most-once、derived-only。它只在进程内 buffer,在 pipeline 退出前向 stdout 打一行 `RAISED: <base64-url-encoded JSON>`。supervise 从 stdout 末尾向前解析，malformed 只 warn,不 crash。
+
+Source 只能来自 `cron` 与 `file_watch`。复杂日历、时区、退避、业务轮询、HTTP ingress 都不进入 source kind；用现有 source + Lua + 文件落盘组合。新增 source kind 是 trusted base 扩张，必须有真实 evidence、设计闭包和 conformance。
+
+启动图固定来自 `FKST_PACKAGE_ROOT` 或 `--package-root` 指向的 package root,再加 host root。合法输入是 `departments/`、`raisers/` 和可被 Lua `require` 的 package 文件。`package.lua`、package manifest、root list、dependency/order/override DSL、`FKST_STDLIB_ROOT`、`FKST_RUNTIME_PACKAGE_ROOT`、`FKST_GRAPH_ROOTS` 都不是合法 surface。
+
+## 边界
+
+Lua SDK surface 固定为:
+
+`pipeline / source / raise / spawn_codex_sync / spawn_codex / exec_sync / await_all / with_lock / git_log_count / git_log_grep / count_worktrees / list_orphan_worktrees / setup_worktree / file / log.{info,warn,error} / now`
+
+其中 `pipeline` 与 `source` 是 graph/package 侧约定，Rust 注册的运行时 primitive 是 `raise`、codex、exec、await、lock、git/worktree、file、log、now。新增 SDK 函数就是扩 trusted base,必须走 Tier III 演化、测试和 conformance,不能顺手加入。
+
+framework 看得见的概念只有 `event`、`source`、`queue`、`pipeline`、`coroutine/Lua state`、`worktree`、`subprocess`、`git ref`、`filesystem`、`file lock`、`time`、`known-good`。framework 看不见 `round`、`gate`、`phase`、`consensus`、`review policy`、`cooldown`、`retry policy`、`heal_attempt`、`audit_session` 或任何具体业务部门名。
+
+SDK 命名可以直接写 `codex`。不要做通用 LLM provider 抽象；别的模型或 CLI 可以由 package/host 用 `exec_sync` 组合。
+
+## Fanout / 队列
+
+队列物理实现是显式 `Vec<mpsc::Sender<Event>>`。禁止换成 `tokio::sync::broadcast`；broadcast 的 lag 语义和本引擎的 per-consumer drop-on-full 语义不一致。
+
+Producer 对 queue 调用 `try_send`。某个慢消费者 `Full` 或 `Closed` 只 drop 该订阅者并 warn,不阻塞其它订阅者。未知 queue warn 后 drop。
+
+启动 validation 强制检查 queue capacity > 0、引用的 queue 必须存在、Department lua 文件必须存在、timeout 必须是 `s/m/h` 结尾、孤立 queue 拒绝、多消费者必须 fanout、同 Department consume+produce 同一 queue 必须 fanout。
+
+## 子进程契约
+
+supervisor spawn framework 时使用独立 process group,但收到 `SIGINT` 或 `SIGTERM` 时只退出自己，不向 event runtime 发送信号。restart 不杀 in-flight framework/codex；在飞工作可以自然完成并留下事实，后续事件若丢失应由 package/host scanner 从事实源恢复。
+
+Department execution 由 supervise spawn `fkst-framework run <lua> --package-root <path> --event <json>`。每个 framework child 有独立 process group、具名 log、stdout/stderr 捕获和 no-output stall window。stall window 是无输出卡死检测，不是总时长上限；有持续输出就等自然退出。stall 时发送 `SIGKILL` 到整个 process group,退出码映射为 `124`。
+
+Codex 调用固定为 `codex exec --dangerously-bypass-approvals-and-sandbox [-C worktree] [--context context] -`。prompt 写入 stdin；stdin EOF 是调用边界。stdout、stderr、exit_code、cmd、done time、stall window 必须写入 codex log。`spawn_codex` 返回的 handle 只能由同一 pipeline 的 `await_all` 消费，不能跨 pipeline 复用。
+
+## 单 repo 单实例
+
+一个 host git repo 对应一个 supervisor、一个 framework binary、一组 package+host composed graph 和一个 `FKST_RUNTIME_ROOT`。多 repo 或多业务是多次部署，不是在同一 framework 进程里跑多套主链路。
+
+不做 web dashboard。完整可观察面是 git、runtime filesystem、locks、logs 和 host 自己选择的外部界面。dashboard 会把事实源变成第二系统，违反 trusted base 最小化。
+
+## Git Ref Namespace
+
+引擎层承认 `refs/known-good` 作为 framework accepted binary/source 的 CAS ref。`fkst-framework known-good` 负责 conformance/self-test/review evidence、health observation、rollback witness 和 `git update-ref --create-reflog`。
+
+candidate branch 前缀、integration ref、runtime hidden refs 等属于 package/host 配置或外部治理策略；引擎只提供 `setup_worktree`、`git_log_*`、known-good CAS 和底层命名/锁能力。不要把具体 branch topology 写成 substrate 事实。
+
+## 编码行为纪律
+
+源文件内部英文。错误分类要窄，避免 `general error`。日志和 commit/body/event payload 要可 grep,写清触发来源、行为类型、等价语义、后续复用和失败归属。AI 生成的对外文本末尾保留 `⟦AI:FKST⟧`。
+
+不写历史叙述，不写版本阶段标签，不写“曾经如何”。文档描述当前态；历史留给 git。不要留下 deprecated shim、compat layer、`.old`、`.bak`、`_legacy` 或“后续删除”的并行实现。改契约就改完整，旧形态从当前态删除。
+
+命名即本体论。`Company`、`Department`、`Person` 是结构约束，不是比喻。类型与函数名应反映引擎事实，而不是 host 业务愿望。Rust framework 中出现业务名、具体部门名或共识策略名，通常就是边界泄漏。
+
+## 已拒绝方向
+
+拒绝 workflow engine 化、actor 平台化、LLM provider 抽象、package manifest DSL、YAML/JSON 配置语言驱动行为图、多 package-root override graph、runtime dynamic handler registration、SQLite/KV/event-log 状态层、web dashboard、持久 agent 记忆、agent 直接通信、framework 内业务 retry/cooldown/gate/round。
+
+拒绝用文档警告替代接口收窄。接口如果很容易被误用，说明设计还没完成；应缩小 surface,把不变量放进代码和 conformance。
+
+## 设计完备性判据
+
+一个引擎改动只有在同时满足这些条件时才算完整:它不扩大 trusted base 或者有 evidence 支撑扩张；它保持三层稳定性和三级公司边界；它的事实落点只在 git/filesystem/fcntl/log；它不引入业务概念；它的失败可分类、可 grep、可恢复；它的 runtime 产物能映射到 `RuntimeLayout` 或明确的 git ref；它有适用测试或 conformance；它不需要 dashboard、内存状态或人工记忆才能解释系统发生了什么。
+
+跨文档定位以本仓库为准:`README.md` 说明当前抽取状态和验证命令，`SPEC.md` 定义身份锚点，`docs/architecture.md` 说明引擎架构。任何引用都必须指向 fkst-substrate 自己的文档，不把外部 dogfood 仓库当成当前事实。
 
 ⟦AI:FKST⟧
