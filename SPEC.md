@@ -4,6 +4,8 @@
 
 本文档定义 fkst 的 Tier II 身份锚点。它只回答"系统是什么",不记录"系统现在在做什么"。
 
+> 抽取快照说明:本文从 ChronoAIProject/fkst 原样带入作身份锚点。其中引用的 `conformance/run_all.sh`、conformance gate 集尚未迁入 fkst-substrate(见 README deferred 清单);相关条目描述的是 substrate 的目标 invariant,不代表本仓库当前已物化对应文件。
+
 ## 身份边界
 
 - Tier I 是 process-root supervisor 源码,默认不可变;只允许定位 accepted runtime artifact、启动 / 观察 Tier III event runtime、记录 spawn/exit、转发 process-level signal。
