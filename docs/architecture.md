@@ -41,7 +41,7 @@ fkst-substrate/
 └── docs/architecture.md                       本文
 ```
 
-业务 Lua package 不在本仓;`examples/minimal-package/` 是引擎自带的、唯一随仓发布的 package,仅用于证明 `--package-root` 能加载并跑通最小闭环,不含任何业务语义。host 注入的 package 用同样的 `departments/` + `raisers/` + `tunables/` 形状,经 `FKST_PACKAGE_ROOT` 指向。
+业务 Lua package 不在本仓;`examples/minimal-package/` 是引擎自带的、唯一随仓发布的 package,用于证明 `--package-root` 能被独立加载并通过图/fanout 契约 validation,且单个 producer pipeline 可 `run` 起来发出 `RAISED`,不含任何业务语义。完整 `tick → 路由 → fanout → consumer witness` 端到端需常驻 `supervise`,其 bounded smoke 为 deferred(见 `README.md`)。host 注入的 package 用同样的 `departments/` + `raisers/` + `tunables/` 形状,经 `FKST_PACKAGE_ROOT` 指向。
 
 ## 1. 三层稳定性与三级公司
 
