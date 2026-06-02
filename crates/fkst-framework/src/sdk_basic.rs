@@ -1,0 +1,337 @@
+//! SDK: `now() -> integer`, `exec_sync(cmd | opts) -> {stdout, stderr, exit_code}`.
+//!
+//! `exec_sync` takes either a string command or an options table with `cwd`,
+//! `env`, and `timeout`.
+
+use mlua::{Lua, Result, Table, Value};
+use std::io::Read;
+use std::process::{Command, Stdio};
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
+
+struct ExecOptions {
+    cmd: String,
+    cwd: Option<String>,
+    env: Vec<(String, String)>,
+    timeout: Option<Duration>,
+}
+
+struct ExecResult {
+    stdout: String,
+    stderr: String,
+    exit_code: i32,
+    timed_out: Option<bool>,
+}
+
+// Lua SDK registration and self-test match the fixed CLAUDE.md surface exactly; human notification, if needed, is represented through existing git/fs/log facts rather than a new SDK function.
+pub fn register(lua: &Lua) -> Result<()> {
+    lua.globals().set(
+        "now",
+        lua.create_function(|_, ()| {
+            let secs = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_err(mlua::Error::external)?
+                .as_secs();
+            Ok(secs)
+        })?,
+    )?;
+
+    lua.globals().set(
+        "exec_sync",
+        lua.create_function(|lua, arg: Value| {
+            let opts = parse_exec_options(arg)?;
+            let out = run_exec_sync(opts)?;
+            let t = lua.create_table()?;
+            t.set("stdout", out.stdout)?;
+            t.set("stderr", out.stderr)?;
+            t.set("exit_code", out.exit_code)?;
+            if let Some(timed_out) = out.timed_out {
+                t.set("timed_out", timed_out)?;
+            }
+            Ok(t)
+        })?,
+    )?;
+
+    Ok(())
+}
+
+fn parse_exec_options(arg: Value) -> Result<ExecOptions> {
+    match arg {
+        Value::String(cmd) => Ok(ExecOptions {
+            cmd: cmd.to_str()?.to_string(),
+            cwd: None,
+            env: Vec::new(),
+            timeout: None,
+        }),
+        Value::Table(table) => {
+            let cmd: String = table.get("cmd")?;
+            let cwd: Option<String> = table.get("cwd")?;
+            let env = match table.get::<Option<Table>>("env")? {
+                Some(env_table) => env_table
+                    .pairs::<String, String>()
+                    .collect::<Result<Vec<(String, String)>>>()?,
+                None => Vec::new(),
+            };
+            let timeout = table
+                .get::<Option<f64>>("timeout")?
+                .map(|secs| Duration::from_secs_f64(secs.max(0.0)));
+
+            Ok(ExecOptions {
+                cmd,
+                cwd,
+                env,
+                timeout,
+            })
+        }
+        other => Err(mlua::Error::external(format!(
+            "exec_sync expects string or table, got {}",
+            other.type_name()
+        ))),
+    }
+}
+
+fn build_command(opts: &ExecOptions) -> Command {
+    let mut command = Command::new("/bin/sh");
+    command.arg("-c").arg(&opts.cmd);
+    if let Some(cwd) = &opts.cwd {
+        command.current_dir(cwd);
+    }
+    for (key, value) in &opts.env {
+        command.env(key, value);
+    }
+    command
+}
+
+#[cfg(unix)]
+fn make_process_group_leader(command: &mut Command) {
+    use std::os::unix::process::CommandExt;
+
+    command.process_group(0);
+}
+
+#[cfg(not(unix))]
+fn make_process_group_leader(_command: &mut Command) {}
+
+#[cfg(unix)]
+fn kill_process_group(child_pid: u32) {
+    use nix::sys::signal::{killpg, Signal};
+    use nix::unistd::Pid;
+
+    let _ = killpg(Pid::from_raw(child_pid as i32), Signal::SIGKILL);
+}
+
+#[cfg(not(unix))]
+fn kill_process_group(_child_pid: u32) {}
+
+fn run_exec_sync(opts: ExecOptions) -> Result<ExecResult> {
+    match opts.timeout {
+        Some(timeout) => run_exec_sync_with_timeout(&opts, timeout),
+        None => {
+            let out = build_command(&opts)
+                .output()
+                .map_err(mlua::Error::external)?;
+            Ok(ExecResult {
+                stdout: String::from_utf8_lossy(&out.stdout).to_string(),
+                stderr: String::from_utf8_lossy(&out.stderr).to_string(),
+                exit_code: out.status.code().unwrap_or(-1),
+                timed_out: None,
+            })
+        }
+    }
+}
+
+fn run_exec_sync_with_timeout(opts: &ExecOptions, timeout: Duration) -> Result<ExecResult> {
+    let mut command = build_command(opts);
+    make_process_group_leader(&mut command);
+    let mut child = command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(mlua::Error::external)?;
+    let child_pid = child.id();
+    let stdout_reader = child
+        .stdout
+        .take()
+        .map(read_pipe_in_thread)
+        .ok_or_else(|| mlua::Error::external("failed to capture stdout"))?;
+    let stderr_reader = child
+        .stderr
+        .take()
+        .map(read_pipe_in_thread)
+        .ok_or_else(|| mlua::Error::external("failed to capture stderr"))?;
+
+    let start = Instant::now();
+    loop {
+        if let Some(status) = child.try_wait().map_err(mlua::Error::external)? {
+            let stdout = join_pipe_reader(stdout_reader)?;
+            let stderr = join_pipe_reader(stderr_reader)?;
+            return Ok(ExecResult {
+                stdout: String::from_utf8_lossy(&stdout).to_string(),
+                stderr: String::from_utf8_lossy(&stderr).to_string(),
+                exit_code: status.code().unwrap_or(-1),
+                timed_out: Some(false),
+            });
+        }
+
+        if start.elapsed() >= timeout {
+            kill_process_group(child_pid);
+            let _ = child.wait();
+            let stdout = join_pipe_reader(stdout_reader)?;
+            let stderr = join_pipe_reader(stderr_reader)?;
+            return Ok(ExecResult {
+                stdout: String::from_utf8_lossy(&stdout).to_string(),
+                stderr: String::from_utf8_lossy(&stderr).to_string(),
+                exit_code: 124,
+                timed_out: Some(true),
+            });
+        }
+
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn read_pipe_in_thread<R>(mut pipe: R) -> JoinHandle<std::io::Result<Vec<u8>>>
+where
+    R: Read + Send + 'static,
+{
+    std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        pipe.read_to_end(&mut buf)?;
+        Ok(buf)
+    })
+}
+
+fn join_pipe_reader(reader: JoinHandle<std::io::Result<Vec<u8>>>) -> Result<Vec<u8>> {
+    reader
+        .join()
+        .map_err(|_| mlua::Error::external("pipe reader thread panicked"))?
+        .map_err(mlua::Error::external)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mlua::Lua;
+    #[cfg(unix)]
+    use nix::errno::Errno;
+    #[cfg(unix)]
+    use nix::fcntl::{open, OFlag};
+    #[cfg(unix)]
+    use nix::sys::stat::Mode;
+    #[cfg(unix)]
+    use nix::unistd::mkfifo;
+
+    #[test]
+    fn now_returns_positive_int() {
+        let lua = Lua::new();
+        register(&lua).unwrap();
+        let n: i64 = lua.load("return now()").eval().unwrap();
+        assert!(n > 1_700_000_000, "now() returned {}", n);
+    }
+
+    #[test]
+    fn exec_sync_echo_works() {
+        let lua = Lua::new();
+        register(&lua).unwrap();
+        let t: Table = lua
+            .load(r#"return exec_sync("echo hello")"#)
+            .eval()
+            .unwrap();
+        let stdout: String = t.get("stdout").unwrap();
+        let exit_code: i64 = t.get("exit_code").unwrap();
+        assert_eq!(exit_code, 0);
+        assert!(stdout.contains("hello"));
+    }
+
+    #[test]
+    fn exec_sync_nonzero_exit() {
+        let lua = Lua::new();
+        register(&lua).unwrap();
+        let t: Table = lua.load(r#"return exec_sync("exit 7")"#).eval().unwrap();
+        let exit_code: i64 = t.get("exit_code").unwrap();
+        assert_eq!(exit_code, 7);
+    }
+
+    #[test]
+    fn exec_sync_table_cwd_works() {
+        let dir = tempfile::tempdir().unwrap();
+        let expected = dir.path().to_string_lossy().to_string();
+        let lua = Lua::new();
+        register(&lua).unwrap();
+        lua.globals().set("cwd", expected.clone()).unwrap();
+        let t: Table = lua
+            .load(r#"return exec_sync({ cmd = "pwd", cwd = cwd })"#)
+            .eval()
+            .unwrap();
+        let stdout: String = t.get("stdout").unwrap();
+        let exit_code: i64 = t.get("exit_code").unwrap();
+        assert_eq!(exit_code, 0);
+        assert_eq!(
+            std::fs::canonicalize(stdout.trim()).unwrap(),
+            std::fs::canonicalize(expected).unwrap()
+        );
+    }
+
+    #[test]
+    fn exec_sync_table_env_works() {
+        let lua = Lua::new();
+        register(&lua).unwrap();
+        let t: Table = lua
+            .load(r#"return exec_sync({ cmd = "echo $X", env = { X = "from-env" } })"#)
+            .eval()
+            .unwrap();
+        let stdout: String = t.get("stdout").unwrap();
+        let exit_code: i64 = t.get("exit_code").unwrap();
+        assert_eq!(exit_code, 0);
+        assert_eq!(stdout.trim(), "from-env");
+    }
+
+    #[test]
+    fn exec_sync_table_timeout_works() {
+        let lua = Lua::new();
+        register(&lua).unwrap();
+        let t: Table = lua
+            .load(r#"return exec_sync({ cmd = "sleep 10", timeout = 1 })"#)
+            .eval()
+            .unwrap();
+        let exit_code: i64 = t.get("exit_code").unwrap();
+        let timed_out: bool = t.get("timed_out").unwrap();
+        assert_eq!(exit_code, 124);
+        assert!(timed_out);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exec_sync_timeout_kills_process_group() {
+        let dir = tempfile::tempdir().unwrap();
+        let fifo = dir.path().join("probe.fifo");
+        let pidfile = dir.path().join("child.pid");
+        mkfifo(&fifo, Mode::S_IRUSR | Mode::S_IWUSR).unwrap();
+
+        let lua = Lua::new();
+        register(&lua).unwrap();
+        lua.globals()
+            .set(
+                "cmd",
+                format!(
+                    "(read _ < '{}') & echo $! > '{}'; wait",
+                    fifo.display(),
+                    pidfile.display()
+                ),
+            )
+            .unwrap();
+        let t: Table = lua
+            .load(r#"return exec_sync({ cmd = cmd, timeout = 0.2 })"#)
+            .eval()
+            .unwrap();
+        let exit_code: i64 = t.get("exit_code").unwrap();
+        let timed_out: bool = t.get("timed_out").unwrap();
+        assert_eq!(exit_code, 124);
+        assert!(timed_out);
+        assert!(pidfile.exists());
+
+        let err = open(&fifo, OFlag::O_WRONLY | OFlag::O_NONBLOCK, Mode::empty())
+            .expect_err("fifo writer should have no live reader after timeout");
+        assert_eq!(err, Errno::ENXIO);
+    }
+}
