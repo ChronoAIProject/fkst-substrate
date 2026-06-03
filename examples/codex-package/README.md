@@ -2,8 +2,8 @@
 
 `examples/codex-package` 是一个 package-root fixture，用来展示现有 Lua SDK 里的 `spawn_codex_sync`：
 
-- `raisers/requests.lua` 通过 `file_watch` 观察 `requests/*.md`，产生 `codex_request`。
-- `departments/codex_demo/main.lua` 消费 `codex_request`，调用 `spawn_codex_sync({ prompt, stall_window })`，再 `raise("codex_result", payload)`。
+- `raisers/requests.lua` 通过 `file_watch` 观察 `requests/*.md`，产生 payload 为 `{ "path": "<abs path>" }` 的 `codex_request`。
+- `departments/codex_demo/main.lua` 消费 `codex_request`，读取 `payload.path` 指向的请求文件内容，调用 `spawn_codex_sync({ prompt, stall_window })`，再 `raise("codex_result", payload)`。
 - `departments/codex_demo/prompt.lua` 只包含纯字符串逻辑，不调用 SDK。
 - `departments/codex_demo/codex_demo_test.lua` 用 Lua 内置 `assert` 覆盖纯逻辑。
 
@@ -47,7 +47,9 @@ local result = spawn_codex_sync({
 
 ## 单点运行
 
-这些命令都是单 pipeline 注入，不经过 supervise 路由，也不会自动消费 `requests/req-001.md`：
+仓库里没有随包提交的 `requests/*.md` 种子文件，所以 `supervise` 启动扫描不会自动触发 codex。只有用户丢入请求文件，或者用 `run --event` 注入带 `{ "path": "<abs path>" }` 的事件，才会调用 codex。
+
+这些命令都是单 pipeline 注入，不经过 supervise 路由：
 
 ```sh
 cargo build --workspace
@@ -80,6 +82,8 @@ echo FAKE_CODEX_OK
 exit 0
 SH
 chmod 755 "$fake_bin/codex"
+mkdir -p "$tmp_host/requests"
+printf 'hello task\n' > "$tmp_host/requests/manual.md"
 
 PATH="$fake_bin:$PATH" \
 FKST_RUNTIME_ROOT="$tmp_host/.fkst/runtime" \
@@ -88,7 +92,7 @@ FKST_CODEX_PERMIT_SLOTS=4 \
   "$tmp_host/departments/codex_demo/main.lua" \
   --project-root "$tmp_host" \
   --package-root "$tmp_host" \
-  --event '{"queue":"codex_request","payload":{"input":"hello"}}'
+  --event "{\"queue\":\"codex_request\",\"payload\":{\"path\":\"$tmp_host/requests/manual.md\"}}"
 ```
 
 stdout 应包含 `RAISED:`，解码后 queue 是 `codex_result`，payload 里 `summary` 包含 `FAKE_CODEX_OK`，`exit_code` 是 `0`。stderr 应包含 `codex exit_code=0 log=`。

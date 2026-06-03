@@ -130,22 +130,33 @@ fn codex_demo_raises_fake_codex_result() {
     let runtime = tempfile::tempdir().unwrap();
     let fake_bin = tempfile::tempdir().unwrap();
     copy_codex_package(host.path());
+    let request_path = host.path().join("requests/manual.md");
+    fs::write(&request_path, "hello task").unwrap();
+    let prompt_path = runtime.path().join("codex-stdin.txt");
     install_codex_script(
         fake_bin.path(),
-        r#"#!/bin/sh
-cat >/dev/null
+        &format!(
+            r#"#!/bin/sh
+cat > "{}"
 echo FAKE_CODEX_OK
 exit 0
 "#,
+            prompt_path.display()
+        ),
     );
 
     let original_path = std::env::var("PATH").unwrap_or_default();
     let fake_path = format!("{}:{}", fake_bin.path().display(), original_path);
+    let event = serde_json::json!({
+        "queue": "codex_request",
+        "payload": { "path": request_path }
+    })
+    .to_string();
     let output = run_department(
         host.path(),
         runtime.path(),
         "departments/codex_demo/main.lua",
-        r#"{"queue":"codex_request","payload":{"input":"hello"}}"#,
+        &event,
     )
     .env("PATH", fake_path)
     .env("FKST_CODEX_PERMIT_SLOTS", "4")
@@ -163,6 +174,9 @@ exit 0
     assert_eq!(raised[0]["payload"]["exit_code"], 0);
     assert_eq!(raised[0]["payload"]["summary"], "FAKE_CODEX_OK");
     assert!(raised[0].get("ts").is_none(), "raised={raised}");
+
+    let prompt = fs::read_to_string(&prompt_path).unwrap();
+    assert!(prompt.contains("hello task"), "prompt={prompt}");
 }
 
 #[test]

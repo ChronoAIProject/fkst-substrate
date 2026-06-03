@@ -8,7 +8,12 @@ M.spec = {
 }
 
 function pipeline(event)
-  local request = (event.payload or {}).input or ""
+  local path = event.payload and event.payload.path or nil
+  if path == nil or path == "" then
+    log.warn("codex request missing payload.path")
+    return
+  end
+  local request = file.read(path)
   local result = spawn_codex_sync({
     prompt = prompt.build(request),
     stall_window = 300,
