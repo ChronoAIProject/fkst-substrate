@@ -32,7 +32,7 @@ fkst-substrate/
 └── docs/architecture.md
 ```
 
-`examples/minimal-package/` 是引擎自带的最小示例包，用于证明 `--package-root` 能被独立加载、通过图/fanout validation，并且单个 producer pipeline 可 `run` 起来发出 `RAISED`。它不代表业务语义。
+`examples/minimal-package/` 是引擎自带的最小 reconciliation/control-loop 示例包，用于证明 `--package-root` 能被独立加载、通过图 validation，并且 scanner/worker pipeline 可独立 `run`。它演示事件瞬时、host repo 文件承载本地 durable 完成事实、崩溃后由 cron/file_watch 重新扫描再推导工作。
 
 ## 1. 三层稳定性与三级公司
 
@@ -120,8 +120,10 @@ run 模式未传 --project-root 时可从 Lua 路径推断
 
 ```lua
 { type = "cron", interval = "10s", produces = "queue" }
-{ type = "file_watch", glob = "path-or-runtime://artifacts/pipeline/...", produces = "queue" }
+{ type = "file_watch", glob = "host-root-relative/or/absolute/path/*.md", produces = "queue" }
 ```
+
+`file_watch.glob` 可以是 host root 相对路径或绝对路径；相对路径由 engine 锚到 host root。它用于监听 host repo durable 文件或外部同步到 host 的文件，不支持已移除的 runtime scheme。
 
 ## 5. Engine Operation Registry
 
@@ -141,21 +143,19 @@ run 模式未传 --project-root 时可从 Lua 路径推断
 
 ## 6. Runtime I/O 与落点
 
-`RuntimeKind` 固定 5 类。下表是每类的 I/O：落点、用途、以及**谁写**(`<RT>` = `FKST_RUNTIME_ROOT`，已锚到 `<HOST>`)。
+`RuntimeKind` 固定 4 类。它们都是一轮运行的一次性 scratch 落点，不是 package 状态层，也不是 durable 真相源。`<RT>` 表示引擎 runtime root，相对值会锚到 `<HOST>`。
 
 | RuntimeKind | 落点 | 用途 | 写入者(engine) | 读取者 |
 |---|---|---|---|---|
-| `Artifacts` | `<RT>/artifacts` | package/host 可写的 ephemeral-local 命名空间;`pipeline`/`mailbox` 是 package 子目录约定,非引擎事实 | **无**(package/host 经 `file.write`) | package/host;`file_watch` 可监听 |
 | `Worktrees` | `<RT>/worktrees` | 隔离 worktree | `sdk_git::setup_worktree`(`git worktree add`) | `count_worktrees` / `list_orphan_worktrees` |
 | `CodexPermits` | `<RT>/codex-permits` | `permit-*` fcntl codex 并发池 | `sdk_codex`(建池 + flock 占位) | `spawn_codex` 抢 permit |
 | `Locks` | `<RT>/locks` | fcntl 锁文件 | `sdk_git::with_lock` | 同 — 跨 pipeline 互斥 |
 | `Logs` | `<RT>/logs` | 过程日志 | `supervise::spawner`(framework-child)+ `sdk_codex`(codex log) | 人手 / 调试,非 file_watch 输入 |
 
 说明:
-- **engine 自己只写"结构事实"**(worktree / permit / lock / log);**`artifacts` 下的内容由注入的 package/host 经 `file.write` 写**,engine 不产其内容,`pipeline` 与 `mailbox` 只是 package 子目录约定。
-- `RuntimeLayout::runtime_path(kind, relative)` 拒绝 parent traversal 与绝对 relative path;framework 先把相对 `FKST_RUNTIME_ROOT` 锚到 `<HOST>` 再建路径。
-- `runtime://` glob 只允许 `file_watch` 映射到**显式** runtime kind:**未知 kind fail-closed,缺少 kind fail-closed**(不再有 evolve-requests 之类的隐式默认回退);`runtime://logs` 是 local-only,不能作 file_watch 输入。
-- `Artifacts` 不属于 engine 的 durable 状态,engine 不承诺跨机同步；需要跨机或长期保留时,package/host controller 必须把 intent 物化到自己的可观测事实中。
+- **engine 自己只写 scratch 结构事实**(worktree / permit / lock / log)。package 不访问 `<RT>`，也不把 `<RT>` 当 inbox、完成态或业务 schema 数据库。
+- `RuntimeLayout` 只提供固定 runtime dir 解析，framework 先把相对 runtime root 锚到 `<HOST>` 再建路径。
+- 已移除的 runtime scheme 不再是 graph surface；`file_watch` 只接受 host-root 相对或绝对 glob。
 - engine **不写** runtime 持久状态(无 `refs/known-good` / accepted-state / rollback —— 那是外部 release pipeline 的事实,见 §12)。
 
 ## 7. 运行态数据流
@@ -185,17 +185,17 @@ Fanout::send(raised.queue, raised_event)
 
 `consumer.rs` 为每个 Department 的每个 consumed queue 建 receiver，再汇入该 Department 的 inbox。每个事件 spawn 一个 framework child，不是在 supervisor 进程内直接调用 Lua。framework child 的 stdout/stderr 会写到 `<RT>/logs/framework-child/` 下的具名 log；RAISED 解析不依赖 log 文件，而是解析 captured stdout。
 
-`raise` 不落盘。需要 durable intent 时，package/host 必须显式写入 git commit/worktree/artifact/package 请求 inbox 等可观测事实，再由 package controller 通过 `file_watch` 或 scanner 重新引入事件。
+`raise` 不落盘。需要 durable intent 或完成事实时，package/host 必须显式写入 git commit、host repo 文件或外部源，再由 package controller 通过 `file_watch` 或 scanner 重新引入事件。
 
 ## 8. Reconciliation / Control-loop 事件模型
 
 内存队列是瞬时队列。它只存在于当前 `fkst-framework supervise` 进程和 supervisor 生命周期内；进程挂掉、supervisor 重启或 host 迁移时队列内容丢失。engine 不把 queue 当 durable message state,不跨机同步队列,也不引入 MQ broker。
 
-durable 真相来自可观测事实：git commit、worktree、package 物化的 artifact 与请求 inbox。这里的 artifact 与 inbox 是 package/host controller 自己约定、物化并自管保留/同步的事实。`locks` 不是 durable 真相——`with_lock` 只是进程死即释放的**处理中租约/协调事实**（见下），不承载完成态。engine 只提供 `file`、`file_watch`、cron、git/worktree 和 `with_lock` 等原语，不拥有 scanner 部门、inbox schema、done 判定、重试策略或幂等语义。
+durable 真相来自可观测事实：git commit、host repo 文件与外部源（例如 GitHub issue）。host repo 文件适合本地或单机演示；真正跨机或长期保留的完成事实应进入 git commit 或外部源。`<RT>` 只是一轮运行的一次性 scratch，`locks` 也不是 durable 真相——`with_lock` 只是进程死即释放的**处理中租约/协调事实**，不承载完成态。engine 只提供 `file`、`file_watch`、cron、git/worktree 和 `with_lock` 等原语，不拥有 scanner 部门、inbox schema、done 判定、重试策略或幂等语义。
 
-恢复模型是 control-loop：package controller 用 cron / file_watch scanner 扫描可观测事实，reconcile 未完成工作，并重新 enqueue 对应事件。幂等由 package controller 保证；engine 只负责把重新 raised / scanned 的事件送入当前内存队列。
+恢复模型是 control-loop：package controller 用 cron / file_watch scanner 扫描 durable 源，reconcile 未完成工作，并重新 enqueue 对应事件。崩溃等价于从 0 重来；in-flight 事件丢失后，下一拍从 durable 源重新推导。幂等由 package controller 保证；engine 只负责把重新 raised / scanned 的事件送入当前内存队列。
 
-engine 不维护消息状态。`处理中` 要么是 `with_lock` 租约（进程死后 fcntl lock 自动释放），要么是 worktree 等可观测事实；`done` 是 commit 或 artifact 等可观测事实。engine 明确不提供 message state、ack / visibility timeout、dead-letter queue、状态队列或 durable broker。
+engine 不维护消息状态。`处理中` 可以是 `with_lock` 租约（进程死后 fcntl lock 自动释放）或 worktree 等可观测事实；`done` 是 commit、host repo 文件或外部源事实。engine 明确不提供 message state、ack / visibility timeout、dead-letter queue、状态队列或 durable broker。
 
 ## 9. SDK Surface
 
