@@ -115,3 +115,25 @@ fn minimal_package_reconciles_work_and_done_marker() {
     assert_success(&scanner_after_done);
     assert!(!stdout(&scanner_after_done).contains("RAISED:"));
 }
+
+#[test]
+fn minimal_package_worker_renames_shell_metacharacter_id_without_injection() {
+    let host = tempfile::tempdir().unwrap();
+    let runtime = tempfile::tempdir().unwrap();
+    let package = repo_root().join("examples/minimal-package");
+    copy_dir(&package, host.path());
+
+    let worker = run_department(
+        host.path(),
+        runtime.path(),
+        "departments/worker/main.lua",
+        r#"{"type":"work","payload":{"id":"req; touch injected; #","request_path":"requests/req; touch injected; #.md"}}"#,
+    );
+    assert_success(&worker);
+
+    let done = host.path().join("state/done/req; touch injected; #.txt");
+    let done_content = fs::read_to_string(&done).unwrap();
+    assert!(done_content.contains("id=req; touch injected; #"));
+    assert!(!host.path().join("injected").exists());
+    assert!(!host.path().join("state/done/.req; touch injected; #.tmp").exists());
+}
