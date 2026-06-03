@@ -62,6 +62,8 @@ fkst-substrate 的 accepted release state 来自外部 release pipeline，而不
 
 host/package 可以在此 runtime 上编排 SDLC 工作流，但这属于外部行为层，不是 engine 内建职责。
 
+engine 队列是瞬时的；durable intent 属于 package/外部可观测事实，不在 engine 内部维护。
+
 ## 文档
 
 - `CLAUDE.md`（= `AGENTS.md` 软链）：引擎治理与哲学不动点。

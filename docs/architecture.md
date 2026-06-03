@@ -145,7 +145,7 @@ run 模式未传 --project-root 时可从 Lua 路径推断
 
 | RuntimeKind | 落点 | 用途 | 写入者(engine) | 读取者 |
 |---|---|---|---|---|
-| `Artifacts` | `<RT>/artifacts` | package/host 写的持久内容命名空间;`pipeline`/`mailbox` 是 package 子目录约定,非引擎事实 | **无**(package/host 经 `file.write`) | package/host;`file_watch` 可监听 |
+| `Artifacts` | `<RT>/artifacts` | package/host 可写的 ephemeral-local 命名空间;`pipeline`/`mailbox` 是 package 子目录约定,非引擎事实 | **无**(package/host 经 `file.write`) | package/host;`file_watch` 可监听 |
 | `Worktrees` | `<RT>/worktrees` | 隔离 worktree | `sdk_git::setup_worktree`(`git worktree add`) | `count_worktrees` / `list_orphan_worktrees` |
 | `CodexPermits` | `<RT>/codex-permits` | `permit-*` fcntl codex 并发池 | `sdk_codex`(建池 + flock 占位) | `spawn_codex` 抢 permit |
 | `Locks` | `<RT>/locks` | fcntl 锁文件 | `sdk_git::with_lock` | 同 — 跨 pipeline 互斥 |
@@ -155,7 +155,8 @@ run 模式未传 --project-root 时可从 Lua 路径推断
 - **engine 自己只写"结构事实"**(worktree / permit / lock / log);**`artifacts` 下的内容由注入的 package/host 经 `file.write` 写**,engine 不产其内容,`pipeline` 与 `mailbox` 只是 package 子目录约定。
 - `RuntimeLayout::runtime_path(kind, relative)` 拒绝 parent traversal 与绝对 relative path;framework 先把相对 `FKST_RUNTIME_ROOT` 锚到 `<HOST>` 再建路径。
 - `runtime://` glob 只允许 `file_watch` 映射到**显式** runtime kind:**未知 kind fail-closed,缺少 kind fail-closed**(不再有 evolve-requests 之类的隐式默认回退);`runtime://logs` 是 local-only,不能作 file_watch 输入。
-- engine **不写** runtime 持久状态(无 `refs/known-good` / accepted-state / rollback —— 那是外部 release pipeline 的事实,见 §11)。
+- `Artifacts` 不属于 engine 的 durable 状态,engine 不承诺跨机同步；需要跨机或长期保留时,package/host controller 必须把 intent 物化到自己的可观测事实中。
+- engine **不写** runtime 持久状态(无 `refs/known-good` / accepted-state / rollback —— 那是外部 release pipeline 的事实,见 §12)。
 
 ## 7. 运行态数据流
 
@@ -184,9 +185,19 @@ Fanout::send(raised.queue, raised_event)
 
 `consumer.rs` 为每个 Department 的每个 consumed queue 建 receiver，再汇入该 Department 的 inbox。每个事件 spawn 一个 framework child，不是在 supervisor 进程内直接调用 Lua。framework child 的 stdout/stderr 会写到 `<RT>/logs/framework-child/` 下的具名 log；RAISED 解析不依赖 log 文件，而是解析 captured stdout。
 
-`raise` 不落盘。需要 durable intent 时，package/host 必须显式写文件到 `<RT>/artifacts/pipeline`、`<RT>/artifacts/mailbox` 或其它 `<RT>/artifacts` 下的约定落点，再由 `file_watch` 或 scanner 重新引入事件。
+`raise` 不落盘。需要 durable intent 时，package/host 必须显式写入 git commit/worktree/artifact/package 请求 inbox 等可观测事实，再由 package controller 通过 `file_watch` 或 scanner 重新引入事件。
 
-## 8. SDK Surface
+## 8. Reconciliation / Control-loop 事件模型
+
+内存队列是瞬时队列。它只存在于当前 `fkst-framework supervise` 进程和 supervisor 生命周期内；进程挂掉、supervisor 重启或 host 迁移时队列内容丢失。engine 不把 queue 当 durable message state,不跨机同步队列,也不引入 MQ broker。
+
+durable 真相来自可观测事实：git commit、worktree、artifact、package 请求 inbox、locks。这里的 artifact 与 inbox 是 package/host controller 自己约定和维护的事实；engine 只提供 `file`、`file_watch`、cron、git/worktree 和 `with_lock` 等原语，不拥有 scanner 部门、inbox schema、done 判定、重试策略或幂等语义。
+
+恢复模型是 control-loop：package controller 用 cron / file_watch scanner 扫描可观测事实，reconcile 未完成工作，并重新 enqueue 对应事件。幂等由 package controller 保证；engine 只负责把重新 raised / scanned 的事件送入当前内存队列。
+
+engine 不维护消息状态。`处理中` 要么是 `with_lock` 租约（进程死后 fcntl lock 自动释放），要么是 worktree 等可观测事实；`done` 是 commit 或 artifact 等可观测事实。engine 明确不提供 message state、ack / visibility timeout、dead-letter queue、状态队列或 durable broker。
+
+## 9. SDK Surface
 
 固定 surface：
 
@@ -211,7 +222,7 @@ Fanout::send(raised.queue, raised_event)
 
 `spawn_codex` 的 handle 只能由同一个 Lua pipeline 的 `await_all` 消费。单 handle 等待用 `await_all({handle})`。没有 sleep timer、first-result fanout、业务 retry、provider abstraction 或动态 SDK extension。
 
-## 9. 事件与队列机制
+## 10. 事件与队列机制
 
 `Config` 包含 `queue`、`raiser`、`department`、`limits`。Queue 有 `capacity` 与 `fanout`。Raiser 只有 `Cron` 与 `FileWatch`。Department 有 `lua`、`consumes`、`produces`、`timeout`。
 
@@ -229,7 +240,7 @@ validation 规则：
 
 `M.spec.fanout` 的语义是 queue contract，不是广播主题。声明者必须在同一 `M.spec` 的 `consumes` 或 `produces` 中引用该 queue；否则 graph scan 拒绝。fanout queue 的物理实现仍是 `Vec<mpsc::Sender<Event>>`，只是 validator 允许多个 active consumer。
 
-## 10. 并发与进程边界
+## 11. 并发与进程边界
 
 supervisor 使用 current-thread tokio runtime，spawn `fkst-framework supervise` 并把 stdout/stderr 继承出去。收到 interrupt/terminate 时 supervisor 返回对应 exit code，不 signal event runtime。它最后 best-effort reap children。
 
@@ -239,13 +250,13 @@ Codex SDK 也把 `codex exec` 放入 process group。stall 时 kill process grou
 
 `with_lock(path, fn)` 是跨 pipeline 互斥 primitive。它打开 path，获取 exclusive flock，执行 Lua function，释放 file handle。进程死时 lock 自动释放。
 
-## 11. Git 与 Worktree Primitives
+## 12. Git 与 Worktree Primitives
 
 `setup_worktree` 会创建 candidate branch。所有 git SDK 命令使用 `git -C <HOST> ...`，不依赖 framework launcher cwd。branch 前缀和 from separator 是 HostFact，来自 `FKST_CANDIDATE_PREFIX` / `FKST_CANDIDATE_FROM_SEP` 或 host `fkst.env`，缺失时 fail-closed。
 
-具体 integration branch、candidate topology、runtime hidden refs、push/pull 策略属于 package/host，不是 substrate 固定事实。
+具体 integration branch、candidate topology、host ref 命名、push/pull 策略属于 package/host，不是 substrate 固定事实。
 
-## 12. 发布边界
+## 13. 发布边界
 
 fkst-substrate 的 accepted release state 是外部 release pipeline 的事实。推荐外部链路是 build → test → `--self-test` → conformance → 签名 artifact → deploy → canary / 回退策略。
 
