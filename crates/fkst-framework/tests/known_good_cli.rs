@@ -36,14 +36,6 @@ fn write_and_commit(root: &std::path::Path, name: &str, body: &str) -> String {
 fn write_minimal_host(root: &std::path::Path) {
     fs::create_dir_all(root.join("departments/hello")).unwrap();
     fs::create_dir_all(root.join("raisers")).unwrap();
-    fs::create_dir_all(root.join("tunables")).unwrap();
-    fs::write(root.join("tunables/queue_capacity.txt"), "100\n").unwrap();
-    fs::write(
-        root.join("tunables/department_default_timeout.txt"),
-        "30m\n",
-    )
-    .unwrap();
-    fs::write(root.join("tunables/codex_permit_slots.txt"), "20\n").unwrap();
     fs::write(
         root.join("departments/hello/main.lua"),
         r#"
@@ -70,7 +62,7 @@ fn repo() -> tempfile::TempDir {
         &["config", "user.email", "fkst-test@example.invalid"],
     );
     write_minimal_host(tmp.path());
-    run_git(tmp.path(), &["add", "departments", "raisers", "tunables"]);
+    run_git(tmp.path(), &["add", "departments", "raisers"]);
     run_git(tmp.path(), &["commit", "-m", "host graph"]);
     tmp
 }
@@ -179,7 +171,7 @@ fn framework_known_good_bootstrap_uses_host_env_file_integration_ref() {
 }
 
 #[test]
-fn framework_known_good_bootstrap_uses_tunable_integration_ref() {
+fn framework_known_good_bootstrap_ignores_removed_tunable_integration_ref() {
     let tmp = repo();
     let candidate = write_and_commit(tmp.path(), "candidate.txt", "candidate\n");
     run_git(tmp.path(), &["branch", "integration/test", &candidate]);
@@ -204,13 +196,17 @@ fn framework_known_good_bootstrap_uses_tunable_integration_ref() {
         .unwrap();
 
     assert!(
-        output.status.success(),
-        "stderr={}",
-        String::from_utf8_lossy(&output.stderr)
+        !output.status.success(),
+        "removed tunable unexpectedly configured integration ref"
     );
-    assert_eq!(
-        run_git(tmp.path(), &["rev-parse", "refs/known-good"]),
-        candidate
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("integration-branch-unconfigured"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("FKST_INTEGRATION_BRANCH missing"),
+        "{stderr}"
     );
 }
 

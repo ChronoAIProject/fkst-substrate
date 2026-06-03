@@ -1,5 +1,7 @@
 // path-based integration tests own behavior coverage while runtime modules keep runtime code.
 
+#[path = "../src/config_registry.rs"]
+mod config_registry;
 #[path = "../src/sdk_git.rs"]
 mod sdk_git;
 mod support;
@@ -291,20 +293,13 @@ fn setup_worktree_uses_short_sha_parent_when_detached() {
 }
 
 #[test]
-fn setup_worktree_prefers_env_over_package_tunables() {
+fn setup_worktree_prefers_env_over_fkst_env() {
     let lua = Lua::new();
     register(&lua).unwrap();
     let repo = repo_with_commit("worktree tunable base");
-    let package = tempdir().unwrap();
-    std::fs::create_dir(package.path().join("tunables")).unwrap();
     std::fs::write(
-        package.path().join("tunables/candidate_prefix.txt"),
-        "file-rc\n",
-    )
-    .unwrap();
-    std::fs::write(
-        package.path().join("tunables/candidate_from_sep.txt"),
-        "__file__\n",
+        repo.path().join("fkst.env"),
+        "FKST_CANDIDATE_PREFIX=file-rc\nFKST_CANDIDATE_FROM_SEP=__file__\n",
     )
     .unwrap();
 
@@ -312,7 +307,6 @@ fn setup_worktree_prefers_env_over_package_tunables() {
         repo.path(),
         |sandbox| {
             sandbox.runtime_root(".fkst/runtime");
-            sandbox.set_env("FKST_PACKAGE_ROOT", package.path().as_os_str().to_owned());
             sandbox.set_env("FKST_CANDIDATE_PREFIX", "env-rc");
             sandbox.set_env("FKST_CANDIDATE_FROM_SEP", "__env__");
         },
@@ -336,20 +330,13 @@ fn setup_worktree_prefers_env_over_package_tunables() {
 }
 
 #[test]
-fn setup_worktree_uses_package_tunables_without_env() {
+fn setup_worktree_uses_fkst_env_without_env() {
     let lua = Lua::new();
     register(&lua).unwrap();
     let repo = repo_with_commit("worktree tunable base");
-    let package = tempdir().unwrap();
-    std::fs::create_dir(package.path().join("tunables")).unwrap();
     std::fs::write(
-        package.path().join("tunables/candidate_prefix.txt"),
-        "file-rc\n",
-    )
-    .unwrap();
-    std::fs::write(
-        package.path().join("tunables/candidate_from_sep.txt"),
-        "__file__\n",
+        repo.path().join("fkst.env"),
+        "FKST_CANDIDATE_PREFIX=file-rc\nFKST_CANDIDATE_FROM_SEP=__file__\n",
     )
     .unwrap();
 
@@ -357,7 +344,6 @@ fn setup_worktree_uses_package_tunables_without_env() {
         repo.path(),
         |sandbox| {
             sandbox.runtime_root(".fkst/runtime");
-            sandbox.set_env("FKST_PACKAGE_ROOT", package.path().as_os_str().to_owned());
             sandbox.unset_env("FKST_CANDIDATE_PREFIX");
             sandbox.unset_env("FKST_CANDIDATE_FROM_SEP");
         },
@@ -405,23 +391,15 @@ fn setup_worktree_rejects_invalid_candidate_prefix_before_side_effects() {
     let lua = Lua::new();
     register(&lua).unwrap();
     let repo = repo_with_commit("worktree base");
-    let package = tempdir().unwrap();
-    std::fs::create_dir(package.path().join("tunables")).unwrap();
     std::fs::write(
-        package.path().join("tunables/candidate_prefix.txt"),
-        "bad prefix\n",
-    )
-    .unwrap();
-    std::fs::write(
-        package.path().join("tunables/candidate_from_sep.txt"),
-        "__base__\n",
+        repo.path().join("fkst.env"),
+        "FKST_CANDIDATE_PREFIX=bad prefix\nFKST_CANDIDATE_FROM_SEP=__base__\n",
     )
     .unwrap();
     let err = in_sandbox(
         repo.path(),
         |sandbox| {
             sandbox.runtime_root(".fkst/runtime");
-            sandbox.set_env("FKST_PACKAGE_ROOT", package.path().as_os_str().to_owned());
             sandbox.unset_env("FKST_CANDIDATE_PREFIX");
             sandbox.unset_env("FKST_CANDIDATE_FROM_SEP");
         },
@@ -443,11 +421,9 @@ fn setup_worktree_requires_candidate_prefix_before_side_effects() {
     let lua = Lua::new();
     register(&lua).unwrap();
     let repo = repo_with_commit("worktree base");
-    let package = tempdir().unwrap();
-    std::fs::create_dir(package.path().join("tunables")).unwrap();
     std::fs::write(
-        package.path().join("tunables/candidate_from_sep.txt"),
-        "__base__\n",
+        repo.path().join("fkst.env"),
+        "FKST_CANDIDATE_FROM_SEP=__base__\n",
     )
     .unwrap();
 
@@ -455,7 +431,6 @@ fn setup_worktree_requires_candidate_prefix_before_side_effects() {
         repo.path(),
         |sandbox| {
             sandbox.runtime_root(".fkst/runtime");
-            sandbox.set_env("FKST_PACKAGE_ROOT", package.path().as_os_str().to_owned());
             sandbox.unset_env("FKST_CANDIDATE_PREFIX");
             sandbox.unset_env("FKST_CANDIDATE_FROM_SEP");
         },
@@ -466,10 +441,7 @@ fn setup_worktree_requires_candidate_prefix_before_side_effects() {
         },
     );
 
-    assert_lua_error_contains(
-        err,
-        &["FKST candidate branch prefix tunable or FKST_CANDIDATE_PREFIX required"],
-    );
+    assert_lua_error_contains(err, &["FKST_CANDIDATE_PREFIX missing"]);
     assert!(!repo.path().join(".fkst/runtime/worktrees").exists());
 }
 
@@ -478,11 +450,9 @@ fn setup_worktree_requires_candidate_from_separator_before_side_effects() {
     let lua = Lua::new();
     register(&lua).unwrap();
     let repo = repo_with_commit("worktree base");
-    let package = tempdir().unwrap();
-    std::fs::create_dir(package.path().join("tunables")).unwrap();
     std::fs::write(
-        package.path().join("tunables/candidate_prefix.txt"),
-        "file-rc\n",
+        repo.path().join("fkst.env"),
+        "FKST_CANDIDATE_PREFIX=file-rc\n",
     )
     .unwrap();
 
@@ -490,7 +460,6 @@ fn setup_worktree_requires_candidate_from_separator_before_side_effects() {
         repo.path(),
         |sandbox| {
             sandbox.runtime_root(".fkst/runtime");
-            sandbox.set_env("FKST_PACKAGE_ROOT", package.path().as_os_str().to_owned());
             sandbox.unset_env("FKST_CANDIDATE_PREFIX");
             sandbox.unset_env("FKST_CANDIDATE_FROM_SEP");
         },
@@ -501,10 +470,7 @@ fn setup_worktree_requires_candidate_from_separator_before_side_effects() {
         },
     );
 
-    assert_lua_error_contains(
-        err,
-        &["FKST candidate branch from separator tunable or FKST_CANDIDATE_FROM_SEP required"],
-    );
+    assert_lua_error_contains(err, &["FKST_CANDIDATE_FROM_SEP missing"]);
     assert!(!repo.path().join(".fkst/runtime/worktrees").exists());
 }
 

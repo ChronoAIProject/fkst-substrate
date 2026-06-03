@@ -10,11 +10,11 @@ use fkst_common::{RuntimeKind, RuntimeLayout};
 use mlua::{Function, Lua, Result};
 use nix::fcntl::{flock, FlockArg};
 use std::os::fd::AsRawFd;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-const PACKAGE_ROOT_ENV: &str = "FKST_PACKAGE_ROOT";
+use crate::config_registry::{self, ConfigKey};
 
 pub fn register(lua: &Lua) -> Result<()> {
     register_with_lock(lua)?;
@@ -101,60 +101,17 @@ fn register_setup_worktree(lua: &Lua) -> Result<()> {
 }
 
 fn candidate_branch_config() -> Result<(String, String)> {
-    let prefix =
-        candidate_branch_config_value("FKST_CANDIDATE_PREFIX", "tunables/candidate_prefix.txt")?;
-    let from_sep = candidate_branch_config_value(
-        "FKST_CANDIDATE_FROM_SEP",
-        "tunables/candidate_from_sep.txt",
-    )?;
+    let prefix = candidate_branch_config_value(ConfigKey::CandidatePrefix)?;
+    let from_sep = candidate_branch_config_value(ConfigKey::CandidateFromSep)?;
     validate_branch_fragment("FKST_CANDIDATE_PREFIX", &prefix)?;
     validate_branch_fragment("FKST_CANDIDATE_FROM_SEP", &from_sep)?;
     Ok((prefix, from_sep))
 }
 
-fn candidate_branch_config_value(key: &str, tunable_rel: &str) -> Result<String> {
-    match std::env::var(key) {
-        Ok(value) => return Ok(value.trim().to_string()),
-        Err(std::env::VarError::NotPresent) => {}
-        Err(std::env::VarError::NotUnicode(_)) => Err(mlua::Error::external(anyhow::anyhow!(
-            "{key} must be valid UTF-8"
-        )))?,
-    }
-    if let Some(value) = read_package_tunable(tunable_rel)? {
-        return Ok(value);
-    }
-    Err(mlua::Error::external(anyhow::anyhow!(
-        "{}",
-        missing_candidate_config_message(key, tunable_rel)
-    )))
-}
-
-fn missing_candidate_config_message(key: &str, tunable_rel: &str) -> String {
-    match key {
-        "FKST_CANDIDATE_PREFIX" => {
-            "FKST candidate branch prefix tunable or FKST_CANDIDATE_PREFIX required".to_string()
-        }
-        "FKST_CANDIDATE_FROM_SEP" => {
-            "FKST candidate branch from separator tunable or FKST_CANDIDATE_FROM_SEP required"
-                .to_string()
-        }
-        _ => format!("{key} tunable {tunable_rel} required"),
-    }
-}
-
-fn read_package_tunable(tunable_rel: &str) -> Result<Option<String>> {
-    let Some(root) = std::env::var_os(PACKAGE_ROOT_ENV) else {
-        return Ok(None);
-    };
-    let path = PathBuf::from(root).join(tunable_rel);
-    match std::fs::read_to_string(&path) {
-        Ok(content) => Ok(Some(content.trim().to_string())),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(err) => Err(mlua::Error::external(anyhow::anyhow!(
-            "read {} failed: {err}",
-            path.display()
-        ))),
-    }
+fn candidate_branch_config_value(key: ConfigKey) -> Result<String> {
+    config_registry::resolve_process_key(key)
+        .map(|resolved| resolved.value)
+        .map_err(mlua::Error::external)
 }
 
 fn validate_branch_fragment(name: &str, value: &str) -> Result<()> {

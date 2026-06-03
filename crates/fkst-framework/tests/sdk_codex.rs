@@ -1,5 +1,7 @@
 // path-based integration tests own behavior coverage while runtime modules keep runtime code.
 
+#[path = "../src/config_registry.rs"]
+mod config_registry;
 #[path = "../src/sdk_codex.rs"]
 mod sdk_codex;
 mod support;
@@ -8,7 +10,6 @@ use mlua::{AnyUserData, Lua, Table};
 use nix::fcntl::{flock, FlockArg};
 use sdk_codex::{
     acquire_permit, ensure_pool, register, CodexResult, CodexTaskHandle, CODEX_PERMIT_SLOTS_ENV,
-    POOL_SIZE,
 };
 use std::io::Write;
 use std::os::fd::AsRawFd;
@@ -16,6 +17,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use support::process_sandbox::ProcessSandbox;
+
+const DEFAULT_CODEX_PERMIT_SLOTS: usize = 20;
 
 #[cfg(unix)]
 fn install_codex_script(dir: &Path, body: &str) -> PathBuf {
@@ -227,7 +230,7 @@ fn ensure_pool_creates_permits_under_configured_runtime_root() {
     sandbox.enter_cwd(tmp.path()).runtime_root(runtime.path());
     let (_lock, _guard) = sandbox.enter();
     ensure_pool().unwrap();
-    for i in 0..POOL_SIZE {
+    for i in 0..DEFAULT_CODEX_PERMIT_SLOTS {
         assert!(runtime
             .path()
             .join(format!("codex-permits/permit-{}", i))
@@ -252,7 +255,7 @@ fn acquire_two_permits_concurrently() {
 
 #[test]
 fn invalid_permit_slot_count_fails_closed() {
-    for value in ["0", "", "not-a-number"] {
+    for value in ["0", "not-a-number"] {
         let tmp = tempfile::tempdir().unwrap();
         let mut sandbox = ProcessSandbox::new();
         sandbox.enter_cwd(tmp.path()).runtime_root(".fkst/runtime");
@@ -263,6 +266,24 @@ fn invalid_permit_slot_count_fails_closed() {
             err.contains(CODEX_PERMIT_SLOTS_ENV),
             "value={value} err={err}"
         );
+    }
+}
+
+#[test]
+fn empty_permit_slot_count_uses_operational_default() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut sandbox = ProcessSandbox::new();
+    sandbox.enter_cwd(tmp.path()).runtime_root(".fkst/runtime");
+    sandbox.set_env(CODEX_PERMIT_SLOTS_ENV, "");
+    let (_lock, _guard) = sandbox.enter();
+
+    ensure_pool().unwrap();
+
+    for i in 0..DEFAULT_CODEX_PERMIT_SLOTS {
+        assert!(tmp
+            .path()
+            .join(format!(".fkst/runtime/codex-permits/permit-{}", i))
+            .exists());
     }
 }
 

@@ -11,10 +11,10 @@
 - Tier I 是 process-root supervisor 源码,默认不可变;只允许定位 accepted runtime artifact、启动 / 观察 Tier III event runtime、记录 spawn/exit、转发 process-level signal。
 - Tier II 是身份锚点:SPEC、conformance 入口,以及不可覆盖 gate 的承诺。
 - Tier III 是 framework Rust(event runtime + one-shot runner) 与固定 behavior graph,由 installed package root 与 host root 组合物化;两者共同形成单一 Company、单一 dispatcher、单一 queue set。
-- installed package root 由 `FKST_PACKAGE_ROOT` 或 `--package-root` 定位,承载 package-owned 标准 `departments/`、`raisers/`、`fkst/`、`scripts/`、`tunables/` 与随 runtime 发布的 gate 资产;host root 承载 host-owned 扩展与业务代码。
-- host `tunables/<name>.txt` 是 policy override channel,不是 package asset collision;普通 tunable ladder 是 process env、host `fkst.env`、host `tunables/<name>.txt`、package `tunables/<name>.txt`。
-- integration branch promotion policy 不读取 package default;其 ladder 是 explicit CLI、process env、host `fkst.env`、host `tunables/integration_branch.txt`,缺失时 fail closed。
-- `fkst.package_asset` 是 package-root immutable asset reader,不得读取 host root relative path;host policy/tunable 读取归属 `fkst.tunable`。
+- installed package root 由 `FKST_PACKAGE_ROOT` 或 `--package-root` 定位,承载 package-owned 标准 `departments/`、`raisers/`、`fkst/`、`scripts/` 与随 runtime 发布的 gate 资产;host root 承载 host-owned 扩展与业务代码。
+- engine operation knob 由 source-owned typed registry 声明;解析顺序是 process env、host `fkst.env`、Operational 默认。HostFact 缺失 fail closed。registry 不读取 `tunables/*.txt`,不提供 set/write/dynamic registration/YAML/DSL/manifest/plugin。
+- integration branch promotion policy 不读取 package default;其 ladder 是 explicit CLI、process env、host `fkst.env`,缺失时 fail closed。
+- `fkst.package_asset` 是 package-root immutable asset reader,不得读取 host root relative path;host operation config 读取归属 Rust registry。
 - layout collision 只拒绝会改变 behavior graph 或 package Lua module identity 的同名 `departments/*`、`raisers/*`、`fkst/*`;host `scripts/*` 与 `conformance/*` 同名普通文件不构成 package identity collision。
 - 不存在第二 package/root 语义;`FKST_STDLIB_ROOT`、`FKST_RUNTIME_PACKAGE_ROOT`、`FKST_GRAPH_ROOTS` 不是合法 contract。
 - 当前 fkst 仓库把 Tier II 身份锚点物化在根目录 `SPEC.md` 与 `conformance/run_all.sh`。
@@ -75,6 +75,6 @@
 - 演化白名单分组锚点 `evolution-whitelist-groups` 必须覆盖 Tier I、Tier II、Tier III、detector、business Lua 路径。
 - Tier I 白名单是 `crates/fkst-supervisor/`。
 - Tier II 白名单是 `SPEC.md`、`conformance/*.sh`。
-- Tier III 白名单是 `crates/fkst-framework/`、package root 或 host root 中的 `departments/<dept>/main.lua`、`departments/<dept>/<helper>.lua`、`raisers/<dept>.lua`、`departments/<dept>/<prompt>.txt`、`fkst/`、`scripts/`、`tunables/`。
-- detector 白名单是 package root 或 host root 中的 `departments/<dept>/<prompt>.txt`、`tunables/`、`gates/`、`audit_rules/`,并精确包含 `scripts/check_source_english.sh` 与 `scripts/check_source_english_test.sh` 两个 source-English detector 例外。
+- Tier III 白名单是 `crates/fkst-framework/`、package root 或 host root 中的 `departments/<dept>/main.lua`、`departments/<dept>/<helper>.lua`、`raisers/<dept>.lua`、`departments/<dept>/<prompt>.txt`、`fkst/`、`scripts/`。
+- detector 白名单是 package root 或 host root 中的 `departments/<dept>/<prompt>.txt`、`gates/`、`audit_rules/`,并精确包含 `scripts/check_source_english.sh` 与 `scripts/check_source_english_test.sh` 两个 source-English detector 例外。
 - business Lua 白名单是 package root 或 host root 中的 `departments/<dept>/main.lua`、`departments/<dept>/<helper>.lua`、`raisers/<dept>.lua`、`fkst/`、`scripts/`,但 `scripts/` 排除 `scripts/check_source_english.sh` 与 `scripts/check_source_english_test.sh` 两个 detector 例外。

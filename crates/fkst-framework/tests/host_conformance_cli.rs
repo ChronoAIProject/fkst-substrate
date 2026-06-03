@@ -84,14 +84,11 @@ return M
 }
 
 fn write_host_defaults(root: &std::path::Path) {
-    fs::create_dir_all(root.join("tunables")).unwrap();
-    fs::write(root.join("tunables/queue_capacity.txt"), "100\n").unwrap();
     fs::write(
-        root.join("tunables/department_default_timeout.txt"),
-        "30m\n",
+        root.join("fkst.env"),
+        "FKST_QUEUE_CAPACITY=100\nFKST_DEPARTMENT_DEFAULT_TIMEOUT=30m\nFKST_CODEX_PERMIT_SLOTS=20\n",
     )
     .unwrap();
-    fs::write(root.join("tunables/codex_permit_slots.txt"), "20\n").unwrap();
 }
 
 fn write_package_raiser(root: &std::path::Path) {

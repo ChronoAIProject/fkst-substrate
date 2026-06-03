@@ -21,7 +21,6 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-pub const POOL_SIZE: usize = 20; // default SDK codex permit slots
 pub(crate) const CODEX_PERMIT_SLOTS_ENV: &str = "FKST_CODEX_PERMIT_SLOTS";
 pub const RUNTIME_LOG_DIR_ENV: &str = "FKST_RUNTIME_LOG_DIR";
 const DEFAULT_STALL_WINDOW_SECONDS: i64 = 900;
@@ -887,23 +886,10 @@ pub(crate) fn acquire_permit() -> mlua::Result<std::fs::File> {
 }
 
 fn permit_slot_count() -> mlua::Result<usize> {
-    // framework children can receive host-configured slot width
-    // from supervise, and the SDK still enforces capacity only through fcntl locks.
-    let Some(raw) = std::env::var_os(CODEX_PERMIT_SLOTS_ENV) else {
-        return Ok(POOL_SIZE);
-    };
-    let raw = raw.to_string_lossy();
-    let value = raw.parse::<usize>().map_err(|_| {
-        mlua::Error::external(format!(
-            "{CODEX_PERMIT_SLOTS_ENV} must be a positive integer, got {raw:?}"
-        ))
-    })?;
-    if value == 0 {
-        return Err(mlua::Error::external(format!(
-            "{CODEX_PERMIT_SLOTS_ENV} must be > 0"
-        )));
-    }
-    Ok(value)
+    crate::config_registry::resolved_positive_usize(
+        crate::config_registry::ConfigKey::CodexPermitSlots,
+    )
+    .map_err(mlua::Error::external)
 }
 
 fn permit_pool_dir() -> mlua::Result<PathBuf> {

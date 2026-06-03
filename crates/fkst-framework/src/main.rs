@@ -18,6 +18,7 @@ use path_resolver::PackageRoots;
 use serde_json::Value as JsonValue;
 use std::path::PathBuf;
 
+mod config_registry;
 mod host_conformance;
 mod known_good;
 mod mlua_init;
@@ -45,6 +46,7 @@ enum CliCommand {
     },
     KnownGood(KnownGoodCli),
     Conformance(HostConformanceOptions),
+    Config(ConfigCli),
     SelfTest,
 }
 
@@ -53,7 +55,7 @@ fn parse_args() -> Result<CliCommand> {
     let mut args_iter = args.into_iter();
     let sub = args_iter.next().ok_or_else(|| {
         anyhow::anyhow!(
-            "usage: fkst-framework run <lua> --event <json> | fkst-framework supervise --project-root <path> --framework-bin <path> | fkst-framework known-good <promote|bootstrap> [options] | fkst-framework --self-test"
+            "usage: fkst-framework run <lua> --event <json> | fkst-framework supervise --project-root <path> --framework-bin <path> | fkst-framework known-good <promote|bootstrap> [options] | fkst-framework conformance --project-root <path> | fkst-framework config --project-root <path> [--package-root <path>] | fkst-framework --self-test"
         )
     })?;
     if sub == "--self-test" {
@@ -100,6 +102,10 @@ fn parse_args() -> Result<CliCommand> {
         let rest = args_iter.collect::<Vec<_>>();
         return Ok(CliCommand::Conformance(parse_conformance_args(&rest)?));
     }
+    if sub == "config" {
+        let rest = args_iter.collect::<Vec<_>>();
+        return Ok(CliCommand::Config(parse_config_args(&rest)?));
+    }
     if sub == "run" {
         let lua_path: PathBuf = args_iter
             .next()
@@ -126,6 +132,11 @@ fn parse_args() -> Result<CliCommand> {
         });
     }
     anyhow::bail!("unknown subcommand: {}", sub);
+}
+
+#[derive(Clone, Debug)]
+struct ConfigCli {
+    roots: PackageRoots,
 }
 
 fn parse_conformance_args(args: &[String]) -> Result<HostConformanceOptions> {
@@ -155,6 +166,37 @@ fn parse_conformance_args(args: &[String]) -> Result<HostConformanceOptions> {
 
     let root = project_root.ok_or_else(|| anyhow::anyhow!("missing --project-root"))?;
     Ok(HostConformanceOptions {
+        roots: PackageRoots::resolve(root, package_root)?,
+    })
+}
+
+fn parse_config_args(args: &[String]) -> Result<ConfigCli> {
+    let mut project_root: Option<PathBuf> = None;
+    let mut package_root: Option<PathBuf> = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--project-root" => {
+                if project_root.is_some() {
+                    anyhow::bail!("duplicate --project-root");
+                }
+                i += 1;
+                project_root = Some(next_value(args, i, "--project-root")?.into());
+            }
+            "--package-root" => {
+                if package_root.is_some() {
+                    anyhow::bail!("duplicate --package-root");
+                }
+                i += 1;
+                package_root = Some(next_value(args, i, "--package-root")?.into());
+            }
+            other => anyhow::bail!("unknown config argument: {}", other),
+        }
+        i += 1;
+    }
+
+    let root = project_root.ok_or_else(|| anyhow::anyhow!("missing --project-root"))?;
+    Ok(ConfigCli {
         roots: PackageRoots::resolve(root, package_root)?,
     })
 }
@@ -331,6 +373,34 @@ fn run_pipeline(lua_path: PathBuf, package_root: PathBuf, event: JsonValue) -> R
     Ok(exit_code)
 }
 
+fn run_config_command(options: ConfigCli) -> Result<i32> {
+    let process_env = config_registry::process_env_for_registry()?;
+    let fkst_env = config_registry::read_fkst_env(options.roots.host_root())?;
+    for entry in config_registry::CONFIG_REGISTRY {
+        let resolved = config_registry::resolve(entry.key, &process_env, &fkst_env);
+        let (value, source) = match resolved {
+            Ok(resolved) => (resolved.value, resolved.source.label().to_string()),
+            Err(_) => ("missing".to_string(), "missing".to_string()),
+        };
+        let requirement = match entry.kind.default() {
+            Some(default) => format!("default={default}"),
+            None => "required".to_string(),
+        };
+        println!(
+            "name={} env={} kind={} type={} {} resolved={} source={} doc={}",
+            entry.name,
+            entry.env_key,
+            entry.kind.label(),
+            entry.value_type.label(),
+            requirement,
+            value,
+            source,
+            entry.doc
+        );
+    }
+    Ok(0)
+}
+
 fn run() -> Result<i32> {
     match parse_args()? {
         CliCommand::Run {
@@ -357,6 +427,7 @@ fn run() -> Result<i32> {
         }
         CliCommand::KnownGood(options) => run_known_good_command(options),
         CliCommand::Conformance(options) => host_conformance::run(options),
+        CliCommand::Config(options) => run_config_command(options),
         CliCommand::SelfTest => match self_test::run() {
             Ok(()) => Ok(0),
             Err(err) => {

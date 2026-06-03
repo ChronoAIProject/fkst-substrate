@@ -20,14 +20,12 @@ fn write_executable(path: &std::path::Path, body: &str) {
 }
 
 fn write_graph_defaults(root: &std::path::Path) {
-    fs::create_dir_all(root.join("tunables")).unwrap();
-    fs::write(root.join("tunables/queue_capacity.txt"), "100\n").unwrap();
+    fs::create_dir_all(root).unwrap();
     fs::write(
-        root.join("tunables/department_default_timeout.txt"),
-        "30m\n",
+        root.join("fkst.env"),
+        "FKST_QUEUE_CAPACITY=100\nFKST_DEPARTMENT_DEFAULT_TIMEOUT=30m\nFKST_CODEX_PERMIT_SLOTS=20\n",
     )
     .unwrap();
-    fs::write(root.join("tunables/codex_permit_slots.txt"), "20\n").unwrap();
 }
 
 fn fake_framework(root: &Path, body: &str) -> PathBuf {
@@ -58,14 +56,11 @@ fn supervise_dispatches_file_watch_event_to_department() {
     let root = tmp.path();
     fs::create_dir_all(root.join("departments/recorder")).unwrap();
     fs::create_dir_all(root.join("raisers")).unwrap();
-    fs::create_dir_all(root.join("tunables")).unwrap();
-    fs::write(root.join("tunables/queue_capacity.txt"), "100\n").unwrap();
     fs::write(
-        root.join("tunables/department_default_timeout.txt"),
-        "30m\n",
+        root.join("fkst.env"),
+        "FKST_QUEUE_CAPACITY=100\nFKST_DEPARTMENT_DEFAULT_TIMEOUT=30m\nFKST_CODEX_PERMIT_SLOTS=20\n",
     )
     .unwrap();
-    fs::write(root.join("tunables/codex_permit_slots.txt"), "20\n").unwrap();
     fs::write(
         root.join("departments/recorder/main.lua"),
         r#"

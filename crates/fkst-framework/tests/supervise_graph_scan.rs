@@ -1,5 +1,7 @@
 // path-based integration tests own behavior coverage while runtime modules keep runtime code.
 
+#[path = "../src/config_registry.rs"]
+mod config_registry;
 #[path = "../src/supervise/graph_scan.rs"]
 mod graph_scan;
 #[path = "../src/path_resolver.rs"]
@@ -61,14 +63,14 @@ fn load(path: &std::path::Path) -> anyhow::Result<fkst_common::config::Config> {
 }
 
 fn write_host_defaults(root: &std::path::Path, queue: &str, timeout: &str, slots: &str) {
-    fs::create_dir_all(root.join("tunables")).unwrap();
-    fs::write(root.join("tunables/queue_capacity.txt"), queue).unwrap();
     fs::write(
-        root.join("tunables/department_default_timeout.txt"),
-        timeout,
+        root.join("fkst.env"),
+        format!(
+            "FKST_QUEUE_CAPACITY={}FKST_DEPARTMENT_DEFAULT_TIMEOUT={}FKST_CODEX_PERMIT_SLOTS={}",
+            queue, timeout, slots
+        ),
     )
     .unwrap();
-    fs::write(root.join("tunables/codex_permit_slots.txt"), slots).unwrap();
 }
 
 fn write_repo(depts: &[(&str, &str)], raisers: &[(&str, &str)]) -> TempDir {
@@ -159,7 +161,43 @@ return M
 }
 
 #[test]
-fn host_graph_defaults_use_tunables_when_env_and_fkst_env_are_absent() {
+fn host_graph_defaults_use_operational_defaults_when_env_and_fkst_env_are_absent() {
+    let _env_lock = CURRENT_DIR_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap();
+    let _queue = EnvGuard::unset(QUEUE_CAPACITY_ENV);
+    let _timeout = EnvGuard::unset(DEPARTMENT_DEFAULT_TIMEOUT_ENV);
+    let _slots = EnvGuard::unset(CODEX_PERMIT_SLOTS_ENV);
+    let dir = TempDir::new().unwrap();
+    let depts_root = dir.path().join("departments");
+    fs::create_dir_all(depts_root.join("hello")).unwrap();
+    fs::write(
+        depts_root.join("hello/main.lua"),
+        r#"
+local M = {}
+M.spec = { consumes = {"tick"} }
+function pipeline(_) end
+return M
+"#,
+    )
+    .unwrap();
+    fs::create_dir_all(dir.path().join("raisers")).unwrap();
+    fs::write(
+        dir.path().join("raisers/cron_a.lua"),
+        r#"return { type = "cron", interval = "10s", produces = "tick" }"#,
+    )
+    .unwrap();
+
+    let cfg = load(dir.path()).unwrap();
+
+    assert_eq!(cfg.queue.get("tick").unwrap().capacity, 16);
+    assert_eq!(cfg.department.get("hello").unwrap().timeout, "30s");
+    assert_eq!(cfg.limits.global_codex_processes, 20);
+}
+
+#[test]
+fn host_graph_defaults_use_fkst_env() {
     let _env_lock = CURRENT_DIR_LOCK
         .get_or_init(|| Mutex::new(()))
         .lock()
@@ -192,44 +230,6 @@ return M
 }
 
 #[test]
-fn host_graph_defaults_use_fkst_env_before_tunables() {
-    let _env_lock = CURRENT_DIR_LOCK
-        .get_or_init(|| Mutex::new(()))
-        .lock()
-        .unwrap();
-    let _queue = EnvGuard::unset(QUEUE_CAPACITY_ENV);
-    let _timeout = EnvGuard::unset(DEPARTMENT_DEFAULT_TIMEOUT_ENV);
-    let _slots = EnvGuard::unset(CODEX_PERMIT_SLOTS_ENV);
-    let dir = write_repo(
-        &[(
-            "hello",
-            r#"
-local M = {}
-M.spec = { consumes = {"tick"} }
-function pipeline(_) end
-return M
-"#,
-        )],
-        &[(
-            "cron_a",
-            r#"return { type = "cron", interval = "10s", produces = "tick" }"#,
-        )],
-    );
-    write_host_defaults(dir.path(), "11\n", "44s\n", "12\n");
-    fs::write(
-        dir.path().join("fkst.env"),
-        "FKST_QUEUE_CAPACITY=21\nFKST_DEPARTMENT_DEFAULT_TIMEOUT=55m\nFKST_CODEX_PERMIT_SLOTS=22\n",
-    )
-    .unwrap();
-
-    let cfg = load(dir.path()).unwrap();
-
-    assert_eq!(cfg.queue.get("tick").unwrap().capacity, 21);
-    assert_eq!(cfg.department.get("hello").unwrap().timeout, "55m");
-    assert_eq!(cfg.limits.global_codex_processes, 22);
-}
-
-#[test]
 fn host_graph_defaults_use_env_before_fkst_env() {
     let _env_lock = CURRENT_DIR_LOCK
         .get_or_init(|| Mutex::new(()))
@@ -253,7 +253,6 @@ return M
             r#"return { type = "cron", interval = "10s", produces = "tick" }"#,
         )],
     );
-    write_host_defaults(dir.path(), "11\n", "44s\n", "12\n");
     fs::write(
         dir.path().join("fkst.env"),
         "FKST_QUEUE_CAPACITY=21\nFKST_DEPARTMENT_DEFAULT_TIMEOUT=55m\nFKST_CODEX_PERMIT_SLOTS=22\n",
@@ -284,15 +283,13 @@ return M
             r#"return { type = "cron", interval = "10s", produces = "tick" }"#,
         )],
     );
-    write_host_defaults(dir.path(), "11\n", "44s\n", "12\n");
-
     let cfg = load(dir.path()).unwrap();
 
     assert_eq!(cfg.department.get("hello").unwrap().timeout, "9s");
 }
 
 #[test]
-fn host_graph_defaults_fail_closed_when_required_key_is_missing() {
+fn operational_defaults_ignore_removed_txt_files() {
     let _env_lock = CURRENT_DIR_LOCK
         .get_or_init(|| Mutex::new(()))
         .lock()
@@ -300,43 +297,42 @@ fn host_graph_defaults_fail_closed_when_required_key_is_missing() {
     let _queue = EnvGuard::unset(QUEUE_CAPACITY_ENV);
     let _timeout = EnvGuard::unset(DEPARTMENT_DEFAULT_TIMEOUT_ENV);
     let _slots = EnvGuard::unset(CODEX_PERMIT_SLOTS_ENV);
-    let cases = [
-        (QUEUE_CAPACITY_ENV, "tunables/queue_capacity.txt"),
-        (
-            DEPARTMENT_DEFAULT_TIMEOUT_ENV,
-            "tunables/department_default_timeout.txt",
-        ),
-        (CODEX_PERMIT_SLOTS_ENV, "tunables/codex_permit_slots.txt"),
-    ];
-
-    for (key, path) in cases {
-        let dir = write_repo(
-            &[(
-                "hello",
-                r#"
+    let dir = TempDir::new().unwrap();
+    fs::create_dir_all(dir.path().join("departments/hello")).unwrap();
+    fs::create_dir_all(dir.path().join("raisers")).unwrap();
+    fs::create_dir_all(dir.path().join("tunables")).unwrap();
+    fs::write(dir.path().join("tunables/queue_capacity.txt"), "99\n").unwrap();
+    fs::write(
+        dir.path().join("tunables/department_default_timeout.txt"),
+        "99m\n",
+    )
+    .unwrap();
+    fs::write(dir.path().join("tunables/codex_permit_slots.txt"), "99\n").unwrap();
+    fs::write(
+        dir.path().join("departments/hello/main.lua"),
+        r#"
 local M = {}
 M.spec = { consumes = {"tick"} }
 function pipeline(_) end
 return M
 "#,
-            )],
-            &[(
-                "cron_a",
-                r#"return { type = "cron", interval = "10s", produces = "tick" }"#,
-            )],
-        );
-        fs::remove_file(dir.path().join(path)).unwrap();
+    )
+    .unwrap();
+    fs::write(
+        dir.path().join("raisers/cron_a.lua"),
+        r#"return { type = "cron", interval = "10s", produces = "tick" }"#,
+    )
+    .unwrap();
 
-        let err = load(dir.path()).unwrap_err();
-        let msg = format!("{:#}", err);
+    let cfg = load(dir.path()).unwrap();
 
-        assert!(msg.contains(key), "got: {msg}");
-        assert!(msg.contains("missing"), "got: {msg}");
-    }
+    assert_eq!(cfg.queue.get("tick").unwrap().capacity, 16);
+    assert_eq!(cfg.department.get("hello").unwrap().timeout, "30s");
+    assert_eq!(cfg.limits.global_codex_processes, 20);
 }
 
 #[test]
-fn host_graph_defaults_fail_closed_when_required_key_is_invalid() {
+fn host_graph_defaults_fail_closed_when_configured_value_is_invalid() {
     let _env_lock = CURRENT_DIR_LOCK
         .get_or_init(|| Mutex::new(()))
         .lock()
@@ -345,24 +341,12 @@ fn host_graph_defaults_fail_closed_when_required_key_is_invalid() {
     let _timeout = EnvGuard::unset(DEPARTMENT_DEFAULT_TIMEOUT_ENV);
     let _slots = EnvGuard::unset(CODEX_PERMIT_SLOTS_ENV);
     let cases = [
-        (
-            QUEUE_CAPACITY_ENV,
-            "tunables/queue_capacity.txt",
-            "not-a-number\n",
-        ),
-        (
-            DEPARTMENT_DEFAULT_TIMEOUT_ENV,
-            "tunables/department_default_timeout.txt",
-            "30x\n",
-        ),
-        (
-            CODEX_PERMIT_SLOTS_ENV,
-            "tunables/codex_permit_slots.txt",
-            "0\n",
-        ),
+        (QUEUE_CAPACITY_ENV, "not-a-number"),
+        (DEPARTMENT_DEFAULT_TIMEOUT_ENV, "30x"),
+        (CODEX_PERMIT_SLOTS_ENV, "0"),
     ];
 
-    for (key, path, value) in cases {
+    for (key, value) in cases {
         let dir = write_repo(
             &[(
                 "hello",
@@ -378,7 +362,7 @@ return M
                 r#"return { type = "cron", interval = "10s", produces = "tick" }"#,
             )],
         );
-        fs::write(dir.path().join(path), value).unwrap();
+        fs::write(dir.path().join("fkst.env"), format!("{key}={value}\n")).unwrap();
 
         let err = load(dir.path()).unwrap_err();
         let msg = format!("{:#}", err);

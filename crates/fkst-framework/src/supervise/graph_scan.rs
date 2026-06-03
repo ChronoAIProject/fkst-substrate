@@ -16,11 +16,10 @@ use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
+use crate::config_registry::{
+    self, parse_duration_string, parse_positive_usize, ConfigKey, ConfigValueType,
+};
 use crate::path_resolver::{GraphRoot, GraphRootKind, PackageRoots};
-
-const QUEUE_CAPACITY_KEY: &str = "FKST_QUEUE_CAPACITY";
-const DEPARTMENT_DEFAULT_TIMEOUT_KEY: &str = "FKST_DEPARTMENT_DEFAULT_TIMEOUT";
-const CODEX_PERMIT_SLOTS_KEY: &str = "FKST_CODEX_PERMIT_SLOTS";
 
 /// Deserialization helper for a department's `M.spec` table.
 #[derive(Deserialize)]
@@ -44,77 +43,44 @@ struct HostGraphDefaults {
 
 impl HostGraphDefaults {
     fn load(roots: &PackageRoots) -> Result<Self> {
-        let sources = HostGraphDefaultSources::load(roots)?;
+        let process_env = config_registry::process_env_for_registry()?;
+        let fkst_env = config_registry::read_fkst_env(roots.host_root())?;
         Ok(Self {
-            queue_capacity: sources
-                .positive_usize(QUEUE_CAPACITY_KEY, "tunables/queue_capacity.txt")?,
-            department_default_timeout: sources.timeout(
-                DEPARTMENT_DEFAULT_TIMEOUT_KEY,
-                "tunables/department_default_timeout.txt",
+            queue_capacity: resolve_usize(ConfigKey::QueueCapacity, &process_env, &fkst_env)?,
+            department_default_timeout: resolve_timeout(
+                ConfigKey::DepartmentDefaultTimeout,
+                &process_env,
+                &fkst_env,
             )?,
-            codex_permit_slots: sources
-                .positive_usize(CODEX_PERMIT_SLOTS_KEY, "tunables/codex_permit_slots.txt")?,
+            codex_permit_slots: resolve_usize(
+                ConfigKey::CodexPermitSlots,
+                &process_env,
+                &fkst_env,
+            )?,
         })
     }
 }
 
-struct HostGraphDefaultSources {
-    package_root: PathBuf,
-    fkst_env: HashMap<String, String>,
+fn resolve_usize(
+    key: ConfigKey,
+    process_env: &HashMap<String, String>,
+    fkst_env: &HashMap<String, String>,
+) -> Result<usize> {
+    let resolved = config_registry::resolve(key, process_env, fkst_env)?;
+    let entry = config_registry::entry(key);
+    assert_eq!(entry.value_type, ConfigValueType::Usize);
+    parse_positive_usize(entry, &resolved.value)
 }
 
-impl HostGraphDefaultSources {
-    fn load(roots: &PackageRoots) -> Result<Self> {
-        Ok(Self {
-            package_root: roots.package_root().to_path_buf(),
-            fkst_env: read_fkst_env(roots.host_root())?,
-        })
-    }
-
-    fn raw_value(&self, key: &str, tunable_rel: &str) -> Result<String> {
-        if let Some(value) = std::env::var_os(key) {
-            let value = value
-                .into_string()
-                .map_err(|_| anyhow!("{key} must be valid UTF-8"))?;
-            return Ok(value);
-        }
-
-        if let Some(value) = self.fkst_env.get(key) {
-            return Ok(value.clone());
-        }
-
-        let tunable_path = self.package_root.join(tunable_rel);
-        if tunable_path.is_file() {
-            return std::fs::read_to_string(&tunable_path)
-                .with_context(|| format!("read {}", tunable_path.display()))
-                .map(|value| value.trim().to_string());
-        }
-
-        bail!("{key} missing; set process env, fkst.env, or {tunable_rel}")
-    }
-
-    fn positive_usize(&self, key: &str, tunable_rel: &str) -> Result<usize> {
-        let raw = self.raw_value(key, tunable_rel)?;
-        let value = raw
-            .trim()
-            .parse::<usize>()
-            .with_context(|| format!("{key} must be a positive integer, got {raw:?}"))?;
-        if value == 0 {
-            bail!("{key} must be > 0");
-        }
-        Ok(value)
-    }
-
-    fn timeout(&self, key: &str, tunable_rel: &str) -> Result<String> {
-        let raw = self.raw_value(key, tunable_rel)?;
-        let value = raw.trim().to_string();
-        if value.is_empty()
-            || !(value.ends_with('s') || value.ends_with('m') || value.ends_with('h'))
-        {
-            bail!("{key} must be a timeout ending with s/m/h, got {raw:?}");
-        }
-        Ok(value)
-    }
+fn resolve_timeout(
+    key: ConfigKey,
+    process_env: &HashMap<String, String>,
+    fkst_env: &HashMap<String, String>,
+) -> Result<String> {
+    let resolved = config_registry::resolve(key, process_env, fkst_env)?;
+    let entry = config_registry::entry(key);
+    assert_eq!(entry.value_type, ConfigValueType::DurationString);
+    parse_duration_string(entry, &resolved.value)
 }
 
 #[cfg(test)]
@@ -357,31 +323,6 @@ fn derive_queues(
         );
     }
     Ok(queues)
-}
-
-fn read_fkst_env(repo_root: &Path) -> Result<HashMap<String, String>> {
-    let path = repo_root.join("fkst.env");
-    if !path.is_file() {
-        return Ok(HashMap::new());
-    }
-
-    let content =
-        std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
-    let mut values = HashMap::new();
-    for (idx, line) in content.lines().enumerate() {
-        let line = line.trim_end_matches('\r');
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        let Some((key, value)) = line.split_once('=') else {
-            bail!("{}:{} must use KEY=value", path.display(), idx + 1);
-        };
-        if key.trim() != key || key.is_empty() {
-            bail!("{}:{} has invalid key", path.display(), idx + 1);
-        }
-        values.insert(key.to_string(), value.to_string());
-    }
-    Ok(values)
 }
 
 fn resolve_department_fanout(

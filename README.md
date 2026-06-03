@@ -11,6 +11,27 @@ cargo build --workspace
 cargo test --workspace
 ```
 
+配置机制：
+
+引擎操作配置由 `crates/fkst-framework/src/config_registry.rs` 中的静态 typed registry 声明。读取优先级固定为 process env → host `fkst.env` → operational 默认；HostFact 缺失 fail-closed。registry 只读,没有 set/apply/watch、YAML/DSL/manifest/plugin 或 per-key `tunables/*.txt` 兼容层。
+
+6 个 knob:
+
+- Operational: `FKST_QUEUE_CAPACITY` 默认 `16`
+- Operational: `FKST_DEPARTMENT_DEFAULT_TIMEOUT` 默认 `30s`
+- Operational: `FKST_CODEX_PERMIT_SLOTS` 默认 `20`
+- HostFact: `FKST_CANDIDATE_PREFIX` 必填
+- HostFact: `FKST_CANDIDATE_FROM_SEP` 必填
+- HostFact: `FKST_INTEGRATION_BRANCH` 必填
+
+只读自省:
+
+```sh
+target/debug/fkst-framework config \
+  --project-root "$PWD/examples/minimal-package" \
+  --package-root "$PWD/examples/minimal-package"
+```
+
 独立运行：
 
 本仓库内置一个通用最小 package：`examples/minimal-package`。它**声明**了 cron source `tick`、producer（consume `tick`、produce+fanout `work`、写 witness）与两个 fanout consumers（consume `work`、各写 witness），用来作为 `--package-root` 的可加载实例。

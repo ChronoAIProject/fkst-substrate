@@ -20,7 +20,8 @@ fkst-substrate/
 │   │   ├── runtime_layout.rs                  RuntimeKind / RuntimeLayout
 │   │   ├── error.rs validation.rs
 │   └── fkst-framework/src/
-│       ├── main.rs                            CLI: run / supervise / known-good / conformance / --self-test
+│       ├── main.rs                            CLI: run / supervise / known-good / conformance / config / --self-test
+│       ├── config_registry.rs                 typed registry + resolver + config 自省数据源
 │       ├── path_resolver.rs raise.rs mlua_init.rs
 │       ├── sdk_basic.rs sdk_codex.rs sdk_fs.rs sdk_git.rs sdk_log.rs
 │       ├── known_good.rs host_conformance.rs self_test.rs
@@ -29,10 +30,6 @@ fkst-substrate/
 │           └── event_fanout.rs consumer.rs spawner.rs raised.rs
 ├── examples/
 │   └── minimal-package/                       引擎自带最小示例包(证明 package-root 契约)
-│       ├── tunables/
-│       │   ├── queue_capacity.txt
-│       │   ├── department_default_timeout.txt
-│       │   └── codex_permit_slots.txt
 │       ├── raisers/tick.lua                   cron source → 队列 tick
 │       └── departments/
 │           ├── producer/main.lua              consume tick;produce + fanout work;raise + file witness
@@ -41,7 +38,7 @@ fkst-substrate/
 └── docs/architecture.md                       本文
 ```
 
-业务 Lua package 不在本仓;`examples/minimal-package/` 是引擎自带的、唯一随仓发布的 package,用于证明 `--package-root` 能被独立加载并通过图/fanout 契约 validation,且单个 producer pipeline 可 `run` 起来发出 `RAISED`,不含任何业务语义。完整 `tick → 路由 → fanout → consumer witness` 端到端需常驻 `supervise`,其 bounded smoke 为 deferred(见 `README.md`)。host 注入的 package 用同样的 `departments/` + `raisers/` + `tunables/` 形状,经 `FKST_PACKAGE_ROOT` 指向。
+业务 Lua package 不在本仓;`examples/minimal-package/` 是引擎自带的、唯一随仓发布的 package,用于证明 `--package-root` 能被独立加载并通过图/fanout 契约 validation,且单个 producer pipeline 可 `run` 起来发出 `RAISED`,不含任何业务语义。完整 `tick → 路由 → fanout → consumer witness` 端到端需常驻 `supervise`,其 bounded smoke 为 deferred(见 `README.md`)。host 注入的 package 用同样的 `departments/` + `raisers/` + `fkst/` + `scripts/` 形状,经 `FKST_PACKAGE_ROOT` 指向。引擎操作配置不属于 package 文件树,由 Rust registry 读取 env 与 host `fkst.env`。
 
 ## 1. 三层稳定性与三级公司
 
@@ -60,7 +57,7 @@ Tier II  SPEC + conformance
 
 Tier III  framework + common + injected package graph
   crates: crates/fkst-framework, crates/fkst-common
-  package: <PKG>/departments, <PKG>/raisers, <PKG>/fkst, <PKG>/tunables
+  package: <PKG>/departments, <PKG>/raisers, <PKG>/fkst, <PKG>/scripts
   host: <HOST>/departments, <HOST>/raisers, host-owned config and assets
   role: event runtime, Lua SDK, package graph loader, subprocess boundary.
 ```
@@ -135,9 +132,16 @@ L1  common, crates/fkst-common
 
 L2a  framework CLI 与 root resolver
   files: main.rs, path_resolver.rs
-  引入概念:run, supervise, known-good, conformance, self-test; package root + host root
-  读: FKST_PACKAGE_ROOT, --package-root, --project-root, rejected env 检查
+  引入概念:run, supervise, known-good, conformance, config, self-test; package root + host root
+  读: FKST_PACKAGE_ROOT, --package-root, --project-root, rejected env 检查, config 自省读取 host fkst.env
   写: CLI stdout/stderr;不写业务状态
+
+L2cfg  engine operation registry
+  files: config_registry.rs
+  引入概念:source-owned typed registry, resolver, config introspection
+  读: process env, <HOST>/fkst.env
+  写: 无
+  约束:静态表,无 set/write/dynamic registration,无 YAML/DSL/manifest/plugin,不读 tunables/*.txt
 
 L2b  graph scan 与 source runner
   files: supervise/graph_scan.rs, source_runner.rs
@@ -145,7 +149,7 @@ L2b  graph scan 与 source runner
   crate: mlua 用于求值 M.spec 与 raisers; notify 用于 file_watch
   读: <PKG>/departments/*/main.lua, <PKG>/raisers/*.lua,
       <HOST>/departments/*/main.lua, <HOST>/raisers/*.lua,
-      <PKG>/tunables/*.txt, <HOST>/fkst.env, env defaults
+      config registry resolved operational defaults
   写: in-memory Config;file_watch glob 可解析 runtime:// 到 <RT>
 
 L2c  fanout 与 routing
@@ -185,7 +189,7 @@ L2e  known-good 与 lifecycle
 
 L3  injected Lua package, not stored in this repository
   引入概念:host/business SDLC behavior
-  位置: <PKG>/departments, <PKG>/raisers, <PKG>/fkst, <PKG>/tunables,
+  位置: <PKG>/departments, <PKG>/raisers, <PKG>/fkst, <PKG>/scripts,
        optional <HOST>/departments and <HOST>/raisers
   读写: 只能经 L2 SDK 触达 git, filesystem, locks, subprocesses, logs and RAISED
 ```
@@ -249,7 +253,20 @@ host root 来自 --project-root 或 run 模式下 Lua 路径推断
 { type = "file_watch", glob = "path-or-runtime://...", produces = "queue" }
 ```
 
-队列不是 manifest 手写对象，而是从 Department consumes/produces 与 Raiser produces 的并集推导。capacity 来自 `FKST_QUEUE_CAPACITY`、`<HOST>/fkst.env` 或 `<PKG>/tunables/queue_capacity.txt`。Department 默认 timeout 和 codex permit slots 同理来自 env、`fkst.env` 或 package tunable。
+队列不是 manifest 手写对象，而是从 Department consumes/produces 与 Raiser produces 的并集推导。引擎操作 knob 统一由 `config_registry.rs` 的静态 typed registry 声明和解析；读取优先级是 process env → host `fkst.env` → operational 默认。registry 不读 `tunables/*.txt`,也没有 set/write/dynamic registration、YAML、DSL、manifest、plugin 或 dashboard 入口。
+
+当前 registry 只有 6 项:
+
+| name | env key | kind | type | default / required |
+|---|---|---|---|---|
+| `queue_capacity` | `FKST_QUEUE_CAPACITY` | Operational | `usize` | default `16` |
+| `department_default_timeout` | `FKST_DEPARTMENT_DEFAULT_TIMEOUT` | Operational | duration string | default `30s` |
+| `codex_permit_slots` | `FKST_CODEX_PERMIT_SLOTS` | Operational | `usize` | default `20` |
+| `candidate_prefix` | `FKST_CANDIDATE_PREFIX` | HostFact | string | required |
+| `candidate_from_sep` | `FKST_CANDIDATE_FROM_SEP` | HostFact | string | required |
+| `integration_branch` | `FKST_INTEGRATION_BRANCH` | HostFact | string | required |
+
+`fkst-framework config --project-root <path> [--package-root <path>]` 是只读自省命令,逐项打印 env key、kind、type、default/required、resolved value/source 与 doc。HostFact 缺失时显示缺失,不会写配置或访问网络。
 
 ## 6. 运行态数据流
 
@@ -369,7 +386,7 @@ refs/known-good
 
 `KNOWN_GOOD_REF` 是 ref,不是 branch。它表示当前 accepted framework state。推进动作使用 CAS:old sha 必须匹配,否则报告 update-ref conflict。
 
-`setup_worktree` 会创建 candidate branch。branch 前缀和 from separator 来自 `FKST_CANDIDATE_PREFIX` / `FKST_CANDIDATE_FROM_SEP` 或 package tunables。具体 integration branch、candidate topology、runtime hidden refs、push/pull 策略属于 package/host,不是 substrate 固定事实。
+`setup_worktree` 会创建 candidate branch。branch 前缀和 from separator 是 HostFact,来自 `FKST_CANDIDATE_PREFIX` / `FKST_CANDIDATE_FROM_SEP` 或 host `fkst.env`,缺失时 fail-closed。具体 integration branch、candidate topology、runtime hidden refs、push/pull 策略属于 package/host,不是 substrate 固定事实。
 
 ## 11. 并发与进程边界
 
@@ -377,7 +394,7 @@ supervisor 使用 current-thread tokio runtime,spawn `fkst-framework supervise` 
 
 supervise 运行在 current-thread tokio runtime 内,但每个 Department event 都会 spawn 一个 framework child process。framework child 是新的 process group leader。stall window 内无 stdout/stderr 输出时，supervise 对 `-pgid` 发送 `SIGKILL`,使 framework child 及其 codex 子孙一起退出。
 
-Codex SDK 也把 `codex exec` 放入 process group。stall 时 kill process group。permit 池使用 fcntl lock file,不是内存 semaphore。默认 permit 数是 `20`,但 supervise 会通过 `FKST_CODEX_PERMIT_SLOTS` 把 host graph defaults 传给 framework child。
+Codex SDK 也把 `codex exec` 放入 process group。stall 时 kill process group。permit 池使用 fcntl lock file,不是内存 semaphore。permit 数来自 registry 的 `codex_permit_slots`:env 或 host `fkst.env` 可覆盖,未设置时默认 `20`。同一 resolved 值同时驱动 graph limits 与 `sdk_codex` permit pool。
 
 `with_lock(path, fn)` 是跨 pipeline 互斥 primitive。它打开 path,获取 exclusive flock,执行 Lua function,释放 file handle。进程死时 lock 自动释放。
 

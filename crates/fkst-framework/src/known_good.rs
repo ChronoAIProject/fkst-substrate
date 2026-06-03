@@ -10,6 +10,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
 
+use crate::config_registry::{self, ConfigKey};
+
 const KNOWN_GOOD_REF: &str = "refs/known-good";
 const NULL_SHA: &str = "0000000000000000000000000000000000000000";
 const HEALTH_LOCK: &str = "known-good-health.lock";
@@ -722,41 +724,11 @@ fn resolve_integration_ref(root: &Path, explicit: Option<String>) -> Result<Stri
     if let Some(value) = nonempty(explicit) {
         return Ok(value);
     }
-    if let Some(value) = nonempty(std::env::var("FKST_INTEGRATION_BRANCH").ok()) {
-        return Ok(value);
-    }
-    if let Some(value) = read_env_file_value(&root.join("fkst.env"), "FKST_INTEGRATION_BRANCH")? {
-        return Ok(value);
-    }
-    let tunable = root.join("tunables/integration_branch.txt");
-    if let Ok(content) = std::fs::read_to_string(&tunable) {
-        if let Some(value) = nonempty(Some(content)) {
-            return Ok(value);
-        }
-    }
-    anyhow::bail!(
-        "integration-branch-unconfigured: missing FKST_INTEGRATION_BRANCH or tunables/integration_branch.txt"
-    )
-}
-
-fn read_env_file_value(path: &Path, key: &str) -> Result<Option<String>> {
-    let Ok(content) = std::fs::read_to_string(path) else {
-        return Ok(None);
-    };
-    for line in content.lines() {
-        let line = line.trim_end_matches('\r');
-        let trimmed = line.trim_start();
-        if trimmed.is_empty() || trimmed.starts_with('#') {
-            continue;
-        }
-        let Some(value) = line.strip_prefix(&format!("{key}=")) else {
-            continue;
-        };
-        if let Some(value) = nonempty(Some(value.to_string())) {
-            return Ok(Some(value));
-        }
-    }
-    Ok(None)
+    let process_env = config_registry::process_env_for_registry()?;
+    let fkst_env = config_registry::read_fkst_env(root)?;
+    config_registry::resolve(ConfigKey::IntegrationBranch, &process_env, &fkst_env)
+        .map(|resolved| resolved.value)
+        .map_err(|err| anyhow::anyhow!("integration-branch-unconfigured: {err:#}"))
 }
 
 fn missing(value: &Option<String>) -> bool {
