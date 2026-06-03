@@ -21,7 +21,7 @@ producer 的 `RAISED:` 解码后形状如下，注意这里还没有 `ts`：
 真实 dispatch 派发给 consumer 的标准事件形状如下，`ts` 是 runtime 生成的 Unix 毫秒，实际值会变：
 
 ```json
-{"queue":"example_event","payload":{"from":"producer","note":"opaque example payload","source_queue":"tick","source_raiser":"tick"},"ts":1234567890}
+{"queue":"example_event","payload":{"from":"producer","note":"opaque example payload","source_queue":"tick","source_raiser":"tick"},"ts":1717420800000}
 ```
 
 单点查看命令不会经过路由，只是向单个 pipeline 注入事件：

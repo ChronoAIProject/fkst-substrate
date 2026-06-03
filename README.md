@@ -55,7 +55,7 @@ Department 收到的标准事件结构是 `Event{queue,payload,ts}`，其中 `ts
 真实 dispatch 派发给 consumer 的标准事件会包含 runtime 生成的 Unix 毫秒 `ts`，实际值会变：
 
 ```json
-{"queue":"example_event","payload":{"from":"producer","note":"opaque example payload","source_queue":"tick","source_raiser":"tick"},"ts":1234567890}
+{"queue":"example_event","payload":{"from":"producer","note":"opaque example payload","source_queue":"tick","source_raiser":"tick"},"ts":1717420800000}
 ```
 
 ```sh
