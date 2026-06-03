@@ -210,8 +210,8 @@ fn codex_request_from_opts(opts: Table) -> CodexRequest {
     let prompt: String = opts.get("prompt").unwrap_or_default();
     let context: Option<String> = opts.get("context").ok();
     let worktree: Option<String> = opts.get("worktree").ok();
-    let timeout: Option<i64> = opts.get("timeout").ok();
-    let stall_window_seconds = timeout
+    let stall_window: Option<i64> = opts.get("stall_window").ok();
+    let stall_window_seconds = stall_window
         .filter(|seconds| *seconds > 0)
         .unwrap_or(DEFAULT_STALL_WINDOW_SECONDS);
     let log_path = codex_log_path(worktree.as_deref());

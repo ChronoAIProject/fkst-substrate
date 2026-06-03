@@ -141,7 +141,7 @@ fn run_stall_window_activity_test(output_stream: TestStream) -> ActivityResult {
         register(&lua).unwrap();
         let spawn: mlua::Function = lua.globals().get("spawn_codex_sync").unwrap();
         let opts = lua_opts(&lua, "active");
-        opts.set("timeout", 1).unwrap();
+        opts.set("stall_window", 1).unwrap();
         let result: Table = spawn.call(opts).unwrap();
         result_tx
             .send(ActivityResult {
@@ -332,7 +332,7 @@ printf 'ok'
     opts.set("prompt", prompt.as_str()).unwrap();
     opts.set("context", "ctx.json").unwrap();
     opts.set("worktree", "wt").unwrap();
-    opts.set("timeout", 42).unwrap();
+    opts.set("stall_window", 42).unwrap();
 
     let result: mlua::Table = spawn.call(opts).unwrap();
     assert_eq!(result.get::<i64>("exit_code").unwrap(), 0);
@@ -738,7 +738,7 @@ while :; do :; done
     register(&lua).unwrap();
     let spawn: mlua::Function = lua.globals().get("spawn_codex_sync").unwrap();
     let opts = lua_opts(&lua, "stalled");
-    opts.set("timeout", 1).unwrap();
+    opts.set("stall_window", 1).unwrap();
 
     let result: Table = spawn.call(opts).unwrap();
     assert_eq!(result.get::<i64>("exit_code").unwrap(), 124);
@@ -787,7 +787,7 @@ read _ < "$STALL_FIFO"
     register(&lua).unwrap();
     let spawn: mlua::Function = lua.globals().get("spawn_codex_sync").unwrap();
     let opts = lua_opts(&lua, "stalled");
-    opts.set("timeout", 1).unwrap();
+    opts.set("stall_window", 1).unwrap();
 
     let result: Table = spawn.call(opts).unwrap();
     let child_pid = pid_reader.join().unwrap();
