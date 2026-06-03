@@ -100,7 +100,15 @@ fn test_runner_runs_minimal_package_sanity_tests() {
         out.contains("PASS tests/sanity_test.lua::test_nil"),
         "stdout: {out}"
     );
-    assert!(out.contains("3 passed, 0 failed"), "stdout: {out}");
+    assert!(
+        out.contains("PASS tests/sanity_test.lua::test_json_decode"),
+        "stdout: {out}"
+    );
+    assert!(
+        out.contains("PASS tests/sanity_test.lua::test_json_decode_invalid_input_raises"),
+        "stdout: {out}"
+    );
+    assert!(out.contains("5 passed, 0 failed"), "stdout: {out}");
 }
 
 #[test]
