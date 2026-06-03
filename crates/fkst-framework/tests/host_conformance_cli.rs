@@ -70,7 +70,7 @@ fn write_minimal_host(root: &std::path::Path) {
         root.join("departments/hello/main.lua"),
         r#"
 local M = {}
-M.spec = { consumes = {"tick"}, timeout = "30s" }
+M.spec = { consumes = {"tick"}, stall_window = "30s" }
 function pipeline(_) end
 return M
 "#,
@@ -86,7 +86,7 @@ return M
 fn write_host_defaults(root: &std::path::Path) {
     fs::write(
         root.join("fkst.env"),
-        "FKST_QUEUE_CAPACITY=100\nFKST_DEPARTMENT_DEFAULT_TIMEOUT=30m\nFKST_CODEX_PERMIT_SLOTS=20\n",
+        "FKST_QUEUE_CAPACITY=100\nFKST_DEPARTMENT_DEFAULT_STALL_WINDOW=30m\nFKST_CODEX_PERMIT_SLOTS=20\n",
     )
     .unwrap();
 }
@@ -107,7 +107,7 @@ fn write_host_department(root: &std::path::Path) {
         root.join("departments/hello/main.lua"),
         r#"
 local M = {}
-M.spec = { consumes = {"tick"}, timeout = "30s" }
+M.spec = { consumes = {"tick"}, stall_window = "30s" }
 function pipeline(_) end
 return M
 "#,
@@ -365,7 +365,7 @@ fn host_failures_exit_one_with_check_ids() {
         schema_invalid.path().join("departments/bad/main.lua"),
         r#"
 local M = {}
-M.spec = { consumes = {"tick"}, produces = {"tick"}, timeout = "30x" }
+M.spec = { consumes = {"tick"}, produces = {"tick"}, stall_window = "30x" }
 function pipeline(_) end
 return M
 "#,

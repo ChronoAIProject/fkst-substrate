@@ -3,7 +3,7 @@
 //! The package root owns standard assets and the host root owns host
 //! departments and raisers. `package.lua` is not a supported graph input.
 //!
-//! Each department exposes `M.spec = { consumes, produces, fanout, timeout }`
+//! Each department exposes `M.spec = { consumes, produces, fanout, stall_window }`
 //! at module top level. Queues are auto-derived from the union of department
 //! and raiser consumes+produces, with fanout coming only from Department
 //! `M.spec.fanout`. Host graph defaults are read before graph materialization.
@@ -20,6 +20,7 @@ use crate::path_resolver::{GraphRoot, GraphRootKind, PackageRoots};
 
 /// Deserialization helper for a department's `M.spec` table.
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct DeptSpec {
     #[serde(default)]
     consumes: Vec<String>,
@@ -28,13 +29,13 @@ struct DeptSpec {
     #[serde(default)]
     fanout: Vec<String>,
     #[serde(default)]
-    timeout: String,
+    stall_window: String,
 }
 
 #[derive(Clone, Debug, PartialEq)]
 struct HostGraphDefaults {
     queue_capacity: usize,
-    department_default_timeout: String,
+    department_default_stall_window: String,
     codex_permit_slots: usize,
 }
 
@@ -43,9 +44,9 @@ impl HostGraphDefaults {
         let config = ConfigContext::from_host_root(roots.host_root())?;
         Ok(Self {
             queue_capacity: resolve_usize(&config, ConfigKey::QueueCapacity)?,
-            department_default_timeout: resolve_timeout(
+            department_default_stall_window: resolve_stall_window(
                 &config,
-                ConfigKey::DepartmentDefaultTimeout,
+                ConfigKey::DepartmentDefaultStallWindow,
             )?,
             codex_permit_slots: resolve_usize(&config, ConfigKey::CodexPermitSlots)?,
         })
@@ -58,7 +59,7 @@ fn resolve_usize(config: &ConfigContext, key: ConfigKey) -> Result<usize> {
     config.resolved_positive_usize(key)
 }
 
-fn resolve_timeout(config: &ConfigContext, key: ConfigKey) -> Result<String> {
+fn resolve_stall_window(config: &ConfigContext, key: ConfigKey) -> Result<String> {
     let entry = crate::config_registry::entry(key);
     assert_eq!(entry.value_type, ConfigValueType::DurationString);
     config.resolved_duration_string(key)
@@ -155,10 +156,10 @@ fn scan_departments(
                 lua: config_path.clone(),
                 consumes: spec.consumes,
                 produces: spec.produces,
-                timeout: if spec.timeout.trim().is_empty() {
-                    defaults.department_default_timeout.clone()
+                stall_window: if spec.stall_window.trim().is_empty() {
+                    defaults.department_default_stall_window.clone()
                 } else {
-                    spec.timeout
+                    spec.stall_window
                 },
             },
             &config_path,

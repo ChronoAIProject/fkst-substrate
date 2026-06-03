@@ -6,7 +6,7 @@ fn framework_bin() -> &'static str {
 
 const CONFIG_ENVS: &[&str] = &[
     "FKST_QUEUE_CAPACITY",
-    "FKST_DEPARTMENT_DEFAULT_TIMEOUT",
+    "FKST_DEPARTMENT_DEFAULT_STALL_WINDOW",
     "FKST_CODEX_PERMIT_SLOTS",
     "FKST_CANDIDATE_PREFIX",
     "FKST_CANDIDATE_FROM_SEP",
@@ -46,7 +46,7 @@ fn config_reads_host_fkst_env_from_project_root_when_cwd_differs() {
     let cwd = tempfile::tempdir().unwrap();
     std::fs::write(
         host.path().join("fkst.env"),
-        "FKST_QUEUE_CAPACITY=31\nFKST_DEPARTMENT_DEFAULT_TIMEOUT=7m\nFKST_CODEX_PERMIT_SLOTS=9\nFKST_CANDIDATE_PREFIX=host-rc\nFKST_CANDIDATE_FROM_SEP=__from__\n",
+        "FKST_QUEUE_CAPACITY=31\nFKST_DEPARTMENT_DEFAULT_STALL_WINDOW=7m\nFKST_CODEX_PERMIT_SLOTS=9\nFKST_CANDIDATE_PREFIX=host-rc\nFKST_CANDIDATE_FROM_SEP=__from__\n",
     )
     .unwrap();
 

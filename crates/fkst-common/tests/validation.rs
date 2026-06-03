@@ -36,7 +36,7 @@ fn cfg_minimal(lua_file: &Path) -> Config {
             lua: lua_file.into(),
             consumes: vec!["tick".into()],
             produces: vec![],
-            timeout: "30m".into(),
+            stall_window: "30m".into(),
         },
     );
     Config {
@@ -50,14 +50,14 @@ fn cfg_minimal(lua_file: &Path) -> Config {
 }
 
 #[test]
-fn direct_deserialize_requires_department_timeout() {
+fn direct_deserialize_requires_department_stall_window() {
     let err = serde_json::from_value::<DepartmentDecl>(serde_json::json!({
         "lua": "d.lua",
         "consumes": ["tick"]
     }))
     .unwrap_err();
 
-    assert!(err.to_string().contains("timeout"), "{err}");
+    assert!(err.to_string().contains("stall_window"), "{err}");
 }
 
 #[test]
@@ -141,13 +141,13 @@ fn global_codex_processes_zero_rejected() {
 }
 
 #[test]
-fn bad_timeout_rejected() {
+fn bad_stall_window_rejected() {
     let tmp = tempdir().unwrap();
     let lua = touch(tmp.path(), "d.lua");
     let mut cfg = cfg_minimal(&lua);
-    cfg.department.get_mut("d").unwrap().timeout = "30x".into();
+    cfg.department.get_mut("d").unwrap().stall_window = "30x".into();
     let e = validate(&cfg, tmp.path()).unwrap_err();
-    assert!(e.to_string().contains("timeout"), "{}", e);
+    assert!(e.to_string().contains("stall_window"), "{}", e);
 }
 
 #[test]
@@ -229,7 +229,7 @@ fn duplicate_consumers_without_fanout_rejected() {
             lua: lua.clone(),
             consumes: vec!["tick".into()],
             produces: vec![],
-            timeout: "30m".into(),
+            stall_window: "30m".into(),
         },
     );
 
@@ -251,7 +251,7 @@ fn duplicate_consumers_with_fanout_pass() {
             lua: lua.clone(),
             consumes: vec!["tick".into()],
             produces: vec![],
-            timeout: "30m".into(),
+            stall_window: "30m".into(),
         },
     );
 

@@ -38,7 +38,7 @@ bootstrap seed 可以有小 LOC 口径；当前生产态 Tier III 总 LOC 不是
 
 Company 是 supervisor + framework + composed graph。它接收 source 事件、根据静态图建立 queue 和 consumer、按 queue 将事件送入 Department、spawn 一次 `fkst-framework run <lua>` 执行 pipeline，解析 `RAISED:` 后再投递事件。Company 不写业务。
 
-Department 是 package root 或 host root 中的 `departments/<dept>/main.lua`。它暴露 `M.spec` 和 `pipeline(event)`；`M.spec` 声明 `consumes`、`produces`、`fanout`、`timeout`。Department 无 lifecycle hook，无共享内存，同一个 `pipeline` 跑两次就是两次独立调用。
+Department 是 package root 或 host root 中的 `departments/<dept>/main.lua`。它暴露 `M.spec` 和 `pipeline(event)`；`M.spec` 声明 `consumes`、`produces`、`fanout`、`stall_window`。Department 无 lifecycle hook，无共享内存，同一个 `pipeline` 跑两次就是两次独立调用。
 
 Person 是一次 `codex exec` 子进程。它通过 `spawn_codex_sync` 或 `spawn_codex` 启动，做完一件事即退出。Person 之间禁止直接通信；并发 Person 只能由 Department 用 `await_all` join。
 
@@ -64,7 +64,7 @@ Codex 全局上限由 `<RT>/codex-permits/permit-*` 的 fcntl permit 池强制�
 
 ## Pipeline / 事件 / 路由
 
-事件流是 `source -> fanout -> route -> spawn -> RAISED`。`cron` 和 `file_watch` source 由 `raisers/*.lua` 静态声明；Department 的 `M.spec` 静态声明 consumes/produces/fanout/timeout。启动时 graph scan 一次性求值 package root 与 host root 中固定目录，构造 Config。
+事件流是 `source -> fanout -> route -> spawn -> RAISED`。`cron` 和 `file_watch` source 由 `raisers/*.lua` 静态声明；Department 的 `M.spec` 静态声明 consumes/produces/fanout/stall_window。启动时 graph scan 一次性求值 package root 与 host root 中固定目录，构造 Config。
 
 路由按 queue 和消费者集合发生。普通 queue 只能有一个 active consumer；fanout queue 必须由相关 Department 的 `M.spec.fanout` 显式声明。重复声明幂等，未声明多消费者或同队列反馈会在启动 validation 阶段拒绝。
 
@@ -92,7 +92,7 @@ SDK 命名可以直接写 `codex`。不要做通用 LLM provider 抽象；别的
 
 Producer 对 queue 调用 `try_send`。某个慢消费者 `Full` 或 `Closed` 只 drop 该订阅者并 warn，不阻塞其它订阅者。未知 queue warn 后 drop。
 
-启动 validation 强制检查 queue capacity > 0、引用的 queue 必须存在、Department lua 文件必须存在、timeout 必须是 `s/m/h` 结尾、孤立 queue 拒绝、多消费者必须 fanout、同 Department consume+produce 同一 queue 必须 fanout。
+启动 validation 强制检查 queue capacity > 0、引用的 queue 必须存在、Department lua 文件必须存在、stall_window 必须是 `s/m/h` 结尾、孤立 queue 拒绝、多消费者必须 fanout、同 Department consume+produce 同一 queue 必须 fanout。
 
 ## 子进程契约
 

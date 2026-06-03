@@ -108,7 +108,7 @@ fn minimal_config(lua_rel: PathBuf) -> Config {
             lua: lua_rel,
             consumes: vec!["self_test".into()],
             produces: vec![],
-            timeout: "30s".into(),
+            stall_window: "30s".into(),
         },
     );
 

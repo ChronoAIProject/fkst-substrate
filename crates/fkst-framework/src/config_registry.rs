@@ -33,7 +33,7 @@ pub(crate) enum ConfigKind {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ConfigKey {
     QueueCapacity,
-    DepartmentDefaultTimeout,
+    DepartmentDefaultStallWindow,
     CodexPermitSlots,
     CandidatePrefix,
     CandidateFromSep,
@@ -134,12 +134,12 @@ pub(crate) static CONFIG_REGISTRY: &[ConfigEntry] = &[
         doc: "Default capacity for derived event queues.",
     },
     ConfigEntry {
-        key: ConfigKey::DepartmentDefaultTimeout,
-        name: "department_default_timeout",
-        env_key: "FKST_DEPARTMENT_DEFAULT_TIMEOUT",
+        key: ConfigKey::DepartmentDefaultStallWindow,
+        name: "department_default_stall_window",
+        env_key: "FKST_DEPARTMENT_DEFAULT_STALL_WINDOW",
         kind: ConfigKind::Operational { default: "30s" },
         value_type: ConfigValueType::DurationString,
-        doc: "Default Department timeout used when M.spec.timeout is empty.",
+        doc: "Default Department no-output stall window used when M.spec.stall_window is empty.",
     },
     ConfigEntry {
         key: ConfigKey::CodexPermitSlots,
@@ -257,7 +257,7 @@ pub(crate) fn parse_duration_string(entry: &ConfigEntry, raw: &str) -> Result<St
     let value = raw.trim().to_string();
     if value.is_empty() || !(value.ends_with('s') || value.ends_with('m') || value.ends_with('h')) {
         bail!(
-            "{} must be a timeout ending with s/m/h, got {raw:?}",
+            "{} must be a no-output stall window duration ending with s/m/h, got {raw:?}",
             entry.env_key
         );
     }
