@@ -60,6 +60,10 @@ fn stdout(output: &Output) -> String {
     String::from_utf8_lossy(&output.stdout).to_string()
 }
 
+fn stderr(output: &Output) -> String {
+    String::from_utf8_lossy(&output.stderr).to_string()
+}
+
 fn raised_entries(output: &Output) -> Vec<Value> {
     let out = stdout(output);
     let line = out
@@ -73,8 +77,26 @@ fn raised_entries(output: &Output) -> Vec<Value> {
     serde_json::from_slice(&bytes).unwrap()
 }
 
+fn file_count(root: &Path) -> usize {
+    fn walk(path: &Path, count: &mut usize) {
+        for entry in fs::read_dir(path).unwrap() {
+            let entry = entry.unwrap();
+            let path = entry.path();
+            if path.is_dir() {
+                walk(&path, count);
+            } else {
+                *count += 1;
+            }
+        }
+    }
+
+    let mut count = 0;
+    walk(root, &mut count);
+    count
+}
+
 #[test]
-fn minimal_package_reconciles_work_and_done_marker() {
+fn minimal_package_scanner_raises_work_and_worker_logs_completion() {
     let host = tempfile::tempdir().unwrap();
     let runtime = tempfile::tempdir().unwrap();
     let package = repo_root().join("examples/minimal-package");
@@ -91,7 +113,9 @@ fn minimal_package_reconciles_work_and_done_marker() {
     assert_eq!(raised.len(), 1);
     assert_eq!(raised[0]["queue"], "work");
     assert_eq!(raised[0]["payload"]["id"], "req-001");
+    assert_eq!(raised[0]["payload"]["request_path"], "requests/req-001.md");
 
+    let host_file_count_before_worker = file_count(host.path());
     let worker = run_department(
         host.path(),
         runtime.path(),
@@ -99,41 +123,19 @@ fn minimal_package_reconciles_work_and_done_marker() {
         r#"{"type":"work","payload":{"id":"req-001","request_path":"requests/req-001.md"}}"#,
     );
     assert_success(&worker);
-
-    let done = host.path().join("state/done/req-001.txt");
-    let done_content = fs::read_to_string(&done).unwrap();
-    assert!(!done_content.is_empty());
-    assert!(runtime.path().join("locks/worker-req-001").exists());
-    assert!(!host.path().join("worker-req-001").exists());
-
-    let scanner_after_done = run_department(
-        host.path(),
-        runtime.path(),
-        "departments/scanner/main.lua",
-        r#"{"type":"reconcile_tick","payload":{}}"#,
+    let host_file_count_after_worker = file_count(host.path());
+    assert_eq!(
+        host_file_count_before_worker, host_file_count_after_worker,
+        "worker must not write runtime files into host"
     );
-    assert_success(&scanner_after_done);
-    assert!(!stdout(&scanner_after_done).contains("RAISED:"));
-}
 
-#[test]
-fn minimal_package_worker_renames_shell_metacharacter_id_without_injection() {
-    let host = tempfile::tempdir().unwrap();
-    let runtime = tempfile::tempdir().unwrap();
-    let package = repo_root().join("examples/minimal-package");
-    copy_dir(&package, host.path());
-
-    let worker = run_department(
-        host.path(),
-        runtime.path(),
-        "departments/worker/main.lua",
-        r#"{"type":"work","payload":{"id":"req; touch injected; #","request_path":"requests/req; touch injected; #.md"}}"#,
+    let err = stderr(&worker);
+    assert!(
+        err.lines().any(|line| {
+            line.contains("TIMESTAMP=")
+                && line.contains(" LEVEL=info ")
+                && line.contains(" MSG=work completed: req-001")
+        }),
+        "stderr: {err}"
     );
-    assert_success(&worker);
-
-    let done = host.path().join("state/done/req; touch injected; #.txt");
-    let done_content = fs::read_to_string(&done).unwrap();
-    assert!(done_content.contains("id=req; touch injected; #"));
-    assert!(!host.path().join("injected").exists());
-    assert!(!host.path().join("state/done/.req; touch injected; #.tmp").exists());
 }
