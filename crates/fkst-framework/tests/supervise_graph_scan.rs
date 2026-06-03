@@ -18,7 +18,7 @@ use tempfile::TempDir;
 
 const RUNTIME_ROOT_ENV: &str = "FKST_RUNTIME_ROOT";
 const QUEUE_CAPACITY_ENV: &str = "FKST_QUEUE_CAPACITY";
-const DEPARTMENT_DEFAULT_TIMEOUT_ENV: &str = "FKST_DEPARTMENT_DEFAULT_TIMEOUT";
+const DEPARTMENT_DEFAULT_STALL_WINDOW_ENV: &str = "FKST_DEPARTMENT_DEFAULT_STALL_WINDOW";
 const CODEX_PERMIT_SLOTS_ENV: &str = "FKST_CODEX_PERMIT_SLOTS";
 const PACKAGE_ROOT_ENV: &str = "FKST_PACKAGE_ROOT";
 
@@ -62,12 +62,12 @@ fn load(path: &std::path::Path) -> anyhow::Result<fkst_common::config::Config> {
     graph_load(path)
 }
 
-fn write_host_defaults(root: &std::path::Path, queue: &str, timeout: &str, slots: &str) {
+fn write_host_defaults(root: &std::path::Path, queue: &str, stall_window: &str, slots: &str) {
     fs::write(
         root.join("fkst.env"),
         format!(
-            "FKST_QUEUE_CAPACITY={}FKST_DEPARTMENT_DEFAULT_TIMEOUT={}FKST_CODEX_PERMIT_SLOTS={}",
-            queue, timeout, slots
+            "FKST_QUEUE_CAPACITY={}FKST_DEPARTMENT_DEFAULT_STALL_WINDOW={}FKST_CODEX_PERMIT_SLOTS={}",
+            queue, stall_window, slots
         ),
     )
     .unwrap();
@@ -94,7 +94,7 @@ fn dept(consumes: &str, produces: &str) -> String {
     format!(
         r#"
 local M = {{}}
-M.spec = {{ consumes = {{{}}}, produces = {{{}}}, timeout = "30s" }}
+M.spec = {{ consumes = {{{}}}, produces = {{{}}}, stall_window = "30s" }}
 function pipeline(_) end
 return M
 "#,
@@ -106,7 +106,7 @@ fn dept_with_fanout(consumes: &str, produces: &str, fanout: &str) -> String {
     format!(
         r#"
 local M = {{}}
-M.spec = {{ consumes = {{{}}}, produces = {{{}}}, fanout = {{{}}}, timeout = "30s" }}
+M.spec = {{ consumes = {{{}}}, produces = {{{}}}, fanout = {{{}}}, stall_window = "30s" }}
 function pipeline(_) end
 return M
 "#,
@@ -118,7 +118,7 @@ fn write_package_helper(root: &std::path::Path) {
     fs::create_dir_all(root.join("fkst")).unwrap();
     fs::write(
         root.join("fkst/spec_helper.lua"),
-        r#"return { timeout = function() return "45s" end }"#,
+        r#"return { stall_window = function() return "45s" end }"#,
     )
     .unwrap();
 }
@@ -130,7 +130,7 @@ fn scans_minimal_repo() {
             "hello",
             r#"
 local M = {}
-M.spec = { consumes = {"tick"}, timeout = "30s" }
+M.spec = { consumes = {"tick"}, stall_window = "30s" }
 function pipeline(_) end
 return M
 "#,
@@ -167,7 +167,7 @@ fn host_graph_defaults_use_operational_defaults_when_env_and_fkst_env_are_absent
         .lock()
         .unwrap_or_else(|err| err.into_inner());
     let _queue = EnvGuard::unset(QUEUE_CAPACITY_ENV);
-    let _timeout = EnvGuard::unset(DEPARTMENT_DEFAULT_TIMEOUT_ENV);
+    let _timeout = EnvGuard::unset(DEPARTMENT_DEFAULT_STALL_WINDOW_ENV);
     let _slots = EnvGuard::unset(CODEX_PERMIT_SLOTS_ENV);
     let dir = TempDir::new().unwrap();
     let depts_root = dir.path().join("departments");
@@ -192,7 +192,7 @@ return M
     let cfg = load(dir.path()).unwrap();
 
     assert_eq!(cfg.queue.get("tick").unwrap().capacity, 16);
-    assert_eq!(cfg.department.get("hello").unwrap().timeout, "30s");
+    assert_eq!(cfg.department.get("hello").unwrap().stall_window, "30s");
     assert_eq!(cfg.limits.global_codex_processes, 20);
 }
 
@@ -203,7 +203,7 @@ fn host_graph_defaults_use_fkst_env() {
         .lock()
         .unwrap();
     let _queue = EnvGuard::unset(QUEUE_CAPACITY_ENV);
-    let _timeout = EnvGuard::unset(DEPARTMENT_DEFAULT_TIMEOUT_ENV);
+    let _timeout = EnvGuard::unset(DEPARTMENT_DEFAULT_STALL_WINDOW_ENV);
     let _slots = EnvGuard::unset(CODEX_PERMIT_SLOTS_ENV);
     let dir = write_repo(
         &[(
@@ -225,7 +225,7 @@ return M
     let cfg = load(dir.path()).unwrap();
 
     assert_eq!(cfg.queue.get("tick").unwrap().capacity, 11);
-    assert_eq!(cfg.department.get("hello").unwrap().timeout, "44s");
+    assert_eq!(cfg.department.get("hello").unwrap().stall_window, "44s");
     assert_eq!(cfg.limits.global_codex_processes, 12);
 }
 
@@ -236,7 +236,7 @@ fn host_graph_defaults_use_env_before_fkst_env() {
         .lock()
         .unwrap();
     let _queue = EnvGuard::set(QUEUE_CAPACITY_ENV, "31");
-    let _timeout = EnvGuard::set(DEPARTMENT_DEFAULT_TIMEOUT_ENV, "66h");
+    let _timeout = EnvGuard::set(DEPARTMENT_DEFAULT_STALL_WINDOW_ENV, "66h");
     let _slots = EnvGuard::set(CODEX_PERMIT_SLOTS_ENV, "32");
     let dir = write_repo(
         &[(
@@ -255,14 +255,14 @@ return M
     );
     fs::write(
         dir.path().join("fkst.env"),
-        "FKST_QUEUE_CAPACITY=21\nFKST_DEPARTMENT_DEFAULT_TIMEOUT=55m\nFKST_CODEX_PERMIT_SLOTS=22\n",
+        "FKST_QUEUE_CAPACITY=21\nFKST_DEPARTMENT_DEFAULT_STALL_WINDOW=55m\nFKST_CODEX_PERMIT_SLOTS=22\n",
     )
     .unwrap();
 
     let cfg = load(dir.path()).unwrap();
 
     assert_eq!(cfg.queue.get("tick").unwrap().capacity, 31);
-    assert_eq!(cfg.department.get("hello").unwrap().timeout, "66h");
+    assert_eq!(cfg.department.get("hello").unwrap().stall_window, "66h");
     assert_eq!(cfg.limits.global_codex_processes, 32);
 }
 
@@ -273,7 +273,7 @@ fn explicit_department_timeout_overrides_host_default_timeout() {
             "hello",
             r#"
 local M = {}
-M.spec = { consumes = {"tick"}, timeout = "9s" }
+M.spec = { consumes = {"tick"}, stall_window = "9s" }
 function pipeline(_) end
 return M
 "#,
@@ -285,7 +285,7 @@ return M
     );
     let cfg = load(dir.path()).unwrap();
 
-    assert_eq!(cfg.department.get("hello").unwrap().timeout, "9s");
+    assert_eq!(cfg.department.get("hello").unwrap().stall_window, "9s");
 }
 
 #[test]
@@ -295,7 +295,7 @@ fn operational_defaults_ignore_removed_txt_files() {
         .lock()
         .unwrap();
     let _queue = EnvGuard::unset(QUEUE_CAPACITY_ENV);
-    let _timeout = EnvGuard::unset(DEPARTMENT_DEFAULT_TIMEOUT_ENV);
+    let _timeout = EnvGuard::unset(DEPARTMENT_DEFAULT_STALL_WINDOW_ENV);
     let _slots = EnvGuard::unset(CODEX_PERMIT_SLOTS_ENV);
     let dir = TempDir::new().unwrap();
     fs::create_dir_all(dir.path().join("departments/hello")).unwrap();
@@ -303,7 +303,8 @@ fn operational_defaults_ignore_removed_txt_files() {
     fs::create_dir_all(dir.path().join("tunables")).unwrap();
     fs::write(dir.path().join("tunables/queue_capacity.txt"), "99\n").unwrap();
     fs::write(
-        dir.path().join("tunables/department_default_timeout.txt"),
+        dir.path()
+            .join("tunables/department_default_stall_window.txt"),
         "99m\n",
     )
     .unwrap();
@@ -327,7 +328,7 @@ return M
     let cfg = load(dir.path()).unwrap();
 
     assert_eq!(cfg.queue.get("tick").unwrap().capacity, 16);
-    assert_eq!(cfg.department.get("hello").unwrap().timeout, "30s");
+    assert_eq!(cfg.department.get("hello").unwrap().stall_window, "30s");
     assert_eq!(cfg.limits.global_codex_processes, 20);
 }
 
@@ -338,11 +339,11 @@ fn host_graph_defaults_fail_closed_when_configured_value_is_invalid() {
         .lock()
         .unwrap();
     let _queue = EnvGuard::unset(QUEUE_CAPACITY_ENV);
-    let _timeout = EnvGuard::unset(DEPARTMENT_DEFAULT_TIMEOUT_ENV);
+    let _timeout = EnvGuard::unset(DEPARTMENT_DEFAULT_STALL_WINDOW_ENV);
     let _slots = EnvGuard::unset(CODEX_PERMIT_SLOTS_ENV);
     let cases = [
         (QUEUE_CAPACITY_ENV, "not-a-number"),
-        (DEPARTMENT_DEFAULT_TIMEOUT_ENV, "30x"),
+        (DEPARTMENT_DEFAULT_STALL_WINDOW_ENV, "30x"),
         (CODEX_PERMIT_SLOTS_ENV, "0"),
     ];
 
@@ -379,7 +380,7 @@ fn graph_scan_loads_root_modules() {
             r#"
 local helper = require("fkst.spec_helper")
 local M = {}
-M.spec = { consumes = {"in"}, produces = {"out"}, timeout = helper.timeout() }
+M.spec = { consumes = {"in"}, produces = {"out"}, stall_window = helper.stall_window() }
 function pipeline(_) end
 return M
 "#,
@@ -389,12 +390,12 @@ return M
     fs::create_dir_all(repo.path().join("fkst")).unwrap();
     fs::write(
         repo.path().join("fkst/spec_helper.lua"),
-        r#"return { timeout = function() return "45s" end }"#,
+        r#"return { stall_window = function() return "45s" end }"#,
     )
     .unwrap();
 
     let cfg = load(repo.path()).unwrap();
-    assert_eq!(cfg.department["hello"].timeout, "45s");
+    assert_eq!(cfg.department["hello"].stall_window, "45s");
 }
 
 #[test]
@@ -414,7 +415,7 @@ fn package_root_assets_and_host_departments_form_one_graph() {
             r#"
 local helper = require("fkst.spec_helper")
 local M = {}
-M.spec = { consumes = {"standard_tick"}, produces = {"host_done"}, timeout = helper.timeout() }
+M.spec = { consumes = {"standard_tick"}, produces = {"host_done"}, stall_window = helper.stall_window() }
 function pipeline(_) end
 return M
 "#,
@@ -427,7 +428,7 @@ return M
 
     assert!(cfg.raiser.contains_key("standard_tick"));
     assert!(cfg.department.contains_key("host_worker"));
-    assert_eq!(cfg.department["host_worker"].timeout, "45s");
+    assert_eq!(cfg.department["host_worker"].stall_window, "45s");
     assert_eq!(
         cfg.department["host_worker"].lua,
         host.path()
@@ -519,7 +520,7 @@ local M = {}
 M.spec = {
 consumes = {"evolve_request"},
 produces = {"evolve_done", "evolve_failed"},
-timeout = "30m",
+stall_window = "30m",
 }
 function pipeline(_) end
 return M
@@ -569,7 +570,7 @@ fn graph_scan_rejects_fkst_paths_global() {
 local M = {}
 assert(fkst_paths == nil, "fkst_paths graph-scan global must not be injected")
 local _ = fkst_paths.runtime_root()
-M.spec = { consumes = {"tick"}, timeout = "30s" }
+M.spec = { consumes = {"tick"}, stall_window = "30s" }
 function pipeline(_) end
 return M
 "#,
@@ -619,7 +620,10 @@ fn runtime_file_watch_glob_is_removed_surface() {
         )),
         "got: {msg}"
     );
-    assert!(msg.contains("host-root relative or absolute glob"), "got: {msg}");
+    assert!(
+        msg.contains("host-root relative or absolute glob"),
+        "got: {msg}"
+    );
 }
 
 #[test]
@@ -711,7 +715,7 @@ fn duplicate_department_name_fails_closed() {
             lua: path.clone(),
             consumes: vec!["tick".into()],
             produces: Vec::new(),
-            timeout: "30s".into(),
+            stall_window: "30s".into(),
         },
         &path,
     )
@@ -723,7 +727,7 @@ fn duplicate_department_name_fails_closed() {
             lua: path.clone(),
             consumes: vec!["tick".into()],
             produces: Vec::new(),
-            timeout: "30s".into(),
+            stall_window: "30s".into(),
         },
         &path,
     )

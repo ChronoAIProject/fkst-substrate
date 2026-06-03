@@ -18,7 +18,7 @@ cargo test --workspace -- --test-threads=1
 5 个 knob:
 
 - Operational: `FKST_QUEUE_CAPACITY` 默认 `16`
-- Operational: `FKST_DEPARTMENT_DEFAULT_TIMEOUT` 默认 `30s`
+- Operational: `FKST_DEPARTMENT_DEFAULT_STALL_WINDOW` 默认 `30s`
 - Operational: `FKST_CODEX_PERMIT_SLOTS` 默认 `20`
 - HostFact: `FKST_CANDIDATE_PREFIX` 必填
 - HostFact: `FKST_CANDIDATE_FROM_SEP` 必填

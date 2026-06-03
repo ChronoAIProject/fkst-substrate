@@ -42,7 +42,7 @@ pub struct DepartmentDecl {
     pub consumes: Vec<String>,
     #[serde(default)]
     pub produces: Vec<String>,
-    pub timeout: String,
+    pub stall_window: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]

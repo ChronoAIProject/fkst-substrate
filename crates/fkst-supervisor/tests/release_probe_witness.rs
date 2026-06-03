@@ -43,7 +43,7 @@ local M = {}
 M.spec = {
     consumes = { "release_probe" },
     produces = { "release_probe_done" },
-    timeout = "5s",
+    stall_window = "5s",
 }
 
 function pipeline(event)
@@ -70,7 +70,7 @@ local M = {{}}
 
 M.spec = {{
     consumes = {{ "release_probe_done" }},
-    timeout = "5s",
+    stall_window = "5s",
 }}
 
 function pipeline(event)
@@ -101,7 +101,7 @@ fn write_release_raiser(root: &Path) {
 fn write_host_defaults(root: &Path) {
     fs::write(
         root.join("fkst.env"),
-        "FKST_QUEUE_CAPACITY=100\nFKST_DEPARTMENT_DEFAULT_TIMEOUT=30m\nFKST_CODEX_PERMIT_SLOTS=20\n",
+        "FKST_QUEUE_CAPACITY=100\nFKST_DEPARTMENT_DEFAULT_STALL_WINDOW=30m\nFKST_CODEX_PERMIT_SLOTS=20\n",
     )
     .unwrap();
 }

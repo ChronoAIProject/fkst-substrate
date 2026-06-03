@@ -112,7 +112,7 @@ run 模式未传 --project-root 时可从 Lua 路径推断
   consumes = {...},
   produces = {...},
   fanout = {...},
-  timeout = "30s"
+  stall_window = "30s"
 }
 ```
 
@@ -134,7 +134,7 @@ run 模式未传 --project-root 时可从 Lua 路径推断
 | name | env key | kind | type | default / required |
 |---|---|---|---|---|
 | `queue_capacity` | `FKST_QUEUE_CAPACITY` | Operational | `usize` | default `16` |
-| `department_default_timeout` | `FKST_DEPARTMENT_DEFAULT_TIMEOUT` | Operational | duration string | default `30s` |
+| `department_default_stall_window` | `FKST_DEPARTMENT_DEFAULT_STALL_WINDOW` | Operational | duration string | default `30s` |
 | `codex_permit_slots` | `FKST_CODEX_PERMIT_SLOTS` | Operational | `usize` | default `20` |
 | `candidate_prefix` | `FKST_CANDIDATE_PREFIX` | HostFact | string | required |
 | `candidate_from_sep` | `FKST_CANDIDATE_FROM_SEP` | HostFact | string | required |
@@ -225,7 +225,7 @@ engine 不维护消息状态。`处理中` 可以是 `with_lock` 租约（进程
 
 ## 10. 事件与队列机制
 
-`Config` 包含 `queue`、`raiser`、`department`、`limits`。Queue 有 `capacity` 与 `fanout`。Raiser 只有 `Cron` 与 `FileWatch`。Department 有 `lua`、`consumes`、`produces`、`timeout`。
+`Config` 包含 `queue`、`raiser`、`department`、`limits`。Queue 有 `capacity` 与 `fanout`。Raiser 只有 `Cron` 与 `FileWatch`。Department 有 `lua`、`consumes`、`produces`、`stall_window`。
 
 validation 规则：
 
@@ -234,7 +234,7 @@ validation 规则：
 - 每个 Raiser produces 必须引用已声明 queue
 - 每个 Department consumes/produces 必须引用已声明 queue
 - Department lua 文件必须存在
-- timeout 必须以 `s`、`m` 或 `h` 结尾
+- stall_window 必须以 `s`、`m` 或 `h` 结尾
 - queue 不能孤立
 - 非 fanout queue 不能有多个 consumer
 - Department consume 和 produce 同一 queue 时，该 queue 必须 fanout

@@ -2,7 +2,7 @@ local M = {}
 
 M.spec = {
   consumes = { "example_event" },
-  timeout = "30s",
+  stall_window = "30s",
 }
 
 function pipeline(event)

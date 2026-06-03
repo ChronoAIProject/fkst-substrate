@@ -32,7 +32,7 @@ pub async fn spawn_consumer(
     }
     tokio::spawn(async move {
         let stall_window =
-            parse_duration(&decl.timeout).expect("validation already accepted timeout");
+            parse_duration(&decl.stall_window).expect("validation already accepted stall_window");
         let framework_child_log_dir = crate::runtime_context::layout_from_host_root(&project_root)
             .expect("runtime layout should be valid")
             .runtime_dir(RuntimeKind::Logs)
@@ -178,7 +178,7 @@ mod tests {
                 lua: PathBuf::from("departments/test.lua"),
                 consumes: vec!["input".to_string(), "second-input".to_string()],
                 produces: Vec::new(),
-                timeout: "5s".to_string(),
+                stall_window: "5s".to_string(),
             },
             project.path().to_path_buf(),
             project.path().to_path_buf(),

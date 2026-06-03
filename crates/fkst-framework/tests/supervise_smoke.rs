@@ -23,7 +23,7 @@ fn write_graph_defaults(root: &std::path::Path) {
     fs::create_dir_all(root).unwrap();
     fs::write(
         root.join("fkst.env"),
-        "FKST_QUEUE_CAPACITY=100\nFKST_DEPARTMENT_DEFAULT_TIMEOUT=30m\nFKST_CODEX_PERMIT_SLOTS=20\n",
+        "FKST_QUEUE_CAPACITY=100\nFKST_DEPARTMENT_DEFAULT_STALL_WINDOW=30m\nFKST_CODEX_PERMIT_SLOTS=20\n",
     )
     .unwrap();
 }
@@ -58,14 +58,14 @@ fn supervise_dispatches_file_watch_event_to_department() {
     fs::create_dir_all(root.join("raisers")).unwrap();
     fs::write(
         root.join("fkst.env"),
-        "FKST_QUEUE_CAPACITY=100\nFKST_DEPARTMENT_DEFAULT_TIMEOUT=30m\nFKST_CODEX_PERMIT_SLOTS=20\n",
+        "FKST_QUEUE_CAPACITY=100\nFKST_DEPARTMENT_DEFAULT_STALL_WINDOW=30m\nFKST_CODEX_PERMIT_SLOTS=20\n",
     )
     .unwrap();
     fs::write(
         root.join("departments/recorder/main.lua"),
         r#"
 local M = {}
-M.spec = { consumes = {"files"}, timeout = "5s" }
+M.spec = { consumes = {"files"}, stall_window = "5s" }
 function pipeline(event)
   local f = assert(io.open("seen.txt", "w"))
   f:write(event.payload.path or "")
@@ -136,7 +136,7 @@ fn supervise_env_package_root_reaches_child_framework() {
         r#"
 return {
   marker = function() return "package-standard-marker" end,
-  timeout = function() return "5s" end,
+  stall_window = function() return "5s" end,
 }
 "#,
     )
@@ -155,7 +155,7 @@ return {
             r#"
 local standard = require("fkst.standard_asset")
 local M = {{}}
-M.spec = {{ consumes = {{"standard_input"}}, timeout = standard.timeout() }}
+M.spec = {{ consumes = {{"standard_input"}}, stall_window = standard.stall_window() }}
 function pipeline(event)
   local f = assert(io.open({}, "w"))
   f:write("marker=" .. standard.marker() .. "\n")

@@ -13,7 +13,7 @@ use crate::error::FkstError;
 /// - queues with only producers or only consumers emit startup warnings
 /// - every department's `lua` path must exist on disk
 /// - queue capacity > 0
-/// - department timeout is parseable (we just check non-empty + ends with s/m/h)
+/// - department stall_window is parseable (we just check non-empty + ends with s/m/h)
 /// - duplicate raiser → same name impossible (HashMap), so skip
 pub fn validate(cfg: &Config, project_root: &std::path::Path) -> Result<Vec<String>, FkstError> {
     if cfg.limits.global_codex_processes == 0 {
@@ -76,13 +76,13 @@ pub fn validate(cfg: &Config, project_root: &std::path::Path) -> Result<Vec<Stri
                 lua_full.display()
             )));
         }
-        if !(dept.timeout.ends_with('s')
-            || dept.timeout.ends_with('m')
-            || dept.timeout.ends_with('h'))
+        if !(dept.stall_window.ends_with('s')
+            || dept.stall_window.ends_with('m')
+            || dept.stall_window.ends_with('h'))
         {
             return Err(FkstError::Schema(format!(
-                "department '{}' timeout '{}' must end with s/m/h",
-                name, dept.timeout
+                "department '{}' stall_window '{}' must end with s/m/h",
+                name, dept.stall_window
             )));
         }
     }
@@ -243,7 +243,7 @@ mod tests {
                 lua: lua.file_name().unwrap().into(),
                 consumes: vec!["tick".into()],
                 produces: Vec::new(),
-                timeout: "30s".into(),
+                stall_window: "30s".into(),
             },
         );
         cfg
@@ -308,13 +308,13 @@ mod tests {
     }
 
     #[test]
-    fn bad_timeout_rejected() {
+    fn bad_stall_window_rejected() {
         let tmp = tempdir().unwrap();
         let lua = touch(tmp.path(), "d.lua");
         let mut cfg = cfg_minimal(&lua);
-        cfg.department.get_mut("d").unwrap().timeout = "30x".into();
+        cfg.department.get_mut("d").unwrap().stall_window = "30x".into();
         let e = validate(&cfg, tmp.path()).unwrap_err();
-        assert!(e.to_string().contains("timeout"), "{}", e);
+        assert!(e.to_string().contains("stall_window"), "{}", e);
     }
 
     #[test]
