@@ -85,7 +85,7 @@ fn minimal_package_loads_and_logs_event() {
         host.path(),
         runtime.path(),
         "departments/logger/main.lua",
-        r#"{"type":"tick","payload":{}}"#,
+        r#"{"queue":"tick","payload":{"raiser":"tick"}}"#,
     );
     assert_success(&logger);
 
@@ -94,7 +94,7 @@ fn minimal_package_loads_and_logs_event() {
         err.lines().any(|line| {
             line.contains("TIMESTAMP=")
                 && line.contains(" LEVEL=info ")
-                && line.contains(" MSG=event received: tick")
+                && line.contains(" MSG=event received on queue: tick")
         }),
         "stderr: {err}"
     );

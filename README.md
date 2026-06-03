@@ -40,7 +40,7 @@ target/debug/fkst-framework config \
 下列命令证明的范围如下：
 
 - `conformance`：minimal-package 的单 source / 单 department 图通过 validation。
-- `run logger`：单个 logger pipeline 消费 `tick`，并向 stderr 写结构化 `event received` 日志行。
+- `run logger`：单个 logger pipeline 消费真实 dispatch 形状的 `tick` 事件，并向 stderr 写结构化 `event received on queue` 日志行。
 
 ```sh
 cargo build --workspace
@@ -56,11 +56,11 @@ target/debug/fkst-framework conformance \
     "$tmp_host/departments/logger/main.lua" \
     --project-root "$tmp_host" \
     --package-root "$tmp_host" \
-    --event '{"type":"tick","payload":{}}'
+    --event '{"queue":"tick","payload":{"raiser":"tick"}}'
 )
 ```
 
-logger 的 stderr 应包含结构化日志行，例如 `LEVEL=info MSG=event received: tick`。
+logger 的 stderr 应包含一行结构化日志 `event received on queue: tick`。这个 `--event` 展示的是 cron `tick` source 真实派发的事件形状：`queue`、`payload` 与运行时补入的 `ts`。
 
 ## 发布边界
 

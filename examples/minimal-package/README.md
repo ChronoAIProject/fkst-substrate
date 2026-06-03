@@ -3,7 +3,7 @@
 `examples/minimal-package` 是一个最小 package-root fixture。它只包含一个 cron source 和一个 log-only department：
 
 - `raisers/tick.lua` 每 5 秒产生 `tick`。
-- `departments/logger/main.lua` 消费 `tick`，在 `pipeline(event)` 中写一行结构化日志。
+- `departments/logger/main.lua` 消费 `tick`，在 `pipeline(event)` 中按 queue 写一行结构化日志。
 
 这个 fixture 用来证明 `--package-root` 可以独立加载、通过 graph validation，并且 source 事件可以 dispatch 到 `pipeline(event)`。它不演示业务扫描、派生工作、完成事实或持久化策略。
 
@@ -23,10 +23,10 @@ target/debug/fkst-framework conformance \
     "$tmp_host/departments/logger/main.lua" \
     --project-root "$tmp_host" \
     --package-root "$tmp_host" \
-    --event '{"type":"tick","payload":{}}'
+    --event '{"queue":"tick","payload":{"raiser":"tick"}}'
 )
 ```
 
-`run logger` 的 stderr 应包含结构化日志行，例如 `LEVEL=info MSG=event received: tick`。
+`run logger` 的 stderr 应包含一行结构化日志 `event received on queue: tick`。这个 `--event` 展示的是 cron `tick` source 真实派发的事件形状：`queue`、`payload` 与运行时补入的 `ts`。
 
 ⟦AI:FKST⟧
