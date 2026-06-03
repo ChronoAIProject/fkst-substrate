@@ -60,7 +60,7 @@ target/debug/fkst-framework conformance \
 )
 ```
 
-logger 的 stderr 应包含一行结构化日志 `event received on queue: tick`。这个 `--event` 展示的是 cron `tick` source 真实派发的事件形状：`queue`、`payload` 与运行时补入的 `ts`。
+logger 的 stderr 应包含一行结构化日志 `event received on queue: tick`。这个 `--event` 用 cron `tick` source 真实派发的字段形状（`queue` + `payload`）；真实 supervise 派发还会带一个 `ts` 字段，此处手动 fixture 省略了它（`run --event` 不会自动补 `ts`）。
 
 ## 发布边界
 
