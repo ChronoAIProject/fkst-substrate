@@ -8,8 +8,7 @@ pub const RUNTIME_ROOT_ENV: &str = "FKST_RUNTIME_ROOT";
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 // runtime path categories are explicit and bounded before path construction.
 pub enum RuntimeKind {
-    Pipeline,
-    Mailbox,
+    Artifacts,
     Worktrees,
     CodexPermits,
     Locks,
@@ -26,8 +25,7 @@ impl RuntimeKind {
     // external kind strings enter through one checked parser.
     pub fn parse(value: &str) -> Result<Self> {
         match value {
-            "pipeline" => Ok(Self::Pipeline),
-            "mailbox" => Ok(Self::Mailbox),
+            "artifacts" => Ok(Self::Artifacts),
             "worktrees" => Ok(Self::Worktrees),
             "codex_permits" | "codex-permits" => Ok(Self::CodexPermits),
             "locks" => Ok(Self::Locks),
@@ -38,8 +36,7 @@ impl RuntimeKind {
 
     fn dir_name(self) -> &'static str {
         match self {
-            Self::Pipeline => "pipeline",
-            Self::Mailbox => "mailbox",
+            Self::Artifacts => "artifacts",
             Self::Worktrees => "worktrees",
             Self::CodexPermits => "codex-permits",
             Self::Locks => "locks",
@@ -170,9 +167,9 @@ mod tests {
         let layout = RuntimeLayout::from_env().unwrap();
         assert_eq!(
             layout
-                .runtime_path(RuntimeKind::Mailbox, "threads/a")
+                .runtime_path(RuntimeKind::Artifacts, "mailbox/threads/a")
                 .unwrap(),
-            PathBuf::from(".fkst/custom-runtime/mailbox/threads/a")
+            PathBuf::from(".fkst/custom-runtime/artifacts/mailbox/threads/a")
         );
     }
 
@@ -189,14 +186,16 @@ mod tests {
     fn traversal_is_rejected() {
         assert!(RuntimeLayout::new("../runtime").is_err());
         let layout = RuntimeLayout::new(".fkst/runtime").unwrap();
-        assert!(layout.runtime_path(RuntimeKind::Pipeline, "../x").is_err());
+        assert!(layout.runtime_path(RuntimeKind::Artifacts, "../x").is_err());
         assert!(layout
-            .runtime_path(RuntimeKind::Pipeline, "/tmp/x")
+            .runtime_path(RuntimeKind::Artifacts, "/tmp/x")
             .is_err());
     }
 
     #[test]
     fn unknown_kind_is_rejected() {
         assert!(RuntimeKind::parse("unknown").is_err());
+        assert!(RuntimeKind::parse("pipeline").is_err());
+        assert!(RuntimeKind::parse("mailbox").is_err());
     }
 }

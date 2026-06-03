@@ -120,7 +120,7 @@ run 模式未传 --project-root 时可从 Lua 路径推断
 
 ```lua
 { type = "cron", interval = "10s", produces = "queue" }
-{ type = "file_watch", glob = "path-or-runtime://pipeline/...", produces = "queue" }
+{ type = "file_watch", glob = "path-or-runtime://artifacts/pipeline/...", produces = "queue" }
 ```
 
 ## 5. Engine Operation Registry
@@ -141,19 +141,18 @@ run 模式未传 --project-root 时可从 Lua 路径推断
 
 ## 6. Runtime I/O 与落点
 
-`RuntimeKind` 固定六类。下表是每类的 I/O：落点、用途、以及**谁写**(`<RT>` = `FKST_RUNTIME_ROOT`，已锚到 `<HOST>`)。
+`RuntimeKind` 固定 5 类。下表是每类的 I/O：落点、用途、以及**谁写**(`<RT>` = `FKST_RUNTIME_ROOT`，已锚到 `<HOST>`)。
 
 | RuntimeKind | 落点 | 用途 | 写入者(engine) | 读取者 |
 |---|---|---|---|---|
-| `Pipeline` | `<RT>/pipeline` | pipeline artifact | **无**(package/host 经 `file.write`) | package/host;`file_watch` 可监听 |
-| `Mailbox` | `<RT>/mailbox` | mailbox artifact | **无**(package/host 经 `file.write`) | package/host;`file_watch` 可监听 |
+| `Artifacts` | `<RT>/artifacts` | package/host 写的持久内容命名空间;`pipeline`/`mailbox` 是 package 子目录约定,非引擎事实 | **无**(package/host 经 `file.write`) | package/host;`file_watch` 可监听 |
 | `Worktrees` | `<RT>/worktrees` | 隔离 worktree | `sdk_git::setup_worktree`(`git worktree add`) | `count_worktrees` / `list_orphan_worktrees` |
 | `CodexPermits` | `<RT>/codex-permits` | `permit-*` fcntl codex 并发池 | `sdk_codex`(建池 + flock 占位) | `spawn_codex` 抢 permit |
 | `Locks` | `<RT>/locks` | fcntl 锁文件 | `sdk_git::with_lock` | 同 — 跨 pipeline 互斥 |
 | `Logs` | `<RT>/logs` | 过程日志 | `supervise::spawner`(framework-child)+ `sdk_codex`(codex log) | 人手 / 调试,非 file_watch 输入 |
 
 说明:
-- **engine 自己只写"结构事实"**(worktree / permit / lock / log);**`pipeline` 与 `mailbox` 的内容由注入的 package/host 经 `file.write` 写**,engine 不产其内容,只保留命名空间与路径解析。
+- **engine 自己只写"结构事实"**(worktree / permit / lock / log);**`artifacts` 下的内容由注入的 package/host 经 `file.write` 写**,engine 不产其内容,`pipeline` 与 `mailbox` 只是 package 子目录约定。
 - `RuntimeLayout::runtime_path(kind, relative)` 拒绝 parent traversal 与绝对 relative path;framework 先把相对 `FKST_RUNTIME_ROOT` 锚到 `<HOST>` 再建路径。
 - `runtime://` glob 只允许 `file_watch` 映射到**显式** runtime kind:**未知 kind fail-closed,缺少 kind fail-closed**(不再有 evolve-requests 之类的隐式默认回退);`runtime://logs` 是 local-only,不能作 file_watch 输入。
 - engine **不写** runtime 持久状态(无 `refs/known-good` / accepted-state / rollback —— 那是外部 release pipeline 的事实,见 §11)。
@@ -185,7 +184,7 @@ Fanout::send(raised.queue, raised_event)
 
 `consumer.rs` 为每个 Department 的每个 consumed queue 建 receiver，再汇入该 Department 的 inbox。每个事件 spawn 一个 framework child，不是在 supervisor 进程内直接调用 Lua。framework child 的 stdout/stderr 会写到 `<RT>/logs/framework-child/` 下的具名 log；RAISED 解析不依赖 log 文件，而是解析 captured stdout。
 
-`raise` 不落盘。需要 durable intent 时，package/host 必须显式写文件到 `<RT>/pipeline`、`<RT>/mailbox` 或其它约定落点，再由 `file_watch` 或 scanner 重新引入事件。
+`raise` 不落盘。需要 durable intent 时，package/host 必须显式写文件到 `<RT>/artifacts/pipeline`、`<RT>/artifacts/mailbox` 或其它 `<RT>/artifacts` 下的约定落点，再由 `file_watch` 或 scanner 重新引入事件。
 
 ## 8. SDK Surface
 

@@ -39,7 +39,7 @@
 ## 事实源
 
 - 跨 pipeline 稳定事实只能来自 `git refs/commits/branches`、host-configured filesystem boundary、fcntl 文件锁。
-- 持久 runtime facts 通过 host-configured hidden runtime projection 同步；host main repo HEAD/index 不承载 `.fkst/runtime/**`、`.fkst-mailbox/**`、`.fkst-pipeline/**`、`.worktrees/**`、`.codex-permits/**` runtime layout pathspec。
+- 持久 runtime facts 通过 host-configured hidden runtime projection 同步；host main repo HEAD/index 不承载 `.fkst/runtime/**`、`.worktrees/**`、`.codex-permits/**` runtime layout pathspec。
 - 内存、coroutine local table、subprocess handle、prompt 记忆、agent 判断都只是 cache。
 - framework 不写持久状态文件。
 - `SPEC.md` 禁止记录 runtime facts；包括 active branch、当前 round、队列深度、正在运行的 pid、临时 worktree 列表、最近失败次数。

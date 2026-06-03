@@ -568,7 +568,7 @@ fn resolves_runtime_file_watch_glob() {
         &[],
         &[(
             "inbox_watch",
-            r#"return { type = "file_watch", glob = "runtime://pipeline/inbox/*.md", produces = "pipeline_request" }"#,
+            r#"return { type = "file_watch", glob = "runtime://artifacts/pipeline/inbox/*.md", produces = "pipeline_request" }"#,
         )],
     );
     let cfg = load(dir.path()).unwrap();
@@ -579,7 +579,7 @@ fn resolves_runtime_file_watch_glob() {
                 &dir.path()
                     .canonicalize()
                     .unwrap()
-                    .join(".fkst/runtime/pipeline/inbox/*.md")
+                    .join(".fkst/runtime/artifacts/pipeline/inbox/*.md")
                     .to_string_lossy()
                     .into_owned()
             );
@@ -610,7 +610,7 @@ return M
         )],
         &[(
             "runtime_watch",
-            r#"return { type = "file_watch", glob = "runtime://pipeline/*/meta.md", produces = "tick" }"#,
+            r#"return { type = "file_watch", glob = "runtime://artifacts/pipeline/*/meta.md", produces = "tick" }"#,
         )],
     );
     let err = load(dir.path()).unwrap_err();
@@ -679,11 +679,11 @@ fn resolves_runtime_file_watch_glob_with_out_of_tree_root() {
         &[
             (
                 "pipeline_watch",
-                r#"return { type = "file_watch", glob = "runtime://pipeline/inbox/*.md", produces = "pipeline_request" }"#,
+                r#"return { type = "file_watch", glob = "runtime://artifacts/pipeline/inbox/*.md", produces = "pipeline_request" }"#,
             ),
             (
                 "mailbox_watch",
-                r#"return { type = "file_watch", glob = "runtime://mailbox/threads/*/comments/*-human-issue.md", produces = "triage_request" }"#,
+                r#"return { type = "file_watch", glob = "runtime://artifacts/mailbox/threads/*/comments/*-human-issue.md", produces = "triage_request" }"#,
             ),
         ],
     );
@@ -695,7 +695,7 @@ fn resolves_runtime_file_watch_glob_with_out_of_tree_root() {
                 glob,
                 &runtime
                     .path()
-                    .join("pipeline/inbox/*.md")
+                    .join("artifacts/pipeline/inbox/*.md")
                     .to_string_lossy()
                     .into_owned()
             );
@@ -709,7 +709,7 @@ fn resolves_runtime_file_watch_glob_with_out_of_tree_root() {
                 glob,
                 &runtime
                     .path()
-                    .join("mailbox/threads/*/comments/*-human-issue.md")
+                    .join("artifacts/mailbox/threads/*/comments/*-human-issue.md")
                     .to_string_lossy()
                     .into_owned()
             );

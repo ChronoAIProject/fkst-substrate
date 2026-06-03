@@ -13,8 +13,8 @@ end
 
 local function write_witness(name, content)
   local root = runtime_root()
-  exec_sync("mkdir -p " .. root .. "/pipeline")
-  file.write(root .. "/pipeline/" .. name, content)
+  exec_sync("mkdir -p " .. root .. "/artifacts/pipeline")
+  file.write(root .. "/artifacts/pipeline/" .. name, content)
 end
 
 function pipeline(event)
