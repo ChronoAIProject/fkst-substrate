@@ -1,5 +1,5 @@
 return {
   type = "cron",
-  interval = "5s",
+  interval = "1s",
   produces = "tick",
 }

@@ -32,7 +32,7 @@ fkst-substrate/
 └── docs/architecture.md
 ```
 
-`examples/minimal-package/` 是引擎自带的最小 package-root fixture：单个 cron source 产生 `tick`，单个 log-only pipeline 消费 `tick` 并写结构化日志。它用于证明 `--package-root` 能被独立加载、通过 graph validation，并且 source 事件可以 dispatch 到 `pipeline(event)`。
+`examples/minimal-package/` 是引擎自带的 package-root fixture：单个 cron source 产生 `tick`，producer Department 消费 `tick` 并 `raise("example_event", payload)`，consumer Department 消费 `example_event` 并打印标准 `Event{queue,payload,ts}`。它用于证明 `--package-root` 能被独立加载、通过 graph validation，并且真实 supervise 可以完成 `source -> dispatch -> pipeline -> RAISED -> dispatch -> pipeline`。
 
 ## 1. 三层稳定性与三级公司
 
