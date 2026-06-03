@@ -44,7 +44,7 @@ target/debug/fkst-framework config \
 - `run consumer`：单个 consumer pipeline 消费注入的标准事件，并向 stderr 打印 `Event{queue,payload,ts}`。
 - `producer -> consumer` 契约测试：直接把 producer 的真实 payload 放进 consumer 标准事件，不经过 supervise dispatcher 路由。
 
-Department 收到的标准事件结构是 `Event{queue,payload,ts}`。producer 的 `RAISED:` 解码后是 queue + payload，还没有 `ts`：
+Department 收到的标准事件结构是 `Event{queue,payload,ts}`，其中 `ts` 是 Unix 毫秒。producer 的 `RAISED:` 解码后是 queue + payload，还没有 `ts`：
 
 ```json
 [{"queue":"example_event","payload":{"from":"producer","note":"opaque example payload","source_queue":"tick","source_raiser":"tick"}}]
@@ -52,10 +52,10 @@ Department 收到的标准事件结构是 `Event{queue,payload,ts}`。producer �
 
 `run --event` 是单 pipeline 注入，不经过 supervise 路由。示例里的事件不会获得 runtime 生成的 `ts`；consumer 示例里的 numeric `ts` 是注入的标准事件值。真实 dispatch 由 runtime 生成 `ts`。
 
-真实 dispatch 派发给 consumer 的标准事件会包含 runtime 生成的 `ts`，实际值会变：
+真实 dispatch 派发给 consumer 的标准事件会包含 runtime 生成的 Unix 毫秒 `ts`，实际值会变：
 
 ```json
-{"queue":"example_event","payload":{"from":"producer","note":"opaque example payload","source_queue":"tick","source_raiser":"tick"},"ts":1234567890}
+{"queue":"example_event","payload":{"from":"producer","note":"opaque example payload","source_queue":"tick","source_raiser":"tick"},"ts":1717420800000}
 ```
 
 ```sh
@@ -109,8 +109,6 @@ engine 队列是瞬时的；durable 真相属于 git commit、明确的 host fil
 - `CLAUDE.md`（= `AGENTS.md` 软链）：引擎治理与哲学不动点。
 - `SPEC.md`：Tier II 身份锚点。
 - `docs/architecture.md`：详细引擎架构（分层 / 依赖 / I/O / SDK / 事件机制 / runtime 目录 / 并发）。
-
-来源：从 ChronoAIProject/fkst clean-init 抽取（历史留在该 public repo）。
 
 本仓库作为稳定发布衬底消费前，应以 `cargo build --workspace`、`cargo test --workspace -- --test-threads=1`、`--self-test` 与 `conformance` 结果为准。
 
