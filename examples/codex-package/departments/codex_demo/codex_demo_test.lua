@@ -1,7 +1,11 @@
 local prompt = require("departments.codex_demo.prompt")
+local t = fkst.test
 
-function pipeline(event)
-  assert(prompt.build("x") == "Summarize: x", "build failed")
-  assert(prompt.parse("hello\n") == "hello", "parse failed")
-  log.info("codex_demo unit tests passed")
-end
+return {
+  test_build = function()
+    t.eq(prompt.build("x"), "Summarize: x")
+  end,
+  test_parse = function()
+    t.eq(prompt.parse("hello\n"), "hello")
+  end,
+}
