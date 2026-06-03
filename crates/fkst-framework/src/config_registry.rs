@@ -5,7 +5,7 @@
 
 use anyhow::{bail, Context, Result};
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ConfigValueType {
@@ -54,6 +54,42 @@ pub(crate) struct ConfigEntry {
 pub(crate) struct Resolved {
     pub(crate) value: String,
     pub(crate) source: ConfigSource,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ConfigContext {
+    #[allow(dead_code)]
+    host_root: PathBuf,
+    process_env: HashMap<String, String>,
+    fkst_env: HashMap<String, String>,
+}
+
+impl ConfigContext {
+    pub(crate) fn from_host_root(host_root: &Path) -> Result<Self> {
+        Ok(Self {
+            host_root: host_root.to_path_buf(),
+            process_env: process_env_for_registry()?,
+            fkst_env: read_fkst_env(host_root)?,
+        })
+    }
+
+    pub(crate) fn resolve(&self, key: ConfigKey) -> Result<Resolved> {
+        resolve(key, &self.process_env, &self.fkst_env)
+    }
+
+    pub(crate) fn resolved_positive_usize(&self, key: ConfigKey) -> Result<usize> {
+        let resolved = self.resolve(key)?;
+        parse_positive_usize(entry(key), &resolved.value)
+    }
+
+    pub(crate) fn resolved_duration_string(&self, key: ConfigKey) -> Result<String> {
+        let resolved = self.resolve(key)?;
+        parse_duration_string(entry(key), &resolved.value)
+    }
+
+    pub(crate) fn resolved_string(&self, key: ConfigKey) -> Result<String> {
+        self.resolve(key).map(|resolved| resolved.value)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -213,21 +249,6 @@ pub(crate) fn read_fkst_env(root: &Path) -> Result<HashMap<String, String>> {
         values.insert(key.to_string(), value.to_string());
     }
     Ok(values)
-}
-
-pub(crate) fn resolve_process_key(key: ConfigKey) -> Result<Resolved> {
-    let process_env = process_env_for_registry()?;
-    let fkst_env = std::env::current_dir()
-        .ok()
-        .map(|root| read_fkst_env(&root))
-        .transpose()?
-        .unwrap_or_default();
-    resolve(key, &process_env, &fkst_env)
-}
-
-pub(crate) fn resolved_positive_usize(key: ConfigKey) -> Result<usize> {
-    let resolved = resolve_process_key(key)?;
-    parse_positive_usize(entry(key), &resolved.value)
 }
 
 pub(crate) fn parse_positive_usize(entry: &ConfigEntry, raw: &str) -> Result<usize> {

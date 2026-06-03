@@ -52,6 +52,7 @@ FKST_RUNTIME_ROOT=/tmp/min-rt-$$ target/debug/fkst-framework conformance \
   --package-root "$PWD/examples/minimal-package"
 FKST_RUNTIME_ROOT=/tmp/min-rt-$$ target/debug/fkst-framework run \
   "$PWD/examples/minimal-package/departments/producer/main.lua" \
+  --project-root "$PWD/examples/minimal-package" \
   --package-root "$PWD/examples/minimal-package" \
   --event '{"type":"tick","payload":{}}'   # 输出含 RAISED: work
 ```
@@ -69,7 +70,7 @@ FKST_RUNTIME_ROOT=/tmp/min-rt-$$ target/debug/fkst-framework run \
 已知 contract gap（公开消费前必读）：
 
 - **`update` 自更新子命令已删除**：旧实现只服务旧单仓自更新契约，未被 known-good/swap 非测试代码依赖；fkst-substrate 不提供 `update` 命令。
-- **`SPEC.md` 引用的 `conformance/run_all.sh` 尚未迁入本仓库**：SPEC 作为身份锚点先行带过，conformance gate 集的迁移/泛化为 deferred（见下）。
+- **`SPEC.md` 引用的 `conformance/run_all.sh` 尚未迁入本仓库**：当前 Tier II 物化锚点是根目录 `SPEC.md`；Rust `fkst-framework conformance` 是 engine host-conformance,不是缺失的 `run_all.sh`。conformance gate 集迁移/泛化为 deferred（见下）。
 
 Deferred（尚未迁入）清单：
 

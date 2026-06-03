@@ -2,7 +2,7 @@ use crate::path_resolver::PackageRoots;
 use crate::supervise;
 use anyhow::{Context, Result};
 use fkst_common::validation::validate;
-use fkst_common::{RuntimeKind, RuntimeLayout};
+use fkst_common::RuntimeKind;
 
 pub(crate) struct HostConformanceOptions {
     pub(crate) roots: PackageRoots,
@@ -82,16 +82,17 @@ impl HostConformanceSuite {
     }
 
     fn check_runtime_layout(&self) -> HostCheck {
-        match RuntimeLayout::from_env().and_then(|layout| {
-            layout.runtime_path(RuntimeKind::Pipeline, "")?;
-            layout.runtime_path(RuntimeKind::Mailbox, "")?;
-            layout.runtime_path(RuntimeKind::EvolveRequests, "")?;
-            layout.runtime_path(RuntimeKind::Worktrees, "")?;
-            layout.runtime_path(RuntimeKind::CodexPermits, "")?;
-            layout.runtime_path(RuntimeKind::Locks, "")?;
-            layout.runtime_path(RuntimeKind::Logs, "")?;
-            Ok(layout)
-        }) {
+        match crate::runtime_context::layout_from_host_root(self.options.roots.host_root())
+            .and_then(|layout| {
+                layout.runtime_path(RuntimeKind::Pipeline, "")?;
+                layout.runtime_path(RuntimeKind::Mailbox, "")?;
+                layout.runtime_path(RuntimeKind::EvolveRequests, "")?;
+                layout.runtime_path(RuntimeKind::Worktrees, "")?;
+                layout.runtime_path(RuntimeKind::CodexPermits, "")?;
+                layout.runtime_path(RuntimeKind::Locks, "")?;
+                layout.runtime_path(RuntimeKind::Logs, "")?;
+                Ok(layout)
+            }) {
             Ok(layout) => HostCheck::pass(
                 "runtime-layout",
                 format!("runtime root accepted: {}", layout.runtime_root().display()),

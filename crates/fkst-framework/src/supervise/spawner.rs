@@ -1,6 +1,6 @@
 //! Framework spawn with new process group + SIGKILL -pgid on stall.
 //!
-//! Spawn `fkst-framework run <lua_path> --package-root <path> --event <json>` with setsid.
+//! Spawn `fkst-framework run <lua_path> --project-root <path> --package-root <path> --event <json>` with setsid.
 //! On no-output stall, send SIGKILL to -pgid so codex subprocess children are collected too.
 
 use anyhow::{Context, Result};
@@ -50,6 +50,7 @@ enum FrameworkEvent {
 pub async fn spawn_framework(
     binary: &Path,
     lua_path: &Path,
+    host_root: &Path,
     package_root: &Path,
     event_json: &str,
     stall_window: Duration,
@@ -59,14 +60,16 @@ pub async fn spawn_framework(
 ) -> Result<SpawnResult> {
     let start = std::time::Instant::now();
     let cmd_line = format!(
-        "{} run {} --package-root {} --event <json>",
+        "{} run {} --project-root {} --package-root {} --event <json>",
         binary.display(),
         lua_path.display(),
+        host_root.display(),
         package_root.display()
     );
     let mut log = FrameworkChildLog::open(log_dir, child_label);
     log.write_line(&format!("CMD={cmd_line}"));
     log.write_line(&format!("LUA={}", lua_path.display()));
+    log.write_line(&format!("HOST_ROOT={}", host_root.display()));
     log.write_line(&format!("PACKAGE_ROOT={}", package_root.display()));
     log.write_line(&format!("DEPT={child_label}"));
     log.write_line(&format!("STALL_WINDOW_MS={}", stall_window.as_millis()));
@@ -74,6 +77,8 @@ pub async fn spawn_framework(
     let mut cmd = Command::new(binary);
     cmd.arg("run")
         .arg(lua_path)
+        .arg("--project-root")
+        .arg(host_root)
         .arg("--package-root")
         .arg(package_root)
         .arg("--event")
@@ -85,6 +90,7 @@ pub async fn spawn_framework(
         crate::sdk_codex::CODEX_PERMIT_SLOTS_ENV,
         codex_permit_slots.to_string(),
     );
+    cmd.current_dir(host_root);
 
     // Set a new process group before exec so framework becomes its own group leader.
     // tokio::process exposes `process_group(0)` to call setpgid(0,0); equivalent for our purposes.

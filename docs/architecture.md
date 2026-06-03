@@ -111,7 +111,7 @@ workspace 只包含这三个 crate。没有业务 Lua package crate,也没有 pa
 
 `<RT>` = `FKST_RUNTIME_ROOT`  
 `<PKG>` = package root,来自 `FKST_PACKAGE_ROOT` 或 `--package-root`  
-`<HOST>` = host root,即 `--project-root` 或当前 repo root  
+`<HOST>` = host root,即显式 `--project-root`;仅 `run` 未传时可从 Lua 路径推断以保留 standalone 兼容  
 
 ```
 L0  supervisor, crates/fkst-supervisor
@@ -119,7 +119,7 @@ L0  supervisor, crates/fkst-supervisor
   crate: tokio, nix, tracing, anyhow
   OS: spawn, waitpid, SIGINT, SIGTERM, process_group
   外部程序: fkst-framework
-  读: cwd, FKST_FRAMEWORK_BIN, signals, child exit
+  读: cwd(仅用于选择 supervisor 启动时的 host root), FKST_FRAMEWORK_BIN, signals, child exit
   写: stdout/stderr 继承到调用方日志;不写 runtime 状态文件
 
 L1  common, crates/fkst-common
@@ -210,7 +210,7 @@ L3  injected Lua package, not stored in this repository
 | `Locks` | `<RT>/locks` | `with_lock` 与 known-good health lock |
 | `Logs` | `<RT>/logs` | framework child logs;package 也可选择写本地 logs |
 
-`RuntimeLayout::runtime_path(kind, relative)` 拒绝 parent traversal 和绝对 relative path。`runtime://` glob 解析只允许 file_watch 映射到 runtime kind；`runtime://logs` 是 local-only,不能作为 file_watch 输入。
+`RuntimeLayout::runtime_path(kind, relative)` 拒绝 parent traversal 和绝对 relative path。framework 调用处先把相对 `FKST_RUNTIME_ROOT` 锚到 `<HOST>`,再创建 permit/worktree/lock/log 路径。`runtime://` glob 解析只允许 file_watch 映射到 runtime kind；相对 runtime root 同样锚到 `<HOST>`；`runtime://logs` 是 local-only,不能作为 file_watch 输入。
 
 Codex SDK 的日志目录不是 `RuntimeKind::Logs` 的唯一来源。它优先用 `FKST_RUNTIME_LOG_DIR`,否则落到用户日志目录，如 macOS `~/Library/Logs/fkst/codex` 或 `~/.local/state/fkst/codex`。这是过程日志，不是业务状态。
 
@@ -221,7 +221,7 @@ Codex SDK 的日志目录不是 `RuntimeKind::Logs` 的唯一来源。它优先�
 ```
 --package-root <path> 优先
 否则 FKST_PACKAGE_ROOT
-host root 来自 --project-root 或 run 模式下 Lua 路径推断
+host root 来自显式 --project-root;仅 run 模式未传 --project-root 时可从 Lua 路径推断
 ```
 
 如果 `<PKG> == <HOST>`,graph root 只有一个 `PackageAndHost`。否则扫描顺序是 package root 后 host root。重复 Department 名或 Raiser 名直接拒绝启动。`package.lua` 是被移除的 surface,存在即拒绝启动。
@@ -253,7 +253,7 @@ host root 来自 --project-root 或 run 模式下 Lua 路径推断
 { type = "file_watch", glob = "path-or-runtime://...", produces = "queue" }
 ```
 
-队列不是 manifest 手写对象，而是从 Department consumes/produces 与 Raiser produces 的并集推导。引擎操作 knob 统一由 `config_registry.rs` 的静态 typed registry 声明和解析；读取优先级是 process env → host `fkst.env` → operational 默认。registry 不读 `tunables/*.txt`,也没有 set/write/dynamic registration、YAML、DSL、manifest、plugin 或 dashboard 入口。
+队列不是 manifest 手写对象，而是从 Department consumes/produces 与 Raiser produces 的并集推导。引擎操作 knob 统一由 `config_registry.rs` 的静态 typed registry 声明,并通过显式 host root 构造的 `ConfigContext` 解析；读取优先级是 process env → host `fkst.env` → operational 默认。registry 不读 cwd、`tunables/*.txt`,也没有 set/write/dynamic registration、YAML、DSL、manifest、plugin 或 dashboard 入口。
 
 当前 registry 只有 6 项:
 
@@ -282,7 +282,7 @@ Vec<mpsc::Sender<Event>>
     ↓
 consumer inbox
     ↓
-spawn fkst-framework run <department main.lua> --event <json>
+spawn fkst-framework run <department main.lua> --project-root <HOST> --package-root <PKG> --event <json>
     ↓
 single Lua state + pipeline(event)
     ↓
@@ -386,7 +386,7 @@ refs/known-good
 
 `KNOWN_GOOD_REF` 是 ref,不是 branch。它表示当前 accepted framework state。推进动作使用 CAS:old sha 必须匹配,否则报告 update-ref conflict。
 
-`setup_worktree` 会创建 candidate branch。branch 前缀和 from separator 是 HostFact,来自 `FKST_CANDIDATE_PREFIX` / `FKST_CANDIDATE_FROM_SEP` 或 host `fkst.env`,缺失时 fail-closed。具体 integration branch、candidate topology、runtime hidden refs、push/pull 策略属于 package/host,不是 substrate 固定事实。
+`setup_worktree` 会创建 candidate branch。所有 git SDK 命令使用 `git -C <HOST> ...`,不依赖 framework launcher cwd。branch 前缀和 from separator 是 HostFact,来自 `FKST_CANDIDATE_PREFIX` / `FKST_CANDIDATE_FROM_SEP` 或 host `fkst.env`,缺失时 fail-closed。具体 integration branch、candidate topology、runtime hidden refs、push/pull 策略属于 package/host,不是 substrate 固定事实。
 
 ## 11. 并发与进程边界
 

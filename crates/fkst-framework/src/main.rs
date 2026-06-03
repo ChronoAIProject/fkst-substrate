@@ -1,6 +1,6 @@
 //! fkst-framework — Tier III one-shot Lua runner.
 //!
-//! CLI: `fkst-framework run <lua_file> --event '<json>'`
+//! CLI: `fkst-framework run <lua_file> --project-root <path> --event '<json>'`
 //! CLI: `fkst-framework supervise --project-root <path> --framework-bin <path>`
 //! CLI: `fkst-framework known-good <promote|bootstrap> [options]`
 //! CLI: `fkst-framework conformance --project-root <path>`
@@ -24,6 +24,7 @@ mod known_good;
 mod mlua_init;
 mod path_resolver;
 mod raise;
+mod runtime_context;
 mod sdk_basic;
 mod sdk_codex;
 mod sdk_fs;
@@ -37,7 +38,7 @@ use raise::RaiseBuffer;
 enum CliCommand {
     Run {
         lua_path: PathBuf,
-        package_root: PathBuf,
+        roots: PackageRoots,
         event: JsonValue,
     },
     Supervise {
@@ -55,7 +56,7 @@ fn parse_args() -> Result<CliCommand> {
     let mut args_iter = args.into_iter();
     let sub = args_iter.next().ok_or_else(|| {
         anyhow::anyhow!(
-            "usage: fkst-framework run <lua> --event <json> | fkst-framework supervise --project-root <path> --framework-bin <path> | fkst-framework known-good <promote|bootstrap> [options] | fkst-framework conformance --project-root <path> | fkst-framework config --project-root <path> [--package-root <path>] | fkst-framework --self-test"
+            "usage: fkst-framework run <lua> --project-root <path> --event <json> | fkst-framework supervise --project-root <path> --framework-bin <path> | fkst-framework known-good <promote|bootstrap> [options] | fkst-framework conformance --project-root <path> | fkst-framework config --project-root <path> [--package-root <path>] | fkst-framework --self-test"
         )
     })?;
     if sub == "--self-test" {
@@ -111,11 +112,13 @@ fn parse_args() -> Result<CliCommand> {
             .next()
             .ok_or_else(|| anyhow::anyhow!("missing <lua_file> arg"))?
             .into();
+        let mut project_root: Option<PathBuf> = None;
         let mut package_root: Option<PathBuf> = None;
         let mut event_json: Option<String> = None;
         while let Some(a) = args_iter.next() {
             match a.as_str() {
                 "--event" => event_json = args_iter.next(),
+                "--project-root" => project_root = args_iter.next().map(PathBuf::from),
                 "--package-root" => package_root = args_iter.next().map(PathBuf::from),
                 other => anyhow::bail!("unknown run argument: {}", other),
             }
@@ -123,11 +126,18 @@ fn parse_args() -> Result<CliCommand> {
         let event_str = event_json.unwrap_or_else(|| "{}".into());
         let event: JsonValue = serde_json::from_str(&event_str)
             .with_context(|| format!("--event not valid json: {}", event_str))?;
-        let inferred_project_root = mlua_init::package_root_for_lua(&lua_path);
-        let roots = PackageRoots::resolve(inferred_project_root, package_root)?;
+        let inferred_project_root;
+        let project_root = match project_root {
+            Some(project_root) => project_root,
+            None => {
+                inferred_project_root = mlua_init::package_root_for_lua(&lua_path);
+                inferred_project_root
+            }
+        };
+        let roots = PackageRoots::resolve(project_root, package_root)?;
         return Ok(CliCommand::Run {
             lua_path,
-            package_root: roots.package_root().to_path_buf(),
+            roots,
             event,
         });
     }
@@ -268,7 +278,7 @@ fn next_value(args: &[String], index: usize, flag: &str) -> Result<String> {
 fn run_known_good_command(options: KnownGoodCli) -> Result<i32> {
     let root = options
         .project_root
-        .unwrap_or(std::env::current_dir().context("get cwd")?);
+        .ok_or_else(|| anyhow::anyhow!("missing --project-root"))?;
     let known_good = KnownGoodRef::new(root.clone(), options.integration_ref)?;
     let evidence = SwapEvidence {
         conformance: Some(run_known_good_conformance(&root)?),
@@ -354,30 +364,28 @@ fn print_known_good_success(outcome: &PromotionOutcome) {
     }
 }
 
-fn run_pipeline(lua_path: PathBuf, package_root: PathBuf, event: JsonValue) -> Result<i32> {
+fn run_pipeline(lua_path: PathBuf, roots: PackageRoots, event: JsonValue) -> Result<i32> {
     let lua = mlua_init::new_lua();
     let raise_buf = RaiseBuffer::new();
 
-    mlua_init::register_framework_sdk(&lua, raise_buf.clone())?;
+    mlua_init::register_framework_sdk(&lua, raise_buf.clone(), roots.host_root())?;
 
-    let exit_code =
-        match mlua_init::run_dept_with_package_root(&lua, &lua_path, &event, &package_root) {
-            Ok(()) => 0,
-            Err(e) => {
-                eprintln!("[framework] pipeline failed: {:#}", e);
-                1
-            }
-        };
+    let exit_code = match mlua_init::run_dept_with_roots(&lua, &lua_path, &event, &roots) {
+        Ok(()) => 0,
+        Err(e) => {
+            eprintln!("[framework] pipeline failed: {:#}", e);
+            1
+        }
+    };
 
     raise_buf.emit_stdout();
     Ok(exit_code)
 }
 
 fn run_config_command(options: ConfigCli) -> Result<i32> {
-    let process_env = config_registry::process_env_for_registry()?;
-    let fkst_env = config_registry::read_fkst_env(options.roots.host_root())?;
+    let config = config_registry::ConfigContext::from_host_root(options.roots.host_root())?;
     for entry in config_registry::CONFIG_REGISTRY {
-        let resolved = config_registry::resolve(entry.key, &process_env, &fkst_env);
+        let resolved = config.resolve(entry.key);
         let (value, source) = match resolved {
             Ok(resolved) => (resolved.value, resolved.source.label().to_string()),
             Err(_) => ("missing".to_string(), "missing".to_string()),
@@ -405,9 +413,9 @@ fn run() -> Result<i32> {
     match parse_args()? {
         CliCommand::Run {
             lua_path,
-            package_root,
+            roots,
             event,
-        } => run_pipeline(lua_path, package_root, event),
+        } => run_pipeline(lua_path, roots, event),
         CliCommand::Supervise {
             roots,
             framework_bin,

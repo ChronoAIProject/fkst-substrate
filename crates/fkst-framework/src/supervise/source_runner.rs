@@ -49,10 +49,11 @@ fn cron_payload(name: &str) -> serde_json::Value {
 pub fn spawn_file_watch(
     name: String,
     glob: &str,
+    host_root: &Path,
     produces: String,
     fanout: Fanout,
 ) -> anyhow::Result<tokio::task::JoinHandle<()>> {
-    let glob = absolutize_glob(glob)?;
+    let glob = absolutize_glob(glob, host_root)?;
     let handle = tokio::spawn(async move {
         info!(raiser = %name, glob = %glob, "file_watch raiser starting");
 
@@ -244,12 +245,12 @@ fn visit_files(root: &Path, f: &mut impl FnMut(&Path)) {
     }
 }
 
-fn absolutize_glob(glob: &str) -> anyhow::Result<String> {
+fn absolutize_glob(glob: &str, host_root: &Path) -> anyhow::Result<String> {
     let path = Path::new(glob);
     let path = if path.is_absolute() {
         PathBuf::from(glob)
     } else {
-        std::env::current_dir()?.join(glob)
+        host_root.join(glob)
     };
     let path = path.to_string_lossy().into_owned();
     if !glob_has_magic(&path) {
@@ -440,6 +441,7 @@ mod tests {
         let handle = spawn_file_watch(
             "watch".to_string(),
             glob.to_str().unwrap(),
+            tmp.path(),
             "files".to_string(),
             fanout,
         )
@@ -467,6 +469,7 @@ mod tests {
         let handle = spawn_file_watch(
             "watch".to_string(),
             glob.to_str().unwrap(),
+            tmp.path(),
             "files".to_string(),
             fanout,
         )
@@ -498,6 +501,7 @@ mod tests {
         let handle = spawn_file_watch(
             "watch".to_string(),
             glob.to_str().unwrap(),
+            tmp.path(),
             "files".to_string(),
             fanout,
         )
@@ -527,6 +531,7 @@ mod tests {
         let handle = spawn_file_watch(
             "watch".to_string(),
             glob.to_str().unwrap(),
+            tmp.path(),
             "files".to_string(),
             fanout,
         )
@@ -565,6 +570,7 @@ mod tests {
         let handle = spawn_file_watch(
             "watch".to_string(),
             glob.to_str().unwrap(),
+            tmp.path(),
             "files".to_string(),
             fanout.clone(),
         )
@@ -583,6 +589,7 @@ mod tests {
         let restarted = spawn_file_watch(
             "watch".to_string(),
             glob.to_str().unwrap(),
+            tmp.path(),
             "files".to_string(),
             fanout,
         )

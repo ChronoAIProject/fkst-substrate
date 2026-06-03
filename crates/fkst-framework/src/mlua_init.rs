@@ -5,6 +5,8 @@ use mlua::{Lua, LuaSerdeExt, Value as LuaValue};
 use serde_json::Value as JsonValue;
 use std::path::{Path, PathBuf};
 
+use crate::config_registry::ConfigContext;
+use crate::path_resolver::PackageRoots;
 use crate::raise::RaiseBuffer;
 
 /// Create a Lua state with stdlib enabled.
@@ -13,12 +15,17 @@ pub fn new_lua() -> Lua {
 }
 
 /// Register the framework SDK globals in the same order for every entry point.
-pub fn register_framework_sdk(lua: &Lua, raise_buf: RaiseBuffer) -> mlua::Result<()> {
+pub fn register_framework_sdk(
+    lua: &Lua,
+    raise_buf: RaiseBuffer,
+    host_root: &Path,
+) -> mlua::Result<()> {
+    let config = ConfigContext::from_host_root(host_root).map_err(mlua::Error::external)?;
     crate::sdk_log::register(lua)?;
     crate::sdk_basic::register(lua)?;
     crate::sdk_fs::register(lua)?;
-    crate::sdk_git::register(lua)?;
-    crate::sdk_codex::register(lua)?;
+    crate::sdk_git::register(lua, host_root, config.clone())?;
+    crate::sdk_codex::register(lua, host_root, config)?;
     crate::raise::register(lua, raise_buf)?;
     Ok(())
 }
@@ -121,6 +128,15 @@ pub fn run_dept_with_package_root(
         .call::<()>(event_lua)
         .context("pipeline(event) call")?;
     Ok(())
+}
+
+pub fn run_dept_with_roots(
+    lua: &Lua,
+    lua_path: &Path,
+    event: &JsonValue,
+    roots: &PackageRoots,
+) -> Result<()> {
+    run_dept_with_package_root(lua, lua_path, event, roots.package_root())
 }
 
 #[cfg(test)]

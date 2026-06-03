@@ -1,7 +1,7 @@
 //! Known-good swap owner for CAS, candidate checkout, health observation, and rollback witnesses.
 
 use anyhow::{Context, Result};
-use fkst_common::{RuntimeKind, RuntimeLayout};
+use fkst_common::RuntimeKind;
 use nix::fcntl::{flock, FlockArg};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -10,7 +10,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
 
-use crate::config_registry::{self, ConfigKey};
+use crate::config_registry::{ConfigContext, ConfigKey};
+use crate::runtime_context;
 
 const KNOWN_GOOD_REF: &str = "refs/known-good";
 const NULL_SHA: &str = "0000000000000000000000000000000000000000";
@@ -377,7 +378,7 @@ impl KnownGoodRef {
         &self,
         options: &HealthGateOptions,
     ) -> std::result::Result<File, KnownGoodError> {
-        let layout = RuntimeLayout::from_env()
+        let layout = runtime_context::layout_from_host_root(&self.root)
             .map_err(|err| KnownGoodError::UpdateRefIo(err.to_string()))?;
         let locks_dir = layout.runtime_dir(RuntimeKind::Locks);
         std::fs::create_dir_all(locks_dir)
@@ -724,10 +725,8 @@ fn resolve_integration_ref(root: &Path, explicit: Option<String>) -> Result<Stri
     if let Some(value) = nonempty(explicit) {
         return Ok(value);
     }
-    let process_env = config_registry::process_env_for_registry()?;
-    let fkst_env = config_registry::read_fkst_env(root)?;
-    config_registry::resolve(ConfigKey::IntegrationBranch, &process_env, &fkst_env)
-        .map(|resolved| resolved.value)
+    ConfigContext::from_host_root(root)?
+        .resolved_string(ConfigKey::IntegrationBranch)
         .map_err(|err| anyhow::anyhow!("integration-branch-unconfigured: {err:#}"))
 }
 

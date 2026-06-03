@@ -4,7 +4,7 @@
 //! locks exclusive non-blocking. If none available, block on the first one. Permit
 //! holds for the duration of the codex subprocess; released on file drop after exit.
 
-use fkst_common::{RuntimeKind, RuntimeLayout};
+use fkst_common::RuntimeKind;
 use mlua::{AnyUserData, Lua, Result, Table, UserData};
 use nix::fcntl::{flock, FlockArg};
 use std::collections::HashSet;
@@ -20,6 +20,9 @@ use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+use crate::config_registry::{ConfigContext, ConfigKey};
+use crate::runtime_context;
 
 pub(crate) const CODEX_PERMIT_SLOTS_ENV: &str = "FKST_CODEX_PERMIT_SLOTS";
 pub const RUNTIME_LOG_DIR_ENV: &str = "FKST_RUNTIME_LOG_DIR";
@@ -164,23 +167,30 @@ fn result_table(
     Ok(t)
 }
 
-pub fn register(lua: &Lua) -> Result<()> {
+pub fn register(lua: &Lua, host_root: &Path, config: ConfigContext) -> Result<()> {
     let owner_id = NEXT_PIPELINE_OWNER_ID.fetch_add(1, Ordering::Relaxed);
     let next_task_id = Arc::new(AtomicU64::new(1));
+    let host_root = Arc::new(host_root.to_path_buf());
+    let config = Arc::new(config);
 
-    lua.globals().set(
-        "spawn_codex_sync",
-        lua.create_function(|lua, opts: Table| {
+    lua.globals().set("spawn_codex_sync", {
+        let host_root = Arc::clone(&host_root);
+        let config = Arc::clone(&config);
+        lua.create_function(move |lua, opts: Table| {
             let request = codex_request_from_opts(opts);
-            run_codex_request(request).into_lua_table(lua)
-        })?,
-    )?;
+            run_codex_request(request, &host_root, &config).into_lua_table(lua)
+        })?
+    })?;
     lua.globals().set("spawn_codex", {
         let next_task_id = Arc::clone(&next_task_id);
+        let host_root = Arc::clone(&host_root);
+        let config = Arc::clone(&config);
         lua.create_function(move |_, opts: Table| {
             let request = codex_request_from_opts(opts);
             let task_id = next_task_id.fetch_add(1, Ordering::Relaxed);
-            let join = std::thread::spawn(move || run_codex_request(request));
+            let host_root = Arc::clone(&host_root);
+            let config = Arc::clone(&config);
+            let join = std::thread::spawn(move || run_codex_request(request, &host_root, &config));
             Ok(CodexTaskHandle {
                 owner_id,
                 task_id,
@@ -291,8 +301,12 @@ fn await_all(lua: &Lua, handles: Table, owner_id: u64) -> Result<Table> {
 }
 
 // sync and async calls share permit acquisition while preserving P11 lifetime.
-fn run_codex_request(request: CodexRequest) -> CodexResult {
-    if let Err(err) = ensure_pool() {
+fn run_codex_request(
+    request: CodexRequest,
+    host_root: &Path,
+    config: &ConfigContext,
+) -> CodexResult {
+    if let Err(err) = ensure_pool_with_context(host_root, config) {
         let message = format!("codex permit pool failed: {err}");
         write_codex_log(
             &request.log_path,
@@ -311,7 +325,7 @@ fn run_codex_request(request: CodexRequest) -> CodexResult {
             request.log_path.to_string_lossy().into_owned(),
         );
     }
-    let _permit = match acquire_permit() {
+    let _permit = match acquire_permit_with_context(host_root, config) {
         Ok(permit) => permit,
         Err(err) => {
             let message = format!("codex permit acquire failed: {err}");
@@ -837,9 +851,19 @@ fn shell_quote(value: &str) -> String {
 }
 
 // crate-internal visibility keeps permit setup testable after extraction.
+#[cfg(test)]
 pub(crate) fn ensure_pool() -> mlua::Result<()> {
-    let pool_dir = permit_pool_dir()?;
-    let slot_count = permit_slot_count()?;
+    let host_root = std::env::current_dir().map_err(mlua::Error::external)?;
+    let config = ConfigContext::from_host_root(&host_root).map_err(mlua::Error::external)?;
+    ensure_pool_with_context(&host_root, &config)
+}
+
+pub(crate) fn ensure_pool_with_context(
+    host_root: &Path,
+    config: &ConfigContext,
+) -> mlua::Result<()> {
+    let pool_dir = permit_pool_dir(host_root)?;
+    let slot_count = permit_slot_count(config)?;
     // permits live below RuntimeLayout codex-permits dir.
     std::fs::create_dir_all(&pool_dir).map_err(mlua::Error::external)?;
     for i in 0..slot_count {
@@ -851,18 +875,29 @@ pub(crate) fn ensure_pool() -> mlua::Result<()> {
     Ok(())
 }
 
-pub(crate) fn self_test_permit_pool() -> mlua::Result<()> {
-    ensure_pool()?;
-    let permit = acquire_permit()?;
+pub(crate) fn self_test_permit_pool(host_root: &Path) -> mlua::Result<()> {
+    let config = ConfigContext::from_host_root(&host_root).map_err(mlua::Error::external)?;
+    ensure_pool_with_context(&host_root, &config)?;
+    let permit = acquire_permit_with_context(&host_root, &config)?;
     drop(permit);
     Ok(())
 }
 
 /// Returns a held file (lock active) or blocks until one is available.
 // crate-internal visibility keeps permit locking behavior testable after extraction.
+#[cfg(test)]
 pub(crate) fn acquire_permit() -> mlua::Result<std::fs::File> {
-    let pool_dir = permit_pool_dir()?;
-    let slot_count = permit_slot_count()?;
+    let host_root = std::env::current_dir().map_err(mlua::Error::external)?;
+    let config = ConfigContext::from_host_root(&host_root).map_err(mlua::Error::external)?;
+    acquire_permit_with_context(&host_root, &config)
+}
+
+fn acquire_permit_with_context(
+    host_root: &Path,
+    config: &ConfigContext,
+) -> mlua::Result<std::fs::File> {
+    let pool_dir = permit_pool_dir(host_root)?;
+    let slot_count = permit_slot_count(config)?;
     for i in 0..slot_count {
         let p = pool_dir.join(format!("permit-{}", i));
         let f = std::fs::OpenOptions::new()
@@ -885,15 +920,14 @@ pub(crate) fn acquire_permit() -> mlua::Result<std::fs::File> {
     Ok(f)
 }
 
-fn permit_slot_count() -> mlua::Result<usize> {
-    crate::config_registry::resolved_positive_usize(
-        crate::config_registry::ConfigKey::CodexPermitSlots,
-    )
-    .map_err(mlua::Error::external)
+fn permit_slot_count(config: &ConfigContext) -> mlua::Result<usize> {
+    config
+        .resolved_positive_usize(ConfigKey::CodexPermitSlots)
+        .map_err(mlua::Error::external)
 }
 
-fn permit_pool_dir() -> mlua::Result<PathBuf> {
-    RuntimeLayout::from_env()
+fn permit_pool_dir(host_root: &Path) -> mlua::Result<PathBuf> {
+    runtime_context::layout_from_host_root(host_root)
         .map(|layout| layout.runtime_dir(RuntimeKind::CodexPermits))
         .map_err(mlua::Error::external)
 }

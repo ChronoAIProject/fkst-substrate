@@ -8,7 +8,7 @@ use super::source_runner::parse_duration;
 use super::spawner::spawn_framework;
 use fkst_common::config::DepartmentDecl;
 use fkst_common::Event;
-use fkst_common::{RuntimeKind, RuntimeLayout};
+use fkst_common::RuntimeKind;
 use std::path::PathBuf;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -33,7 +33,7 @@ pub async fn spawn_consumer(
     tokio::spawn(async move {
         let stall_window =
             parse_duration(&decl.timeout).expect("validation already accepted timeout");
-        let framework_child_log_dir = RuntimeLayout::from_env()
+        let framework_child_log_dir = crate::runtime_context::layout_from_host_root(&project_root)
             .expect("runtime layout should be valid")
             .runtime_dir(RuntimeKind::Logs)
             .join("framework-child");
@@ -67,12 +67,14 @@ pub async fn spawn_consumer(
             let fanout_clone = fanout.clone();
             let dept_name = name.clone();
             let framework_bin = framework_binary.clone();
+            let project_root = project_root.clone();
             let package_root = package_root.clone();
             let log_dir = framework_child_log_dir.clone();
             tokio::spawn(async move {
                 match spawn_framework(
                     &framework_bin,
                     &lua_full,
+                    &project_root,
                     &package_root,
                     &event_json,
                     stall_window,

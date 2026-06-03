@@ -1,3 +1,4 @@
+use std::path::Path;
 use std::process::Command;
 
 fn framework_bin() -> &'static str {
@@ -7,6 +8,32 @@ fn framework_bin() -> &'static str {
 const CODEX_PERMIT_SLOTS_ENV: &str = "FKST_CODEX_PERMIT_SLOTS";
 const PACKAGE_ROOT_ENV: &str = "FKST_PACKAGE_ROOT";
 const RUNTIME_ROOT_ENV: &str = "FKST_RUNTIME_ROOT";
+
+fn run_git(repo: &Path, args: &[&str]) {
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(repo)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "git {:?} failed: {}",
+        args,
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+fn init_repo(repo: &Path) {
+    run_git(repo, &["init", "-q"]);
+    run_git(repo, &["config", "user.email", "test@example.com"]);
+    run_git(repo, &["config", "user.name", "Test User"]);
+    std::fs::write(repo.join("file.txt"), "content\n").unwrap();
+    run_git(repo, &["add", "file.txt"]);
+    run_git(
+        repo,
+        &["commit", "-q", "-m", "sdk git host fact regression"],
+    );
+}
 
 #[test]
 fn self_test_succeeds_in_temp_cwd() {
@@ -123,5 +150,79 @@ end
         output.status.success(),
         "stderr: {}",
         String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn run_project_root_controls_host_facts_and_git_sdk_when_cwd_differs() {
+    let root = tempfile::tempdir().unwrap();
+    let host = root.path().join("host");
+    let cwd = root.path().join("unrelated");
+    std::fs::create_dir_all(host.join("departments/worker")).unwrap();
+    std::fs::create_dir_all(&cwd).unwrap();
+    init_repo(&host);
+    std::fs::write(
+        host.join("fkst.env"),
+        "FKST_CANDIDATE_PREFIX=host-rc\nFKST_CANDIDATE_FROM_SEP=__base__\n",
+    )
+    .unwrap();
+    let witness = host.join("witness.txt");
+    let lua = host.join("departments/worker/main.lua");
+    std::fs::write(
+        &lua,
+        format!(
+            r#"
+function pipeline(event)
+    local count = git_log_count("sdk git host fact regression", "1970-01-01T00:00:00Z")
+    local worktree = setup_worktree("host-root-test")
+    local f = assert(io.open({:?}, "w"))
+    f:write("count=" .. tostring(count) .. "\n")
+    f:write("worktree=" .. worktree .. "\n")
+    f:close()
+    raise("done", {{ count = count }})
+end
+"#,
+            witness.to_string_lossy()
+        ),
+    )
+    .unwrap();
+
+    let runtime_root = root.path().join("runtime");
+    let output = Command::new(framework_bin())
+        .arg("run")
+        .arg(&lua)
+        .arg("--project-root")
+        .arg(&host)
+        .arg("--package-root")
+        .arg(&host)
+        .arg("--event")
+        .arg(r#"{"name":"ok"}"#)
+        .env(RUNTIME_ROOT_ENV, &runtime_root)
+        .env_remove(PACKAGE_ROOT_ENV)
+        .env_remove(CODEX_PERMIT_SLOTS_ENV)
+        .current_dir(&cwd)
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("RAISED: "), "{stdout}");
+    let body = std::fs::read_to_string(&witness).unwrap();
+    assert!(body.contains("count=1\n"), "{body}");
+    assert!(
+        body.contains(&format!(
+            "worktree={}/worktrees/host-root-test-",
+            runtime_root.display()
+        )),
+        "{body}"
+    );
+    assert!(
+        !cwd.join(".fkst/runtime/worktrees").exists(),
+        "launcher cwd must not receive runtime worktrees"
     );
 }

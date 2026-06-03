@@ -6,6 +6,8 @@ mod config_registry;
 mod graph_scan;
 #[path = "../src/path_resolver.rs"]
 mod path_resolver;
+#[path = "../src/runtime_context.rs"]
+mod runtime_context;
 
 use fkst_common::config::RaiserDecl;
 use fkst_common::validation::validate;
@@ -165,7 +167,7 @@ fn host_graph_defaults_use_operational_defaults_when_env_and_fkst_env_are_absent
     let _env_lock = CURRENT_DIR_LOCK
         .get_or_init(|| Mutex::new(()))
         .lock()
-        .unwrap();
+        .unwrap_or_else(|err| err.into_inner());
     let _queue = EnvGuard::unset(QUEUE_CAPACITY_ENV);
     let _timeout = EnvGuard::unset(DEPARTMENT_DEFAULT_TIMEOUT_ENV);
     let _slots = EnvGuard::unset(CODEX_PERMIT_SLOTS_ENV);
@@ -572,7 +574,15 @@ fn resolves_runtime_file_watch_glob() {
     let cfg = load(dir.path()).unwrap();
     match cfg.raiser.get("inbox_watch").unwrap() {
         RaiserDecl::FileWatch { glob, produces } => {
-            assert_eq!(glob, ".fkst/runtime/evolve-requests/inbox/*.md");
+            assert_eq!(
+                glob,
+                &dir.path()
+                    .canonicalize()
+                    .unwrap()
+                    .join(".fkst/runtime/evolve-requests/inbox/*.md")
+                    .to_string_lossy()
+                    .into_owned()
+            );
             assert_eq!(produces, "evolve_request");
         }
         _ => panic!("expected FileWatch"),
@@ -584,7 +594,7 @@ fn graph_scan_rejects_fkst_paths_global() {
     let _env = CURRENT_DIR_LOCK
         .get_or_init(|| Mutex::new(()))
         .lock()
-        .unwrap();
+        .unwrap_or_else(|err| err.into_inner());
     let _root = EnvGuard::set(RUNTIME_ROOT_ENV, ".fkst/runtime");
     let dir = write_repo(
         &[(
@@ -618,7 +628,7 @@ fn runtime_logs_file_watch_fails_closed() {
     let _env = CURRENT_DIR_LOCK
         .get_or_init(|| Mutex::new(()))
         .lock()
-        .unwrap();
+        .unwrap_or_else(|err| err.into_inner());
     let _root = EnvGuard::set(RUNTIME_ROOT_ENV, ".fkst/runtime");
     let dir = write_repo(
         &[],
@@ -640,7 +650,7 @@ fn resolves_runtime_file_watch_glob_with_out_of_tree_root() {
     let _env = CURRENT_DIR_LOCK
         .get_or_init(|| Mutex::new(()))
         .lock()
-        .unwrap();
+        .unwrap_or_else(|err| err.into_inner());
     let runtime = TempDir::new().unwrap();
     let _root = EnvGuard::set(RUNTIME_ROOT_ENV, runtime.path());
     let dir = write_repo(

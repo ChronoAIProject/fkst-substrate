@@ -2,6 +2,8 @@
 
 #[path = "../src/config_registry.rs"]
 mod config_registry;
+#[path = "../src/runtime_context.rs"]
+mod runtime_context;
 #[path = "../src/sdk_codex.rs"]
 mod sdk_codex;
 mod support;
@@ -9,7 +11,7 @@ mod support;
 use mlua::{AnyUserData, Lua, Table};
 use nix::fcntl::{flock, FlockArg};
 use sdk_codex::{
-    acquire_permit, ensure_pool, register, CodexResult, CodexTaskHandle, CODEX_PERMIT_SLOTS_ENV,
+    acquire_permit, ensure_pool, CodexResult, CodexTaskHandle, CODEX_PERMIT_SLOTS_ENV,
 };
 use std::io::Write;
 use std::os::fd::AsRawFd;
@@ -19,6 +21,13 @@ use std::time::Duration;
 use support::process_sandbox::ProcessSandbox;
 
 const DEFAULT_CODEX_PERMIT_SLOTS: usize = 20;
+
+fn register(lua: &Lua) -> mlua::Result<()> {
+    let host_root = std::env::current_dir().map_err(mlua::Error::external)?;
+    let config = config_registry::ConfigContext::from_host_root(&host_root)
+        .map_err(mlua::Error::external)?;
+    sdk_codex::register(lua, &host_root, config)
+}
 
 #[cfg(unix)]
 fn install_codex_script(dir: &Path, body: &str) -> PathBuf {

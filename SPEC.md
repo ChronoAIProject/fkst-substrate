@@ -4,7 +4,7 @@
 
 本文档定义 fkst 的 Tier II 身份锚点。它只回答"系统是什么",不记录"系统现在在做什么"。
 
-> 抽取快照说明:本文从 ChronoAIProject/fkst 原样带入作身份锚点。其中引用的 `conformance/run_all.sh`、conformance gate 集尚未迁入 fkst-substrate(见 README deferred 清单);相关条目描述的是 substrate 的目标 invariant,不代表本仓库当前已物化对应文件。
+> 抽取快照说明:本文从 ChronoAIProject/fkst 原样带入作身份锚点。其中引用的 `conformance/run_all.sh`、conformance gate 集尚未迁入 fkst-substrate(见 README deferred 清单)。当前 Tier II 物化锚点是根目录 `SPEC.md`;Rust `fkst-framework conformance` 是 engine host-conformance,不是缺失的 `run_all.sh`。
 
 ## 身份边界
 
@@ -17,7 +17,7 @@
 - `fkst.package_asset` 是 package-root immutable asset reader,不得读取 host root relative path;host operation config 读取归属 Rust registry。
 - layout collision 只拒绝会改变 behavior graph 或 package Lua module identity 的同名 `departments/*`、`raisers/*`、`fkst/*`;host `scripts/*` 与 `conformance/*` 同名普通文件不构成 package identity collision。
 - 不存在第二 package/root 语义;`FKST_STDLIB_ROOT`、`FKST_RUNTIME_PACKAGE_ROOT`、`FKST_GRAPH_ROOTS` 不是合法 contract。
-- 当前 fkst 仓库把 Tier II 身份锚点物化在根目录 `SPEC.md` 与 `conformance/run_all.sh`。
+- 当前 fkst-substrate 仓库把 Tier II 身份锚点物化在根目录 `SPEC.md`;`conformance/run_all.sh` 尚未迁入。
 - 根目录 SPEC/conformance 只是当前 fkst dogfood 物化,不是所有 host project 的路径本体论。
 - 未来 host policy 可以命名等价 SPEC 与 conformance 入口,但不得覆盖身份 gate。
 - Tier II 身份不得依赖仓库内提交的派生 hash 摘要。
@@ -50,7 +50,7 @@
 
 ## Conformance
 
-- 当前 fkst 仓库的 conformance 入口是 `conformance/run_all.sh`。
+- 当前 fkst-substrate 的 engine host-conformance 入口是 Rust CLI `fkst-framework conformance --project-root <path>`;历史 `conformance/run_all.sh` 尚未迁入,不是当前入口。
 - 首批 invariant 分组是 Tier II identity、source-language-identity、三级公司、事实源、SDK surface、部门本地模块边界、演化白名单、CI wiring、Tier I boundary。
 - `source-language-identity` 要求 `crates/`、`conformance/`、`departments/`、`raisers/`、`scripts/`、`tests/` 下后缀为 `.rs`、`.lua`、`.sh`、`.py`、`.ts` 的 managed source files 不含中文自然语言文本。
 - `conformance/source_language_identity.sh` 是该 invariant 的 Tier II gate。

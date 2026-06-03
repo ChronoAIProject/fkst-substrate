@@ -29,15 +29,34 @@ pub fn run() -> std::result::Result<(), Failure> {
         class: "schema-validation",
         source,
     })?;
-    check_sdk_registration().map_err(|source| Failure {
+    let host_root = self_test_host_root().map_err(|source| Failure {
+        class: "self-test-host-root",
+        source,
+    })?;
+    check_sdk_registration(&host_root).map_err(|source| Failure {
         class: "sdk-registration",
         source,
     })?;
-    crate::sdk_codex::self_test_permit_pool().map_err(|source| Failure {
+    let cwd = std::env::current_dir().map_err(|source| Failure {
+        class: "self-test-host-root",
+        source: anyhow::Error::new(source),
+    })?;
+    crate::sdk_codex::self_test_permit_pool(&cwd).map_err(|source| Failure {
         class: "permit-pool",
         source: anyhow::Error::msg(source.to_string()),
     })?;
     Ok(())
+}
+
+fn self_test_host_root() -> Result<PathBuf> {
+    let root = std::env::temp_dir().join(format!(
+        "fkst-framework-self-test-host-{}-{}",
+        std::process::id(),
+        unique_suffix()
+    ));
+    std::fs::create_dir_all(&root)
+        .with_context(|| format!("create temporary self-test host root {}", root.display()))?;
+    Ok(root)
 }
 
 fn check_validation() -> Result<()> {
@@ -104,9 +123,9 @@ fn minimal_config(lua_rel: PathBuf) -> Config {
 }
 
 // the self-test pins the fixed `file.read`, `file.write`, and `file.exists` table shape.
-fn check_sdk_registration() -> Result<()> {
+fn check_sdk_registration(host_root: &std::path::Path) -> Result<()> {
     let lua = crate::mlua_init::new_lua();
-    crate::mlua_init::register_framework_sdk(&lua, RaiseBuffer::new())
+    crate::mlua_init::register_framework_sdk(&lua, RaiseBuffer::new(), host_root)
         .context("register framework SDK")?;
     lua.load(
         r#"

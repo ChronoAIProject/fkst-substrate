@@ -48,7 +48,9 @@ pub async fn supervise(roots: PackageRoots, framework_bin: PathBuf) -> Result<()
     let codex_permit_slots = cfg.limits.global_codex_processes;
     let mut handles = vec![];
 
-    for (name, decl) in cfg.department.iter() {
+    let mut departments = cfg.department.iter().collect::<Vec<_>>();
+    departments.sort_by(|(left, _), (right, _)| left.cmp(right));
+    for (name, decl) in departments {
         let q_cap = decl
             .consumes
             .iter()
@@ -78,7 +80,9 @@ pub async fn supervise(roots: PackageRoots, framework_bin: PathBuf) -> Result<()
 
     // dispatch stays tied to
     // `RaiserDecl`'s implemented source kinds; unsupported types fail at parse time.
-    for (name, raiser) in cfg.raiser.iter() {
+    let mut raisers = cfg.raiser.iter().collect::<Vec<_>>();
+    raisers.sort_by(|(left, _), (right, _)| left.cmp(right));
+    for (name, raiser) in raisers {
         match raiser {
             RaiserDecl::Cron { interval, produces } => {
                 handles.push(spawn_cron(
@@ -92,6 +96,7 @@ pub async fn supervise(roots: PackageRoots, framework_bin: PathBuf) -> Result<()
                 handles.push(spawn_file_watch(
                     name.clone(),
                     glob,
+                    &project_root,
                     produces.clone(),
                     fanout.clone(),
                 )?);

@@ -2,10 +2,13 @@
 
 #[path = "../src/config_registry.rs"]
 mod config_registry;
+#[path = "../src/runtime_context.rs"]
+mod runtime_context;
 #[path = "../src/sdk_git.rs"]
 mod sdk_git;
 mod support;
 
+use config_registry::ConfigContext;
 use mlua::Lua;
 use sdk_git::{parse_worktree_paths, register};
 use std::path::Path;
@@ -64,8 +67,25 @@ fn repo_with_commit(message: &str) -> tempfile::TempDir {
     tmp
 }
 
+fn write_candidate_config(root: &Path, prefix: &str, from_sep: &str) {
+    std::fs::write(
+        root.join("fkst.env"),
+        format!("FKST_CANDIDATE_PREFIX={prefix}\nFKST_CANDIDATE_FROM_SEP={from_sep}\n"),
+    )
+    .unwrap();
+}
+
 fn in_dir<T>(dir: &Path, f: impl FnOnce() -> T) -> T {
     in_sandbox(dir, |_| {}, f)
+}
+
+fn register_for_host(lua: &Lua, host_root: &Path) {
+    register(
+        lua,
+        host_root,
+        ConfigContext::from_host_root(host_root).unwrap(),
+    )
+    .unwrap();
 }
 
 #[cfg(unix)]
@@ -91,7 +111,8 @@ fn assert_lua_error_contains(err: mlua::Error, parts: &[&str]) {
 #[test]
 fn with_lock_runs_fn() {
     let lua = Lua::new();
-    register(&lua).unwrap();
+    let tmp = tempdir().unwrap();
+    register_for_host(&lua, tmp.path());
 
     let tmp = tempdir().unwrap();
     let lock = tmp.path().join("x.lock").to_string_lossy().to_string();
@@ -114,12 +135,14 @@ fn with_lock_runs_fn() {
 #[test]
 fn git_log_count_returns_int() {
     let lua = Lua::new();
-    register(&lua).unwrap();
+    let repo = repo_with_commit("git log count base");
+    register_for_host(&lua, repo.path());
 
-    let r: i64 = lua
-        .load(r#"return git_log_count("never-matches-xyzzy", "100 years ago")"#)
-        .eval()
-        .unwrap();
+    let r: i64 = in_dir(repo.path(), || {
+        lua.load(r#"return git_log_count("never-matches-xyzzy", "100 years ago")"#)
+            .eval()
+            .unwrap()
+    });
 
     assert_eq!(r, 0);
 }
@@ -128,13 +151,14 @@ fn git_log_count_returns_int() {
 #[test]
 fn git_log_count_failure_raises_lua_error() {
     let lua = Lua::new();
-    register(&lua).unwrap();
+    let host = tempdir().unwrap();
+    register_for_host(&lua, host.path());
     let sandbox = ProcessSandbox::new();
     let bin_dir = sandbox.temp_path("bin");
     install_git_script(
         &bin_dir,
         r#"#!/bin/sh
-if [ "$1" = "log" ]; then
+if [ "$1" = "-C" ] && [ "$3" = "log" ]; then
   printf 'count backend unavailable\n' >&2
   exit 2
 fi
@@ -158,8 +182,8 @@ exit 99
 #[test]
 fn git_log_grep_returns_shas() {
     let lua = Lua::new();
-    register(&lua).unwrap();
     let repo = repo_with_commit("C3 unique message");
+    register_for_host(&lua, repo.path());
 
     let shas: Vec<String> = in_dir(repo.path(), || {
         lua.load(r#"return git_log_grep("C3 unique", "1970-01-01T00:00:00Z")"#)
@@ -175,13 +199,14 @@ fn git_log_grep_returns_shas() {
 #[test]
 fn git_log_grep_failure_raises_lua_error() {
     let lua = Lua::new();
-    register(&lua).unwrap();
+    let host = tempdir().unwrap();
+    register_for_host(&lua, host.path());
     let sandbox = ProcessSandbox::new();
     let bin_dir = sandbox.temp_path("bin");
     install_git_script(
         &bin_dir,
         r#"#!/bin/sh
-if [ "$1" = "log" ]; then
+if [ "$1" = "-C" ] && [ "$3" = "log" ]; then
   printf 'grep backend unavailable\n' >&2
   exit 1
 fi
@@ -214,14 +239,13 @@ fn parse_worktree_paths_reads_porcelain_worktree_lines() {
 #[test]
 fn setup_worktree_creates_under_runtime_worktrees() {
     let lua = Lua::new();
-    register(&lua).unwrap();
     let repo = repo_with_commit("worktree base");
+    write_candidate_config(repo.path(), "host-rc", "__base__");
+    register_for_host(&lua, repo.path());
     let path: String = in_sandbox(
         repo.path(),
         |sandbox| {
             sandbox.runtime_root(".fkst/runtime");
-            sandbox.set_env("FKST_CANDIDATE_PREFIX", "host-rc");
-            sandbox.set_env("FKST_CANDIDATE_FROM_SEP", "__base__");
         },
         || {
             lua.load(r#"return setup_worktree("c3-test")"#)
@@ -230,8 +254,11 @@ fn setup_worktree_creates_under_runtime_worktrees() {
         },
     );
 
-    assert!(path.starts_with(".fkst/runtime/worktrees/c3-test-"));
-    assert!(repo.path().join(&path).is_dir());
+    assert!(path.starts_with(&format!(
+        "{}/.fkst/runtime/worktrees/c3-test-",
+        repo.path().display()
+    )));
+    assert!(Path::new(&path).is_dir());
     assert!(!repo.path().join(".worktrees").exists());
 
     let worktree_branch = git_stdout(
@@ -257,8 +284,9 @@ fn setup_worktree_creates_under_runtime_worktrees() {
 #[test]
 fn setup_worktree_uses_short_sha_parent_when_detached() {
     let lua = Lua::new();
-    register(&lua).unwrap();
     let repo = repo_with_commit("worktree detached base");
+    write_candidate_config(repo.path(), "host-rc", "__base__");
+    register_for_host(&lua, repo.path());
     let parent_sha = git_stdout(repo.path(), &["rev-parse", "--short=12", "HEAD"]);
     git(repo.path(), &["checkout", "--detach", "HEAD"]);
 
@@ -266,8 +294,6 @@ fn setup_worktree_uses_short_sha_parent_when_detached() {
         repo.path(),
         |sandbox| {
             sandbox.runtime_root(".fkst/runtime");
-            sandbox.set_env("FKST_CANDIDATE_PREFIX", "host-rc");
-            sandbox.set_env("FKST_CANDIDATE_FROM_SEP", "__base__");
         },
         || {
             lua.load(r#"return setup_worktree("detached-test")"#)
@@ -294,8 +320,6 @@ fn setup_worktree_uses_short_sha_parent_when_detached() {
 
 #[test]
 fn setup_worktree_prefers_env_over_fkst_env() {
-    let lua = Lua::new();
-    register(&lua).unwrap();
     let repo = repo_with_commit("worktree tunable base");
     std::fs::write(
         repo.path().join("fkst.env"),
@@ -311,6 +335,8 @@ fn setup_worktree_prefers_env_over_fkst_env() {
             sandbox.set_env("FKST_CANDIDATE_FROM_SEP", "__env__");
         },
         || {
+            let lua = Lua::new();
+            register_for_host(&lua, repo.path());
             lua.load(r#"return setup_worktree("tunable-test")"#)
                 .eval()
                 .unwrap()
@@ -332,13 +358,13 @@ fn setup_worktree_prefers_env_over_fkst_env() {
 #[test]
 fn setup_worktree_uses_fkst_env_without_env() {
     let lua = Lua::new();
-    register(&lua).unwrap();
     let repo = repo_with_commit("worktree tunable base");
     std::fs::write(
         repo.path().join("fkst.env"),
         "FKST_CANDIDATE_PREFIX=file-rc\nFKST_CANDIDATE_FROM_SEP=__file__\n",
     )
     .unwrap();
+    register_for_host(&lua, repo.path());
 
     let path: String = in_sandbox(
         repo.path(),
@@ -367,14 +393,13 @@ fn setup_worktree_uses_fkst_env_without_env() {
 #[test]
 fn setup_worktree_requires_runtime_root() {
     let lua = Lua::new();
-    register(&lua).unwrap();
     let repo = repo_with_commit("worktree base");
+    write_candidate_config(repo.path(), "host-rc", "__base__");
+    register_for_host(&lua, repo.path());
     let err = in_sandbox(
         repo.path(),
         |sandbox| {
             sandbox.unset_env(fkst_common::runtime_layout::RUNTIME_ROOT_ENV);
-            sandbox.set_env("FKST_CANDIDATE_PREFIX", "host-rc");
-            sandbox.set_env("FKST_CANDIDATE_FROM_SEP", "__base__");
         },
         || {
             lua.load(r#"return setup_worktree("c3-test")"#)
@@ -389,13 +414,13 @@ fn setup_worktree_requires_runtime_root() {
 #[test]
 fn setup_worktree_rejects_invalid_candidate_prefix_before_side_effects() {
     let lua = Lua::new();
-    register(&lua).unwrap();
     let repo = repo_with_commit("worktree base");
     std::fs::write(
         repo.path().join("fkst.env"),
         "FKST_CANDIDATE_PREFIX=bad prefix\nFKST_CANDIDATE_FROM_SEP=__base__\n",
     )
     .unwrap();
+    register_for_host(&lua, repo.path());
     let err = in_sandbox(
         repo.path(),
         |sandbox| {
@@ -419,13 +444,13 @@ fn setup_worktree_rejects_invalid_candidate_prefix_before_side_effects() {
 #[test]
 fn setup_worktree_requires_candidate_prefix_before_side_effects() {
     let lua = Lua::new();
-    register(&lua).unwrap();
     let repo = repo_with_commit("worktree base");
     std::fs::write(
         repo.path().join("fkst.env"),
         "FKST_CANDIDATE_FROM_SEP=__base__\n",
     )
     .unwrap();
+    register_for_host(&lua, repo.path());
 
     let err = in_sandbox(
         repo.path(),
@@ -448,13 +473,13 @@ fn setup_worktree_requires_candidate_prefix_before_side_effects() {
 #[test]
 fn setup_worktree_requires_candidate_from_separator_before_side_effects() {
     let lua = Lua::new();
-    register(&lua).unwrap();
     let repo = repo_with_commit("worktree base");
     std::fs::write(
         repo.path().join("fkst.env"),
         "FKST_CANDIDATE_PREFIX=file-rc\n",
     )
     .unwrap();
+    register_for_host(&lua, repo.path());
 
     let err = in_sandbox(
         repo.path(),
@@ -477,16 +502,15 @@ fn setup_worktree_requires_candidate_from_separator_before_side_effects() {
 #[test]
 fn setup_worktree_creates_under_configured_runtime_worktrees() {
     let lua = Lua::new();
-    register(&lua).unwrap();
     let repo = repo_with_commit("worktree base");
+    write_candidate_config(repo.path(), "host-rc", "__base__");
+    register_for_host(&lua, repo.path());
     let runtime = tempdir().unwrap();
 
     let path: String = in_sandbox(
         repo.path(),
         |sandbox| {
             sandbox.runtime_root(runtime.path());
-            sandbox.set_env("FKST_CANDIDATE_PREFIX", "host-rc");
-            sandbox.set_env("FKST_CANDIDATE_FROM_SEP", "__base__");
         },
         || {
             lua.load(r#"return setup_worktree("c3-external")"#)
@@ -507,8 +531,8 @@ fn setup_worktree_creates_under_configured_runtime_worktrees() {
 #[test]
 fn count_worktrees_returns_linked_worktree_count() {
     let lua = Lua::new();
-    register(&lua).unwrap();
     let repo = repo_with_commit("worktree base");
+    register_for_host(&lua, repo.path());
     let linked = repo.path().join(".fkst/runtime/worktrees/c3-count");
     git(
         repo.path(),
@@ -530,13 +554,14 @@ fn count_worktrees_returns_linked_worktree_count() {
 #[test]
 fn count_worktrees_failure_raises_lua_error() {
     let lua = Lua::new();
-    register(&lua).unwrap();
+    let host = tempdir().unwrap();
+    register_for_host(&lua, host.path());
     let sandbox = ProcessSandbox::new();
     let bin_dir = sandbox.temp_path("bin");
     install_git_script(
         &bin_dir,
         r#"#!/bin/sh
-if [ "$1" = "worktree" ] && [ "$2" = "list" ] && [ "$3" = "--porcelain" ]; then
+if [ "$1" = "-C" ] && [ "$3" = "worktree" ] && [ "$4" = "list" ] && [ "$5" = "--porcelain" ]; then
   printf 'worktree backend unavailable\n' >&2
   exit 2
 fi
@@ -563,8 +588,8 @@ exit 99
 #[test]
 fn list_orphan_worktrees_returns_matching_prefixed_paths() {
     let lua = Lua::new();
-    register(&lua).unwrap();
     let repo = repo_with_commit("worktree base");
+    register_for_host(&lua, repo.path());
     let matching = repo.path().join(".fkst/runtime/worktrees/c3-orphan-a");
     let other = repo.path().join(".fkst/runtime/worktrees/other-orphan-a");
     git(
@@ -601,13 +626,14 @@ fn list_orphan_worktrees_returns_matching_prefixed_paths() {
 #[test]
 fn list_orphan_worktrees_failure_raises_lua_error() {
     let lua = Lua::new();
-    register(&lua).unwrap();
+    let host = tempdir().unwrap();
+    register_for_host(&lua, host.path());
     let sandbox = ProcessSandbox::new();
     let bin_dir = sandbox.temp_path("bin");
     install_git_script(
         &bin_dir,
         r#"#!/bin/sh
-if [ "$1" = "worktree" ] && [ "$2" = "list" ] && [ "$3" = "--porcelain" ]; then
+if [ "$1" = "-C" ] && [ "$3" = "worktree" ] && [ "$4" = "list" ] && [ "$5" = "--porcelain" ]; then
   printf 'orphan backend unavailable\n' >&2
   exit 1
 fi
@@ -634,8 +660,8 @@ exit 99
 #[test]
 fn list_orphan_worktrees_filters_configured_runtime_worktrees() {
     let lua = Lua::new();
-    register(&lua).unwrap();
     let repo = repo_with_commit("worktree base");
+    register_for_host(&lua, repo.path());
     let runtime = tempdir().unwrap();
     let matching = runtime.path().join("worktrees/c3-external-a");
     let other = repo.path().join(".fkst/runtime/worktrees/c3-external-b");

@@ -22,6 +22,7 @@ async fn file_watch_existing_file_emits_event() {
     let handle = spawn_file_watch(
         "watch".to_string(),
         glob.to_str().unwrap(),
+        tmp.path(),
         "files".to_string(),
         fanout,
     )
@@ -49,6 +50,7 @@ async fn file_watch_new_file_emits_event() {
     let handle = spawn_file_watch(
         "watch".to_string(),
         glob.to_str().unwrap(),
+        tmp.path(),
         "files".to_string(),
         fanout,
     )
@@ -80,6 +82,7 @@ async fn file_watch_periodic_scan_dedupes_unchanged_file() {
     let handle = spawn_file_watch(
         "watch".to_string(),
         glob.to_str().unwrap(),
+        tmp.path(),
         "files".to_string(),
         fanout,
     )
@@ -109,6 +112,7 @@ async fn file_watch_periodic_scan_reemits_changed_file() {
     let handle = spawn_file_watch(
         "watch".to_string(),
         glob.to_str().unwrap(),
+        tmp.path(),
         "files".to_string(),
         fanout,
     )
@@ -147,6 +151,7 @@ async fn file_watch_restart_startup_scan_replays_existing_file() {
     let handle = spawn_file_watch(
         "watch".to_string(),
         glob.to_str().unwrap(),
+        tmp.path(),
         "files".to_string(),
         fanout.clone(),
     )
@@ -165,6 +170,7 @@ async fn file_watch_restart_startup_scan_replays_existing_file() {
     let restarted = spawn_file_watch(
         "watch".to_string(),
         glob.to_str().unwrap(),
+        tmp.path(),
         "files".to_string(),
         fanout,
     )

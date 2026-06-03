@@ -10,16 +10,15 @@
 
 use anyhow::{anyhow, bail, Context, Result};
 use fkst_common::config::{Config, DepartmentDecl, LimitsDecl, QueueDecl, RaiserDecl};
-use fkst_common::{RuntimeKind, RuntimeLayout};
+use fkst_common::RuntimeKind;
 use mlua::{Lua, LuaSerdeExt, Table, Value as LuaValue};
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
-use crate::config_registry::{
-    self, parse_duration_string, parse_positive_usize, ConfigKey, ConfigValueType,
-};
+use crate::config_registry::{ConfigContext, ConfigKey, ConfigValueType};
 use crate::path_resolver::{GraphRoot, GraphRootKind, PackageRoots};
+use crate::runtime_context;
 
 /// Deserialization helper for a department's `M.spec` table.
 #[derive(Deserialize)]
@@ -43,44 +42,28 @@ struct HostGraphDefaults {
 
 impl HostGraphDefaults {
     fn load(roots: &PackageRoots) -> Result<Self> {
-        let process_env = config_registry::process_env_for_registry()?;
-        let fkst_env = config_registry::read_fkst_env(roots.host_root())?;
+        let config = ConfigContext::from_host_root(roots.host_root())?;
         Ok(Self {
-            queue_capacity: resolve_usize(ConfigKey::QueueCapacity, &process_env, &fkst_env)?,
+            queue_capacity: resolve_usize(&config, ConfigKey::QueueCapacity)?,
             department_default_timeout: resolve_timeout(
+                &config,
                 ConfigKey::DepartmentDefaultTimeout,
-                &process_env,
-                &fkst_env,
             )?,
-            codex_permit_slots: resolve_usize(
-                ConfigKey::CodexPermitSlots,
-                &process_env,
-                &fkst_env,
-            )?,
+            codex_permit_slots: resolve_usize(&config, ConfigKey::CodexPermitSlots)?,
         })
     }
 }
 
-fn resolve_usize(
-    key: ConfigKey,
-    process_env: &HashMap<String, String>,
-    fkst_env: &HashMap<String, String>,
-) -> Result<usize> {
-    let resolved = config_registry::resolve(key, process_env, fkst_env)?;
-    let entry = config_registry::entry(key);
+fn resolve_usize(config: &ConfigContext, key: ConfigKey) -> Result<usize> {
+    let entry = crate::config_registry::entry(key);
     assert_eq!(entry.value_type, ConfigValueType::Usize);
-    parse_positive_usize(entry, &resolved.value)
+    config.resolved_positive_usize(key)
 }
 
-fn resolve_timeout(
-    key: ConfigKey,
-    process_env: &HashMap<String, String>,
-    fkst_env: &HashMap<String, String>,
-) -> Result<String> {
-    let resolved = config_registry::resolve(key, process_env, fkst_env)?;
-    let entry = config_registry::entry(key);
+fn resolve_timeout(config: &ConfigContext, key: ConfigKey) -> Result<String> {
+    let entry = crate::config_registry::entry(key);
     assert_eq!(entry.value_type, ConfigValueType::DurationString);
-    parse_duration_string(entry, &resolved.value)
+    config.resolved_duration_string(key)
 }
 
 #[cfg(test)]
@@ -111,7 +94,13 @@ pub fn load_roots(roots: &PackageRoots) -> Result<Config> {
             &mut departments,
             &mut department_fanout,
         )?;
-        scan_raisers(&lua, graph_root, &lua_roots, &mut raisers)?;
+        scan_raisers(
+            &lua,
+            graph_root,
+            &lua_roots,
+            roots.host_root(),
+            &mut raisers,
+        )?;
     }
 
     let queues = derive_queues(&departments, &raisers, &department_fanout, &defaults)?;
@@ -193,6 +182,7 @@ fn scan_raisers(
     lua: &Lua,
     graph_root: &GraphRoot,
     lua_roots: &[&Path],
+    host_root: &Path,
     raisers: &mut HashMap<String, RaiserDecl>,
 ) -> Result<()> {
     let repo_root = &graph_root.root;
@@ -214,7 +204,7 @@ fn scan_raisers(
         let mut r: RaiserDecl = lua
             .from_value(val)
             .with_context(|| format!("parse raisers/{}.lua", stem))?;
-        resolve_runtime_file_watch_glob(&mut r)?;
+        resolve_runtime_file_watch_glob(&mut r, host_root)?;
 
         let config_path = config_path(repo_root, graph_root.kind, &path);
         insert_raiser_decl_with_root(raisers, &stem, r, &config_path, graph_root.kind)?;
@@ -350,10 +340,10 @@ fn resolve_department_fanout(
     Ok(fanout)
 }
 
-fn resolve_runtime_file_watch_glob(raiser: &mut RaiserDecl) -> Result<()> {
+fn resolve_runtime_file_watch_glob(raiser: &mut RaiserDecl, host_root: &Path) -> Result<()> {
     if let RaiserDecl::FileWatch { glob, .. } = raiser {
         if let Some(relative) = glob.strip_prefix("runtime://") {
-            let layout = RuntimeLayout::from_env()?;
+            let layout = runtime_context::layout_from_host_root(host_root)?;
             let (kind, relative) = split_runtime_glob_kind(relative)?;
             if kind == RuntimeKind::Logs {
                 bail!("runtime://logs is local-only and cannot be used as file_watch input");
