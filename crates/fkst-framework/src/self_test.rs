@@ -168,7 +168,14 @@ fn check_sdk_registration(host_root: &std::path::Path) -> Result<()> {
         expect_nil("read_file", read_file)
         expect_nil("write_file", write_file)
         expect_nil("path_exists", path_exists)
-        expect_nil("json", json)
+        expect_type("json", json, "table")
+        expect_type("json.decode", json.decode, "function")
+        expect_nil("json.encode", json.encode)
+        for json_key in pairs(json) do
+            if json_key ~= "decode" then
+                error("json table has unexpected key: " .. tostring(json_key))
+            end
+        end
         expect_nil("notify_human", notify_human)
         "#,
     )

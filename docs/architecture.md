@@ -189,7 +189,7 @@ spawn fkst-framework run <department main.lua> --project-root <HOST> --package-r
     ↓
 single Lua state + pipeline(event)
     ↓
-SDK calls: file/git/lock/worktree/exec/codex/log/now/raise
+SDK calls: file/json/git/lock/worktree/exec/codex/log/now/raise
     ↓
 optional stdout line: RAISED: <base64-url-json>
     ↓

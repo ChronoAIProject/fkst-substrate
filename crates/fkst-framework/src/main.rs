@@ -27,6 +27,7 @@ mod sdk_basic;
 mod sdk_codex;
 mod sdk_fs;
 mod sdk_git;
+mod sdk_json;
 mod sdk_log;
 mod self_test;
 mod supervise;

@@ -78,9 +78,9 @@ Source 只能来自 `cron` 与 `file_watch`。复杂日历、时区、退避、�
 
 Lua SDK surface 固定为：
 
-`pipeline / source / raise / spawn_codex_sync / spawn_codex / exec_sync / await_all / with_lock / git_log_count / git_log_grep / count_worktrees / list_orphan_worktrees / setup_worktree / file / log.{info,warn,error} / now`
+`pipeline / source / raise / spawn_codex_sync / spawn_codex / exec_sync / await_all / with_lock / git_log_count / git_log_grep / count_worktrees / list_orphan_worktrees / setup_worktree / file / json.decode / log.{info,warn,error} / now`
 
-其中 `pipeline` 与 `source` 是 graph/package 侧约定，Rust 注册的运行时 primitive 是 `raise`、codex、exec、await、lock、git/worktree、file、log、now。新增 SDK 函数就是扩 trusted base，必须走 Tier III 测试和 conformance，不能顺手加入。
+其中 `pipeline` 与 `source` 是 graph/package 侧约定，Rust 注册的运行时 primitive 是 `raise`、codex、exec、await、lock、git/worktree、file、json、log、now。`json` 仅 decode（`json.decode`）：JSON 是 engine wire format，Lua 值经 `raise` 出引擎，故不提供 `json.encode`。新增 SDK 函数就是扩 trusted base，必须走 Tier III 测试和 conformance，不能顺手加入。
 
 framework 看得见的概念只有 `event`、`source`、`queue`、`pipeline`、`coroutine/Lua state`、`worktree`、`subprocess`、`git ref`、`filesystem`、`file lock`、`time`。framework 看不见业务轮次、业务关卡、业务阶段、判断策略、审查策略、退避策略、重试策略、修复尝试、审计会话或任何具体业务部门名。
 

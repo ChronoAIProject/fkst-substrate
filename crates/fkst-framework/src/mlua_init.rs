@@ -24,6 +24,7 @@ pub fn register_framework_sdk(
     crate::sdk_log::register(lua)?;
     crate::sdk_basic::register(lua)?;
     crate::sdk_fs::register(lua)?;
+    crate::sdk_json::register(lua)?;
     crate::sdk_git::register(lua, host_root, config.clone())?;
     crate::sdk_codex::register(lua, host_root, config)?;
     crate::raise::register(lua, raise_buf)?;

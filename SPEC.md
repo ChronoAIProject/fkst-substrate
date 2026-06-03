@@ -58,8 +58,9 @@
 
 ## SDK surface
 
-- 固定 Lua SDK surface 锚点是 `fixed-lua-sdk-surface`；允许 surface 是 `pipeline`、`source`、`raise`、`spawn_codex_sync`、`spawn_codex`、`exec_sync`、`await_all`、`with_lock`、`git_log_count`、`git_log_grep`、`count_worktrees`、`list_orphan_worktrees`、`setup_worktree`、`file`、`log.info`、`log.warn`、`log.error`、`now`。
+- 固定 Lua SDK surface 锚点是 `fixed-lua-sdk-surface`；允许 surface 是 `pipeline`、`source`、`raise`、`spawn_codex_sync`、`spawn_codex`、`exec_sync`、`await_all`、`with_lock`、`git_log_count`、`git_log_grep`、`count_worktrees`、`list_orphan_worktrees`、`setup_worktree`、`file`、`json.decode`、`log.info`、`log.warn`、`log.error`、`now`。
 - `spawn_codex` handle 只能由 `await_all` join；单 handle 等待使用 `await_all({handle})`；first-result fanout 与 sleep timer 不是固定 Lua SDK surface。
+- `json` 是 decode-only：`json.decode` 暴露 engine 自身 JSON wire format 的解析（event 进、`raise` 出都是 JSON），Lua 值经 `raise` 出引擎，故不提供 `json.encode`；`json` table 锁定为只含 `decode`，新增 encode 或其它 key 必须另走 evidence + conformance。
 - 新增 SDK 函数必须经 evidence、深度共识与 conformance 覆盖，不能由单个 codex 实例直接扩张。
 
 ## 改动范围
