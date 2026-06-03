@@ -150,12 +150,13 @@ run 模式未传 --project-root 时可从 Lua 路径推断
 | `Worktrees` | `<RT>/worktrees` | 隔离 worktree | `sdk_git::setup_worktree`(`git worktree add`) | `count_worktrees` / `list_orphan_worktrees` |
 | `CodexPermits` | `<RT>/codex-permits` | `permit-*` fcntl codex 并发池 | `sdk_codex`(建池 + flock 占位) | `spawn_codex` 抢 permit |
 | `Locks` | `<RT>/locks` | fcntl 锁文件 | `sdk_git::with_lock` | 同 — 跨 pipeline 互斥 |
-| `Logs` | `<RT>/logs` | 过程日志 | `supervise::spawner`(framework-child)+ `sdk_codex`(codex log) | 人手 / 调试,非 file_watch 输入 |
+| `Logs` | `<RT>/logs` | 过程日志 | `supervise::spawner`(framework-child;dept `log.*` 经 stderr 捕获于此) | 人手 / 调试,非 file_watch 输入 |
 
 说明:
 - **engine 自己只写 scratch 结构事实**(worktree / permit / lock / log)。package 不访问 `<RT>`，也不把 `<RT>` 当 inbox、完成态或业务 schema 数据库。
 - `RuntimeLayout` 只提供固定 runtime dir 解析，framework 先把相对 runtime root 锚到 `<HOST>` 再建路径。
 - 已移除的 runtime scheme 不再是 graph surface；`file_watch` 只接受 host-root 相对或绝对 glob。
+- codex log **不属** `RuntimeKind`/`<RT>`:`sdk_codex` 把它落到 `FKST_RUNTIME_LOG_DIR` 或平台默认目录(如 `~/Library/Logs/fkst`)下的 `codex/`。它与 `<RT>/logs` 同属 process-trace scratch(可 grep、非事实源),但落点不同,`supervise` 也不给 framework child 注入 `FKST_RUNTIME_LOG_DIR`。
 - engine **不写** runtime 持久状态(无 `refs/known-good` / accepted-state / rollback —— 那是外部 release pipeline 的事实,见 §12)。
 
 ## 7. 运行态数据流
