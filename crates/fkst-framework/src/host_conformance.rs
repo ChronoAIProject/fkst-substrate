@@ -84,11 +84,10 @@ impl HostConformanceSuite {
     fn check_runtime_layout(&self) -> HostCheck {
         match crate::runtime_context::layout_from_host_root(self.options.roots.host_root())
             .and_then(|layout| {
-                layout.runtime_path(RuntimeKind::Artifacts, "")?;
-                layout.runtime_path(RuntimeKind::Worktrees, "")?;
-                layout.runtime_path(RuntimeKind::CodexPermits, "")?;
-                layout.runtime_path(RuntimeKind::Locks, "")?;
-                layout.runtime_path(RuntimeKind::Logs, "")?;
+                layout.runtime_dir(RuntimeKind::Worktrees);
+                layout.runtime_dir(RuntimeKind::CodexPermits);
+                layout.runtime_dir(RuntimeKind::Locks);
+                layout.runtime_dir(RuntimeKind::Logs);
                 Ok(layout)
             }) {
             Ok(layout) => HostCheck::pass(

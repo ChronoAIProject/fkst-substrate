@@ -8,7 +8,6 @@ pub const RUNTIME_ROOT_ENV: &str = "FKST_RUNTIME_ROOT";
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 // runtime path categories are explicit and bounded before path construction.
 pub enum RuntimeKind {
-    Artifacts,
     Worktrees,
     CodexPermits,
     Locks,
@@ -22,21 +21,8 @@ pub struct RuntimeLayout {
 }
 
 impl RuntimeKind {
-    // external kind strings enter through one checked parser.
-    pub fn parse(value: &str) -> Result<Self> {
-        match value {
-            "artifacts" => Ok(Self::Artifacts),
-            "worktrees" => Ok(Self::Worktrees),
-            "codex_permits" | "codex-permits" => Ok(Self::CodexPermits),
-            "locks" => Ok(Self::Locks),
-            "logs" => Ok(Self::Logs),
-            _ => Err(anyhow!("unknown runtime kind: {value}")),
-        }
-    }
-
     fn dir_name(self) -> &'static str {
         match self {
-            Self::Artifacts => "artifacts",
             Self::Worktrees => "worktrees",
             Self::CodexPermits => "codex-permits",
             Self::Locks => "locks",
@@ -70,13 +56,6 @@ impl RuntimeLayout {
     pub fn runtime_dir(&self, kind: RuntimeKind) -> PathBuf {
         self.root.join(kind.dir_name())
     }
-
-    // child paths are rejected if they escape the selected runtime kind.
-    pub fn runtime_path(&self, kind: RuntimeKind, relative: impl AsRef<Path>) -> Result<PathBuf> {
-        let relative = relative.as_ref();
-        reject_relative_fragment(relative)?;
-        Ok(self.runtime_dir(kind).join(relative))
-    }
 }
 
 fn reject_traversal(path: &Path) -> Result<()> {
@@ -86,23 +65,6 @@ fn reject_traversal(path: &Path) -> Result<()> {
     for component in path.components() {
         if matches!(component, Component::ParentDir) {
             return Err(anyhow!("runtime root must not contain parent traversal"));
-        }
-    }
-    Ok(())
-}
-
-fn reject_relative_fragment(path: &Path) -> Result<()> {
-    if path.as_os_str().is_empty() {
-        return Ok(());
-    }
-    for component in path.components() {
-        match component {
-            Component::Normal(_) | Component::CurDir => {}
-            _ => {
-                return Err(anyhow!(
-                    "runtime relative path must stay below its kind directory"
-                ))
-            }
         }
     }
     Ok(())
@@ -166,10 +128,8 @@ mod tests {
         let _root = EnvGuard::set(RUNTIME_ROOT_ENV, ".fkst/custom-runtime");
         let layout = RuntimeLayout::from_env().unwrap();
         assert_eq!(
-            layout
-                .runtime_path(RuntimeKind::Artifacts, "mailbox/threads/a")
-                .unwrap(),
-            PathBuf::from(".fkst/custom-runtime/artifacts/mailbox/threads/a")
+            layout.runtime_dir(RuntimeKind::Logs),
+            PathBuf::from(".fkst/custom-runtime/logs")
         );
     }
 
@@ -185,17 +145,5 @@ mod tests {
     #[test]
     fn traversal_is_rejected() {
         assert!(RuntimeLayout::new("../runtime").is_err());
-        let layout = RuntimeLayout::new(".fkst/runtime").unwrap();
-        assert!(layout.runtime_path(RuntimeKind::Artifacts, "../x").is_err());
-        assert!(layout
-            .runtime_path(RuntimeKind::Artifacts, "/tmp/x")
-            .is_err());
-    }
-
-    #[test]
-    fn unknown_kind_is_rejected() {
-        assert!(RuntimeKind::parse("unknown").is_err());
-        assert!(RuntimeKind::parse("pipeline").is_err());
-        assert!(RuntimeKind::parse("mailbox").is_err());
     }
 }
