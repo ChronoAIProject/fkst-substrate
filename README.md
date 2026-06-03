@@ -49,6 +49,8 @@ Department 收到的标准事件结构是 `Event{queue,payload,ts}`。producer �
 [{"queue":"example_event","payload":{"from":"producer","note":"opaque example payload","source_queue":"tick","source_raiser":"tick"}}]
 ```
 
+`run --event` 是单 pipeline 注入，示例里的事件不会获得 runtime 生成的 `ts`；consumer 示例使用 `ts=0` 只是占位。只有真实 supervise 派发时，runtime 才会补上 numeric `ts`。
+
 真实 supervise 派发给 consumer 的标准事件会包含 runtime 生成的 `ts`，实际值会变：
 
 ```json

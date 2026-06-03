@@ -5,7 +5,7 @@ use serde_json::Value;
 use std::fs;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Output};
+use std::process::{Child, Command, ExitStatus, Output};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -118,6 +118,39 @@ fn read_framework_child_logs(runtime: &Path) -> String {
     body
 }
 
+fn read_framework_child_log_bodies(runtime: &Path) -> Vec<String> {
+    let dir = runtime.join("logs/framework-child");
+    let Ok(entries) = fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .filter_map(|entry| {
+            let path = entry.path();
+            if path.is_file() {
+                fs::read_to_string(path).ok()
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+fn consumer_log_completed(runtime: &Path) -> Option<String> {
+    read_framework_child_log_bodies(runtime)
+        .into_iter()
+        .find(|log| {
+            log.contains("consumer received Event{queue=example_event") && log.contains("EXIT=0\n")
+        })
+}
+
+fn consumer_ts(logs: &str) -> Option<u64> {
+    logs.lines()
+        .find(|line| line.contains("consumer received Event{queue=example_event"))
+        .and_then(|line| line.split("ts=").nth(1))
+        .and_then(|tail| tail.trim_end_matches('}').parse::<u64>().ok())
+}
+
 fn stop_supervise(child: &mut Child) {
     let pid = child.id() as i32;
     let pgid = Pid::from_raw(-pid);
@@ -131,6 +164,26 @@ fn stop_supervise(child: &mut Child) {
     }
     let _ = kill(pgid, Signal::SIGKILL);
     let _ = child.wait();
+}
+
+struct SuperviseGuard {
+    child: Child,
+}
+
+impl SuperviseGuard {
+    fn new(child: Child) -> Self {
+        Self { child }
+    }
+
+    fn try_wait(&mut self) -> std::io::Result<Option<ExitStatus>> {
+        self.child.try_wait()
+    }
+}
+
+impl Drop for SuperviseGuard {
+    fn drop(&mut self) {
+        stop_supervise(&mut self.child);
+    }
 }
 
 #[test]
@@ -163,6 +216,7 @@ fn producer_raises_example_event_from_tick() {
     assert_success(&producer);
 
     let raised = decode_raised(&stdout(&producer));
+    assert_eq!(raised.as_array().unwrap().len(), 1, "raised={raised}");
     assert_eq!(raised[0]["queue"], "example_event");
     assert_eq!(raised[0]["payload"]["from"], "producer");
     assert_eq!(raised[0]["payload"]["source_queue"], "tick");
@@ -202,7 +256,7 @@ fn supervise_routes_raised_event_to_consumer() {
     let runtime = tempfile::tempdir().unwrap();
     copy_minimal_package(host.path());
 
-    let mut child = Command::new(framework_bin())
+    let child = Command::new(framework_bin())
         .arg("supervise")
         .arg("--project-root")
         .arg(host.path())
@@ -215,21 +269,21 @@ fn supervise_routes_raised_event_to_consumer() {
         .process_group(0)
         .spawn()
         .unwrap();
+    let mut supervise = SuperviseGuard::new(child);
 
     let deadline = Instant::now() + Duration::from_secs(30);
     let mut logs = String::new();
     while Instant::now() < deadline {
         logs = read_framework_child_logs(runtime.path());
-        if logs.contains("consumer received Event{queue=example_event") {
+        if let Some(log) = consumer_log_completed(runtime.path()) {
+            logs = log;
             break;
         }
-        if let Some(status) = child.try_wait().unwrap() {
+        if let Some(status) = supervise.try_wait().unwrap() {
             panic!("supervise exited early with {status}; logs={logs}");
         }
         thread::sleep(Duration::from_millis(100));
     }
-
-    stop_supervise(&mut child);
 
     assert!(
         logs.contains("consumer received Event{queue=example_event"),
@@ -239,5 +293,8 @@ fn supervise_routes_raised_event_to_consumer() {
     assert!(logs.contains("note=opaque example payload"), "logs={logs}");
     assert!(logs.contains("source_queue=tick"), "logs={logs}");
     assert!(logs.contains("source_raiser=tick"), "logs={logs}");
-    assert!(logs.contains("ts="), "logs={logs}");
+    assert!(!logs.contains("ts=nil"), "logs={logs}");
+    let ts = consumer_ts(&logs).unwrap_or_else(|| panic!("missing numeric ts in logs={logs}"));
+    assert!(ts > 0, "logs={logs}");
+    assert!(logs.contains("EXIT=0\n"), "logs={logs}");
 }

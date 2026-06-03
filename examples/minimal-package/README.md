@@ -10,6 +10,8 @@
 
 Department 收到的标准事件结构是 `Event{queue,payload,ts}`。`raise` 自身只输出 queue 和 payload；runtime 在重新派发时生成 `ts`。
 
+`run --event` 是单 pipeline 注入，示例里的事件不会获得 runtime 生成的 `ts`；consumer 示例使用 `ts=0` 只是占位。只有真实 supervise 派发时，runtime 才会补上 numeric `ts`。
+
 producer 的 `RAISED:` 解码后形状如下，注意这里还没有 `ts`：
 
 ```json
