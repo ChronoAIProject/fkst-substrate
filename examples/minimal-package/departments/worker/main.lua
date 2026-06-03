@@ -9,6 +9,10 @@ local function done_path(id)
   return "state/done/" .. id .. ".txt"
 end
 
+local function temp_done_path(id)
+  return "state/done/." .. id .. ".tmp"
+end
+
 local function ensure_done_dir()
   local out = exec_sync("mkdir -p state/done")
   assert(out.exit_code == 0, "failed to create state/done")
@@ -42,7 +46,10 @@ function pipeline(event)
       "done_at=" .. tostring(now()),
       "",
     }, "\n")
-    file.write(target, content)
+    local temp = temp_done_path(id)
+    file.write(temp, content)
+    local moved = exec_sync("mv -f " .. temp .. " " .. target)
+    assert(moved.exit_code == 0, "failed to move done marker")
     log.info("work completed: " .. id)
   end)
 end

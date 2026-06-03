@@ -210,7 +210,7 @@ engine 不维护消息状态。`处理中` 可以是 `with_lock` 租约（进程
 | `spawn_codex(opts)` | `sdk_codex.rs`，返回 pipeline-local handle |
 | `await_all(handles)` | `sdk_codex.rs`，join handles，防跨 pipeline/重复消费 |
 | `exec_sync(cmd|opts)` | `sdk_basic.rs`，运行 `/bin/sh -c`，可选 cwd/env/timeout |
-| `with_lock(path, fn)` | `sdk_git.rs`，fcntl exclusive flock |
+| `with_lock(name, fn)` | `sdk_git.rs`，fcntl exclusive flock |
 | `git_log_count(grep, since)` | `sdk_git.rs`，调用 `git log --grep --since --oneline` |
 | `git_log_grep(grep, since)` | `sdk_git.rs`，调用 `git log --format=%H` |
 | `count_worktrees()` | `sdk_git.rs`，解析 `git worktree list --porcelain` |
@@ -248,7 +248,7 @@ supervise 运行在 current-thread tokio runtime 内，但每个 Department even
 
 Codex SDK 也把 `codex exec` 放入 process group。stall 时 kill process group。permit 池使用 fcntl lock file，不是内存 semaphore。permit 数来自 registry 的 `codex_permit_slots`：env 或 host `fkst.env` 可覆盖，未设置时默认 `20`。
 
-`with_lock(path, fn)` 是跨 pipeline 互斥 primitive。它打开 path，获取 exclusive flock，执行 Lua function，释放 file handle。进程死时 lock 自动释放。
+`with_lock(name, fn)` 是跨 pipeline 互斥 primitive。它把锁名解析到 `<RT>/locks/<name>` 并打开，获取 exclusive flock，执行 Lua function，释放 file handle。进程死时 lock 自动释放。
 
 ## 12. Git 与 Worktree Primitives
 

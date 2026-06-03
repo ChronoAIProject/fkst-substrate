@@ -1,5 +1,5 @@
 //! SDK: git + filesystem-lock helpers.
-//! - with_lock(path, fn)        -- exclusive flock for cross-process mutual exclusion
+//! - with_lock(name, fn)        -- exclusive flock under <runtime>/locks
 //! - setup_worktree(prefix)     -- git worktree add -b <branch> <runtime>/worktrees/<prefix>-<ULID>
 //! - git_log_count(grep, since) -- count `git log --grep=<g> --since=<s>` entries
 //! - git_log_grep(grep, since)  -- list commit hashes matching `git log --grep=<g> --since=<s>`
@@ -19,7 +19,7 @@ use crate::runtime_context;
 
 pub fn register(lua: &Lua, host_root: &Path, config: ConfigContext) -> Result<()> {
     let host_root = host_root.to_path_buf();
-    register_with_lock(lua)?;
+    register_with_lock(lua, host_root.clone())?;
     register_setup_worktree(lua, host_root.clone(), config)?;
     register_git_log_count(lua, host_root.clone())?;
     register_git_log_grep(lua, host_root.clone())?;
@@ -36,16 +36,22 @@ fn read_failure(label: &str, stderr: &[u8]) -> mlua::Error {
     ))
 }
 
-fn register_with_lock(lua: &Lua) -> Result<()> {
+fn register_with_lock(lua: &Lua, host_root: PathBuf) -> Result<()> {
     lua.globals().set(
         "with_lock",
-        lua.create_function(|_, (path, f): (String, Function)| {
+        lua.create_function(move |_, (name, f): (String, Function)| {
+            validate_lock_name(&name)?;
+            let layout = runtime_context::layout_from_host_root(&host_root)
+                .map_err(mlua::Error::external)?;
+            let locks = layout.runtime_dir(RuntimeKind::Locks);
+            std::fs::create_dir_all(&locks).map_err(mlua::Error::external)?;
+            let path = locks.join(&name);
             let file = std::fs::OpenOptions::new()
                 .create(true)
                 .truncate(false)
                 .read(true)
                 .write(true)
-                .open(&path)
+                .open(path)
                 .map_err(mlua::Error::external)?;
 
             flock(file.as_raw_fd(), FlockArg::LockExclusive).map_err(mlua::Error::external)?;
@@ -55,6 +61,20 @@ fn register_with_lock(lua: &Lua) -> Result<()> {
             result
         })?,
     )?;
+    Ok(())
+}
+
+fn validate_lock_name(name: &str) -> Result<()> {
+    let invalid = name.is_empty()
+        || Path::new(name).is_absolute()
+        || name.contains('/')
+        || name.contains('\\')
+        || name.contains("..");
+    if invalid {
+        return Err(mlua::Error::external(anyhow::anyhow!(
+            "with_lock name must be a single path segment"
+        )));
+    }
     Ok(())
 }
 

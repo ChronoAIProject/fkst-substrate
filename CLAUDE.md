@@ -46,7 +46,7 @@ Person 是一次 `codex exec` 子进程。它通过 `spawn_codex_sync` 或 `spaw
 
 跨 pipeline 的稳定事实只允许来自 `git refs/commits/branches`、filesystem 和 fcntl 文件锁。内存是 cache，进程死后归零。没有 record 即不存在；进程内“觉得发生了”不是事实。
 
-framework 不写持久状态文件。`RuntimeLayout` 把 `FKST_RUNTIME_ROOT` 下的路径限制为 `pipeline`、`mailbox`、`worktrees`、`codex-permits`、`locks`、`logs`。这些是运行时事实和过程日志的落点；它们不是业务 schema 数据库。
+framework 不写持久状态文件。`RuntimeLayout` 把 `FKST_RUNTIME_ROOT` 下的路径限制为 `worktrees`、`codex-permits`、`locks`、`logs`。这些是引擎一次性 scratch 落点；package 不在 `<RT>` 下放 inbox、完成态或业务 schema。
 
 禁止 SQLite、KV store、通用 event log、`.current`、`.heartbeat`、`.next-sha`、进程内计数器或状态文件承担事实源职责。派生状态从事实源重读：计数用 `git_log_count` 或 `count_worktrees`，去重用 `git_log_grep`，互斥用 `with_lock` 或 codex permit pool。
 

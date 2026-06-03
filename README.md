@@ -40,7 +40,7 @@ target/debug/fkst-framework config \
 下列命令证明的范围如下：
 
 - `conformance`：minimal-package 的 scanner/worker 图通过 validation。
-- `run scanner`：单个 scanner pipeline 扫描请求并为未完成请求发出 `RAISED: work`。
+- `run scanner`：单个 scanner pipeline 扫描请求并为未完成请求输出一行 `RAISED:` 前缀的 base64 编码事件，解码后 queue 为 `work`。
 - `run worker`：单个 worker pipeline 消费 work，并写入 `state/done/req-001.txt`。
 
 ```sh
@@ -53,7 +53,7 @@ target/debug/fkst-framework conformance \
   --package-root "$tmp_host"
 (
   cd "$tmp_host" &&
-  "$repo/target/debug/fkst-framework" run \
+  FKST_RUNTIME_ROOT="$tmp_host/.fkst/runtime" "$repo/target/debug/fkst-framework" run \
     "$tmp_host/departments/scanner/main.lua" \
     --project-root "$tmp_host" \
     --package-root "$tmp_host" \
@@ -61,7 +61,7 @@ target/debug/fkst-framework conformance \
 )
 (
   cd "$tmp_host" &&
-  "$repo/target/debug/fkst-framework" run \
+  FKST_RUNTIME_ROOT="$tmp_host/.fkst/runtime" "$repo/target/debug/fkst-framework" run \
     "$tmp_host/departments/worker/main.lua" \
     --project-root "$tmp_host" \
     --package-root "$tmp_host" \
@@ -69,7 +69,7 @@ target/debug/fkst-framework conformance \
 )
 ```
 
-scanner 输出应包含 `RAISED: work`。worker 运行后，`$tmp_host/state/done/req-001.txt` 存在；再次运行 scanner 时不会再为 `req-001` raise work。
+scanner 输出应包含一行 `RAISED:` 前缀的 base64 编码事件，解码后 queue 为 `work`。worker 运行后，`$tmp_host/state/done/req-001.txt` 存在；再次运行 scanner 时不会再为 `req-001` raise work。
 
 ## 发布边界
 

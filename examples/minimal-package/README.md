@@ -23,7 +23,7 @@ target/debug/fkst-framework conformance \
   --package-root "$tmp_host"
 (
   cd "$tmp_host" &&
-  "$repo/target/debug/fkst-framework" run \
+  FKST_RUNTIME_ROOT="$tmp_host/.fkst/runtime" "$repo/target/debug/fkst-framework" run \
     "$tmp_host/departments/scanner/main.lua" \
     --project-root "$tmp_host" \
     --package-root "$tmp_host" \
@@ -31,7 +31,7 @@ target/debug/fkst-framework conformance \
 )
 (
   cd "$tmp_host" &&
-  "$repo/target/debug/fkst-framework" run \
+  FKST_RUNTIME_ROOT="$tmp_host/.fkst/runtime" "$repo/target/debug/fkst-framework" run \
     "$tmp_host/departments/worker/main.lua" \
     --project-root "$tmp_host" \
     --package-root "$tmp_host" \
@@ -39,6 +39,6 @@ target/debug/fkst-framework conformance \
 )
 ```
 
-scanner 输出应包含 `RAISED: work`。worker 运行后会产生 `state/done/req-001.txt`；再次运行 scanner 时不会再为 `req-001` raise work。
+scanner 输出应包含一行 `RAISED:` 前缀的 base64 编码事件，解码后 queue 为 `work`。worker 运行后会产生 `state/done/req-001.txt`；再次运行 scanner 时不会再为 `req-001` raise work。
 
 ⟦AI:FKST⟧
