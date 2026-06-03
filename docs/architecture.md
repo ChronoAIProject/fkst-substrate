@@ -183,7 +183,7 @@ parse_raised from stdout tail
 Fanout::send(raised.queue, raised_event)
 ```
 
-`consumer.rs` 为每个 Department 的每个 consumed queue 建 receiver，再汇入该 Department 的 inbox。每个事件 spawn 一个 framework child，不是在 supervisor 进程内直接调用 Lua。framework child 的 stdout/stderr 会写到 `<RT>/logs/framework-child/` 下的具名 log；RAISED 解析不依赖 log 文件，而是解析 captured stdout。
+`consumer.rs` 为每个 Department 的每个 consumed queue 建 receiver，再汇入该 Department 的 inbox。每个事件 spawn 一个 framework child，不是在 supervisor 进程内直接调用 Lua。framework child 的 stdout/stderr 会写到 `<RT>/logs/framework-child/` 下的具名 log；dept 的 `log.*` 以结构化行写 stderr，并由这个具名 log 捕获。RAISED 解析不依赖 log 文件，而是解析 captured stdout。
 
 `raise` 不落盘。需要 durable intent 或完成事实时，package/host 必须显式写入 git commit、host repo 文件或外部源，再由 package controller 通过 `file_watch` 或 scanner 重新引入事件。
 
@@ -191,11 +191,11 @@ Fanout::send(raised.queue, raised_event)
 
 内存队列是瞬时队列。它只存在于当前 `fkst-framework supervise` 进程和 supervisor 生命周期内；进程挂掉、supervisor 重启或 host 迁移时队列内容丢失。engine 不把 queue 当 durable message state,不跨机同步队列,也不引入 MQ broker。
 
-durable 真相来自可观测事实：git commit、host repo 文件与外部源（例如 GitHub issue）。host repo 文件适合本地或单机演示；真正跨机或长期保留的完成事实应进入 git commit 或外部源。`<RT>` 只是一轮运行的一次性 scratch，`locks` 也不是 durable 真相——`with_lock` 只是进程死即释放的**处理中租约/协调事实**，不承载完成态。engine 只提供 `file`、`file_watch`、cron、git/worktree 和 `with_lock` 等原语，不拥有 scanner 部门、inbox schema、done 判定、重试策略或幂等语义。
+durable 真相来自可观测事实：git commit、明确的 host filesystem fact 与外部源（例如 GitHub issue）。真正跨机或长期保留的完成事实应进入 git commit 或外部源。`<RT>` 只是一轮运行的一次性 scratch，`locks` 也不是 durable 真相——`with_lock` 只是进程死即释放的**处理中租约/协调事实**，不承载完成态。engine 只提供 `file`、`file_watch`、cron、git/worktree 和 `with_lock` 等原语，不拥有 scanner 部门、inbox schema、done 判定、重试策略或幂等语义。
 
 恢复模型是 control-loop：package controller 用 cron / file_watch scanner 扫描 durable 源，reconcile 未完成工作，并重新 enqueue 对应事件。崩溃等价于从 0 重来；in-flight 事件丢失后，下一拍从 durable 源重新推导。幂等由 package controller 保证；engine 只负责把重新 raised / scanned 的事件送入当前内存队列。
 
-engine 不维护消息状态。`处理中` 可以是 `with_lock` 租约（进程死后 fcntl lock 自动释放）或 worktree 等可观测事实；`done` 是 commit、host repo 文件或外部源事实。engine 明确不提供 message state、ack / visibility timeout、dead-letter queue、状态队列或 durable broker。
+engine 不维护消息状态。`处理中` 可以是 `with_lock` 租约（进程死后 fcntl lock 自动释放）或 worktree 等可观测事实；`done` 是 commit、明确的 host filesystem fact 或外部源事实。engine 明确不提供 message state、ack / visibility timeout、dead-letter queue、状态队列或 durable broker。
 
 ## 9. SDK Surface
 
@@ -217,7 +217,7 @@ engine 不维护消息状态。`处理中` 可以是 `with_lock` 租约（进程
 | `list_orphan_worktrees(prefix)` | `sdk_git.rs`，列 `<RT>/worktrees/<prefix>*` linked worktree |
 | `setup_worktree(prefix)` | `sdk_git.rs`，创建 `<RT>/worktrees/<prefix>-<ULID>` 和 candidate branch |
 | `file.read/write/exists` | `sdk_fs.rs` |
-| `log.info/warn/error` | `sdk_log.rs`，写 stderr |
+| `log.info/warn/error` | `sdk_log.rs`，结构化行写 stderr，由 supervise 捕获进 framework-child log |
 | `now()` | `sdk_basic.rs`，Unix seconds |
 
 `spawn_codex` 的 handle 只能由同一个 Lua pipeline 的 `await_all` 消费。单 handle 等待用 `await_all({handle})`。没有 sleep timer、first-result fanout、业务 retry、provider abstraction 或动态 SDK extension。

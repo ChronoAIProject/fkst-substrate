@@ -44,13 +44,13 @@ Person 是一次 `codex exec` 子进程。它通过 `spawn_codex_sync` 或 `spaw
 
 ## 状态与持久化
 
-跨 pipeline 的稳定事实只允许来自 `git refs/commits/branches`、filesystem 和 fcntl 文件锁。内存是 cache，进程死后归零。没有 record 即不存在；进程内“觉得发生了”不是事实。
+跨 pipeline 的 durable 真相只允许来自 `git refs/commits/branches`、外部源和明确的 host filesystem fact。engine 不替它们持久，不存任何“为活过崩溃”的东西。内存是 cache，进程死后归零；事件队列、raise buffer 和 in-flight pipeline 都是瞬时过程。framework 进程独立一次性，崩溃等价从 0 重来；不为故障恢复/持久化做任何设计。恢复只能由 cron/file_watch scanner 从 git、明确 host filesystem fact 或外部源重新推导，不恢复内存或 in-flight 工作。没有 record 即不存在；进程内“觉得发生了”不是事实。
 
-framework 不写持久状态文件。`RuntimeLayout` 把 `FKST_RUNTIME_ROOT` 下的路径限制为 `worktrees`、`codex-permits`、`locks`、`logs`。这些是引擎一次性 scratch 落点；package 不在 `<RT>` 下放 inbox、完成态或业务 schema。
+framework 不写持久状态文件。`RuntimeLayout` 把 `FKST_RUNTIME_ROOT` 下的路径限制为 `worktrees`、`codex-permits`、`locks`、`logs`。这些是引擎一次性 scratch 落点；package 不在 `<RT>` 下放 inbox、完成态或业务 schema。package root / source tree 在运行期只读，只承载代码、fixture 和 asset；运行产生物只能落 RuntimeLayout scratch、明确 host fact boundary、git commit 或外部源，不得写回 package 代码树。
 
 禁止 SQLite、KV store、通用 event log、`.current`、`.heartbeat`、`.next-sha`、进程内计数器或状态文件承担事实源职责。派生状态从事实源重读：计数用 `git_log_count` 或 `count_worktrees`，去重用 `git_log_grep`，互斥用 `with_lock` 或 codex permit pool。
 
-失败是一等输出。pipeline 失败可以产生日志、失败 commit、失败 socket 文件或无 commit，但不能停在隐形状态。可观察性来自 git、filesystem、fcntl lock witness 和落盘日志，不来自 dashboard 或外部 telemetry。
+失败是一等输出。pipeline 失败可以产生日志、失败 commit、失败 socket 文件或无 commit，但不能停在隐形状态。日志是 supervisor / framework / dept 三层过程可追溯记录，落 `<RT>/logs` scratch，可 grep、可调试；它不是事实源、不是 reconciliation 输入、不是 accepted state。dept 的 `log.*` 走 stderr，由 supervise 捕获进 framework-child 具名 log；framework/codex 各自落 `<RT>/logs` 同一 scratch 家族。可观察性来自 git、filesystem、fcntl lock witness 和落盘日志，不来自 dashboard 或外部 telemetry。
 
 ## 并发模型
 

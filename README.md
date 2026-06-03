@@ -33,15 +33,15 @@ target/debug/fkst-framework config \
 
 ## 独立运行
 
-本仓库内置一个 reconciliation/control-loop 最小 package：`examples/minimal-package`。它声明 cron source `reconcile_tick`、file_watch source `request_changed`、`scanner` 与 `worker`。cron 和文件变更都会触发 scanner 全量扫描 host repo 里的 `requests/*.md`，只为 `state/done/<id>.txt` 不存在的请求 raise `work`；worker 抢一次性 `with_lock` 租约，重查 done 文件后写入 host repo 普通文件作为完成事实。
+本仓库内置一个 log-only 最小 package：`examples/minimal-package`。它声明 cron source `reconcile_tick`、file_watch source `request_changed`、`scanner` 与 `worker`。cron 和文件变更都会触发 scanner 全量扫描 host repo 里的 `requests/*.md`，并为每个请求 raise `work`；worker 消费 `work`，读取请求摘要，并通过 `log.info` 写结构化过程日志。
 
-`FKST_RUNTIME_ROOT` 仍是引擎 scratch 配置，用于 worktree、codex permit、lock 与 log 等运行时落点；这个示例 Lua 不读取它，也不把 `<RT>` 当 package 状态目录。示例运行产生的 `state/done/` 是 host repo 文件，用来演示本地 durable 事实。
+`FKST_RUNTIME_ROOT` 仍是引擎 scratch 配置，用于 worktree、codex permit、lock 与 log 等运行时落点；这个示例 Lua 不读取它，也不把 `<RT>` 当 package 状态目录。示例只展示 source → scanner → raise → worker → log 的过程链路，不声明完成事实。真实 package 的幂等 done 事实应来自 git commit、外部源或明确的 host filesystem fact。
 
 下列命令证明的范围如下：
 
 - `conformance`：minimal-package 的 scanner/worker 图通过 validation。
-- `run scanner`：单个 scanner pipeline 扫描请求并为未完成请求输出一行 `RAISED:` 前缀的 base64 编码事件，解码后 queue 为 `work`。
-- `run worker`：单个 worker pipeline 消费 work，并写入 `state/done/req-001.txt`。
+- `run scanner`：单个 scanner pipeline 扫描请求并输出一行 `RAISED:` 前缀的 base64 编码事件，解码后 queue 为 `work`。
+- `run worker`：单个 worker pipeline 消费 work，并向 stderr 写结构化 `work completed` 日志行。
 
 ```sh
 cargo build --workspace
@@ -53,7 +53,7 @@ target/debug/fkst-framework conformance \
   --package-root "$tmp_host"
 (
   cd "$tmp_host" &&
-  FKST_RUNTIME_ROOT="$tmp_host/.fkst/runtime" "$repo/target/debug/fkst-framework" run \
+  "$repo/target/debug/fkst-framework" run \
     "$tmp_host/departments/scanner/main.lua" \
     --project-root "$tmp_host" \
     --package-root "$tmp_host" \
@@ -61,7 +61,7 @@ target/debug/fkst-framework conformance \
 )
 (
   cd "$tmp_host" &&
-  FKST_RUNTIME_ROOT="$tmp_host/.fkst/runtime" "$repo/target/debug/fkst-framework" run \
+  "$repo/target/debug/fkst-framework" run \
     "$tmp_host/departments/worker/main.lua" \
     --project-root "$tmp_host" \
     --package-root "$tmp_host" \
@@ -69,7 +69,7 @@ target/debug/fkst-framework conformance \
 )
 ```
 
-scanner 输出应包含一行 `RAISED:` 前缀的 base64 编码事件，解码后 queue 为 `work`。worker 运行后，`$tmp_host/state/done/req-001.txt` 存在；再次运行 scanner 时不会再为 `req-001` raise work。
+scanner 输出应包含一行 `RAISED:` 前缀的 base64 编码事件，解码后 queue 为 `work`。worker 的 stderr 应包含结构化日志行，例如 `LEVEL=info MSG=work completed: req-001`。再次运行 scanner 仍会为 `req-001` raise work；这个 log-only 示例不证明幂等。
 
 ## 发布边界
 
@@ -77,7 +77,7 @@ fkst-substrate 的 accepted release state 来自外部 release pipeline，而不
 
 host/package 可以在此 runtime 上编排 SDLC 工作流，但这属于外部行为层，不是 engine 内建职责。
 
-engine 队列是瞬时的；durable 真相属于 git commit、host repo 文件或外部源，不在 engine 内部维护。崩溃后由 cron/file_watch 触发 scanner 重新扫描 durable 源并推导未完成工作。
+engine 队列是瞬时的；durable 真相属于 git commit、明确的 host filesystem fact 或外部源，不在 engine 内部维护。崩溃后由 cron/file_watch 触发 scanner 重新扫描 durable 源并推导未完成工作。
 
 ## 文档
 
