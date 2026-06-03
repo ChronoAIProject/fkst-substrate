@@ -1,6 +1,7 @@
 use crate::path_resolver::PackageRoots;
 use crate::supervise;
 use anyhow::{Context, Result};
+use fkst_common::runtime_layout::RUNTIME_ROOT_ENV;
 use fkst_common::validation::validate;
 use fkst_common::RuntimeKind;
 
@@ -82,13 +83,22 @@ impl HostConformanceSuite {
     }
 
     fn check_runtime_layout(&self) -> HostCheck {
+        if std::env::var_os(RUNTIME_ROOT_ENV)
+            .filter(|value| !value.is_empty())
+            .is_none()
+        {
+            return HostCheck::pass(
+                "runtime-layout",
+                format!("{RUNTIME_ROOT_ENV} not set; runtime scratch unused by conformance"),
+            );
+        }
+
         match crate::runtime_context::layout_from_host_root(self.options.roots.host_root())
             .and_then(|layout| {
-                layout.runtime_path(RuntimeKind::Artifacts, "")?;
-                layout.runtime_path(RuntimeKind::Worktrees, "")?;
-                layout.runtime_path(RuntimeKind::CodexPermits, "")?;
-                layout.runtime_path(RuntimeKind::Locks, "")?;
-                layout.runtime_path(RuntimeKind::Logs, "")?;
+                layout.runtime_dir(RuntimeKind::Worktrees);
+                layout.runtime_dir(RuntimeKind::CodexPermits);
+                layout.runtime_dir(RuntimeKind::Locks);
+                layout.runtime_dir(RuntimeKind::Logs);
                 Ok(layout)
             }) {
             Ok(layout) => HostCheck::pass(

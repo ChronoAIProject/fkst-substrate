@@ -6,8 +6,6 @@ mod config_registry;
 mod graph_scan;
 #[path = "../src/path_resolver.rs"]
 mod path_resolver;
-#[path = "../src/runtime_context.rs"]
-mod runtime_context;
 
 use fkst_common::config::RaiserDecl;
 use fkst_common::validation::validate;
@@ -558,38 +556,6 @@ return M
 }
 
 #[test]
-fn resolves_runtime_file_watch_glob() {
-    let _env = CURRENT_DIR_LOCK
-        .get_or_init(|| Mutex::new(()))
-        .lock()
-        .unwrap();
-    let _root = EnvGuard::set(RUNTIME_ROOT_ENV, ".fkst/runtime");
-    let dir = write_repo(
-        &[],
-        &[(
-            "inbox_watch",
-            r#"return { type = "file_watch", glob = "runtime://artifacts/pipeline/inbox/*.md", produces = "pipeline_request" }"#,
-        )],
-    );
-    let cfg = load(dir.path()).unwrap();
-    match cfg.raiser.get("inbox_watch").unwrap() {
-        RaiserDecl::FileWatch { glob, produces } => {
-            assert_eq!(
-                glob,
-                &dir.path()
-                    .canonicalize()
-                    .unwrap()
-                    .join(".fkst/runtime/artifacts/pipeline/inbox/*.md")
-                    .to_string_lossy()
-                    .into_owned()
-            );
-            assert_eq!(produces, "pipeline_request");
-        }
-        _ => panic!("expected FileWatch"),
-    }
-}
-
-#[test]
 fn graph_scan_rejects_fkst_paths_global() {
     let _env = CURRENT_DIR_LOCK
         .get_or_init(|| Mutex::new(()))
@@ -610,7 +576,7 @@ return M
         )],
         &[(
             "runtime_watch",
-            r#"return { type = "file_watch", glob = "runtime://artifacts/pipeline/*/meta.md", produces = "tick" }"#,
+            r#"return { type = "file_watch", glob = "host_inbox/*/meta.md", produces = "tick" }"#,
         )],
     );
     let err = load(dir.path()).unwrap_err();
@@ -624,7 +590,7 @@ return M
 }
 
 #[test]
-fn runtime_logs_file_watch_fails_closed() {
+fn runtime_file_watch_glob_is_removed_surface() {
     let _env = CURRENT_DIR_LOCK
         .get_or_init(|| Mutex::new(()))
         .lock()
@@ -633,90 +599,27 @@ fn runtime_logs_file_watch_fails_closed() {
     let dir = write_repo(
         &[],
         &[(
-            "logs_watch",
-            r#"return { type = "file_watch", glob = "runtime://logs/github-publisher/outbox/*.md", produces = "tick" }"#,
+            "runtime_watch",
+            concat!(
+                r#"return { type = "file_watch", glob = "runtime"#,
+                r#"://arti"#,
+                r#"facts/"#,
+                r#"pipeline/inbox/*.md", produces = "tick" }"#
+            ),
         )],
     );
 
     let err = load(dir.path()).unwrap_err();
     let msg = format!("{:#}", err);
 
-    assert!(msg.contains("runtime://logs"), "got: {msg}");
-    assert!(msg.contains("local-only"), "got: {msg}");
-}
-
-#[test]
-fn unknown_runtime_file_watch_kind_fails_closed() {
-    let _env = CURRENT_DIR_LOCK
-        .get_or_init(|| Mutex::new(()))
-        .lock()
-        .unwrap_or_else(|err| err.into_inner());
-    let _root = EnvGuard::set(RUNTIME_ROOT_ENV, ".fkst/runtime");
-    let dir = write_repo(
-        &[],
-        &[(
-            "unknown_watch",
-            r#"return { type = "file_watch", glob = "runtime://unknown/inbox/*.md", produces = "tick" }"#,
-        )],
+    assert!(
+        msg.contains(concat!(
+            "runtime",
+            ":// file_watch glob is a removed surface"
+        )),
+        "got: {msg}"
     );
-
-    let err = load(dir.path()).unwrap_err();
-    let msg = format!("{:#}", err);
-
-    assert!(msg.contains("unknown runtime kind"), "got: {msg}");
-}
-
-#[test]
-fn resolves_runtime_file_watch_glob_with_out_of_tree_root() {
-    let _env = CURRENT_DIR_LOCK
-        .get_or_init(|| Mutex::new(()))
-        .lock()
-        .unwrap_or_else(|err| err.into_inner());
-    let runtime = TempDir::new().unwrap();
-    let _root = EnvGuard::set(RUNTIME_ROOT_ENV, runtime.path());
-    let dir = write_repo(
-        &[],
-        &[
-            (
-                "pipeline_watch",
-                r#"return { type = "file_watch", glob = "runtime://artifacts/pipeline/inbox/*.md", produces = "pipeline_request" }"#,
-            ),
-            (
-                "mailbox_watch",
-                r#"return { type = "file_watch", glob = "runtime://artifacts/mailbox/threads/*/comments/*-human-issue.md", produces = "triage_request" }"#,
-            ),
-        ],
-    );
-
-    let cfg = load(dir.path()).unwrap();
-    match cfg.raiser.get("pipeline_watch").unwrap() {
-        RaiserDecl::FileWatch { glob, produces } => {
-            assert_eq!(
-                glob,
-                &runtime
-                    .path()
-                    .join("artifacts/pipeline/inbox/*.md")
-                    .to_string_lossy()
-                    .into_owned()
-            );
-            assert_eq!(produces, "pipeline_request");
-        }
-        _ => panic!("expected FileWatch"),
-    }
-    match cfg.raiser.get("mailbox_watch").unwrap() {
-        RaiserDecl::FileWatch { glob, produces } => {
-            assert_eq!(
-                glob,
-                &runtime
-                    .path()
-                    .join("artifacts/mailbox/threads/*/comments/*-human-issue.md")
-                    .to_string_lossy()
-                    .into_owned()
-            );
-            assert_eq!(produces, "triage_request");
-        }
-        _ => panic!("expected FileWatch"),
-    }
+    assert!(msg.contains("host-root relative or absolute glob"), "got: {msg}");
 }
 
 #[test]

@@ -111,25 +111,77 @@ fn assert_lua_error_contains(err: mlua::Error, parts: &[&str]) {
 #[test]
 fn with_lock_runs_fn() {
     let lua = Lua::new();
-    let tmp = tempdir().unwrap();
-    register_for_host(&lua, tmp.path());
+    let host = tempdir().unwrap();
+    register_for_host(&lua, host.path());
+    let runtime = tempdir().unwrap();
 
-    let tmp = tempdir().unwrap();
-    let lock = tmp.path().join("x.lock").to_string_lossy().to_string();
-
-    let n: i64 = lua
-        .load(format!(
-            r#"
+    let n: i64 = in_sandbox(
+        host.path(),
+        |sandbox| {
+            sandbox.runtime_root(runtime.path());
+        },
+        || {
+            lua.load(
+                r#"
             local r = nil
-            with_lock("{}", function() r = 42 end)
+            with_lock("worker-req-001", function() r = 42 end)
             return r
             "#,
-            lock
-        ))
-        .eval()
-        .unwrap();
+            )
+            .eval()
+            .unwrap()
+        },
+    );
 
     assert_eq!(n, 42);
+    assert!(runtime.path().join("locks/worker-req-001").exists());
+    assert!(!host.path().join("worker-req-001").exists());
+}
+
+#[test]
+fn with_lock_requires_runtime_root() {
+    let lua = Lua::new();
+    let host = tempdir().unwrap();
+    register_for_host(&lua, host.path());
+
+    let err = in_sandbox(
+        host.path(),
+        |sandbox| {
+            sandbox.unset_env(fkst_common::runtime_layout::RUNTIME_ROOT_ENV);
+        },
+        || {
+            lua.load(r#"return with_lock("worker-req-001", function() end)"#)
+                .eval::<()>()
+                .unwrap_err()
+        },
+    );
+
+    assert!(err.to_string().contains("FKST_RUNTIME_ROOT must be set"));
+    assert!(!host.path().join("worker-req-001").exists());
+}
+
+#[test]
+fn with_lock_rejects_path_names() {
+    let lua = Lua::new();
+    let host = tempdir().unwrap();
+    register_for_host(&lua, host.path());
+    let runtime = tempdir().unwrap();
+
+    for name in ["../x", "nested/x", "/tmp/x"] {
+        let err = in_sandbox(
+            host.path(),
+            |sandbox| {
+                sandbox.runtime_root(runtime.path());
+            },
+            || {
+                lua.load(format!(r#"return with_lock("{name}", function() end)"#))
+                    .eval::<()>()
+                    .unwrap_err()
+            },
+        );
+
+        assert_lua_error_contains(err, &["with_lock name must be a single path segment"]);
+    }
 }
 
 #[test]

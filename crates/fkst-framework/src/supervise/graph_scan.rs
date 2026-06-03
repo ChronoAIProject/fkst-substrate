@@ -10,7 +10,6 @@
 
 use anyhow::{anyhow, bail, Context, Result};
 use fkst_common::config::{Config, DepartmentDecl, LimitsDecl, QueueDecl, RaiserDecl};
-use fkst_common::RuntimeKind;
 use mlua::{Lua, LuaSerdeExt, Table, Value as LuaValue};
 use serde::Deserialize;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -18,7 +17,6 @@ use std::path::{Path, PathBuf};
 
 use crate::config_registry::{ConfigContext, ConfigKey, ConfigValueType};
 use crate::path_resolver::{GraphRoot, GraphRootKind, PackageRoots};
-use crate::runtime_context;
 
 /// Deserialization helper for a department's `M.spec` table.
 #[derive(Deserialize)]
@@ -94,13 +92,7 @@ pub fn load_roots(roots: &PackageRoots) -> Result<Config> {
             &mut departments,
             &mut department_fanout,
         )?;
-        scan_raisers(
-            &lua,
-            graph_root,
-            &lua_roots,
-            roots.host_root(),
-            &mut raisers,
-        )?;
+        scan_raisers(&lua, graph_root, &lua_roots, &mut raisers)?;
     }
 
     let queues = derive_queues(&departments, &raisers, &department_fanout, &defaults)?;
@@ -182,7 +174,6 @@ fn scan_raisers(
     lua: &Lua,
     graph_root: &GraphRoot,
     lua_roots: &[&Path],
-    host_root: &Path,
     raisers: &mut BTreeMap<String, RaiserDecl>,
 ) -> Result<()> {
     let repo_root = &graph_root.root;
@@ -201,10 +192,10 @@ fn scan_raisers(
             .into_owned();
         let val = eval_lua_value(lua, lua_roots, &path)
             .with_context(|| format!("eval raiser `{}` from {}", stem, path.display()))?;
-        let mut r: RaiserDecl = lua
+        let r: RaiserDecl = lua
             .from_value(val)
             .with_context(|| format!("parse raisers/{}.lua", stem))?;
-        resolve_runtime_file_watch_glob(&mut r, host_root)?;
+        reject_runtime_file_watch_glob(&r)?;
 
         let config_path = config_path(repo_root, graph_root.kind, &path);
         insert_raiser_decl_with_root(raisers, &stem, r, &config_path, graph_root.kind)?;
@@ -348,29 +339,20 @@ fn sorted_department_fanout<'a>(
     entries
 }
 
-fn resolve_runtime_file_watch_glob(raiser: &mut RaiserDecl, host_root: &Path) -> Result<()> {
+const REMOVED_RUNTIME_SCHEME: &str = concat!("runtime", "://");
+
+fn reject_runtime_file_watch_glob(raiser: &RaiserDecl) -> Result<()> {
     if let RaiserDecl::FileWatch { glob, .. } = raiser {
-        if let Some(relative) = glob.strip_prefix("runtime://") {
-            let layout = runtime_context::layout_from_host_root(host_root)?;
-            let (kind, relative) = split_runtime_glob_kind(relative)?;
-            if kind == RuntimeKind::Logs {
-                bail!("runtime://logs is local-only and cannot be used as file_watch input");
-            }
-            *glob = layout
-                .runtime_path(kind, relative)?
-                .to_string_lossy()
-                .into_owned();
+        if glob.starts_with(REMOVED_RUNTIME_SCHEME) {
+            bail!(
+                concat!(
+                    "runtime",
+                    ":// file_watch glob is a removed surface; use a host-root relative or absolute glob"
+                )
+            );
         }
     }
     Ok(())
-}
-
-fn split_runtime_glob_kind(relative: &str) -> Result<(RuntimeKind, &str)> {
-    let Some((head, rest)) = relative.split_once('/') else {
-        bail!("runtime:// glob must include an explicit runtime kind");
-    };
-    let kind = RuntimeKind::parse(head)?;
-    Ok((kind, rest))
 }
 
 fn eval_lua_file(lua: &Lua, lua_roots: &[&Path], path: &Path) -> Result<Table> {

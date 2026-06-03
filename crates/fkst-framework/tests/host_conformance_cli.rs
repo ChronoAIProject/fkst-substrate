@@ -216,7 +216,7 @@ fn valid_host_with_custom_runtime_root_exits_zero() {
 }
 
 #[test]
-fn missing_runtime_root_reports_runtime_layout_failure() {
+fn missing_runtime_root_reports_runtime_scratch_unused() {
     let host = tempfile::tempdir().unwrap();
     write_minimal_host(host.path());
 
@@ -232,10 +232,13 @@ fn missing_runtime_root_reports_runtime_layout_failure() {
         .output()
         .unwrap();
 
-    assert_exit(&output, 1);
+    assert_exit(&output, 0);
     let log = combined_log(&output);
-    assert!(log.contains("FAIL runtime-layout"), "{log}");
-    assert!(log.contains("FKST_RUNTIME_ROOT must be set"), "{log}");
+    assert!(log.contains("PASS runtime-layout"), "{log}");
+    assert!(
+        log.contains("FKST_RUNTIME_ROOT not set; runtime scratch unused by conformance"),
+        "{log}"
+    );
 }
 
 #[test]

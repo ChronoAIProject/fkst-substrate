@@ -93,7 +93,7 @@ fn write_release_raiser(root: &Path) {
     fs::create_dir_all(root.join("raisers")).unwrap();
     fs::write(
         root.join("raisers/release_probe.lua"),
-        r#"return { type = "file_watch", glob = "runtime://artifacts/pipeline/release_probe/*.md", produces = "release_probe" }"#,
+        r#"return { type = "file_watch", glob = "release_probe/*.md", produces = "release_probe" }"#,
     )
     .unwrap();
 }
@@ -413,8 +413,8 @@ fn supervisor_framework_completes_release_probe_raised_cycle() {
         .unwrap();
     let root = tmp.path().to_path_buf();
     let runtime_root = root.join(".fkst/runtime");
-    let probe_dir = runtime_root.join("artifacts/pipeline/release_probe");
-    let witness = runtime_root.join("artifacts/pipeline/release_sink/witness.txt");
+    let probe_dir = root.join("release_probe");
+    let witness = root.join("release_sink/witness.txt");
     let supervisor_log = runtime_root.join("logs/supervisor.log");
     let child_log_dir = runtime_root.join("logs/framework-child");
 
