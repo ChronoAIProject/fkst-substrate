@@ -114,6 +114,8 @@ Codex 调用固定为 `codex exec --dangerously-bypass-approvals-and-sandbox [-C
 
 engine 无 runtime accepted-state/回退；发布安全是外部策略。
 
+允许一个独立的 `fkst-update` 部署客户端(独立 crate/binary,不进 `fkst-supervisor`/`fkst-framework`):从 GitHub Release 下载外部 release pipeline 产出的 `fkst-<target>.tar.gz` 与 `SHA256SUMS`、校验 SHA-256 后原子替换已安装的 engine 二进制。它只消费外部 release 产物、只做 verify+swap;不实现 known-good、accepted-state、rollback、health gate、canary 或进程重启,不维护 `refs/known-good`,也不进入 `supervise`/`run`/SDK 热路径。release 产物的发布权威留在外部 CI(`.github/workflows/release.yml`),重启由 operator/launchd 负责。
+
 ## 编码行为纪律
 
 源文件内部英文。错误分类要窄，避免 `general error`。日志和 commit/body/event payload 要可 grep，写清触发来源、行为类型、等价语义、后续复用和失败归属。AI 生成的对外文本末尾保留 `⟦AI:FKST⟧`。
