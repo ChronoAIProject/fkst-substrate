@@ -10,7 +10,6 @@ pub const RUNTIME_ROOT_ENV: &str = "FKST_RUNTIME_ROOT";
 pub enum RuntimeKind {
     Pipeline,
     Mailbox,
-    EvolveRequests,
     Worktrees,
     CodexPermits,
     Locks,
@@ -29,7 +28,6 @@ impl RuntimeKind {
         match value {
             "pipeline" => Ok(Self::Pipeline),
             "mailbox" => Ok(Self::Mailbox),
-            "evolve_requests" | "evolve-requests" => Ok(Self::EvolveRequests),
             "worktrees" => Ok(Self::Worktrees),
             "codex_permits" | "codex-permits" => Ok(Self::CodexPermits),
             "locks" => Ok(Self::Locks),
@@ -42,7 +40,6 @@ impl RuntimeKind {
         match self {
             Self::Pipeline => "pipeline",
             Self::Mailbox => "mailbox",
-            Self::EvolveRequests => "evolve-requests",
             Self::Worktrees => "worktrees",
             Self::CodexPermits => "codex-permits",
             Self::Locks => "locks",

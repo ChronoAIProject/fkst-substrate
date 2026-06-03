@@ -71,14 +71,14 @@ fn process_root_returns_runtime_success() {
 }
 
 #[test]
-fn process_root_does_not_own_known_good_subcommand() {
+fn process_root_does_not_forward_external_cli_arguments() {
     let tmp = tempfile::tempdir().unwrap();
     let args_path = tmp.path().join("args.txt");
     let runtime = write_fake_runtime(tmp.path(), 0);
     let output = Command::new(supervisor_bin())
         .current_dir(tmp.path())
-        .arg("known-good")
-        .arg("bootstrap")
+        .arg("external-command")
+        .arg("external-action")
         .env("FKST_FRAMEWORK_BIN", &runtime)
         .env("FAKE_RUNTIME_ARGS", &args_path)
         .output()
@@ -91,8 +91,8 @@ fn process_root_does_not_own_known_good_subcommand() {
     );
     let args = fs::read_to_string(args_path).unwrap();
     assert!(args.contains("supervise"));
-    assert!(!args.contains("known-good"));
-    assert!(!args.contains("bootstrap"));
+    assert!(!args.contains("external-command"));
+    assert!(!args.contains("external-action"));
 }
 
 #[test]

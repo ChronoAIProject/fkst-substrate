@@ -367,12 +367,10 @@ fn resolve_runtime_file_watch_glob(raiser: &mut RaiserDecl, host_root: &Path) ->
 
 fn split_runtime_glob_kind(relative: &str) -> Result<(RuntimeKind, &str)> {
     let Some((head, rest)) = relative.split_once('/') else {
-        return Ok((RuntimeKind::EvolveRequests, relative));
+        bail!("runtime:// glob must include an explicit runtime kind");
     };
-    match RuntimeKind::parse(head) {
-        Ok(kind) => Ok((kind, rest)),
-        Err(_) => Ok((RuntimeKind::EvolveRequests, relative)),
-    }
+    let kind = RuntimeKind::parse(head)?;
+    Ok((kind, rest))
 }
 
 fn eval_lua_file(lua: &Lua, lua_roots: &[&Path], path: &Path) -> Result<Table> {

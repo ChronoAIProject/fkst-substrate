@@ -37,7 +37,6 @@ pub(crate) enum ConfigKey {
     CodexPermitSlots,
     CandidatePrefix,
     CandidateFromSep,
-    IntegrationBranch,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -165,14 +164,6 @@ pub(crate) static CONFIG_REGISTRY: &[ConfigEntry] = &[
         kind: ConfigKind::HostFact,
         value_type: ConfigValueType::String,
         doc: "Host-owned separator before the parent ref slug in candidate branch names.",
-    },
-    ConfigEntry {
-        key: ConfigKey::IntegrationBranch,
-        name: "integration_branch",
-        env_key: "FKST_INTEGRATION_BRANCH",
-        kind: ConfigKind::HostFact,
-        value_type: ConfigValueType::String,
-        doc: "Host-owned integration ref used by known-good promotion.",
     },
 ];
 

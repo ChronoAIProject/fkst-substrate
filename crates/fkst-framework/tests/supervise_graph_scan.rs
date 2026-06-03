@@ -568,7 +568,7 @@ fn resolves_runtime_file_watch_glob() {
         &[],
         &[(
             "inbox_watch",
-            r#"return { type = "file_watch", glob = "runtime://evolve_requests/inbox/*.md", produces = "evolve_request" }"#,
+            r#"return { type = "file_watch", glob = "runtime://pipeline/inbox/*.md", produces = "pipeline_request" }"#,
         )],
     );
     let cfg = load(dir.path()).unwrap();
@@ -579,11 +579,11 @@ fn resolves_runtime_file_watch_glob() {
                 &dir.path()
                     .canonicalize()
                     .unwrap()
-                    .join(".fkst/runtime/evolve-requests/inbox/*.md")
+                    .join(".fkst/runtime/pipeline/inbox/*.md")
                     .to_string_lossy()
                     .into_owned()
             );
-            assert_eq!(produces, "evolve_request");
+            assert_eq!(produces, "pipeline_request");
         }
         _ => panic!("expected FileWatch"),
     }
@@ -646,6 +646,27 @@ fn runtime_logs_file_watch_fails_closed() {
 }
 
 #[test]
+fn unknown_runtime_file_watch_kind_fails_closed() {
+    let _env = CURRENT_DIR_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|err| err.into_inner());
+    let _root = EnvGuard::set(RUNTIME_ROOT_ENV, ".fkst/runtime");
+    let dir = write_repo(
+        &[],
+        &[(
+            "unknown_watch",
+            r#"return { type = "file_watch", glob = "runtime://unknown/inbox/*.md", produces = "tick" }"#,
+        )],
+    );
+
+    let err = load(dir.path()).unwrap_err();
+    let msg = format!("{:#}", err);
+
+    assert!(msg.contains("unknown runtime kind"), "got: {msg}");
+}
+
+#[test]
 fn resolves_runtime_file_watch_glob_with_out_of_tree_root() {
     let _env = CURRENT_DIR_LOCK
         .get_or_init(|| Mutex::new(()))
@@ -657,8 +678,8 @@ fn resolves_runtime_file_watch_glob_with_out_of_tree_root() {
         &[],
         &[
             (
-                "inbox_watch",
-                r#"return { type = "file_watch", glob = "runtime://evolve_requests/inbox/*.md", produces = "evolve_request" }"#,
+                "pipeline_watch",
+                r#"return { type = "file_watch", glob = "runtime://pipeline/inbox/*.md", produces = "pipeline_request" }"#,
             ),
             (
                 "mailbox_watch",
@@ -668,17 +689,17 @@ fn resolves_runtime_file_watch_glob_with_out_of_tree_root() {
     );
 
     let cfg = load(dir.path()).unwrap();
-    match cfg.raiser.get("inbox_watch").unwrap() {
+    match cfg.raiser.get("pipeline_watch").unwrap() {
         RaiserDecl::FileWatch { glob, produces } => {
             assert_eq!(
                 glob,
                 &runtime
                     .path()
-                    .join("evolve-requests/inbox/*.md")
+                    .join("pipeline/inbox/*.md")
                     .to_string_lossy()
                     .into_owned()
             );
-            assert_eq!(produces, "evolve_request");
+            assert_eq!(produces, "pipeline_request");
         }
         _ => panic!("expected FileWatch"),
     }

@@ -408,7 +408,7 @@ fn supervisor_framework_completes_release_probe_raised_cycle() {
     fs::create_dir_all(&scratch_root).unwrap();
     let scratch_root = scratch_root.canonicalize().unwrap();
     let tmp = tempfile::Builder::new()
-        .prefix("self-host-witness-")
+        .prefix("release-probe-witness-")
         .tempdir_in(scratch_root)
         .unwrap();
     let root = tmp.path().to_path_buf();

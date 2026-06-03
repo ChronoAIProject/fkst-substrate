@@ -86,7 +86,6 @@ impl HostConformanceSuite {
             .and_then(|layout| {
                 layout.runtime_path(RuntimeKind::Pipeline, "")?;
                 layout.runtime_path(RuntimeKind::Mailbox, "")?;
-                layout.runtime_path(RuntimeKind::EvolveRequests, "")?;
                 layout.runtime_path(RuntimeKind::Worktrees, "")?;
                 layout.runtime_path(RuntimeKind::CodexPermits, "")?;
                 layout.runtime_path(RuntimeKind::Locks, "")?;

@@ -10,7 +10,6 @@ const CONFIG_ENVS: &[&str] = &[
     "FKST_CODEX_PERMIT_SLOTS",
     "FKST_CANDIDATE_PREFIX",
     "FKST_CANDIDATE_FROM_SEP",
-    "FKST_INTEGRATION_BRANCH",
     "FKST_PACKAGE_ROOT",
 ];
 
@@ -47,7 +46,7 @@ fn config_reads_host_fkst_env_from_project_root_when_cwd_differs() {
     let cwd = tempfile::tempdir().unwrap();
     std::fs::write(
         host.path().join("fkst.env"),
-        "FKST_QUEUE_CAPACITY=31\nFKST_DEPARTMENT_DEFAULT_TIMEOUT=7m\nFKST_CODEX_PERMIT_SLOTS=9\nFKST_CANDIDATE_PREFIX=host-rc\nFKST_CANDIDATE_FROM_SEP=__from__\nFKST_INTEGRATION_BRANCH=integration/main\n",
+        "FKST_QUEUE_CAPACITY=31\nFKST_DEPARTMENT_DEFAULT_TIMEOUT=7m\nFKST_CODEX_PERMIT_SLOTS=9\nFKST_CANDIDATE_PREFIX=host-rc\nFKST_CANDIDATE_FROM_SEP=__from__\n",
     )
     .unwrap();
 
@@ -61,7 +60,7 @@ fn config_reads_host_fkst_env_from_project_root_when_cwd_differs() {
 
     assert_exit(&output, 0);
     let out = stdout(&output);
-    assert_eq!(out.lines().count(), 6, "{out}");
+    assert_eq!(out.lines().count(), 5, "{out}");
     assert!(out.contains("name=queue_capacity"), "{out}");
     assert!(out.contains("resolved=31 source=fkst.env"), "{out}");
     assert!(out.contains("name=candidate_prefix"), "{out}");
