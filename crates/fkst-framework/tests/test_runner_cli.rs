@@ -76,6 +76,34 @@ fn test_runner_runs_codex_package_tests() {
 }
 
 #[test]
+fn test_runner_runs_minimal_package_sanity_tests() {
+    let package = repo_root().join("examples/minimal-package");
+
+    let output = run_lua_tests(&package, &package);
+
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}",
+        stdout(&output),
+        stderr(&output)
+    );
+    let out = stdout(&output);
+    assert!(
+        out.contains("PASS tests/sanity_test.lua::test_sanity"),
+        "stdout: {out}"
+    );
+    assert!(
+        out.contains("PASS tests/sanity_test.lua::test_raises"),
+        "stdout: {out}"
+    );
+    assert!(
+        out.contains("PASS tests/sanity_test.lua::test_nil"),
+        "stdout: {out}"
+    );
+    assert!(out.contains("3 passed, 0 failed"), "stdout: {out}");
+}
+
+#[test]
 fn test_runner_continues_after_failure() {
     let host = tempfile::tempdir().unwrap();
     fs::create_dir_all(host.path().join("tests")).unwrap();
