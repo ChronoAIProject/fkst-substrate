@@ -9,6 +9,9 @@ fkst-substrate 是稳定发布的受监督事件 / SDK / 进程衬底：Tier I s
 ```sh
 cargo build --workspace
 cargo test --workspace -- --test-threads=1
+target/debug/fkst-framework test \
+  --project-root "$PWD/examples/minimal-package" \
+  --package-root "$PWD/examples/minimal-package"
 ```
 
 ## 配置机制
@@ -40,6 +43,7 @@ target/debug/fkst-framework config \
 下列命令证明的范围如下：
 
 - `conformance`：minimal-package 的单 source / 双 department / 双 queue 图通过 validation。
+- `test`：扫描 `departments/*/*_test.lua` 和 `tests/*_test.lua`，执行返回表里的 `test_*` 函数。
 - `run producer`：单个 producer pipeline 消费注入的 `tick` 事件，并在 stdout 输出 `RAISED:`。
 - `run consumer`：单个 consumer pipeline 消费注入的标准事件，并向 stderr 打印 `Event{queue,payload,ts}`。
 - `producer -> consumer` 契约测试：直接把 producer 的真实 payload 放进 consumer 标准事件，不经过 supervise dispatcher 路由。
@@ -64,6 +68,9 @@ repo="$PWD"
 tmp_host="$(mktemp -d)"
 cp -R examples/minimal-package/. "$tmp_host/"
 target/debug/fkst-framework conformance \
+  --project-root "$tmp_host" \
+  --package-root "$tmp_host"
+target/debug/fkst-framework test \
   --project-root "$tmp_host" \
   --package-root "$tmp_host"
 (
@@ -95,6 +102,10 @@ FKST_RUNTIME_ROOT="$tmp_host/.fkst/runtime" \
 ```
 
 consumer 的完整事件日志会落在 `<RT>/logs/framework-child/` 下。真实 routing / dispatch 由 framework 自身的 supervise / consumer 测试覆盖；minimal-package 测试不重复启动 supervise。
+
+Lua 单元测试由 `fkst-framework test` 执行。runner 只发现 package root 和 host root 下的 `departments/*/*_test.lua` 与 `tests/*_test.lua`，不全树递归，也不扫描 `raisers/` 或 `fkst/`。测试文件应 `return { test_name = function() ... end }`；runner 按文件路径和 `test_*` key 排序，失败后继续执行后续测试，最后输出通过 / 失败汇总。
+
+`fkst.test` 只在 `test` 子命令的 Lua state 中注册，不属于 production Lua SDK surface；`run` 与 `supervise` 模式不可依赖它。当前断言只有 `eq(actual, expected[, msg])`、`is_true(value[, msg])`、`raises(fn[, msg])` 和 `is_nil(value[, msg])`。这是最小单测工具，不提供 fixture、mock、hook 或测试框架 DSL；除非有意验证真实 CLI 路径，Lua 单测不应调用 `spawn_codex_sync`。
 
 ## 发布边界
 

@@ -65,6 +65,19 @@ fn run_department(host: &Path, runtime: &Path, lua: &str, event: &str) -> Comman
     command
 }
 
+fn run_lua_tests(host: &Path, runtime: &Path) -> Output {
+    Command::new(framework_bin())
+        .arg("test")
+        .arg("--project-root")
+        .arg(host)
+        .arg("--package-root")
+        .arg(host)
+        .current_dir(host)
+        .env("FKST_RUNTIME_ROOT", runtime)
+        .output()
+        .unwrap()
+}
+
 fn assert_success(output: &Output) {
     assert!(
         output.status.success(),
@@ -180,29 +193,22 @@ exit 0
 }
 
 #[test]
-fn codex_demo_lua_unit_test_runs_with_asserts() {
+fn codex_demo_lua_unit_tests_run_with_test_runner() {
     let host = tempfile::tempdir().unwrap();
     let runtime = tempfile::tempdir().unwrap();
     copy_codex_package(host.path());
 
-    let output = run_department(
-        host.path(),
-        runtime.path(),
-        "departments/codex_demo/codex_demo_test.lua",
-        "{}",
-    )
-    .output()
-    .unwrap();
+    let output = run_lua_tests(host.path(), runtime.path());
 
     assert_success(&output);
-    let logs = stderr(&output);
+    let out = stdout(&output);
     assert!(
-        logs.contains("codex_demo unit tests passed"),
-        "stderr: {logs}"
+        out.contains("PASS departments/codex_demo/codex_demo_test.lua::test_build"),
+        "stdout: {out}"
     );
     assert!(
-        stdout(&output).trim().is_empty(),
-        "stdout: {}",
-        stdout(&output)
+        out.contains("PASS departments/codex_demo/codex_demo_test.lua::test_parse"),
+        "stdout: {out}"
     );
+    assert!(out.contains("2 passed, 0 failed"), "stdout: {out}");
 }

@@ -3,6 +3,7 @@
 //! CLI: `fkst-framework run <lua_file> --project-root <path> --event '<json>'`
 //! CLI: `fkst-framework supervise --project-root <path> --framework-bin <path>`
 //! CLI: `fkst-framework conformance --project-root <path>`
+//! CLI: `fkst-framework test --project-root <path> [--package-root <path>]`
 //! CLI: `fkst-framework --self-test`
 //! Exit codes:
 //!   0 = pipeline ok
@@ -29,6 +30,7 @@ mod sdk_git;
 mod sdk_log;
 mod self_test;
 mod supervise;
+mod test_runner;
 
 use raise::RaiseBuffer;
 
@@ -44,6 +46,7 @@ enum CliCommand {
     },
     Conformance(HostConformanceOptions),
     Config(ConfigCli),
+    Test(TestCli),
     SelfTest,
 }
 
@@ -52,7 +55,7 @@ fn parse_args() -> Result<CliCommand> {
     let mut args_iter = args.into_iter();
     let sub = args_iter.next().ok_or_else(|| {
         anyhow::anyhow!(
-            "usage: fkst-framework run <lua> --project-root <path> --event <json> | fkst-framework supervise --project-root <path> --framework-bin <path> | fkst-framework conformance --project-root <path> | fkst-framework config --project-root <path> [--package-root <path>] | fkst-framework --self-test"
+            "usage: fkst-framework run <lua> --project-root <path> --event <json> | fkst-framework supervise --project-root <path> --framework-bin <path> | fkst-framework conformance --project-root <path> | fkst-framework config --project-root <path> [--package-root <path>] | fkst-framework test --project-root <path> [--package-root <path>] | fkst-framework --self-test"
         )
     })?;
     if sub == "--self-test" {
@@ -87,6 +90,10 @@ fn parse_args() -> Result<CliCommand> {
     if sub == "config" {
         let rest = args_iter.collect::<Vec<_>>();
         return Ok(CliCommand::Config(parse_config_args(&rest)?));
+    }
+    if sub == "test" {
+        let rest = args_iter.collect::<Vec<_>>();
+        return Ok(CliCommand::Test(parse_test_args(&rest)?));
     }
     if sub == "run" {
         let lua_path: PathBuf = args_iter
@@ -127,6 +134,11 @@ fn parse_args() -> Result<CliCommand> {
 
 #[derive(Clone, Debug)]
 struct ConfigCli {
+    roots: PackageRoots,
+}
+
+#[derive(Clone, Debug)]
+struct TestCli {
     roots: PackageRoots,
 }
 
@@ -188,6 +200,37 @@ fn parse_config_args(args: &[String]) -> Result<ConfigCli> {
 
     let root = project_root.ok_or_else(|| anyhow::anyhow!("missing --project-root"))?;
     Ok(ConfigCli {
+        roots: PackageRoots::resolve(root, package_root)?,
+    })
+}
+
+fn parse_test_args(args: &[String]) -> Result<TestCli> {
+    let mut project_root: Option<PathBuf> = None;
+    let mut package_root: Option<PathBuf> = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--project-root" => {
+                if project_root.is_some() {
+                    anyhow::bail!("duplicate --project-root");
+                }
+                i += 1;
+                project_root = Some(next_value(args, i, "--project-root")?.into());
+            }
+            "--package-root" => {
+                if package_root.is_some() {
+                    anyhow::bail!("duplicate --package-root");
+                }
+                i += 1;
+                package_root = Some(next_value(args, i, "--package-root")?.into());
+            }
+            other => anyhow::bail!("unknown test argument: {}", other),
+        }
+        i += 1;
+    }
+
+    let root = project_root.ok_or_else(|| anyhow::anyhow!("missing --project-root"))?;
+    Ok(TestCli {
         roots: PackageRoots::resolve(root, package_root)?,
     })
 }
@@ -270,6 +313,7 @@ fn run() -> Result<i32> {
         }
         CliCommand::Conformance(options) => host_conformance::run(options),
         CliCommand::Config(options) => run_config_command(options),
+        CliCommand::Test(options) => test_runner::run_tests(options.roots),
         CliCommand::SelfTest => match self_test::run() {
             Ok(()) => Ok(0),
             Err(err) => {

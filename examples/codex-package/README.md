@@ -5,9 +5,9 @@
 - `raisers/requests.lua` 通过 `file_watch` 观察 `requests/*.md`，产生 payload 为 `{ "path": "<abs path>" }` 的 `codex_request`。
 - `departments/codex_demo/main.lua` 消费 `codex_request`，读取 `payload.path` 指向的请求文件内容，调用 `spawn_codex_sync({ prompt, stall_window })`，再 `raise("codex_result", payload)`。
 - `departments/codex_demo/prompt.lua` 只包含纯字符串逻辑，不调用 SDK。
-- `departments/codex_demo/codex_demo_test.lua` 用 Lua 内置 `assert` 覆盖纯逻辑。
+- `departments/codex_demo/codex_demo_test.lua` 返回 `test_*` 函数表，用 `fkst-framework test` 覆盖纯逻辑。
 
-这个 fixture 只演示引擎 surface：file source、Department、现有 codex SDK、`raise` 和可由 `run` 执行的 Lua 断言测试。它不包含业务部门、审查策略、重试策略、完成事实或 host 发布逻辑。
+这个 fixture 只演示引擎 surface：file source、Department、现有 codex SDK、`raise` 和 test-mode Lua 单测。它不包含业务部门、审查策略、重试策略、完成事实或 host 发布逻辑。
 
 ## require 路径
 
@@ -21,7 +21,7 @@ local prompt = require("departments.codex_demo.prompt")
 
 ## codex SDK
 
-`spawn_codex_sync` 已是引擎 Lua SDK 的固定 surface。示例只使用已有函数，不新增 CLI、SDK、SPEC 或 Lua test runner。
+`spawn_codex_sync` 已是引擎 Lua SDK 的固定 surface。示例只使用已有 production SDK 函数；`fkst.test` 只在 `fkst-framework test` 的 test-mode Lua state 中存在，不属于 production SDK。
 
 调用形状：
 
@@ -61,15 +61,15 @@ target/debug/fkst-framework conformance \
   --package-root "$tmp_host"
 ```
 
-Lua 单元测试用内置 `assert` 加现有 `run` 执行；没有独立 Lua test SDK：
+Lua 单元测试用 `fkst-framework test` 执行。runner 只扫描 `departments/*/*_test.lua` 和 `tests/*_test.lua`，测试文件返回 `{ test_* = fn }` 表：
 
 ```sh
-"$repo/target/debug/fkst-framework" run \
-  "$tmp_host/departments/codex_demo/codex_demo_test.lua" \
+"$repo/target/debug/fkst-framework" test \
   --project-root "$tmp_host" \
-  --package-root "$tmp_host" \
-  --event '{}'
+  --package-root "$tmp_host"
 ```
+
+`fkst.test` 当前只提供 `eq`、`is_true`、`raises`、`is_nil` 四个断言。它是最小 test-mode 工具，不提供 fixture、mock、hook 或测试框架 DSL；本 fixture 的 Lua 单测只测纯字符串逻辑，不调用 codex。
 
 如果要手动验证 codex 调用路径，可以放一个 fake `codex` 到 `PATH` 前面：
 
