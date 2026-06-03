@@ -1,17 +1,19 @@
 //! In-memory startup graph declarations. Validation lives in `validation.rs`.
 
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 pub struct Config {
+    // BTreeMap keeps queue/raiser/department iteration order deterministic
+    // (startup validation, logs, spawn order) instead of HashMap random order.
     #[serde(default)]
-    pub queue: HashMap<String, QueueDecl>,
+    pub queue: BTreeMap<String, QueueDecl>,
     #[serde(default)]
-    pub raiser: HashMap<String, RaiserDecl>,
+    pub raiser: BTreeMap<String, RaiserDecl>,
     #[serde(default)]
-    pub department: HashMap<String, DepartmentDecl>,
+    pub department: BTreeMap<String, DepartmentDecl>,
     pub limits: LimitsDecl,
 }
 

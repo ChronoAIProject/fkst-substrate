@@ -3,7 +3,7 @@
 use anyhow::{Context, Result};
 use fkst_common::config::{Config, DepartmentDecl, LimitsDecl, QueueDecl, RaiserDecl};
 use fkst_common::validation::validate;
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -83,7 +83,7 @@ fn validate_minimal_config() -> Result<()> {
 }
 
 fn minimal_config(lua_rel: PathBuf) -> Config {
-    let mut queue = HashMap::new();
+    let mut queue = BTreeMap::new();
     queue.insert(
         "self_test".into(),
         QueueDecl {
@@ -92,7 +92,7 @@ fn minimal_config(lua_rel: PathBuf) -> Config {
         },
     );
 
-    let mut raiser = HashMap::new();
+    let mut raiser = BTreeMap::new();
     raiser.insert(
         "self_test_cron".into(),
         RaiserDecl::Cron {
@@ -101,7 +101,7 @@ fn minimal_config(lua_rel: PathBuf) -> Config {
         },
     );
 
-    let mut department = HashMap::new();
+    let mut department = BTreeMap::new();
     department.insert(
         "self_test_department".into(),
         DepartmentDecl {

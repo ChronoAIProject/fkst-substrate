@@ -776,9 +776,9 @@ fn root_package_lua_is_removed_surface() {
 #[test]
 fn duplicate_department_name_fails_closed() {
     use fkst_common::config::DepartmentDecl;
-    use std::collections::HashMap;
+    use std::collections::BTreeMap;
 
-    let mut departments = HashMap::new();
+    let mut departments = BTreeMap::new();
     let path = PathBuf::from("departments/alpha/main.lua");
     graph_scan::insert_department_decl(
         &mut departments,
@@ -812,9 +812,9 @@ fn duplicate_department_name_fails_closed() {
 #[cfg(unix)]
 #[test]
 fn duplicate_raiser_name_fails_closed() {
-    use std::collections::HashMap;
+    use std::collections::BTreeMap;
 
-    let mut raisers = HashMap::new();
+    let mut raisers = BTreeMap::new();
     let path = PathBuf::from("raisers/cron_a.lua");
     graph_scan::insert_raiser_decl(
         &mut raisers,

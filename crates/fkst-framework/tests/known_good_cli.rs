@@ -72,6 +72,31 @@ fn runtime_root(root: &std::path::Path) -> std::path::PathBuf {
 }
 
 #[test]
+fn framework_known_good_rejects_package_root_flag() {
+    let tmp = tempfile::tempdir().unwrap();
+    let output = Command::new(framework_bin())
+        .arg("known-good")
+        .arg("bootstrap")
+        .arg("--project-root")
+        .arg(tmp.path())
+        .arg("--package-root")
+        .arg(tmp.path())
+        .output()
+        .unwrap();
+
+    assert!(
+        !output.status.success(),
+        "stdout={}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("unknown known-good option: --package-root"),
+        "{stderr}"
+    );
+}
+
+#[test]
 fn framework_known_good_bootstrap_creates_ref() {
     let tmp = repo();
     let candidate = write_and_commit(tmp.path(), "candidate.txt", "candidate\n");

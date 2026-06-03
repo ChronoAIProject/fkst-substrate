@@ -2,7 +2,7 @@
 
 use fkst_common::config::{Config, DepartmentDecl, LimitsDecl, QueueDecl, RaiserDecl};
 use fkst_common::validation::validate;
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use tempfile::tempdir;
 
@@ -13,7 +13,7 @@ fn touch(dir: &Path, name: &str) -> PathBuf {
 }
 
 fn cfg_minimal(lua_file: &Path) -> Config {
-    let mut queue = HashMap::new();
+    let mut queue = BTreeMap::new();
     queue.insert(
         "tick".into(),
         QueueDecl {
@@ -21,7 +21,7 @@ fn cfg_minimal(lua_file: &Path) -> Config {
             fanout: false,
         },
     );
-    let mut raiser = HashMap::new();
+    let mut raiser = BTreeMap::new();
     raiser.insert(
         "cron_x".into(),
         RaiserDecl::Cron {
@@ -29,7 +29,7 @@ fn cfg_minimal(lua_file: &Path) -> Config {
             produces: "tick".into(),
         },
     );
-    let mut department = HashMap::new();
+    let mut department = BTreeMap::new();
     department.insert(
         "d".into(),
         DepartmentDecl {

@@ -13,7 +13,7 @@ use fkst_common::config::{Config, DepartmentDecl, LimitsDecl, QueueDecl, RaiserD
 use fkst_common::RuntimeKind;
 use mlua::{Lua, LuaSerdeExt, Table, Value as LuaValue};
 use serde::Deserialize;
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use crate::config_registry::{ConfigContext, ConfigKey, ConfigValueType};
@@ -81,8 +81,8 @@ pub fn load_roots(roots: &PackageRoots) -> Result<Config> {
 
     let defaults = HostGraphDefaults::load(roots)?;
     let lua = Lua::new();
-    let mut departments: HashMap<String, DepartmentDecl> = HashMap::new();
-    let mut raisers: HashMap<String, RaiserDecl> = HashMap::new();
+    let mut departments: BTreeMap<String, DepartmentDecl> = BTreeMap::new();
+    let mut raisers: BTreeMap<String, RaiserDecl> = BTreeMap::new();
     let mut department_fanout: HashMap<String, Vec<String>> = HashMap::new();
 
     for graph_root in &graph_roots {
@@ -130,7 +130,7 @@ fn scan_departments(
     graph_root: &GraphRoot,
     lua_roots: &[&Path],
     defaults: &HostGraphDefaults,
-    departments: &mut HashMap<String, DepartmentDecl>,
+    departments: &mut BTreeMap<String, DepartmentDecl>,
     department_fanout: &mut HashMap<String, Vec<String>>,
 ) -> Result<()> {
     let repo_root = &graph_root.root;
@@ -183,7 +183,7 @@ fn scan_raisers(
     graph_root: &GraphRoot,
     lua_roots: &[&Path],
     host_root: &Path,
-    raisers: &mut HashMap<String, RaiserDecl>,
+    raisers: &mut BTreeMap<String, RaiserDecl>,
 ) -> Result<()> {
     let repo_root = &graph_root.root;
     let raisers_dir = repo_root.join("raisers");
@@ -215,7 +215,7 @@ fn scan_raisers(
 
 #[cfg(test)]
 pub(crate) fn insert_department_decl(
-    departments: &mut HashMap<String, DepartmentDecl>,
+    departments: &mut BTreeMap<String, DepartmentDecl>,
     name: &str,
     decl: DepartmentDecl,
     config_path: &Path,
@@ -230,7 +230,7 @@ pub(crate) fn insert_department_decl(
 }
 
 fn insert_department_decl_with_root(
-    departments: &mut HashMap<String, DepartmentDecl>,
+    departments: &mut BTreeMap<String, DepartmentDecl>,
     name: &str,
     decl: DepartmentDecl,
     config_path: &Path,
@@ -249,7 +249,7 @@ fn insert_department_decl_with_root(
 
 #[cfg(test)]
 pub(crate) fn insert_raiser_decl(
-    raisers: &mut HashMap<String, RaiserDecl>,
+    raisers: &mut BTreeMap<String, RaiserDecl>,
     name: &str,
     decl: RaiserDecl,
     config_path: &Path,
@@ -264,7 +264,7 @@ pub(crate) fn insert_raiser_decl(
 }
 
 fn insert_raiser_decl_with_root(
-    raisers: &mut HashMap<String, RaiserDecl>,
+    raisers: &mut BTreeMap<String, RaiserDecl>,
     name: &str,
     decl: RaiserDecl,
     config_path: &Path,
@@ -282,11 +282,11 @@ fn insert_raiser_decl_with_root(
 }
 
 fn derive_queues(
-    departments: &HashMap<String, DepartmentDecl>,
-    raisers: &HashMap<String, RaiserDecl>,
+    departments: &BTreeMap<String, DepartmentDecl>,
+    raisers: &BTreeMap<String, RaiserDecl>,
     department_fanout: &HashMap<String, Vec<String>>,
     defaults: &HostGraphDefaults,
-) -> Result<HashMap<String, QueueDecl>> {
+) -> Result<BTreeMap<String, QueueDecl>> {
     let mut referenced = BTreeSet::new();
     for dept in departments.values() {
         for q in &dept.consumes {
@@ -301,7 +301,7 @@ fn derive_queues(
     }
 
     let fanout = resolve_department_fanout(departments, department_fanout)?;
-    let mut queues = HashMap::new();
+    let mut queues = BTreeMap::new();
     for q in referenced {
         let explicit_fanout = fanout.contains(&q);
         queues.insert(
@@ -316,7 +316,7 @@ fn derive_queues(
 }
 
 fn resolve_department_fanout(
-    departments: &HashMap<String, DepartmentDecl>,
+    departments: &BTreeMap<String, DepartmentDecl>,
     department_fanout: &HashMap<String, Vec<String>>,
 ) -> Result<HashSet<String>> {
     let mut fanout = BTreeSet::new();

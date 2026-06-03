@@ -390,19 +390,43 @@ pub fn parse_duration(s: &str) -> anyhow::Result<Duration> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::{Path, PathBuf};
+    use std::sync::{Mutex, OnceLock};
     use tokio::time::{timeout, Duration};
+
+    static CURRENT_DIR_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+    struct CurrentDirGuard {
+        original: PathBuf,
+    }
+
+    impl CurrentDirGuard {
+        fn enter(path: &Path) -> Self {
+            let original = std::env::current_dir().unwrap();
+            std::env::set_current_dir(path).unwrap();
+            Self { original }
+        }
+    }
+
+    impl Drop for CurrentDirGuard {
+        fn drop(&mut self) {
+            let _ = std::env::set_current_dir(&self.original);
+        }
+    }
 
     #[test]
     fn relative_file_watch_glob_is_host_root_anchored_when_cwd_differs() {
+        let _lock = CURRENT_DIR_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
         let host = tempfile::tempdir().unwrap();
         let unrelated_cwd = tempfile::tempdir().unwrap();
         let input = host.path().join("input");
         std::fs::create_dir(&input).unwrap();
 
-        let original_cwd = std::env::current_dir().unwrap();
-        std::env::set_current_dir(unrelated_cwd.path()).unwrap();
+        let _cwd = CurrentDirGuard::enter(unrelated_cwd.path());
         let resolved = absolutize_glob("input/*.txt", host.path());
-        std::env::set_current_dir(original_cwd).unwrap();
 
         let resolved = resolved.unwrap();
         let expected_prefix = input.canonicalize().unwrap().to_string_lossy().into_owned();
