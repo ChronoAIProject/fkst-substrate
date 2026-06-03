@@ -14,6 +14,8 @@ fkst-substrate 是稳定发布的受监督事件 / SDK / 进程衬底。它提�
 
 核心不是写应用，而是提供应用可运行、可观察、可组合的衬底。framework 提供受限、可审计、可组合的运行环境；业务行为由独立 package root 或 host root 注入的 `departments/`、`raisers/` 和 Lua helper 组成。引擎不能因为某个 host 的业务方便，把业务概念下沉到 Rust。
 
+随仓 `examples/` 只演示引擎 surface：package-root 可加载、graph validation、source → dispatch → pipeline 和固定 SDK 原语；reconciliation、扫目录、done-fact、幂等等是 host package 用 Lua 组合的业务——真实 host 这么做合法，但不进随仓示例。随仓示例与其测试必须忠实真实运行契约：Department 收到的事件是 `Event { queue, payload, ts }`，演示 dispatch 要读真实 queue 事件，不用 synthetic 事件形状伪装成经过路由。
+
 self-hosting 只表示 host/package 可以在此 runtime 上编排 SDLC 工作流；这不是 engine 内建职责，也不是把某个 host 的运行内容写进引擎库的理由。具体部门、判断策略、审查策略、组织拓扑和发布策略属于 package、host 或外部发布系统。
 
 agent 是 system call，不是合作伙伴。一次 `codex exec` 是一次 OS 子进程调用，输入来自 prompt/stdin/context/worktree，输出落到 stdout/stderr/log/exit_code；实例没有身份、记忆、连续性，也不直接互相通信。多 agent 协作只能由 Lua Department 通过事件、文件、git、lock 和 `await_all` 组织。
