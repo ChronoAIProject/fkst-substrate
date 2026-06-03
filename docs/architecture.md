@@ -191,7 +191,7 @@ Fanout::send(raised.queue, raised_event)
 
 内存队列是瞬时队列。它只存在于当前 `fkst-framework supervise` 进程和 supervisor 生命周期内；进程挂掉、supervisor 重启或 host 迁移时队列内容丢失。engine 不把 queue 当 durable message state,不跨机同步队列,也不引入 MQ broker。
 
-durable 真相来自可观测事实：git commit、worktree、artifact、package 请求 inbox、locks。这里的 artifact 与 inbox 是 package/host controller 自己约定和维护的事实；engine 只提供 `file`、`file_watch`、cron、git/worktree 和 `with_lock` 等原语，不拥有 scanner 部门、inbox schema、done 判定、重试策略或幂等语义。
+durable 真相来自可观测事实：git commit、worktree、package 物化的 artifact 与请求 inbox。这里的 artifact 与 inbox 是 package/host controller 自己约定、物化并自管保留/同步的事实。`locks` 不是 durable 真相——`with_lock` 只是进程死即释放的**处理中租约/协调事实**（见下），不承载完成态。engine 只提供 `file`、`file_watch`、cron、git/worktree 和 `with_lock` 等原语，不拥有 scanner 部门、inbox schema、done 判定、重试策略或幂等语义。
 
 恢复模型是 control-loop：package controller 用 cron / file_watch scanner 扫描可观测事实，reconcile 未完成工作，并重新 enqueue 对应事件。幂等由 package controller 保证；engine 只负责把重新 raised / scanned 的事件送入当前内存队列。
 
