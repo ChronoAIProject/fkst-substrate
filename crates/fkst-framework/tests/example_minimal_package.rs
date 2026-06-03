@@ -1,13 +1,8 @@
 use base64::Engine;
-use nix::sys::signal::{kill, Signal};
-use nix::unistd::Pid;
 use serde_json::Value;
 use std::fs;
-use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, ExitStatus, Output};
-use std::thread;
-use std::time::{Duration, Instant};
+use std::process::{Command, Output};
 
 fn framework_bin() -> &'static str {
     env!("CARGO_BIN_EXE_fkst-framework")
@@ -100,92 +95,6 @@ fn decode_raised(stdout: &str) -> Value {
     serde_json::from_slice(&bytes).unwrap()
 }
 
-fn read_framework_child_logs(runtime: &Path) -> String {
-    let dir = runtime.join("logs/framework-child");
-    let mut body = String::new();
-    let Ok(entries) = fs::read_dir(dir) else {
-        return body;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_file() {
-            if let Ok(log) = fs::read_to_string(path) {
-                body.push_str(&log);
-                body.push('\n');
-            }
-        }
-    }
-    body
-}
-
-fn read_framework_child_log_bodies(runtime: &Path) -> Vec<String> {
-    let dir = runtime.join("logs/framework-child");
-    let Ok(entries) = fs::read_dir(dir) else {
-        return Vec::new();
-    };
-    entries
-        .flatten()
-        .filter_map(|entry| {
-            let path = entry.path();
-            if path.is_file() {
-                fs::read_to_string(path).ok()
-            } else {
-                None
-            }
-        })
-        .collect()
-}
-
-fn consumer_log_completed(runtime: &Path) -> Option<String> {
-    read_framework_child_log_bodies(runtime)
-        .into_iter()
-        .find(|log| {
-            log.contains("consumer received Event{queue=example_event") && log.contains("EXIT=0\n")
-        })
-}
-
-fn consumer_ts(logs: &str) -> Option<u64> {
-    logs.lines()
-        .find(|line| line.contains("consumer received Event{queue=example_event"))
-        .and_then(|line| line.split("ts=").nth(1))
-        .and_then(|tail| tail.trim_end_matches('}').parse::<u64>().ok())
-}
-
-fn stop_supervise(child: &mut Child) {
-    let pid = child.id() as i32;
-    let pgid = Pid::from_raw(-pid);
-    let _ = kill(pgid, Signal::SIGTERM);
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while Instant::now() < deadline {
-        if child.try_wait().unwrap().is_some() {
-            return;
-        }
-        thread::sleep(Duration::from_millis(50));
-    }
-    let _ = kill(pgid, Signal::SIGKILL);
-    let _ = child.wait();
-}
-
-struct SuperviseGuard {
-    child: Child,
-}
-
-impl SuperviseGuard {
-    fn new(child: Child) -> Self {
-        Self { child }
-    }
-
-    fn try_wait(&mut self) -> std::io::Result<Option<ExitStatus>> {
-        self.child.try_wait()
-    }
-}
-
-impl Drop for SuperviseGuard {
-    fn drop(&mut self) {
-        stop_supervise(&mut self.child);
-    }
-}
-
 #[test]
 fn minimal_package_loads_producer_consumer_graph() {
     let host = tempfile::tempdir().unwrap();
@@ -251,40 +160,41 @@ fn consumer_logs_complete_standard_event() {
 }
 
 #[test]
-fn supervise_routes_raised_event_to_consumer() {
+fn producer_raised_payload_is_consumable_by_consumer_event() {
     let host = tempfile::tempdir().unwrap();
     let runtime = tempfile::tempdir().unwrap();
     copy_minimal_package(host.path());
 
-    let child = Command::new(framework_bin())
-        .arg("supervise")
-        .arg("--project-root")
-        .arg(host.path())
-        .arg("--package-root")
-        .arg(host.path())
-        .arg("--framework-bin")
-        .arg(framework_bin())
-        .current_dir(host.path())
-        .env("FKST_RUNTIME_ROOT", runtime.path())
-        .process_group(0)
-        .spawn()
-        .unwrap();
-    let mut supervise = SuperviseGuard::new(child);
+    let producer = run_department(
+        host.path(),
+        runtime.path(),
+        "departments/producer/main.lua",
+        r#"{"queue":"tick","payload":{"raiser":"tick"}}"#,
+    );
+    assert_success(&producer);
 
-    let deadline = Instant::now() + Duration::from_secs(30);
-    let mut logs = String::new();
-    while Instant::now() < deadline {
-        logs = read_framework_child_logs(runtime.path());
-        if let Some(log) = consumer_log_completed(runtime.path()) {
-            logs = log;
-            break;
-        }
-        if let Some(status) = supervise.try_wait().unwrap() {
-            panic!("supervise exited early with {status}; logs={logs}");
-        }
-        thread::sleep(Duration::from_millis(100));
-    }
+    let raised = decode_raised(&stdout(&producer));
+    assert_eq!(raised.as_array().unwrap().len(), 1, "raised={raised}");
+    assert_eq!(raised[0]["queue"], "example_event");
+    let payload = raised[0]["payload"].clone();
+    let ts = 1_717_000_000_u64;
+    let consumer_event = serde_json::json!({
+        "queue": "example_event",
+        "payload": payload,
+        "ts": ts,
+    });
 
+    // Direct producer-to-consumer contract check: producer output is consumable by
+    // consumer as a standard Event. Dispatcher routing is covered by framework tests.
+    let consumer = run_department(
+        host.path(),
+        runtime.path(),
+        "departments/consumer/main.lua",
+        &consumer_event.to_string(),
+    );
+    assert_success(&consumer);
+
+    let logs = stderr(&consumer);
     assert!(
         logs.contains("consumer received Event{queue=example_event"),
         "logs={logs}"
@@ -293,8 +203,5 @@ fn supervise_routes_raised_event_to_consumer() {
     assert!(logs.contains("note=opaque example payload"), "logs={logs}");
     assert!(logs.contains("source_queue=tick"), "logs={logs}");
     assert!(logs.contains("source_raiser=tick"), "logs={logs}");
-    assert!(!logs.contains("ts=nil"), "logs={logs}");
-    let ts = consumer_ts(&logs).unwrap_or_else(|| panic!("missing numeric ts in logs={logs}"));
-    assert!(ts > 0, "logs={logs}");
-    assert!(logs.contains("EXIT=0\n"), "logs={logs}");
+    assert!(logs.contains("ts=1717000000"), "logs={logs}");
 }

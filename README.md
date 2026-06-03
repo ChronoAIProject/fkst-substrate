@@ -35,13 +35,14 @@ target/debug/fkst-framework config \
 
 本仓库内置一个 package-root fixture：`examples/minimal-package`。它声明一个 cron source `tick`、一个 producer department 和一个 consumer department。cron source 产生 `tick` queue 事件；producer 消费 `tick` 后 `raise("example_event", payload)`；consumer 消费 `example_event`，只读并打印完整标准事件。
 
-`FKST_RUNTIME_ROOT` 仍是引擎 scratch 配置，用于 worktree、codex permit、lock 与 log 等运行时落点；这个 fixture 的 Lua 不读取它，也不把 `<RT>` 当 package 状态目录。fixture 只展示 package-root 独立加载、graph validation，以及真实 `cron source -> producer -> raise -> dispatch -> consumer`。
+`FKST_RUNTIME_ROOT` 仍是引擎 scratch 配置，用于 worktree、codex permit、lock 与 log 等运行时落点；这个 fixture 的 Lua 不读取它，也不把 `<RT>` 当 package 状态目录。fixture 只展示 package-root 独立加载、graph validation、两个 Department 的直接触发 pipeline 行为，以及 producer 真实 `RAISED:` 输出可被 consumer 作为标准事件消费的契约。
 
 下列命令证明的范围如下：
 
 - `conformance`：minimal-package 的单 source / 双 department / 双 queue 图通过 validation。
 - `run producer`：单个 producer pipeline 消费注入的 `tick` 事件，并在 stdout 输出 `RAISED:`。
 - `run consumer`：单个 consumer pipeline 消费注入的标准事件，并向 stderr 打印 `Event{queue,payload,ts}`。
+- `producer -> consumer` 契约测试：直接把 producer 的真实 payload 放进 consumer 标准事件，不经过 supervise dispatcher 路由。
 
 Department 收到的标准事件结构是 `Event{queue,payload,ts}`。producer 的 `RAISED:` 解码后是 queue + payload，还没有 `ts`：
 
@@ -49,9 +50,9 @@ Department 收到的标准事件结构是 `Event{queue,payload,ts}`。producer �
 [{"queue":"example_event","payload":{"from":"producer","note":"opaque example payload","source_queue":"tick","source_raiser":"tick"}}]
 ```
 
-`run --event` 是单 pipeline 注入，示例里的事件不会获得 runtime 生成的 `ts`；consumer 示例使用 `ts=0` 只是占位。只有真实 supervise 派发时，runtime 才会补上 numeric `ts`。
+`run --event` 是单 pipeline 注入，不经过 supervise 路由。示例里的事件不会获得 runtime 生成的 `ts`；consumer 示例里的 numeric `ts` 是注入的标准事件值。真实 dispatch 由 runtime 生成 `ts`。
 
-真实 supervise 派发给 consumer 的标准事件会包含 runtime 生成的 `ts`，实际值会变：
+真实 dispatch 派发给 consumer 的标准事件会包含 runtime 生成的 `ts`，实际值会变：
 
 ```json
 {"queue":"example_event","payload":{"from":"producer","note":"opaque example payload","source_queue":"tick","source_raiser":"tick"},"ts":1234567890}
@@ -83,7 +84,7 @@ target/debug/fkst-framework conformance \
 )
 ```
 
-上面两个 `run` 命令是单 pipeline 注入，不经过路由。真实 producer -> consumer 路由由 supervise 完成，运行后用 `Ctrl-C` 停止：
+上面两个 `run` 命令是单 pipeline 注入，不经过路由。可以手动运行 supervise 观察真实 producer -> consumer 路由，运行后用 `Ctrl-C` 停止；它不是 example 测试依赖：
 
 ```sh
 FKST_RUNTIME_ROOT="$tmp_host/.fkst/runtime" \
@@ -93,7 +94,7 @@ FKST_RUNTIME_ROOT="$tmp_host/.fkst/runtime" \
     --framework-bin "$repo/target/debug/fkst-framework"
 ```
 
-consumer 的完整事件日志会落在 `<RT>/logs/framework-child/` 下；集成测试覆盖了这条真实路由。
+consumer 的完整事件日志会落在 `<RT>/logs/framework-child/` 下。真实 routing / dispatch 由 framework 自身的 supervise / consumer 测试覆盖；minimal-package 测试不重复启动 supervise。
 
 ## 发布边界
 
