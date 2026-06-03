@@ -14,6 +14,8 @@ target/debug/fkst-framework test \
   --package-root "$PWD/examples/minimal-package"
 ```
 
+这些 gate 现已收敛进 `scripts/verify.sh`，本地与 CI（`.github/workflows/ci.yml`，单 job、stable Rust、push 到 `dev` 与 PR 到 `dev` 触发）都通过它执行，避免本地与 CI 验证漂移。
+
 ## 配置机制
 
 引擎操作配置由 `crates/fkst-framework/src/config_registry.rs` 中的静态 typed registry 声明。读取优先级固定为 process env → host `fkst.env` → operational 默认；HostFact 缺失 fail-closed。registry 只读，没有 set/apply/watch、YAML/DSL/manifest/plugin 或 per-key `tunables/*.txt` 兼容层。
