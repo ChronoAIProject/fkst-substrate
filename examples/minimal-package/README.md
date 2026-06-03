@@ -8,7 +8,7 @@
 
 这个 fixture 用来证明 `--package-root` 可以独立加载、通过 graph validation、两个 Department 可以被直接触发执行，并且 producer 的真实 `RAISED:` payload 可被 consumer 作为标准事件消费。它不演示业务扫描、派生工作、完成事实或持久化策略。
 
-Department 收到的标准事件结构是 `Event{queue,payload,ts}`。`raise` 自身只输出 queue 和 payload；runtime 在重新派发时生成 `ts`。
+Department 收到的标准事件结构是 `Event{queue,payload,ts}`，其中 `ts` 是 Unix 毫秒。`raise` 自身只输出 queue 和 payload；runtime 在重新派发时生成 `ts`。
 
 `run --event` 是单 pipeline 注入，不经过 supervise 路由。示例里的事件不会获得 runtime 生成的 `ts`；consumer 示例里的 numeric `ts` 是注入的标准事件值。真实 dispatch 由 runtime 生成 `ts`。
 
@@ -18,7 +18,7 @@ producer 的 `RAISED:` 解码后形状如下，注意这里还没有 `ts`：
 [{"queue":"example_event","payload":{"from":"producer","note":"opaque example payload","source_queue":"tick","source_raiser":"tick"}}]
 ```
 
-真实 dispatch 派发给 consumer 的标准事件形状如下，`ts` 是 runtime 生成的数字，实际值会变：
+真实 dispatch 派发给 consumer 的标准事件形状如下，`ts` 是 runtime 生成的 Unix 毫秒，实际值会变：
 
 ```json
 {"queue":"example_event","payload":{"from":"producer","note":"opaque example payload","source_queue":"tick","source_raiser":"tick"},"ts":1234567890}

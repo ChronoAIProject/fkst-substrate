@@ -24,7 +24,7 @@ fkst-substrate/
 │       ├── config_registry.rs
 │       ├── path_resolver.rs raise.rs mlua_init.rs
 │       ├── sdk_basic.rs sdk_codex.rs sdk_fs.rs sdk_git.rs sdk_log.rs
-│       ├── host_conformance.rs self_test.rs
+│       ├── host_conformance.rs runtime_context.rs self_test.rs
 │       └── supervise/
 │           ├── mod.rs graph_scan.rs source_runner.rs
 │           └── event_fanout.rs consumer.rs spawner.rs raised.rs
@@ -32,7 +32,7 @@ fkst-substrate/
 └── docs/architecture.md
 ```
 
-`examples/minimal-package/` 是引擎自带的 package-root fixture：单个 cron source 产生 `tick`，producer Department 消费 `tick` 并 `raise("example_event", payload)`，consumer Department 消费 `example_event` 并打印标准 `Event{queue,payload,ts}`。它用于证明 `--package-root` 能被独立加载、通过 graph validation，并且真实 supervise 可以完成 `source -> dispatch -> pipeline -> RAISED -> dispatch -> pipeline`。
+`examples/minimal-package/` 是引擎自带的 package-root fixture：单个 cron source 产生 `tick`，producer Department 消费 `tick` 并 `raise("example_event", payload)`，consumer Department 消费 `example_event` 并打印标准 `Event{queue,payload,ts}`。它用于证明 `--package-root` 能被独立加载、通过 graph validation、直接触发 pipeline，并且 producer payload 可被 consumer 标准事件消费；真实 routing 由 framework 自身测试覆盖。
 
 ## 1. 三层稳定性与三级公司
 
@@ -105,7 +105,7 @@ run 模式未传 --project-root 时可从 Lua 路径推断
 <HOST>/raisers/*.lua
 ```
 
-每个 Department `main.lua` 必须 return table，其中 `M.spec` 至少能解析为：
+每个 Department `main.lua` 必须 return table，其中 `M.spec` 只能解析为：
 
 ```lua
 {
@@ -116,6 +116,8 @@ run 模式未传 --project-root 时可从 Lua 路径推断
 }
 ```
 
+`M.spec` 只接受 `consumes`、`produces`、`fanout`、`stall_window`；未知字段 fail-closed。
+
 每个 Raiser lua 文件 return 一个 source declaration，当前只支持：
 
 ```lua
@@ -123,7 +125,7 @@ run 模式未传 --project-root 时可从 Lua 路径推断
 { type = "file_watch", glob = "host-root-relative/or/absolute/path/*.md", produces = "queue" }
 ```
 
-`file_watch.glob` 可以是 host root 相对路径或绝对路径；相对路径由 engine 锚到 host root。它用于监听 host repo durable 文件或外部同步到 host 的文件，不支持已移除的 runtime scheme。
+`file_watch.glob` 可以是 host root 相对路径或绝对路径；相对路径由 engine 锚到 host root。它用于监听 host repo durable 文件或外部同步到 host 的文件，不支持 runtime scheme。
 
 ## 5. Engine Operation Registry
 
@@ -155,9 +157,9 @@ run 模式未传 --project-root 时可从 Lua 路径推断
 说明:
 - **engine 自己只写 scratch 结构事实**(worktree / permit / lock / log)。package 不访问 `<RT>`，也不把 `<RT>` 当 inbox、完成态或业务 schema 数据库。
 - `RuntimeLayout` 只提供固定 runtime dir 解析，framework 先把相对 runtime root 锚到 `<HOST>` 再建路径。
-- 已移除的 runtime scheme 不再是 graph surface；`file_watch` 只接受 host-root 相对或绝对 glob。
+- `file_watch` 只接受 host-root 相对或绝对 glob；不支持 runtime scheme。
 - codex log **不属** `RuntimeKind`/`<RT>`:`sdk_codex` 把它落到 `FKST_RUNTIME_LOG_DIR` 或平台默认目录(如 `~/Library/Logs/fkst`)下的 `codex/`。它与 `<RT>/logs` 同属 process-trace scratch(可 grep、非事实源),但落点不同,`supervise` 也不给 framework child 注入 `FKST_RUNTIME_LOG_DIR`。
-- engine **不写** runtime 持久状态(无 `refs/known-good` / accepted-state / rollback —— 那是外部 release pipeline 的事实,见 §12)。
+- engine **不写** runtime 持久状态；accepted-state / rollback 是外部 release pipeline 的事实，见 §13。
 
 ## 7. 运行态数据流
 
@@ -184,11 +186,13 @@ parse_raised from stdout tail
 Fanout::send(raised.queue, raised_event)
 ```
 
+Department 收到的标准事件是 `Event{queue,payload,ts}`，其中 `ts` 是 Unix 毫秒。
+
 `consumer.rs` 为每个 Department 的每个 consumed queue 建 receiver，再汇入该 Department 的 inbox。每个事件 spawn 一个 framework child，不是在 supervisor 进程内直接调用 Lua。framework child 的 stdout/stderr 会写到 `<RT>/logs/framework-child/` 下的具名 log；dept 的 `log.*` 以结构化行写 stderr，并由这个具名 log 捕获。RAISED 解析不依赖 log 文件，而是解析 captured stdout。
 
-`raise` 不落盘。需要 durable intent 或完成态事实时，package/host 必须显式写入 git commit、host repo 文件或外部源，再由 package controller 通过 `file_watch` 或其它 source 重新引入事件。
+`raise` 不落盘。需要 durable intent 或完成态事实时，package/host 必须显式写入 git commit、host repo 文件或外部源，再由 package controller 通过 `cron` / `file_watch` 重新引入事件。
 
-## 8. Reconciliation / Control-loop 事件模型
+## 8. 瞬时队列与恢复模型
 
 内存队列是瞬时队列。它只存在于当前 `fkst-framework supervise` 进程和 supervisor 生命周期内；进程挂掉、supervisor 重启或 host 迁移时队列内容丢失。engine 不把 queue 当 durable message state,不跨机同步队列,也不引入 MQ broker。
 

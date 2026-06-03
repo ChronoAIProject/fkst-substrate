@@ -39,7 +39,7 @@
 ## 事实源
 
 - 跨 pipeline 稳定事实只能来自 `git refs/commits/branches`、host-configured filesystem boundary、外部源（GitHub issue / host repo 文件）。
-- runtime layout 是 host-local / ephemeral scratch；事件队列、raise buffer、locks、logs 不构成 durable message state，也不跨机同步。恢复由 cron / file_watch scanner 从 durable 事实 re-derive 并重新 enqueue。host main repo HEAD/index 不承载 `.fkst/runtime/**`、`.worktrees/**`、`.codex-permits/**` runtime layout pathspec。
+- runtime layout 是 host-local / ephemeral scratch；事件队列、raise buffer、locks、logs 不构成 durable message state，也不跨机同步。恢复由 cron / file_watch scanner 从 durable 事实 re-derive 并重新 enqueue。host main repo HEAD/index 不承载 `<RT>/worktrees`、`<RT>/codex-permits`、`<RT>/locks`、`<RT>/logs` runtime layout pathspec。
 - 内存、coroutine local table、subprocess handle、prompt 记忆、agent 判断都只是 cache。
 - framework 不写持久状态文件。
 - `SPEC.md` 禁止记录 runtime facts；包括 active branch、当前 round、队列深度、正在运行的 pid、临时 worktree 列表、最近失败次数。
@@ -55,7 +55,7 @@
 
 ## Conformance
 
-- 当前 fkst-substrate 的 engine host-conformance 入口是 Rust CLI `fkst-framework conformance --project-root <path>`。
+- 当前 fkst-substrate 的 engine host-conformance 入口是 Rust CLI `fkst-framework conformance --project-root <path> [--package-root <path>]`。
 - 首批 invariant 分组是 Tier II identity、source-language-identity、三级公司、事实源、SDK surface、CI wiring、Tier I boundary。
 - `source-language-identity` 要求 `crates/`、`conformance/`、`departments/`、`raisers/`、`scripts/`、`tests/` 下后缀为 `.rs`、`.lua`、`.sh`、`.py`、`.ts` 的 managed source files 不含中文自然语言文本。
 - `host tree pollution` 要求 host main repo HEAD/index 不跟踪 runtime layout pathspec。
