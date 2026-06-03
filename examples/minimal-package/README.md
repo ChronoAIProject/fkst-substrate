@@ -5,6 +5,7 @@
 - `raisers/tick.lua` 每 1 秒产生 `tick`。
 - `departments/producer/main.lua` 消费 `tick`，调用 `raise("example_event", payload)`。
 - `departments/consumer/main.lua` 消费 `example_event`，只读并打印完整标准事件。
+- `tests/sanity_test.lua` 演示 test-mode Lua 单测文件返回 `{ test_* = fn }` 表。
 
 这个 fixture 用来证明 `--package-root` 可以独立加载、通过 graph validation、两个 Department 可以被直接触发执行，并且 producer 的真实 `RAISED:` payload 可被 consumer 作为标准事件消费。它不演示业务扫描、派生工作、完成事实或持久化策略。
 
@@ -34,6 +35,9 @@ cp -R examples/minimal-package/. "$tmp_host/"
 target/debug/fkst-framework conformance \
   --project-root "$tmp_host" \
   --package-root "$tmp_host"
+target/debug/fkst-framework test \
+  --project-root "$tmp_host" \
+  --package-root "$tmp_host"
 (
   cd "$tmp_host" &&
   "$repo/target/debug/fkst-framework" run \
@@ -53,6 +57,8 @@ target/debug/fkst-framework conformance \
 ```
 
 `run producer` 的 stdout 应包含 `RAISED:`，解码后 queue 是 `example_event`。`run consumer` 的 stderr 应包含 `consumer received Event{queue=example_event`。这两个命令都是单 pipeline 注入，不经过 supervise 路由。
+
+Lua 单元测试由 `fkst-framework test` 执行。runner 只扫描 `departments/*/*_test.lua` 和 `tests/*_test.lua`，不全树递归，也不扫描 `raisers/` 或 `fkst/`。`fkst.test` 只在 test-mode 注册，断言只包含 `eq`、`is_true`、`raises`、`is_nil`；它不是 production SDK surface，也不是 mock / fixture 框架。
 
 可以手动运行 supervise 观察真实路由，运行后用 `Ctrl-C` 停止；它不是 example 测试依赖：
 
