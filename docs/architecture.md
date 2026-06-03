@@ -141,20 +141,22 @@ run 模式未传 --project-root 时可从 Lua 路径推断
 
 ## 6. Runtime I/O 与落点
 
-`RuntimeKind` 固定六类：
+`RuntimeKind` 固定六类。下表是每类的 I/O：落点、用途、以及**谁写**(`<RT>` = `FKST_RUNTIME_ROOT`，已锚到 `<HOST>`)。
 
-| RuntimeKind | 目录 | 用途 |
-|---|---|---|
-| `Pipeline` | `<RT>/pipeline` | package/host 可用的 pipeline artifact 落点 |
-| `Mailbox` | `<RT>/mailbox` | package/host 可用的 mailbox artifact 落点 |
-| `Worktrees` | `<RT>/worktrees` | `setup_worktree` 创建隔离 worktree |
-| `CodexPermits` | `<RT>/codex-permits` | `permit-*` fcntl codex 并发池 |
-| `Locks` | `<RT>/locks` | `with_lock` 锁文件 |
-| `Logs` | `<RT>/logs` | framework child logs；package 也可选择写本地 logs |
+| RuntimeKind | 落点 | 用途 | 写入者(engine) | 读取者 |
+|---|---|---|---|---|
+| `Pipeline` | `<RT>/pipeline` | pipeline artifact | **无**(package/host 经 `file.write`) | package/host;`file_watch` 可监听 |
+| `Mailbox` | `<RT>/mailbox` | mailbox artifact | **无**(package/host 经 `file.write`) | package/host;`file_watch` 可监听 |
+| `Worktrees` | `<RT>/worktrees` | 隔离 worktree | `sdk_git::setup_worktree`(`git worktree add`) | `count_worktrees` / `list_orphan_worktrees` |
+| `CodexPermits` | `<RT>/codex-permits` | `permit-*` fcntl codex 并发池 | `sdk_codex`(建池 + flock 占位) | `spawn_codex` 抢 permit |
+| `Locks` | `<RT>/locks` | fcntl 锁文件 | `sdk_git::with_lock` | 同 — 跨 pipeline 互斥 |
+| `Logs` | `<RT>/logs` | 过程日志 | `supervise::spawner`(framework-child)+ `sdk_codex`(codex log) | 人手 / 调试,非 file_watch 输入 |
 
-`RuntimeLayout::runtime_path(kind, relative)` 拒绝 parent traversal 和绝对 relative path。framework 调用处先把相对 `FKST_RUNTIME_ROOT` 锚到 `<HOST>`，再创建 permit/worktree/lock/log 路径。
-
-`runtime://` glob 只允许 file_watch 映射到显式 runtime kind。未知 kind fail-closed；缺少 kind fail-closed；`runtime://logs` 是 local-only，不能作为 file_watch 输入。
+说明:
+- **engine 自己只写"结构事实"**(worktree / permit / lock / log);**`pipeline` 与 `mailbox` 的内容由注入的 package/host 经 `file.write` 写**,engine 不产其内容,只保留命名空间与路径解析。
+- `RuntimeLayout::runtime_path(kind, relative)` 拒绝 parent traversal 与绝对 relative path;framework 先把相对 `FKST_RUNTIME_ROOT` 锚到 `<HOST>` 再建路径。
+- `runtime://` glob 只允许 `file_watch` 映射到**显式** runtime kind:**未知 kind fail-closed,缺少 kind fail-closed**(不再有 evolve-requests 之类的隐式默认回退);`runtime://logs` 是 local-only,不能作 file_watch 输入。
+- engine **不写** runtime 持久状态(无 `refs/known-good` / accepted-state / rollback —— 那是外部 release pipeline 的事实,见 §11)。
 
 ## 7. 运行态数据流
 
