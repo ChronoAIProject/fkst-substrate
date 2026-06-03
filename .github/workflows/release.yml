@@ -1,0 +1,66 @@
+name: release
+
+# Producer for the fkst-update deploy client: on a version tag, build the engine
+# binaries per target, package fkst-<target>.tar.gz, and publish a GitHub Release
+# with a single SHA256SUMS. fkst-update downloads + verifies these exact assets.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - os: macos-14
+            target: aarch64-apple-darwin
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install stable Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustup target add ${{ matrix.target }}
+      - name: Build release binaries
+        run: cargo build --release --target ${{ matrix.target }} -p fkst-supervisor -p fkst-framework
+      - name: Package archive
+        run: |
+          dist="target/${{ matrix.target }}/release"
+          tar -C "$dist" -czf "fkst-${{ matrix.target }}.tar.gz" fkst-supervisor fkst-framework
+      - uses: actions/upload-artifact@v4
+        with:
+          name: fkst-${{ matrix.target }}
+          path: fkst-${{ matrix.target }}.tar.gz
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+      - name: Collect archives and build SHA256SUMS
+        run: |
+          cd dist
+          find . -name 'fkst-*.tar.gz' -exec mv {} . \;
+          rm -f SHA256SUMS
+          for archive in fkst-*.tar.gz; do
+            shasum -a 256 "$archive" >> SHA256SUMS
+          done
+          cat SHA256SUMS
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cd dist
+          gh release create "${{ github.ref_name }}" \
+            --repo "${{ github.repository }}" \
+            --title "${{ github.ref_name }}" \
+            --notes "Automated release ${{ github.ref_name }}." \
+            fkst-*.tar.gz SHA256SUMS

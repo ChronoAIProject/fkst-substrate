@@ -199,6 +199,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "fkst-update"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
 name = "foldhash"
 version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"

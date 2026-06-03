@@ -4,6 +4,7 @@ members = [
     "crates/fkst-common",
     "crates/fkst-supervisor",
     "crates/fkst-framework",
+    "crates/fkst-update",
 ]
 
 [workspace.package]
