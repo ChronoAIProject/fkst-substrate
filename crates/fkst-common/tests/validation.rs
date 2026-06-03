@@ -50,7 +50,7 @@ fn cfg_minimal(lua_file: &Path) -> Config {
 }
 
 #[test]
-fn direct_deserialize_requires_department_timeout() {
+fn direct_deserialize_requires_department_stall_window() {
     let err = serde_json::from_value::<DepartmentDecl>(serde_json::json!({
         "lua": "d.lua",
         "consumes": ["tick"]

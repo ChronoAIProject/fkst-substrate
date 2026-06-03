@@ -167,7 +167,7 @@ fn host_graph_defaults_use_operational_defaults_when_env_and_fkst_env_are_absent
         .lock()
         .unwrap_or_else(|err| err.into_inner());
     let _queue = EnvGuard::unset(QUEUE_CAPACITY_ENV);
-    let _timeout = EnvGuard::unset(DEPARTMENT_DEFAULT_STALL_WINDOW_ENV);
+    let _stall_window = EnvGuard::unset(DEPARTMENT_DEFAULT_STALL_WINDOW_ENV);
     let _slots = EnvGuard::unset(CODEX_PERMIT_SLOTS_ENV);
     let dir = TempDir::new().unwrap();
     let depts_root = dir.path().join("departments");
@@ -203,7 +203,7 @@ fn host_graph_defaults_use_fkst_env() {
         .lock()
         .unwrap();
     let _queue = EnvGuard::unset(QUEUE_CAPACITY_ENV);
-    let _timeout = EnvGuard::unset(DEPARTMENT_DEFAULT_STALL_WINDOW_ENV);
+    let _stall_window = EnvGuard::unset(DEPARTMENT_DEFAULT_STALL_WINDOW_ENV);
     let _slots = EnvGuard::unset(CODEX_PERMIT_SLOTS_ENV);
     let dir = write_repo(
         &[(
@@ -236,7 +236,7 @@ fn host_graph_defaults_use_env_before_fkst_env() {
         .lock()
         .unwrap();
     let _queue = EnvGuard::set(QUEUE_CAPACITY_ENV, "31");
-    let _timeout = EnvGuard::set(DEPARTMENT_DEFAULT_STALL_WINDOW_ENV, "66h");
+    let _stall_window = EnvGuard::set(DEPARTMENT_DEFAULT_STALL_WINDOW_ENV, "66h");
     let _slots = EnvGuard::set(CODEX_PERMIT_SLOTS_ENV, "32");
     let dir = write_repo(
         &[(
@@ -267,7 +267,7 @@ return M
 }
 
 #[test]
-fn explicit_department_timeout_overrides_host_default_timeout() {
+fn explicit_department_stall_window_overrides_host_default_stall_window() {
     let dir = write_repo(
         &[(
             "hello",
@@ -289,13 +289,39 @@ return M
 }
 
 #[test]
+fn dept_spec_rejects_removed_timeout_field_fail_closed() {
+    let dir = write_repo(
+        &[(
+            "hello",
+            r#"
+local M = {}
+M.spec = { consumes = {"tick"}, timeout = "9s" }
+function pipeline(_) end
+return M
+"#,
+        )],
+        &[(
+            "cron_a",
+            r#"return { type = "cron", interval = "10s", produces = "tick" }"#,
+        )],
+    );
+
+    let err = load(dir.path()).unwrap_err();
+    let msg = format!("{:#}", err);
+
+    assert!(msg.contains("parse `hello.spec`"), "got: {msg}");
+    assert!(msg.contains("unknown field"), "got: {msg}");
+    assert!(msg.contains("timeout"), "got: {msg}");
+}
+
+#[test]
 fn operational_defaults_ignore_removed_txt_files() {
     let _env_lock = CURRENT_DIR_LOCK
         .get_or_init(|| Mutex::new(()))
         .lock()
         .unwrap();
     let _queue = EnvGuard::unset(QUEUE_CAPACITY_ENV);
-    let _timeout = EnvGuard::unset(DEPARTMENT_DEFAULT_STALL_WINDOW_ENV);
+    let _stall_window = EnvGuard::unset(DEPARTMENT_DEFAULT_STALL_WINDOW_ENV);
     let _slots = EnvGuard::unset(CODEX_PERMIT_SLOTS_ENV);
     let dir = TempDir::new().unwrap();
     fs::create_dir_all(dir.path().join("departments/hello")).unwrap();
@@ -339,7 +365,7 @@ fn host_graph_defaults_fail_closed_when_configured_value_is_invalid() {
         .lock()
         .unwrap();
     let _queue = EnvGuard::unset(QUEUE_CAPACITY_ENV);
-    let _timeout = EnvGuard::unset(DEPARTMENT_DEFAULT_STALL_WINDOW_ENV);
+    let _stall_window = EnvGuard::unset(DEPARTMENT_DEFAULT_STALL_WINDOW_ENV);
     let _slots = EnvGuard::unset(CODEX_PERMIT_SLOTS_ENV);
     let cases = [
         (QUEUE_CAPACITY_ENV, "not-a-number"),

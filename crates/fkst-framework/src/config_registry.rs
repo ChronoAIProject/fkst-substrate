@@ -257,7 +257,7 @@ pub(crate) fn parse_duration_string(entry: &ConfigEntry, raw: &str) -> Result<St
     let value = raw.trim().to_string();
     if value.is_empty() || !(value.ends_with('s') || value.ends_with('m') || value.ends_with('h')) {
         bail!(
-            "{} must be a timeout ending with s/m/h, got {raw:?}",
+            "{} must be a no-output stall window duration ending with s/m/h, got {raw:?}",
             entry.env_key
         );
     }

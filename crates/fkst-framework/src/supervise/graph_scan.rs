@@ -20,6 +20,7 @@ use crate::path_resolver::{GraphRoot, GraphRootKind, PackageRoots};
 
 /// Deserialization helper for a department's `M.spec` table.
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct DeptSpec {
     #[serde(default)]
     consumes: Vec<String>,
