@@ -7,6 +7,9 @@ set -euo pipefail
 loc=$(find crates/fkst-supervisor/src -name '*.rs' -exec cat {} + | wc -l)
 [ "$loc" -le 150 ] || { echo "supervisor exceeds 150 LOC audit gate: $loc" >&2; exit 1; }
 
+# Shell syntax gate: operator convenience scripts must stay parseable.
+for s in scripts/*.sh; do bash -n "$s"; done
+
 cargo build --workspace
 cargo test --workspace -- --test-threads=1
 

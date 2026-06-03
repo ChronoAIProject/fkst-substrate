@@ -109,6 +109,60 @@ Lua 单元测试由 `fkst-framework test` 执行。runner 只发现 package root
 
 `fkst.test` 只在 `test` 子命令的 Lua state 中注册，不属于 production Lua SDK surface；`run` 与 `supervise` 模式不可依赖它。当前断言只有 `eq(actual, expected[, msg])`、`is_true(value[, msg])`、`raises(fn[, msg])` 和 `is_nil(value[, msg])`。这是最小单测工具，不提供 fixture、mock、hook 或测试框架 DSL；除非有意验证真实 CLI 路径，Lua 单测不应调用 `spawn_codex_sync`。
 
+## 安装与更新
+
+`scripts/install.sh` 是 operator 便利脚本，和 `scripts/verify.sh` 同级，不是 engine surface：它只生成本机 operator 配置,不改 SPEC、conformance、supervisor 或任何二进制默认值。更新走独立的 `fkst-update` 二进制(见下)。
+
+`scripts/install.sh`：
+
+```sh
+scripts/install.sh
+```
+
+它 `cargo build --release --workspace`，把 `fkst-supervisor` 与 `fkst-framework` 装进 `$FKST_HOME/bin`（默认 `~/fkst/bin`），创建 package root（默认 `~/fkst-packages`），并生成启动器 `$FKST_HOME/bin/fkst-run`，由它设置 `FKST_PACKAGE_ROOT` / `FKST_RUNTIME_ROOT` 并 `exec fkst-supervisor`。引擎二进制本身**没有默认 package root**（缺 `FKST_PACKAGE_ROOT` / `--package-root` 时 fail-closed）；`~/fkst-packages` 这个默认值只活在生成的启动器里，是 operator config。路径可用 env 覆盖：
+
+```sh
+FKST_HOME=/opt/fkst FKST_PACKAGE_ROOT=/srv/fkst-packages scripts/install.sh
+```
+
+装好后启动（启动器 `cd` 到 package root，PKG == HOST 单 root）：
+
+```sh
+~/fkst/bin/fkst-run
+```
+
+更新走 `fkst-update`（独立二进制，`crates/fkst-update`，由 `install.sh` 一并装入 `$FKST_HOME/bin`）：从 GitHub Release 下载外部 release pipeline 产出的 `fkst-<target>.tar.gz` 与 `SHA256SUMS`、校验 SHA-256 后**逐二进制原子替换**（每个 rename 在 bin dir 文件系统上原子）`$FKST_HOME/bin` 里的 `fkst-supervisor`、`fkst-framework`，不重建、不联系源码。它只做 verify+swap，**不**实现 known-good / accepted-state / rollback / 进程重启（这些仍是外部策略，见「发布边界」）。
+
+```sh
+fkst-update                 # 装到 latest release
+fkst-update --tag v0.1.0    # 装到指定 tag
+fkst-update --bin-dir /opt/fkst/bin
+```
+
+`fkst-update` 消费的 artifact 由 `.github/workflows/release.yml` 在打 `v*` tag 时产出（构建两 target 的 `fkst-<target>.tar.gz` + 聚合 `SHA256SUMS` 发 GitHub Release）。**没有发布过 release 时 `fkst-update` 无 artifact 可拉**（报 `no-matching-release`）；先 `git tag v0.1.0 && git push origin v0.1.0` 触发发布。
+
+持有源码 checkout、想直接从 dev 跟踪而不走 release 的话，更新就是一行 `git pull --ff-only && scripts/verify.sh && scripts/install.sh`（先过 gate 再重装），不需要单独的更新脚本。
+
+自动更新是把 `fkst-update` 交给 operator 的调度器，引擎不拥有调度。macOS 下用一个 LaunchAgent（落 `~/Library/LaunchAgents/com.fkst.update.plist`，属于本机 ops，不进本仓库），把下面示例里的 `/Users/you/...` 换成你的实际路径：
+
+```xml
+<plist version="1.0"><dict>
+  <key>Label</key><string>com.fkst.update</string>
+  <key>ProgramArguments</key>
+  <array><string>/Users/you/fkst/bin/fkst-update</string></array>
+  <key>EnvironmentVariables</key>
+  <dict><key>PATH</key><string>/usr/bin:/bin</string></dict>
+  <key>StartCalendarInterval</key>
+  <dict><key>Hour</key><integer>4</integer><key>Minute</key><integer>0</integer></dict>
+  <key>StandardOutPath</key><string>/tmp/fkst-update.log</string>
+  <key>StandardErrorPath</key><string>/tmp/fkst-update.log</string>
+</dict></plist>
+```
+
+`StartCalendarInterval` 必须同时给 `Hour` 和 `Minute`，否则 launchd 会在该小时内每分钟触发；`fkst-update` 只用到 `/usr/bin` 下的 `curl`、`tar`、`shasum`。`launchctl load ~/Library/LaunchAgents/com.fkst.update.plist` 后每天 04:00 跑一次。注意 `fkst-update` 只换二进制不重启——新版本要等 supervisor 重启才生效（由你的 launchd 服务或手动重启负责）。
+
+operator 的 package/host root（默认 `~/fkst-packages`）需自备：它应是一个 git repo（git-based SDK 用 `git -C <HOST>`），并在 `fkst.env` 里提供必填 HostFact（如 `FKST_CANDIDATE_PREFIX`、`FKST_CANDIDATE_FROM_SEP`），否则相关 department 行为 fail-closed。安装器只建目录，不替你注入业务配置。
+
 ## 发布边界
 
 fkst-substrate 的 accepted release state 来自外部 release pipeline，而不是 engine runtime 内部状态。推荐外部链路是 build → test → `--self-test` → conformance → 签名 artifact → deploy → canary / 回退策略。engine 无 runtime accepted-state/回退；发布安全是外部策略。
