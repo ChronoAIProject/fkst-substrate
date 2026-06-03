@@ -50,7 +50,7 @@ framework 不写持久状态文件。`RuntimeLayout` 把 `FKST_RUNTIME_ROOT` 下
 
 禁止 SQLite、KV store、通用 event log、`.current`、`.heartbeat`、`.next-sha`、进程内计数器或状态文件承担事实源职责。派生状态从事实源重读：计数用 `git_log_count` 或 `count_worktrees`，去重用 `git_log_grep`，互斥用 `with_lock` 或 codex permit pool。
 
-失败是一等输出。pipeline 失败可以产生日志、失败 commit、失败 socket 文件或无 commit，但不能停在隐形状态。日志是 supervisor / framework / dept 三层过程可追溯记录，落 `<RT>/logs` scratch，可 grep、可调试；它不是事实源、不是 reconciliation 输入、不是 accepted state。dept 的 `log.*` 走 stderr，由 supervise 捕获进 framework-child 具名 log；framework/codex 各自落 `<RT>/logs` 同一 scratch 家族。可观察性来自 git、filesystem、fcntl lock witness 和落盘日志，不来自 dashboard 或外部 telemetry。
+失败是一等输出。pipeline 失败可以产生日志、失败 commit、失败 socket 文件或无 commit，但不能停在隐形状态。日志是 supervisor / framework / dept 三层过程可追溯记录，可 grep、可调试；它不是事实源、不是 reconciliation 输入、不是 accepted state。dept 的 `log.*` 走 stderr，由 supervise 捕获进 `<RT>/logs/framework-child` 下的 framework-child 具名 log；codex log 落 `FKST_RUNTIME_LOG_DIR` 或平台默认日志目录。可观察性来自 git、filesystem、fcntl lock witness 和落盘日志，不来自 dashboard 或外部 telemetry。
 
 ## 并发模型
 
@@ -128,7 +128,7 @@ engine 无 runtime accepted-state/回退；发布安全是外部策略。
 
 ## 设计完备性判据
 
-一个引擎改动只有在同时满足这些条件时才算完整：它不扩大 trusted base 或者有 evidence 支撑扩张；它保持三层稳定性和三级公司边界；它的事实落点只在 git/filesystem/fcntl/log；它不引入业务概念；它的失败可分类、可 grep、可恢复；它的 runtime 产物能映射到 `RuntimeLayout` 或明确的 git ref；它有适用测试或 conformance；它不需要 dashboard、内存状态或人工记忆才能解释系统发生了什么。
+一个引擎改动只有在同时满足这些条件时才算完整：它不扩大 trusted base 或者有 evidence 支撑扩张；它保持三层稳定性和三级公司边界；它的事实落点只在 git/filesystem/fcntl；日志只作 observability scratch；它不引入业务概念；它的失败可分类、可 grep、可恢复；它的 runtime 产物能映射到 `RuntimeLayout` 或明确的 git ref；它有适用测试或 conformance；它不需要 dashboard、内存状态或人工记忆才能解释系统发生了什么。
 
 跨文档定位以本仓库为准：`README.md` 说明当前验证命令，`SPEC.md` 定义身份锚点，`docs/architecture.md` 说明引擎架构。任何引用都必须指向 fkst-substrate 自己的文档，不把外部 host 仓库当成当前事实。
 

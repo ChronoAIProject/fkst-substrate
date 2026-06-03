@@ -106,6 +106,14 @@ mod tests {
     }
 
     #[test]
+    fn log_line_escapes_crlf_in_message() {
+        let line = log_line("info", "a\r\nb");
+        assert!(!line.contains('\r'), "{line}");
+        assert!(!line.contains('\n'), "{line}");
+        assert!(line.contains(r" MSG=a\r\nb"), "{line}");
+    }
+
+    #[test]
     fn timestamp_is_rfc3339_utc_seconds() {
         assert_eq!(rfc3339_from_unix(0), "1970-01-01T00:00:00Z");
         assert_eq!(rfc3339_from_unix(1_700_000_000), "2023-11-14T22:13:20Z");

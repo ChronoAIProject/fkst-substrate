@@ -77,6 +77,24 @@ fn raised_entries(output: &Output) -> Vec<Value> {
     serde_json::from_slice(&bytes).unwrap()
 }
 
+fn file_count(root: &Path) -> usize {
+    fn walk(path: &Path, count: &mut usize) {
+        for entry in fs::read_dir(path).unwrap() {
+            let entry = entry.unwrap();
+            let path = entry.path();
+            if path.is_dir() {
+                walk(&path, count);
+            } else {
+                *count += 1;
+            }
+        }
+    }
+
+    let mut count = 0;
+    walk(root, &mut count);
+    count
+}
+
 #[test]
 fn minimal_package_scanner_raises_work_and_worker_logs_completion() {
     let host = tempfile::tempdir().unwrap();
@@ -97,6 +115,7 @@ fn minimal_package_scanner_raises_work_and_worker_logs_completion() {
     assert_eq!(raised[0]["payload"]["id"], "req-001");
     assert_eq!(raised[0]["payload"]["request_path"], "requests/req-001.md");
 
+    let host_file_count_before_worker = file_count(host.path());
     let worker = run_department(
         host.path(),
         runtime.path(),
@@ -104,12 +123,19 @@ fn minimal_package_scanner_raises_work_and_worker_logs_completion() {
         r#"{"type":"work","payload":{"id":"req-001","request_path":"requests/req-001.md"}}"#,
     );
     assert_success(&worker);
+    let host_file_count_after_worker = file_count(host.path());
+    assert_eq!(
+        host_file_count_before_worker, host_file_count_after_worker,
+        "worker must not write runtime files into host"
+    );
 
     let err = stderr(&worker);
-    assert!(err.contains("TIMESTAMP="), "stderr: {err}");
-    assert!(err.contains(" LEVEL=info "), "stderr: {err}");
     assert!(
-        err.contains(" MSG=work completed: req-001"),
+        err.lines().any(|line| {
+            line.contains("TIMESTAMP=")
+                && line.contains(" LEVEL=info ")
+                && line.contains(" MSG=work completed: req-001")
+        }),
         "stderr: {err}"
     );
 }

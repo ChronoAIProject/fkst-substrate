@@ -17,7 +17,8 @@ end
 function pipeline(event)
   local payload = event.payload or {}
   local id = assert(payload.id, "work payload missing id")
-  local request_path = payload.request_path
+  assert(id:match("^[%w._%-]+$"), "unsafe work id: " .. tostring(id))
+  local request_path = "requests/" .. id .. ".md"
   log.info("work started: " .. id)
   log.info("request summary: " .. request_summary(request_path))
   log.info("work completed: " .. id)

@@ -32,7 +32,7 @@ fkst-substrate/
 └── docs/architecture.md
 ```
 
-`examples/minimal-package/` 是引擎自带的最小 reconciliation/control-loop 示例包，用于证明 `--package-root` 能被独立加载、通过图 validation，并且 scanner/worker pipeline 可独立 `run`。它演示事件瞬时、host repo 文件承载本地 durable 完成事实、崩溃后由 cron/file_watch 重新扫描再推导工作。
+`examples/minimal-package/` 是引擎自带的最小 reconciliation/control-loop 示例包，用于证明 `--package-root` 能被独立加载、通过图 validation，并且 scanner/worker pipeline 可独立 `run`。它演示事件瞬时、source→scanner→raise→worker→结构化日志、崩溃后由 cron/file_watch 重新扫描再推导；真实包的完成事实来自 git commit / 外部源 / 明确 host fact。
 
 ## 1. 三层稳定性与三级公司
 
