@@ -32,6 +32,8 @@ target/debug/fkst-framework config \
   --package-root "$PWD/examples/minimal-package"
 ```
 
+`known-good` 子命令只接受 `--project-root`;package root 不通过 `--package-root` 传入,而是由 `FKST_PACKAGE_ROOT` 解析。不要把 config/run/conformance 的 `--package-root` surface 泛化到 known-good。
+
 独立运行：
 
 本仓库内置一个通用最小 package：`examples/minimal-package`。它**声明**了 cron source `tick`、producer（consume `tick`、produce+fanout `work`、写 witness）与两个 fanout consumers（consume `work`、各写 witness），用来作为 `--package-root` 的可加载实例。

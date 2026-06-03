@@ -393,6 +393,23 @@ mod tests {
     use tokio::time::{timeout, Duration};
 
     #[test]
+    fn relative_file_watch_glob_is_host_root_anchored_when_cwd_differs() {
+        let host = tempfile::tempdir().unwrap();
+        let unrelated_cwd = tempfile::tempdir().unwrap();
+        let input = host.path().join("input");
+        std::fs::create_dir(&input).unwrap();
+
+        let original_cwd = std::env::current_dir().unwrap();
+        std::env::set_current_dir(unrelated_cwd.path()).unwrap();
+        let resolved = absolutize_glob("input/*.txt", host.path());
+        std::env::set_current_dir(original_cwd).unwrap();
+
+        let resolved = resolved.unwrap();
+        let expected_prefix = input.canonicalize().unwrap().to_string_lossy().into_owned();
+        assert_eq!(resolved, format!("{expected_prefix}/*.txt"));
+    }
+
+    #[test]
     fn parses_seconds() {
         assert_eq!(parse_duration("10s").unwrap(), Duration::from_secs(10));
     }

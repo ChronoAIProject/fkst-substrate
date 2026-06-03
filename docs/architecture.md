@@ -113,6 +113,8 @@ workspace 只包含这三个 crate。没有业务 Lua package crate,也没有 pa
 `<PKG>` = package root,来自 `FKST_PACKAGE_ROOT` 或 `--package-root`  
 `<HOST>` = host root,即显式 `--project-root`;仅 `run` 未传时可从 Lua 路径推断以保留 standalone 兼容  
 
+注意:上述 package root surface 适用于 `run`、`supervise`、`conformance`、`config`;`known-good` CLI 只接收 `--project-root`,其 package root 仅经 `FKST_PACKAGE_ROOT` 解析。
+
 ```
 L0  supervisor, crates/fkst-supervisor
   引入概念:进程存活
@@ -223,6 +225,8 @@ Codex SDK 的日志目录不是 `RuntimeKind::Logs` 的唯一来源。它优先�
 否则 FKST_PACKAGE_ROOT
 host root 来自显式 --project-root;仅 run 模式未传 --project-root 时可从 Lua 路径推断
 ```
+
+`known-good` 是例外:CLI 不接收 `--package-root`,只接收 `--project-root`;package root 由 `PackageRoots::resolve(root, None)` 经 `FKST_PACKAGE_ROOT` 解析。
 
 如果 `<PKG> == <HOST>`,graph root 只有一个 `PackageAndHost`。否则扫描顺序是 package root 后 host root。重复 Department 名或 Raiser 名直接拒绝启动。`package.lua` 是被移除的 surface,存在即拒绝启动。
 

@@ -53,9 +53,9 @@
 - 当前 fkst-substrate 的 engine host-conformance 入口是 Rust CLI `fkst-framework conformance --project-root <path>`;历史 `conformance/run_all.sh` 尚未迁入,不是当前入口。
 - 首批 invariant 分组是 Tier II identity、source-language-identity、三级公司、事实源、SDK surface、部门本地模块边界、演化白名单、CI wiring、Tier I boundary。
 - `source-language-identity` 要求 `crates/`、`conformance/`、`departments/`、`raisers/`、`scripts/`、`tests/` 下后缀为 `.rs`、`.lua`、`.sh`、`.py`、`.ts` 的 managed source files 不含中文自然语言文本。
-- `conformance/source_language_identity.sh` 是该 invariant 的 Tier II gate。
+- `conformance/source_language_identity.sh` 是该 invariant 的目标 Tier II shell gate;该 gate 尚未在 fkst-substrate 仓库物化。
 - `host tree pollution` 要求 host main repo HEAD/index 不跟踪 runtime layout pathspec;durable runtime facts 只能通过 host-configured hidden runtime ref projection 进入 runtime ledger。
-- `conformance/host_tracked_runtime_artifacts.sh` 是该 invariant 的 Tier II gate。
+- `conformance/host_tracked_runtime_artifacts.sh` 是该 invariant 的目标 Tier II shell gate;该 gate 尚未在 fkst-substrate 仓库物化。
 - conformance 可以读取仓库文件、检查可执行位、检查治理文档锚点。
 - conformance 必须强制 `crates/fkst-supervisor/src` 只有 `main.rs`、Tier I LOC ≤ 150、且不得 import 或提及 event runtime / department / raiser surface。
 - conformance 必须提供 changed-file 文件集白名单 guard,对 Tier I、Tier II、Tier III、detector、business Lua 演化范围 fail closed。

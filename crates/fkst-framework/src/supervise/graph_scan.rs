@@ -13,7 +13,7 @@ use fkst_common::config::{Config, DepartmentDecl, LimitsDecl, QueueDecl, RaiserD
 use fkst_common::RuntimeKind;
 use mlua::{Lua, LuaSerdeExt, Table, Value as LuaValue};
 use serde::Deserialize;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use crate::config_registry::{ConfigContext, ConfigKey, ConfigValueType};
@@ -287,7 +287,7 @@ fn derive_queues(
     department_fanout: &HashMap<String, Vec<String>>,
     defaults: &HostGraphDefaults,
 ) -> Result<HashMap<String, QueueDecl>> {
-    let mut referenced = HashSet::new();
+    let mut referenced = BTreeSet::new();
     for dept in departments.values() {
         for q in &dept.consumes {
             referenced.insert(q.clone());
@@ -319,8 +319,8 @@ fn resolve_department_fanout(
     departments: &HashMap<String, DepartmentDecl>,
     department_fanout: &HashMap<String, Vec<String>>,
 ) -> Result<HashSet<String>> {
-    let mut fanout = HashSet::new();
-    for (name, queues) in department_fanout {
+    let mut fanout = BTreeSet::new();
+    for (name, queues) in sorted_department_fanout(department_fanout) {
         let dept = departments
             .get(name)
             .ok_or_else(|| anyhow!("department `{}` fanout has no department", name))?;
@@ -337,7 +337,15 @@ fn resolve_department_fanout(
             fanout.insert(queue.clone());
         }
     }
-    Ok(fanout)
+    Ok(fanout.into_iter().collect())
+}
+
+fn sorted_department_fanout<'a>(
+    department_fanout: &'a HashMap<String, Vec<String>>,
+) -> Vec<(&'a String, &'a Vec<String>)> {
+    let mut entries = department_fanout.iter().collect::<Vec<_>>();
+    entries.sort_by(|(left, _), (right, _)| left.cmp(right));
+    entries
 }
 
 fn resolve_runtime_file_watch_glob(raiser: &mut RaiserDecl, host_root: &Path) -> Result<()> {
