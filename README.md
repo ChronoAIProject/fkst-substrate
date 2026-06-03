@@ -33,15 +33,14 @@ target/debug/fkst-framework config \
 
 ## 独立运行
 
-本仓库内置一个 log-only 最小 package：`examples/minimal-package`。它声明 cron source `reconcile_tick`、file_watch source `request_changed`、`scanner` 与 `worker`。cron 和文件变更都会触发 scanner 全量扫描 host repo 里的 `requests/*.md`，并为每个请求 raise `work`；worker 消费 `work`，读取请求摘要，并通过 `log.info` 写结构化过程日志。
+本仓库内置一个最小 package-root fixture：`examples/minimal-package`。它声明一个 cron source `tick` 和一个 log-only department `logger`。cron source 产生 `tick` queue 事件；`logger` 消费 `tick`，并通过 `log.info` 写结构化过程日志。
 
-`FKST_RUNTIME_ROOT` 仍是引擎 scratch 配置，用于 worktree、codex permit、lock 与 log 等运行时落点；这个示例 Lua 不读取它，也不把 `<RT>` 当 package 状态目录。示例只展示 source → scanner → raise → worker → log 的过程链路，不声明完成事实。真实 package 的幂等 done 事实应来自 git commit、外部源或明确的 host filesystem fact。
+`FKST_RUNTIME_ROOT` 仍是引擎 scratch 配置，用于 worktree、codex permit、lock 与 log 等运行时落点；这个 fixture 的 Lua 不读取它，也不把 `<RT>` 当 package 状态目录。fixture 只展示 package-root 独立加载、graph validation，以及 source 事件 dispatch 到 `pipeline(event)`。
 
 下列命令证明的范围如下：
 
-- `conformance`：minimal-package 的 scanner/worker 图通过 validation。
-- `run scanner`：单个 scanner pipeline 扫描请求并输出一行 `RAISED:` 前缀的 base64 编码事件，解码后 queue 为 `work`。
-- `run worker`：单个 worker pipeline 消费 work，并向 stderr 写结构化 `work completed` 日志行。
+- `conformance`：minimal-package 的单 source / 单 department 图通过 validation。
+- `run logger`：单个 logger pipeline 消费 `tick`，并向 stderr 写结构化 `event received` 日志行。
 
 ```sh
 cargo build --workspace
@@ -54,22 +53,14 @@ target/debug/fkst-framework conformance \
 (
   cd "$tmp_host" &&
   "$repo/target/debug/fkst-framework" run \
-    "$tmp_host/departments/scanner/main.lua" \
+    "$tmp_host/departments/logger/main.lua" \
     --project-root "$tmp_host" \
     --package-root "$tmp_host" \
-    --event '{"type":"reconcile_tick","payload":{}}'
-)
-(
-  cd "$tmp_host" &&
-  "$repo/target/debug/fkst-framework" run \
-    "$tmp_host/departments/worker/main.lua" \
-    --project-root "$tmp_host" \
-    --package-root "$tmp_host" \
-    --event '{"type":"work","payload":{"id":"req-001","request_path":"requests/req-001.md"}}'
+    --event '{"type":"tick","payload":{}}'
 )
 ```
 
-scanner 输出应包含一行 `RAISED:` 前缀的 base64 编码事件，解码后 queue 为 `work`。worker 的 stderr 应包含结构化日志行，例如 `LEVEL=info MSG=work completed: req-001`。再次运行 scanner 仍会为 `req-001` raise work；这个 log-only 示例不证明幂等。
+logger 的 stderr 应包含结构化日志行，例如 `LEVEL=info MSG=event received: tick`。
 
 ## 发布边界
 
@@ -77,7 +68,7 @@ fkst-substrate 的 accepted release state 来自外部 release pipeline，而不
 
 host/package 可以在此 runtime 上编排 SDLC 工作流，但这属于外部行为层，不是 engine 内建职责。
 
-engine 队列是瞬时的；durable 真相属于 git commit、明确的 host filesystem fact 或外部源，不在 engine 内部维护。崩溃后由 cron/file_watch 触发 scanner 重新扫描 durable 源并推导未完成工作。
+engine 队列是瞬时的；durable 真相属于 git commit、明确的 host filesystem fact 或外部源，不在 engine 内部维护。
 
 ## 文档
 
