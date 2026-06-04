@@ -10,3 +10,4 @@ pub use config::Config;
 pub use error::FkstError;
 pub use event::Event;
 pub use runtime_layout::{RuntimeKind, RuntimeLayout};
+pub use validation::validate_runtime_key;

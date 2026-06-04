@@ -1,7 +1,7 @@
 // crate-level integration tests own behavior coverage while runtime modules keep runtime code.
 
 use fkst_common::config::{Config, DepartmentDecl, LimitsDecl, QueueDecl, RaiserDecl};
-use fkst_common::validation::validate;
+use fkst_common::validation::{validate, validate_runtime_key};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use tempfile::tempdir;
@@ -74,6 +74,27 @@ fn valid_config_passes() {
     let cfg = cfg_minimal(&lua);
     let warnings = validate(&cfg, tmp.path()).unwrap();
     assert!(warnings.is_empty(), "{warnings:?}");
+}
+
+#[test]
+fn runtime_key_accepts_readable_relative_paths() {
+    assert_eq!(
+        validate_runtime_key("github-proxy/issue/owner/repo/42").unwrap(),
+        "github-proxy/issue/owner/repo/42"
+    );
+    assert_eq!(validate_runtime_key("a.B_0-1").unwrap(), "a.B_0-1");
+}
+
+#[test]
+fn runtime_key_rejects_traversal_and_invalid_segments() {
+    let too_long_segment = "a".repeat(256);
+    for key in [
+        "..", "a/../b", "/abs", "a//b", "a/", "", "bad key", "bad:key",
+        "a\\b", "a/.../b", too_long_segment.as_str(),
+    ] {
+        let err = validate_runtime_key(key).unwrap_err();
+        assert!(err.to_string().contains("runtime key"), "{key:?}: {err}");
+    }
 }
 
 #[test]

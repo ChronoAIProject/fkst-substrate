@@ -59,8 +59,9 @@
 ## SDK surface
 
 - 固定 Lua SDK surface 锚点是 `fixed-lua-sdk-surface`；允许 surface 是 `pipeline`、`source`、`raise`、`spawn_codex_sync`、`spawn_codex`、`exec_sync`、`await_all`、`with_lock`、`once`、`cache_set`、`cache_get`、`git_log_count`、`git_log_grep`、`count_worktrees`、`list_orphan_worktrees`、`setup_worktree`、`file`、`json.decode`、`log.info`、`log.warn`、`log.error`、`now`。
-- `once(key, fn)` 对非空 string key 做 byte-level hex 编码，在 `<RT>/locks/once-<hex>` 上持有 exclusive flock 后检查 `<RT>/marks/<hex>`；marker 已存在时返回 `false` 且不调用 `fn`，不存在时调用 `fn`，成功后写入 marker 并返回 `true`，失败时传播错误且不写 marker。
-- `cache_set(key, value)` 与 `cache_get(key)` 对非空 string key 做 byte-level hex 编码，读写 `<RT>/cache/<hex>`。`cache_set` 原子覆盖写入 string value；`cache_get` 命中时返回 string，缺失时返回 nil。cache 是 host-local best-effort scratch，不是 durable state；调用者需要 read-compare-write 原子性时必须外层使用 `with_lock`。
+- `with_lock(name, fn)`、`once(key, fn)`、`cache_set(key, value)` 与 `cache_get(key)` 共用 runtime key 合约：key / name 必须是非空相对 filesystem path，`/` 表示目录；每个 segment 非空、匹配 `[A-Za-z0-9._-]+`，且不是 `.` 或 `..`；禁止 leading / trailing `/`、`//`、反斜杠、NUL 与绝对路径。校验后的 key 可直接 join 到 `<RT>/{locks,marks,cache}/<key>`，形成可人工浏览的目录树，不再做 byte hex 编码。
+- `once(key, fn)` 在 `<RT>/locks/once/<key>` 上持有 exclusive flock 后检查 `<RT>/marks/<key>`；`locks/once/` 是 once 内部锁的保留子目录，不属于 `with_lock` 用户锁命名空间。marker 已存在时返回 `false` 且不调用 `fn`，不存在时调用 `fn`，成功后写入 marker 并返回 `true`，失败时传播错误且不写 marker。
+- `cache_set(key, value)` 与 `cache_get(key)` 读写 `<RT>/cache/<key>`。`cache_set` 原子覆盖写入 string value；`cache_get` 命中时返回 string，缺失时返回 nil。cache 是 host-local best-effort scratch，不是 durable state；调用者需要 read-compare-write 原子性时必须外层使用 `with_lock`。
 - `spawn_codex` handle 只能由 `await_all` join；单 handle 等待使用 `await_all({handle})`；first-result fanout 与 sleep timer 不是固定 Lua SDK surface。
 - `json` 是 decode-only：`json.decode` 暴露 engine 自身 JSON wire format 的解析（event 进、`raise` 出都是 JSON），Lua 值经 `raise` 出引擎，故不提供 `json.encode`；`json` table 锁定为只含 `decode`，新增 encode 或其它 key 必须另走 evidence + conformance。
 - 新增 SDK 函数必须经 evidence、深度共识与 conformance 覆盖，不能由单个 codex 实例直接扩张。

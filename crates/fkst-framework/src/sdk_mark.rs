@@ -1,6 +1,6 @@
 //! SDK: `once(key, fn) -> boolean` best-effort per-key debounce marker.
 
-use fkst_common::RuntimeKind;
+use fkst_common::{validate_runtime_key, RuntimeKind};
 use mlua::{Function, Lua, Result};
 use nix::fcntl::{flock, FlockArg};
 use std::os::fd::AsRawFd;
@@ -18,18 +18,20 @@ pub fn register(lua: &Lua, host_root: &Path) -> Result<()> {
 }
 
 fn once(host_root: &Path, key: String, f: Function) -> Result<bool> {
-    if key.is_empty() {
-        return Err(mlua::Error::external(anyhow::anyhow!(
-            "once key must not be empty"
-        )));
-    }
-
-    let encoded = hex_encode(key.as_bytes());
+    let key = validate_runtime_key(&key).map_err(mlua::Error::external)?;
     let layout =
         runtime_context::layout_from_host_root(host_root).map_err(mlua::Error::external)?;
-    let locks = layout.runtime_dir(RuntimeKind::Locks);
-    std::fs::create_dir_all(&locks).map_err(mlua::Error::external)?;
-    let lock_path = locks.join(format!("once-{encoded}"));
+    let lock_path = layout
+        .runtime_dir(RuntimeKind::Locks)
+        .join("once")
+        .join(key);
+    let lock_parent = lock_path.parent().ok_or_else(|| {
+        mlua::Error::external(anyhow::anyhow!(
+            "once lock target '{}' has no parent",
+            lock_path.display()
+        ))
+    })?;
+    std::fs::create_dir_all(lock_parent).map_err(mlua::Error::external)?;
     let lock_file = std::fs::OpenOptions::new()
         .create(true)
         .truncate(false)
@@ -40,7 +42,7 @@ fn once(host_root: &Path, key: String, f: Function) -> Result<bool> {
 
     flock(lock_file.as_raw_fd(), FlockArg::LockExclusive).map_err(mlua::Error::external)?;
 
-    let marker = layout.runtime_dir(RuntimeKind::Marks).join(&encoded);
+    let marker = layout.runtime_dir(RuntimeKind::Marks).join(key);
     if marker.exists() {
         sdk_log::info(&format!("once decision=skip-marked key={key}"));
         drop(lock_file);
@@ -50,9 +52,23 @@ fn once(host_root: &Path, key: String, f: Function) -> Result<bool> {
     let result = f.call::<()>(());
     match result {
         Ok(()) => {
-            let marks = layout.runtime_dir(RuntimeKind::Marks);
-            std::fs::create_dir_all(&marks).map_err(mlua::Error::external)?;
-            let temp_marker = marks.join(format!(".{encoded}.tmp"));
+            let marker_parent = marker.parent().ok_or_else(|| {
+                mlua::Error::external(anyhow::anyhow!(
+                    "once marker target '{}' has no parent",
+                    marker.display()
+                ))
+            })?;
+            std::fs::create_dir_all(marker_parent).map_err(mlua::Error::external)?;
+            let marker_name = marker
+                .file_name()
+                .and_then(|name| name.to_str())
+                .ok_or_else(|| {
+                    mlua::Error::external(anyhow::anyhow!(
+                        "once marker target '{}' has no file name",
+                        marker.display()
+                    ))
+                })?;
+            let temp_marker = marker_parent.join(format!(".{marker_name}.tmp"));
             let marked_at = sdk_log::rfc3339_utc_now();
             std::fs::write(&temp_marker, format!("key={key}\nmarked_at={marked_at}\n"))
                 .map_err(mlua::Error::external)?;
@@ -65,26 +81,5 @@ fn once(host_root: &Path, key: String, f: Function) -> Result<bool> {
             drop(lock_file);
             Err(err)
         }
-    }
-}
-
-fn hex_encode(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        out.push(HEX[(byte >> 4) as usize] as char);
-        out.push(HEX[(byte & 0x0f) as usize] as char);
-    }
-    out
-}
-
-#[cfg(test)]
-mod tests {
-    use super::hex_encode;
-
-    #[test]
-    fn hex_encode_is_lowercase_byte_encoding() {
-        assert_eq!(hex_encode(b"k"), "6b");
-        assert_eq!(hex_encode("a/b".as_bytes()), "612f62");
     }
 }

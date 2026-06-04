@@ -124,7 +124,7 @@ fn with_lock_runs_fn() {
             lua.load(
                 r#"
             local r = nil
-            with_lock("worker-req-001", function() r = 42 end)
+            with_lock("github-proxy/issue/owner/repo/42", function() r = 42 end)
             return r
             "#,
             )
@@ -134,7 +134,10 @@ fn with_lock_runs_fn() {
     );
 
     assert_eq!(n, 42);
-    assert!(runtime.path().join("locks/worker-req-001").exists());
+    assert!(runtime
+        .path()
+        .join("locks/github-proxy/issue/owner/repo/42")
+        .exists());
     assert!(!host.path().join("worker-req-001").exists());
 }
 
@@ -161,13 +164,15 @@ fn with_lock_requires_runtime_root() {
 }
 
 #[test]
-fn with_lock_rejects_path_names() {
+fn with_lock_rejects_invalid_path_keys() {
     let lua = Lua::new();
     let host = tempdir().unwrap();
     register_for_host(&lua, host.path());
     let runtime = tempdir().unwrap();
 
-    for name in ["../x", "nested/x", "/tmp/x"] {
+    for name in [
+        "..", "a/../b", "/abs", "a//b", "a/", "", "bad key", "bad:key",
+    ] {
         let err = in_sandbox(
             host.path(),
             |sandbox| {
@@ -180,7 +185,31 @@ fn with_lock_rejects_path_names() {
             },
         );
 
-        assert_lua_error_contains(err, &["with_lock name must be a single path segment"]);
+        assert_lua_error_contains(err, &["runtime key"]);
+    }
+}
+
+#[test]
+fn with_lock_rejects_once_reserved_namespace() {
+    let lua = Lua::new();
+    let host = tempdir().unwrap();
+    register_for_host(&lua, host.path());
+    let runtime = tempdir().unwrap();
+
+    for name in ["once", "once/github-proxy"] {
+        let err = in_sandbox(
+            host.path(),
+            |sandbox| {
+                sandbox.runtime_root(runtime.path());
+            },
+            || {
+                lua.load(format!(r#"return with_lock("{name}", function() end)"#))
+                    .eval::<()>()
+                    .unwrap_err()
+            },
+        );
+
+        assert_lua_error_contains(err, &["reserved lock namespace", "once"]);
     }
 }
 
