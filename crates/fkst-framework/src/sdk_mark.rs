@@ -6,7 +6,7 @@ use nix::fcntl::{flock, FlockArg};
 use std::os::fd::AsRawFd;
 use std::path::Path;
 
-use crate::runtime_context;
+use crate::{runtime_context, sdk_log};
 
 pub fn register(lua: &Lua, host_root: &Path) -> Result<()> {
     let host_root = host_root.to_path_buf();
@@ -42,6 +42,7 @@ fn once(host_root: &Path, key: String, f: Function) -> Result<bool> {
 
     let marker = layout.runtime_dir(RuntimeKind::Marks).join(&encoded);
     if marker.exists() {
+        sdk_log::info(&format!("once decision=skip-marked key={key}"));
         drop(lock_file);
         return Ok(false);
     }
@@ -52,8 +53,11 @@ fn once(host_root: &Path, key: String, f: Function) -> Result<bool> {
             let marks = layout.runtime_dir(RuntimeKind::Marks);
             std::fs::create_dir_all(&marks).map_err(mlua::Error::external)?;
             let temp_marker = marks.join(format!(".{encoded}.tmp"));
-            std::fs::write(&temp_marker, format!("{key}\n")).map_err(mlua::Error::external)?;
+            let marked_at = sdk_log::rfc3339_utc_now();
+            std::fs::write(&temp_marker, format!("key={key}\nmarked_at={marked_at}\n"))
+                .map_err(mlua::Error::external)?;
             std::fs::rename(temp_marker, marker).map_err(mlua::Error::external)?;
+            sdk_log::info(&format!("once decision=ran-marked key={key}"));
             drop(lock_file);
             Ok(true)
         }

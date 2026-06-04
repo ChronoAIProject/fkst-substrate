@@ -2,6 +2,8 @@
 
 #[path = "../src/runtime_context.rs"]
 mod runtime_context;
+#[path = "../src/sdk_log.rs"]
+mod sdk_log;
 #[path = "../src/sdk_mark.rs"]
 mod sdk_mark;
 mod support;
@@ -53,10 +55,9 @@ fn once_runs_first_time_and_writes_marker() {
 
     assert!(ran);
     assert_eq!(count, 1);
-    assert_eq!(
-        std::fs::read_to_string(runtime.path().join("marks/6b")).unwrap(),
-        "k\n"
-    );
+    let marker = std::fs::read_to_string(runtime.path().join("marks/6b")).unwrap();
+    assert!(marker.starts_with("key=k\nmarked_at="), "{marker}");
+    assert!(marker.ends_with("Z\n"), "{marker}");
     assert!(runtime.path().join("locks/once-6b").exists());
 }
 
@@ -139,10 +140,9 @@ fn once_error_does_not_write_marker_and_subsequent_call_retries() {
 
     assert!(ran);
     assert_eq!(count, 1);
-    assert_eq!(
-        std::fs::read_to_string(runtime.path().join("marks/6b")).unwrap(),
-        "k\n"
-    );
+    let marker = std::fs::read_to_string(runtime.path().join("marks/6b")).unwrap();
+    assert!(marker.starts_with("key=k\nmarked_at="), "{marker}");
+    assert!(marker.ends_with("Z\n"), "{marker}");
 }
 
 #[test]

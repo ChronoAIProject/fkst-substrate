@@ -271,6 +271,8 @@ Codex SDK 也把 `codex exec` 放入 process group。stall 时 kill process grou
 
 `once(key, fn)` 是 best-effort per-key de-bounce primitive。它把非空 key 的 bytes hex 编码，在 `<RT>/locks/once-<hex>` 上获取 exclusive flock 后检查 `<RT>/marks/<hex>`；marker 存在则返回 `false`，不存在则执行 `fn`，成功后写 marker 并返回 `true`。marker 是 host-local scratch，不是 durable state；runtime root 被清空或换 host 后，`fn` 会重新运行，这由 at-least-once、下游 / package 幂等和从 durable 源重新推导来容纳。`fn` 失败时不写 marker，后续调用会重试。
 
+`once` 决策通过 engine log 观察：`once decision=skip-marked key=...` 与 `once decision=ran-marked key=...` 提供可 grep trail。marker 内容只含人工提示（`key`、`marked_at`），不被解析；LIVE lock holder 用 `lsof <RT>/locks/once-<hex>` 查看。
+
 ## 12. Git 与 Worktree Primitives
 
 `setup_worktree` 会创建 candidate branch。所有 git SDK 命令使用 `git -C <HOST> ...`，不依赖 framework launcher cwd。branch 前缀和 from separator 是 HostFact，来自 `FKST_CANDIDATE_PREFIX` / `FKST_CANDIDATE_FROM_SEP` 或 host `fkst.env`，缺失时 fail-closed。

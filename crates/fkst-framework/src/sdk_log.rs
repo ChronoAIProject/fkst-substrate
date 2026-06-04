@@ -8,21 +8,21 @@ pub fn register(lua: &Lua) -> Result<()> {
     log.set(
         "info",
         lua.create_function(|_, msg: String| {
-            eprintln!("{}", log_line("info", &msg));
+            info(&msg);
             Ok(())
         })?,
     )?;
     log.set(
         "warn",
         lua.create_function(|_, msg: String| {
-            eprintln!("{}", log_line("warn", &msg));
+            emit("warn", &msg);
             Ok(())
         })?,
     )?;
     log.set(
         "error",
         lua.create_function(|_, msg: String| {
-            eprintln!("{}", log_line("error", &msg));
+            emit("error", &msg);
             Ok(())
         })?,
     )?;
@@ -30,10 +30,18 @@ pub fn register(lua: &Lua) -> Result<()> {
     Ok(())
 }
 
+pub(crate) fn info(msg: &str) {
+    emit("info", msg);
+}
+
+pub(crate) fn emit(level: &str, msg: &str) {
+    eprintln!("{}", log_line(level, msg));
+}
+
 fn log_line(level: &str, msg: &str) -> String {
     format!(
         "TIMESTAMP={} LEVEL={} MSG={}",
-        rfc3339_now(),
+        rfc3339_utc_now(),
         level,
         single_line(msg)
     )
@@ -43,7 +51,7 @@ fn single_line(msg: &str) -> String {
     msg.replace('\r', "\\r").replace('\n', "\\n")
 }
 
-fn rfc3339_now() -> String {
+pub(crate) fn rfc3339_utc_now() -> String {
     let elapsed = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or(Duration::ZERO);
