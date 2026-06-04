@@ -107,7 +107,7 @@ consumer 的完整事件日志会落在 `<RT>/logs/framework-child/` 下。真�
 
 Lua 单元测试由 `fkst-framework test` 执行。runner 只发现 package root 和 host root 下的 `departments/*/*_test.lua` 与 `tests/*_test.lua`，不全树递归，也不扫描 `raisers/` 或 `fkst/`。测试文件应 `return { test_name = function() ... end }`；runner 按文件路径和 `test_*` key 排序，失败后继续执行后续测试，最后输出通过 / 失败汇总。
 
-`fkst.test` 只在 `test` 子命令的 Lua state 中注册，不属于 production Lua SDK surface；`run` 与 `supervise` 模式不可依赖它。当前断言只有 `eq(actual, expected[, msg])`、`is_true(value[, msg])`、`raises(fn[, msg])` 和 `is_nil(value[, msg])`。这是最小单测工具，不提供 fixture、mock、hook 或测试框架 DSL；除非有意验证真实 CLI 路径，Lua 单测不应调用 `spawn_codex_sync`。
+`fkst.test` 只在 `test` 子命令的 Lua state 中注册，不属于 production Lua SDK surface；`run` 与 `supervise` 模式不可依赖它。当前断言只有 `eq(actual, expected[, msg])`、`is_true(value[, msg])`、`raises(fn[, msg])` 和 `is_nil(value[, msg])`。test-mode 还提供 `run_department(path, event[, opts])`，用 fresh Lua state、production SDK 和独立 raise buffer 执行一个 department entrypoint，返回 `{ exit_code = int, raises = { { queue = string, payload = table }, ... } }`；相对路径按 package root 解析，`opts.cwd`、`opts.env`、`opts.path_prepend` 只作用于该次执行并随后恢复。这是最小单测工具，不提供 fixture、mock、hook 或测试框架 DSL；除非有意验证真实 CLI 路径，Lua 单测不应调用 `spawn_codex_sync`。
 
 ## 安装与更新
 

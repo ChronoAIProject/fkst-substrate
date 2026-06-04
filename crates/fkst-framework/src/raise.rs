@@ -23,6 +23,15 @@ impl RaiseBuffer {
         Self::default()
     }
 
+    pub(crate) fn snapshot(&self) -> Vec<(String, JsonValue)> {
+        self.0
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|entry| (entry.queue.clone(), entry.payload.clone()))
+            .collect()
+    }
+
     pub fn emit_stdout(&self) {
         let entries = self.0.lock().unwrap().clone();
         if entries.is_empty() {
