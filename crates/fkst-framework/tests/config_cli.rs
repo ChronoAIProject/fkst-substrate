@@ -8,6 +8,9 @@ const CONFIG_ENVS: &[&str] = &[
     "FKST_QUEUE_CAPACITY",
     "FKST_DEPARTMENT_DEFAULT_STALL_WINDOW",
     "FKST_CODEX_PERMIT_SLOTS",
+    "FKST_RETRY_DEFAULT_MAX_ATTEMPTS",
+    "FKST_RETRY_DEFAULT_BASE",
+    "FKST_RETRY_DEFAULT_CAP",
     "FKST_CANDIDATE_PREFIX",
     "FKST_CANDIDATE_FROM_SEP",
     "FKST_PACKAGE_ROOT",
@@ -60,9 +63,11 @@ fn config_reads_host_fkst_env_from_project_root_when_cwd_differs() {
 
     assert_exit(&output, 0);
     let out = stdout(&output);
-    assert_eq!(out.lines().count(), 5, "{out}");
+    assert_eq!(out.lines().count(), 8, "{out}");
     assert!(out.contains("name=queue_capacity"), "{out}");
     assert!(out.contains("resolved=31 source=fkst.env"), "{out}");
+    assert!(out.contains("name=retry_default_max_attempts"), "{out}");
+    assert!(out.contains("resolved=5 source=default"), "{out}");
     assert!(out.contains("name=candidate_prefix"), "{out}");
     assert!(out.contains("resolved=host-rc source=fkst.env"), "{out}");
 }
@@ -105,6 +110,8 @@ fn config_operational_defaults_and_missing_host_facts_are_reported() {
     let out = stdout(&output);
     assert!(out.contains("name=queue_capacity"), "{out}");
     assert!(out.contains("resolved=16 source=default"), "{out}");
+    assert!(out.contains("name=retry_default_base"), "{out}");
+    assert!(out.contains("resolved=60s source=default"), "{out}");
     assert!(out.contains("name=candidate_prefix"), "{out}");
     assert!(out.contains("resolved=missing source=missing"), "{out}");
 }

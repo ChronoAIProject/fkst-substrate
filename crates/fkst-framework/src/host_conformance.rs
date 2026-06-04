@@ -101,6 +101,8 @@ impl HostConformanceSuite {
                 layout.runtime_dir(RuntimeKind::Logs);
                 layout.runtime_dir(RuntimeKind::Marks);
                 layout.runtime_dir(RuntimeKind::Cache);
+                layout.runtime_dir(RuntimeKind::Retry);
+                layout.runtime_dir(RuntimeKind::Dead);
                 Ok(layout)
             }) {
             Ok(layout) => HostCheck::pass(

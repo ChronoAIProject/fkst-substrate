@@ -43,6 +43,15 @@ pub struct DepartmentDecl {
     #[serde(default)]
     pub produces: Vec<String>,
     pub stall_window: String,
+    #[serde(default)]
+    pub retry: Option<RetryDecl>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+pub struct RetryDecl {
+    pub max_attempts: u64,
+    pub base: String,
+    pub cap: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]

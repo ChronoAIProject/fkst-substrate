@@ -1,6 +1,6 @@
 //! Schema validation on config load. Refuse-to-start on any violation.
 
-use crate::config::{Config, RaiserDecl};
+use crate::config::{Config, RaiserDecl, RetryDecl};
 use crate::error::FkstError;
 
 /// Validate a runtime scratch key before joining it below a RuntimeLayout subdir.
@@ -144,6 +144,9 @@ pub fn validate(cfg: &Config, project_root: &std::path::Path) -> Result<Vec<Stri
                 name, dept.stall_window
             )));
         }
+        if let Some(retry) = &dept.retry {
+            validate_retry_decl(name, retry)?;
+        }
     }
 
     let mut warnings = Vec::new();
@@ -187,6 +190,8 @@ fn validate_queue_contract(
     qname: &str,
     consumers: &[String],
 ) -> Result<(), FkstError> {
+    validate_queue_retry_mix(cfg, qname, consumers)?;
+
     if queue_is_fanout(cfg, qname) {
         return Ok(());
     }
@@ -209,6 +214,87 @@ fn validate_queue_contract(
     }
 
     Ok(())
+}
+
+fn validate_retry_decl(name: &str, retry: &RetryDecl) -> Result<(), FkstError> {
+    if retry.max_attempts == 0 {
+        return Err(FkstError::Schema(format!(
+            "department '{}' retry.max_attempts must be > 0",
+            name
+        )));
+    }
+    let base = parse_duration_millis(&retry.base).ok_or_else(|| {
+        FkstError::Schema(format!(
+            "department '{}' retry.base '{}' must be a positive s/m/h duration",
+            name, retry.base
+        ))
+    })?;
+    let cap = parse_duration_millis(&retry.cap).ok_or_else(|| {
+        FkstError::Schema(format!(
+            "department '{}' retry.cap '{}' must be a positive s/m/h duration",
+            name, retry.cap
+        ))
+    })?;
+    if cap < base {
+        return Err(FkstError::Schema(format!(
+            "department '{}' retry.cap '{}' must be >= retry.base '{}'",
+            name, retry.cap, retry.base
+        )));
+    }
+    Ok(())
+}
+
+fn validate_queue_retry_mix(
+    cfg: &Config,
+    qname: &str,
+    consumers: &[String],
+) -> Result<(), FkstError> {
+    if consumers.len() <= 1 {
+        return Ok(());
+    }
+    let mut retry_enabled = Vec::new();
+    let mut retry_disabled = Vec::new();
+    for consumer in consumers {
+        let name = department_name_from_label(consumer);
+        let Some(dept) = cfg.department.get(name) else {
+            continue;
+        };
+        if dept.retry.is_some() {
+            retry_enabled.push(consumer.clone());
+        } else {
+            retry_disabled.push(consumer.clone());
+        }
+    }
+    if !retry_enabled.is_empty() && !retry_disabled.is_empty() {
+        return Err(FkstError::Schema(format!(
+            "queue '{}' has mixed retry consumers: retry enabled ({}) and retry disabled ({})",
+            qname,
+            retry_enabled.join(", "),
+            retry_disabled.join(", ")
+        )));
+    }
+    Ok(())
+}
+
+fn department_name_from_label(label: &str) -> &str {
+    label
+        .strip_prefix("department '")
+        .and_then(|rest| rest.strip_suffix('\''))
+        .unwrap_or(label)
+}
+
+fn parse_duration_millis(raw: &str) -> Option<u128> {
+    let unit = raw.chars().last()?;
+    let value = raw[..raw.len() - unit.len_utf8()].parse::<u128>().ok()?;
+    if value == 0 {
+        return None;
+    }
+    match unit {
+        's' => Some(value.saturating_mul(1_000)),
+        'm' => Some(value.saturating_mul(60_000)),
+        'h' => Some(value.saturating_mul(3_600_000)),
+        _ => None,
+    }
 }
 
 fn queue_is_fanout(cfg: &Config, qname: &str) -> bool {
@@ -303,6 +389,7 @@ mod tests {
                 consumes: vec!["tick".into()],
                 produces: Vec::new(),
                 stall_window: "30s".into(),
+                retry: None,
             },
         );
         cfg

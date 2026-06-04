@@ -10,11 +10,14 @@ mod consumer;
 pub mod event_fanout;
 mod graph_scan;
 mod raised;
-mod source_runner;
+mod retry_state;
+mod retry_sweep;
+pub(crate) mod source_runner;
 mod spawner;
 
 use consumer::spawn_consumer;
 use event_fanout::Fanout;
+use retry_sweep::spawn_retry_sweeper;
 use source_runner::{spawn_cron, spawn_file_watch};
 
 pub(crate) fn load_host_graph_for_conformance(roots: &PackageRoots) -> Result<Config> {
@@ -47,6 +50,10 @@ pub async fn supervise(roots: PackageRoots, framework_bin: PathBuf) -> Result<()
     let fanout = Fanout::new();
     let codex_permit_slots = cfg.limits.global_codex_processes;
     let mut handles = vec![];
+    handles.push(spawn_retry_sweeper(
+        crate::runtime_context::layout_from_host_root(&project_root)?,
+        fanout.clone(),
+    ));
 
     let mut departments = cfg.department.iter().collect::<Vec<_>>();
     departments.sort_by(|(left, _), (right, _)| left.cmp(right));

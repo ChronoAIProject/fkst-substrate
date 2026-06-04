@@ -14,6 +14,8 @@ pub enum RuntimeKind {
     Logs,
     Marks,
     Cache,
+    Retry,
+    Dead,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -31,6 +33,8 @@ impl RuntimeKind {
             Self::Logs => "logs",
             Self::Marks => "marks",
             Self::Cache => "cache",
+            Self::Retry => "retry",
+            Self::Dead => "dead",
         }
     }
 }
@@ -143,6 +147,14 @@ mod tests {
         assert_eq!(
             layout.runtime_dir(RuntimeKind::Worktrees),
             PathBuf::from("/tmp/fkst-runtime/repo-a/worktrees")
+        );
+        assert_eq!(
+            layout.runtime_dir(RuntimeKind::Retry),
+            PathBuf::from("/tmp/fkst-runtime/repo-a/retry")
+        );
+        assert_eq!(
+            layout.runtime_dir(RuntimeKind::Dead),
+            PathBuf::from("/tmp/fkst-runtime/repo-a/dead")
         );
     }
 

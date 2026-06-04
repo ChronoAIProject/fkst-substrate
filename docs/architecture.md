@@ -24,10 +24,11 @@ fkst-substrate/
 │       ├── config_registry.rs
 │       ├── path_resolver.rs raise.rs mlua_init.rs
 │       ├── sdk_basic.rs sdk_codex.rs sdk_fs.rs sdk_git.rs sdk_log.rs
+│       ├── sdk_mark.rs sdk_cache.rs
 │       ├── host_conformance.rs runtime_context.rs self_test.rs
 │       └── supervise/
 │           ├── mod.rs graph_scan.rs source_runner.rs
-│           └── event_fanout.rs consumer.rs spawner.rs raised.rs
+│           └── event_fanout.rs consumer.rs spawner.rs raised.rs retry_state.rs retry_sweep.rs
 ├── examples/minimal-package/
 └── docs/architecture.md
 ```
@@ -143,13 +144,16 @@ run 模式未传 --project-root 时可从 Lua 路径推断
 
 引擎操作 knob 统一由 `config_registry.rs` 的静态 typed registry 声明，并通过显式 host root 构造的 `ConfigContext` 解析。读取优先级是 process env → host `fkst.env` → operational 默认。registry 不读 cwd、`tunables/*.txt`，也没有 set/write/dynamic registration、YAML、DSL、manifest、plugin 或 dashboard 入口。
 
-当前 registry 只有 5 项：
+当前 registry 只有 8 项：
 
 | name | env key | kind | type | default / required |
 |---|---|---|---|---|
 | `queue_capacity` | `FKST_QUEUE_CAPACITY` | Operational | `usize` | default `16` |
 | `department_default_stall_window` | `FKST_DEPARTMENT_DEFAULT_STALL_WINDOW` | Operational | duration string | default `30s` |
 | `codex_permit_slots` | `FKST_CODEX_PERMIT_SLOTS` | Operational | `usize` | default `20` |
+| `retry_default_max_attempts` | `FKST_RETRY_DEFAULT_MAX_ATTEMPTS` | Operational | `usize` | default `5` |
+| `retry_default_base` | `FKST_RETRY_DEFAULT_BASE` | Operational | duration string | default `60s` |
+| `retry_default_cap` | `FKST_RETRY_DEFAULT_CAP` | Operational | duration string | default `30m` |
 | `candidate_prefix` | `FKST_CANDIDATE_PREFIX` | HostFact | string | required |
 | `candidate_from_sep` | `FKST_CANDIDATE_FROM_SEP` | HostFact | string | required |
 
@@ -157,7 +161,7 @@ run 模式未传 --project-root 时可从 Lua 路径推断
 
 ## 6. Runtime I/O 与落点
 
-`RuntimeKind` 固定 6 类。它们都是 runtime scratch 落点；`Marks` 只承载 `once` 的 best-effort per-key de-bounce marker，`Cache` 只承载 `cache_get` / `cache_set` 的 best-effort scratch KV。marker 和 cache 可以跨 tick 保留以减少重复执行或重复推导，但它们和 locks / permits 一样不是 durable 真相、不是 package 状态层、业务 schema、accepted-state 或 rollback state。`<RT>` 表示引擎 runtime root，相对值会锚到 `<HOST>`。
+`RuntimeKind` 固定 8 类。它们都是 runtime scratch 落点；`Marks` 承载 `once` 与引擎自动可靠重试的 per-(dept,event) success marker，`Cache` 只承载 `cache_get` / `cache_set` 的 best-effort scratch KV，`Retry` / `Dead` 只承载 `M.spec.retry` 驱动的 scratch 重投递记录与终止摘要。marker、cache、retry 和 dead 可以跨 tick 保留以减少重复执行或重投递失败事件，但它们和 locks / permits 一样不是 durable 真相、不是 package 状态层、业务 schema、accepted-state 或 rollback state。`<RT>` 表示引擎 runtime root，相对值会锚到 `<HOST>`。
 
 | RuntimeKind | 落点 | 用途 | 写入者(engine) | 读取者 |
 |---|---|---|---|---|
@@ -165,13 +169,15 @@ run 模式未传 --project-root 时可从 Lua 路径推断
 | `CodexPermits` | `<RT>/codex-permits` | `permit-*` fcntl codex 并发池 | `sdk_codex`(建池 + flock 占位) | `spawn_codex` 抢 permit |
 | `Locks` | `<RT>/locks` | fcntl 锁文件 | `sdk_git::with_lock` | 同 — 跨 pipeline 互斥 |
 | `Logs` | `<RT>/logs` | 过程日志 | `supervise::spawner`(framework-child;dept `log.*` 经 stderr 捕获于此) | 人手 / 调试,非 file_watch 输入 |
-| `Marks` | `<RT>/marks` | `once` per-key marker | `sdk_mark::once` | `once` marker check |
+| `Marks` | `<RT>/marks` | per-key success marker | `sdk_mark::once` / `supervise::retry_state` | `once` / consumer retry / retry sweeper marker check |
 | `Cache` | `<RT>/cache` | best-effort scratch KV | `sdk_cache::cache_set` | `sdk_cache::cache_get` |
+| `Retry` | `<RT>/retry` | reliable retry scratch record | `supervise::retry_state` | `supervise::retry_sweep` |
+| `Dead` | `<RT>/dead` | reliable terminal failure scratch summary | `supervise::retry_state` | 人手 / 调试,非事实源 |
 
 说明:
-- **engine 自己只写 scratch 结构事实**(worktree / permit / lock / log / mark / cache)。package 不访问 `<RT>`，也不把 `<RT>` 当 inbox、完成态或业务 schema 数据库。
+- **engine 自己只写 scratch 结构事实**(worktree / permit / lock / log / mark / cache / retry / dead)。package 不访问 `<RT>`，也不把 `<RT>` 当 inbox、完成态或业务 schema 数据库。
 - `RuntimeLayout` 只提供固定 runtime dir 解析，framework 先把相对 runtime root 锚到 `<HOST>` 再建路径。
-- `with_lock`、`once` 与 `cache` 共用 runtime key 合约：key / name 必须是非空相对 filesystem path，`/` 表示目录；每个 segment 非空、匹配 `[A-Za-z0-9._-]+`，且不是 `.` 或 `..`；禁止 leading / trailing `/`、`//`、反斜杠、NUL 与绝对路径。校验后的 key 直接 join 到 `<RT>/{locks,marks,cache}/<key>`，形成可人工浏览的目录树，不做 byte hex 编码。`locks/once/` 是 `once` 内部锁的保留子目录，不属于 `with_lock` 用户锁命名空间。
+- `with_lock`、`once` 与 `cache` 共用 runtime key 合约：key / name 必须是非空相对 filesystem path，`/` 表示目录；每个 segment 非空、匹配 `[A-Za-z0-9._-]+`，且不是 `.` 或 `..`；禁止 leading / trailing `/`、`//`、反斜杠、NUL 与绝对路径。校验后的 key 直接 join 到 `<RT>/{locks,marks,cache}/<key>`，形成可人工浏览的目录树，不做 byte hex 编码。`locks/once/` 是 `once` 内部锁的保留子目录，`locks/reliable/` 是引擎自动可靠重试内部锁的保留子目录，它们都不属于 `with_lock` 用户锁命名空间。
 - `file_watch` 只接受 host-root 相对或绝对 glob；不支持 runtime scheme。
 - codex log **不属** `RuntimeKind`/`<RT>`:`sdk_codex` 把它落到 `FKST_RUNTIME_LOG_DIR` 或平台默认目录(如 `~/Library/Logs/fkst`)下的 `codex/`。它与 `<RT>/logs` 同属 process-trace scratch(可 grep、非事实源),但落点不同,`supervise` 也不给 framework child 注入 `FKST_RUNTIME_LOG_DIR`。
 - engine **不写** runtime 持久状态；accepted-state / rollback 是外部 release pipeline 的事实，见 §13。
@@ -215,7 +221,9 @@ durable 真相来自可观测事实：git commit、明确的 host filesystem fac
 
 恢复模型：package controller 用 cron / file_watch 读取 durable 源，推导未完成工作，并重新 enqueue 对应事件。崩溃等价于从 0 重来；in-flight 事件丢失后，下一拍从 durable 源重新推导。幂等由 package controller 保证；engine 只负责把重新派生的事件送入当前内存队列。
 
-engine 不维护消息状态。`处理中` 可以是 `with_lock` 租约（进程死后 fcntl lock 自动释放）或 worktree 等可观测事实；完成态是 commit、明确的 host filesystem fact 或外部源事实。engine 明确不提供 message state、ack / visibility timeout、dead-letter queue、状态队列或 durable broker。
+supervise 内置 retry sweeper 是 scratch 重投递修复，不是新 source kind。Department 默认启用可靠重试，使用 registry 的 `retry_default_max_attempts`、`retry_default_base`、`retry_default_cap`。`M.spec.retry = false` 显式关闭；`M.spec.retry = { ... }` 覆盖 `max_attempts`、`base`、`cap` 的任意子集，缺失字段从全局默认补齐。只消费 `dead_letter` 队列的 Department 未显式声明 retry table 时默认关闭；同时消费 `dead_letter` 和其它队列时必须显式声明 retry table 或 `false`。启用后，consumer 用 string `event.payload.dedup_key` 形成 `<dept>/<sanitized(dedup_key)>`；净化是有损映射，段内非法字符替换为 `-`，发生有损净化时 framework warn，host 应产出净化后仍唯一的 key；缺失或非 string 的 dedup_key 安静按普通事件跑一次，不写 marker/retry/dead。有效 key 在 spawn 前持 `<RT>/locks/reliable/<key>` 检查 marker 和 retry record；marker 存在则跳过，record 存在且 `due_at > now` 时跳过且不刷新 `due_at`、不改 `attempt`。只有无 record 或 `due_at <= now` 时才写入 `<RT>/retry/<key>`，其中 `attempt` 保留现有值或为 `0`，`generation` 递增，`due_at = now + stall_window + sweep_interval + margin`。这个 due_at 是 visibility-timeout，不是 execution-timeout；consumer 在 child 存活期间按小于 lease 的间隔续租，只更新同一 `generation` 的 `due_at`，不改 `attempt` 或其它字段。续租在 record 缺失、`generation` 不匹配或 marker 已存在时停止；child 完成后先停止续租，再做完成状态更新。成功 exit 0 写 `<RT>/marks/<key>` 并删除 retry；失败只在当代完成时递增 attempt，未达 `max_attempts` 写退避 due_at，达到上限写 `<RT>/dead/<key>` 并 best-effort 发送 `dead_letter`。当前事件来自 `dead_letter` 时只写 dead record，不再发送新的 `dead_letter`。sweeper 周期扫描 `<RT>/retry`，对 due_at 到期的记录持 `<RT>/locks/reliable/<key>` 后检查 `<RT>/marks/<key>`；marker 已存在则删除 retry，marker 不存在则把记录里的 payload 广播重投到原 queue。sweeper 不递增 attempt。consumer 和 child 活着时租约不会到期；supervisor/consumer 进程死亡后不再续租，租约过期后由 sweeper 重投。fanout queue 的消费者不得混合启用和未启用 retry。`<RT>/retry` 和 `<RT>/dead` 可清可丢，丢失后仍由 durable source 下轮重新推导兜底。整体语义是 at-least-once-until-success；`Fanout::send` 仍是 try_send best-effort，慢消费者仍可能 drop。
+
+engine 不维护 durable message state。`处理中` 可以是 `with_lock` 租约（进程死后 fcntl lock 自动释放）或 worktree 等可观测事实；完成态是 commit、明确的 host filesystem fact 或外部源事实。engine 明确不提供 message state、ack / visibility timeout、状态队列或 durable broker。
 
 ## 9. SDK Surface
 
@@ -243,11 +251,13 @@ engine 不维护消息状态。`处理中` 可以是 `with_lock` 租约（进程
 | `log.info/warn/error` | `sdk_log.rs`，结构化行写 stderr，由 supervise 捕获进 framework-child log |
 | `now()` | `sdk_basic.rs`，Unix seconds |
 
-`spawn_codex` 的 handle 只能由同一个 Lua pipeline 的 `await_all` 消费。单 handle 等待用 `await_all({handle})`。没有 sleep timer、first-result fanout、业务 retry、provider abstraction 或动态 SDK extension。
+`M.spec.retry` 默认启用；`retry=false` opt out；`retry={...}` 支持 `max_attempts`、`base`、`cap` 子集覆盖。全局默认由 registry 的 `retry_default_max_attempts`、`retry_default_base`、`retry_default_cap` 提供。启用后，缺失或非 string 的 `event.payload.dedup_key` 安静普通跑一次，不写 marker/retry/dead。有效 key 会净化为 `<dept>/<sanitized(dedup_key)>`：段内非 `[A-Za-z0-9._-]` 字符替换为 `-`，保留 `/` 作目录分层，再经 runtime key 校验；该映射有损，发生有损净化时 framework warn，host 应保证净化后 key 仍唯一。未到期 retry record 会跳过本次投递；到期投递写入新的 `generation`，child 存活期间续租当前 `generation`，完成只允许当前 `generation` 更新状态。它不做业务错误分类，不提供 exactly-once。
+
+`spawn_codex` 的 handle 只能由同一个 Lua pipeline 的 `await_all` 消费。单 handle 等待用 `await_all({handle})`。没有 sleep timer、first-result fanout、provider abstraction 或动态 SDK extension。
 
 ## 10. 事件与队列机制
 
-`Config` 包含 `queue`、`raiser`、`department`、`limits`。Queue 有 `capacity` 与 `fanout`。Raiser 只有 `Cron` 与 `FileWatch`。Department 有 `lua`、`consumes`、`produces`、`stall_window`。
+`Config` 包含 `queue`、`raiser`、`department`、`limits`。Queue 有 `capacity` 与 `fanout`。Raiser 只有 `Cron` 与 `FileWatch`。Department 有 `lua`、`consumes`、`produces`、`stall_window`、可选 `retry`。
 
 validation 规则：
 
