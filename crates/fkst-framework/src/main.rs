@@ -24,6 +24,7 @@ mod path_resolver;
 mod raise;
 mod runtime_context;
 mod sdk_basic;
+mod sdk_cache;
 mod sdk_codex;
 mod sdk_fs;
 mod sdk_git;

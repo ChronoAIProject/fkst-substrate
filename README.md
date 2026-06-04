@@ -113,6 +113,8 @@ production Lua SDK 包含 `once(key, fn) -> boolean`。它是 best-effort per-ke
 
 `once` 的可观察性来自 engine log 和 runtime scratch：skip / run 决策会写入可 grep 的 `once decision=... key=...` 结构化日志；marker 内容只提供 `key` 与 `marked_at` 的人工可读提示，不参与判重；LIVE lock holder 可用 `lsof <RT>/locks/once-<hex>` 查看。
 
+production Lua SDK 还包含 `cache_set(key, value)` 与 `cache_get(key) -> string | nil`。它们是 best-effort scratch KV primitive，不是 durable state。`key` 必须是非空字符串，framework 对 key bytes 做 hex 编码并读写 `<RT>/cache/<hex>`；`cache_set` 原子覆盖写入 string value，`cache_get` 命中时返回 string，缺失时返回 nil。`<RT>` 被清空或换 host 后，`cache_get` 返回 nil，调用者必须从 durable source 重新推导；需要 read-compare-write 原子性时由调用者外层使用 `with_lock`。
+
 ## 安装与更新
 
 `scripts/install.sh` 是 operator 便利脚本，和 `scripts/verify.sh` 同级，不是 engine surface：它只生成本机 operator 配置,不改 SPEC、conformance、supervisor 或任何二进制默认值。更新走独立的 `fkst-update` 二进制(见下)。
