@@ -153,6 +153,7 @@ fn check_sdk_registration(host_root: &std::path::Path) -> Result<()> {
         expect_type("file.write", file.write, "function")
         expect_type("file.exists", file.exists, "function")
         expect_type("with_lock", with_lock, "function")
+        expect_type("once", once, "function")
         expect_type("setup_worktree", setup_worktree, "function")
         expect_type("git_log_count", git_log_count, "function")
         expect_type("git_log_grep", git_log_grep, "function")

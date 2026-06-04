@@ -157,7 +157,7 @@ run 模式未传 --project-root 时可从 Lua 路径推断
 
 ## 6. Runtime I/O 与落点
 
-`RuntimeKind` 固定 4 类。它们都是一轮运行的一次性 scratch 落点，不是 package 状态层，也不是 durable 真相源。`<RT>` 表示引擎 runtime root，相对值会锚到 `<HOST>`。
+`RuntimeKind` 固定 5 类。它们都是 runtime scratch 落点；`Marks` 只承载 `once` 的 best-effort per-key de-bounce marker。marker 可以跨 tick 保留以减少重复执行，但它和 locks / permits 一样不是 durable 真相、不是 package 状态层、业务 schema、accepted-state 或 rollback state。`<RT>` 表示引擎 runtime root，相对值会锚到 `<HOST>`。
 
 | RuntimeKind | 落点 | 用途 | 写入者(engine) | 读取者 |
 |---|---|---|---|---|
@@ -165,9 +165,10 @@ run 模式未传 --project-root 时可从 Lua 路径推断
 | `CodexPermits` | `<RT>/codex-permits` | `permit-*` fcntl codex 并发池 | `sdk_codex`(建池 + flock 占位) | `spawn_codex` 抢 permit |
 | `Locks` | `<RT>/locks` | fcntl 锁文件 | `sdk_git::with_lock` | 同 — 跨 pipeline 互斥 |
 | `Logs` | `<RT>/logs` | 过程日志 | `supervise::spawner`(framework-child;dept `log.*` 经 stderr 捕获于此) | 人手 / 调试,非 file_watch 输入 |
+| `Marks` | `<RT>/marks` | `once` per-key marker | `sdk_mark::once` | `once` marker check |
 
 说明:
-- **engine 自己只写 scratch 结构事实**(worktree / permit / lock / log)。package 不访问 `<RT>`，也不把 `<RT>` 当 inbox、完成态或业务 schema 数据库。
+- **engine 自己只写 scratch 结构事实**(worktree / permit / lock / log / mark)。package 不访问 `<RT>`，也不把 `<RT>` 当 inbox、完成态或业务 schema 数据库。
 - `RuntimeLayout` 只提供固定 runtime dir 解析，framework 先把相对 runtime root 锚到 `<HOST>` 再建路径。
 - `file_watch` 只接受 host-root 相对或绝对 glob；不支持 runtime scheme。
 - codex log **不属** `RuntimeKind`/`<RT>`:`sdk_codex` 把它落到 `FKST_RUNTIME_LOG_DIR` 或平台默认目录(如 `~/Library/Logs/fkst`)下的 `codex/`。它与 `<RT>/logs` 同属 process-trace scratch(可 grep、非事实源),但落点不同,`supervise` 也不给 framework child 注入 `FKST_RUNTIME_LOG_DIR`。
@@ -228,6 +229,7 @@ engine 不维护消息状态。`处理中` 可以是 `with_lock` 租约（进程
 | `await_all(handles)` | `sdk_codex.rs`，join handles，防跨 pipeline/重复消费 |
 | `exec_sync(cmd|opts)` | `sdk_basic.rs`，运行 `/bin/sh -c`，可选 cwd/env/timeout |
 | `with_lock(name, fn)` | `sdk_git.rs`，fcntl exclusive flock |
+| `once(key, fn)` | `sdk_mark.rs`，locked per-key marker，成功后写入 scratch marker |
 | `git_log_count(grep, since)` | `sdk_git.rs`，调用 `git log --grep --since --oneline` |
 | `git_log_grep(grep, since)` | `sdk_git.rs`，调用 `git log --format=%H` |
 | `count_worktrees()` | `sdk_git.rs`，解析 `git worktree list --porcelain` |
@@ -266,6 +268,10 @@ supervise 运行在 current-thread tokio runtime 内，但每个 Department even
 Codex SDK 也把 `codex exec` 放入 process group。stall 时 kill process group。permit 池使用 fcntl lock file，不是内存 semaphore。permit 数来自 registry 的 `codex_permit_slots`：env 或 host `fkst.env` 可覆盖，未设置时默认 `20`。
 
 `with_lock(name, fn)` 是跨 pipeline 互斥 primitive。它把锁名解析到 `<RT>/locks/<name>` 并打开，获取 exclusive flock，执行 Lua function，释放 file handle。进程死时 lock 自动释放。
+
+`once(key, fn)` 是 best-effort per-key de-bounce primitive。它把非空 key 的 bytes hex 编码，在 `<RT>/locks/once-<hex>` 上获取 exclusive flock 后检查 `<RT>/marks/<hex>`；marker 存在则返回 `false`，不存在则执行 `fn`，成功后写 marker 并返回 `true`。marker 是 host-local scratch，不是 durable state；runtime root 被清空或换 host 后，`fn` 会重新运行，这由 at-least-once、下游 / package 幂等和从 durable 源重新推导来容纳。`fn` 失败时不写 marker，后续调用会重试。
+
+`once` 决策通过 engine log 观察：`once decision=skip-marked key=...` 与 `once decision=ran-marked key=...` 提供可 grep trail。marker 内容只含人工提示（`key`、`marked_at`），不被解析；LIVE lock holder 用 `lsof <RT>/locks/once-<hex>` 查看。
 
 ## 12. Git 与 Worktree Primitives
 

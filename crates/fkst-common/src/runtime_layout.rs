@@ -12,6 +12,7 @@ pub enum RuntimeKind {
     CodexPermits,
     Locks,
     Logs,
+    Marks,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -27,6 +28,7 @@ impl RuntimeKind {
             Self::CodexPermits => "codex-permits",
             Self::Locks => "locks",
             Self::Logs => "logs",
+            Self::Marks => "marks",
         }
     }
 }
