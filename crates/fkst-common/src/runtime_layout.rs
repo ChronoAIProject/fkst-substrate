@@ -13,6 +13,7 @@ pub enum RuntimeKind {
     Locks,
     Logs,
     Marks,
+    Cache,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -29,6 +30,7 @@ impl RuntimeKind {
             Self::Locks => "locks",
             Self::Logs => "logs",
             Self::Marks => "marks",
+            Self::Cache => "cache",
         }
     }
 }
