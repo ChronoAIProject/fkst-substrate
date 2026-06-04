@@ -109,11 +109,11 @@ Lua 单元测试由 `fkst-framework test` 执行。runner 只发现 package root
 
 `fkst.test` 只在 `test` 子命令的 Lua state 中注册，不属于 production Lua SDK surface；`run` 与 `supervise` 模式不可依赖它。当前断言只有 `eq(actual, expected[, msg])`、`is_true(value[, msg])`、`raises(fn[, msg])` 和 `is_nil(value[, msg])`。test-mode 还提供 `run_department(path, event[, opts])`，用 fresh Lua state、production SDK 和独立 raise buffer 执行一个 department entrypoint，返回 `{ exit_code = int, raises = { { queue = string, payload = table }, ... } }`；相对路径按 package root 解析，`opts.cwd`、`opts.env`、`opts.path_prepend` 只作用于该次执行并随后恢复。这是最小单测工具，不提供 fixture、mock、hook 或测试框架 DSL；除非有意验证真实 CLI 路径，Lua 单测不应调用 `spawn_codex_sync`。
 
-production Lua SDK 包含 `once(key, fn) -> boolean`。它是 best-effort per-key de-bounce scratch marker，不是 durable state。`key` 必须是非空字符串；framework 对 key bytes 做 hex 编码，在 `<RT>/locks/once-<hex>` 上获取 exclusive flock，再检查 `<RT>/marks/<hex>`。marker 已存在时返回 `false` 且不调用 `fn`；marker 不存在时调用 `fn`，成功后写入 marker 并返回 `true`；`fn` 失败时错误原样传播且不写 marker，后续调用会重试。
+production Lua SDK 包含 `once(key, fn) -> boolean`。它是 best-effort per-key de-bounce scratch marker，不是 durable state。`key` 必须是非空相对 filesystem path，`/` 表示目录；每个 segment 非空、匹配 `[A-Za-z0-9._-]+`，且不是 `.` 或 `..`；禁止 leading / trailing `/`、`//`、反斜杠、NUL 与绝对路径。framework 直接使用校验后的 key，在 `<RT>/locks/once/<key>` 上获取 exclusive flock，再检查 `<RT>/marks/<key>`。`locks/once/` 是 once 内部锁的保留子目录，不属于 `with_lock` 用户锁命名空间。marker 已存在时返回 `false` 且不调用 `fn`；marker 不存在时调用 `fn`，成功后写入 marker 并返回 `true`；`fn` 失败时错误原样传播且不写 marker，后续调用会重试。
 
-`once` 的可观察性来自 engine log 和 runtime scratch：skip / run 决策会写入可 grep 的 `once decision=... key=...` 结构化日志；marker 内容只提供 `key` 与 `marked_at` 的人工可读提示，不参与判重；LIVE lock holder 可用 `lsof <RT>/locks/once-<hex>` 查看。
+`once` 的可观察性来自 engine log 和 runtime scratch：skip / run 决策会写入可 grep 的 `once decision=... key=...` 结构化日志；marker 内容只提供 `key` 与 `marked_at` 的人工可读提示，不参与判重；LIVE lock holder 可用 `lsof <RT>/locks/once/<key>` 查看。
 
-production Lua SDK 还包含 `cache_set(key, value)` 与 `cache_get(key) -> string | nil`。它们是 best-effort scratch KV primitive，不是 durable state。`key` 必须是非空字符串，framework 对 key bytes 做 hex 编码并读写 `<RT>/cache/<hex>`；`cache_set` 原子覆盖写入 string value，`cache_get` 命中时返回 string，缺失时返回 nil。`<RT>` 被清空或换 host 后，`cache_get` 返回 nil，调用者必须从 durable source 重新推导；需要 read-compare-write 原子性时由调用者外层使用 `with_lock`。
+production Lua SDK 还包含 `cache_set(key, value)` 与 `cache_get(key) -> string | nil`。它们是 best-effort scratch KV primitive，不是 durable state。`key` 使用同一 runtime key 合约，framework 直接读写 `<RT>/cache/<key>`，所以 `<RT>/cache` 是人工可浏览的目录树；`cache_set` 原子覆盖写入 string value，`cache_get` 命中时返回 string，缺失时返回 nil。`<RT>` 被清空或换 host 后，`cache_get` 返回 nil，调用者必须从 durable source 重新推导；需要 read-compare-write 原子性时由调用者外层使用 `with_lock`。
 
 ## 安装与更新
 

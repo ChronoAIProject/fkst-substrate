@@ -6,7 +6,7 @@
 //! - count_worktrees()          -- count linked worktrees excluding main checkout
 //! - list_orphan_worktrees(pfx) -- list <runtime>/worktrees/<pfx>* linked worktree paths
 
-use fkst_common::{RuntimeKind, RuntimeLayout};
+use fkst_common::{validate_runtime_key, RuntimeKind, RuntimeLayout};
 use mlua::{Function, Lua, Result};
 use nix::fcntl::{flock, FlockArg};
 use std::os::fd::AsRawFd;
@@ -40,12 +40,23 @@ fn register_with_lock(lua: &Lua, host_root: PathBuf) -> Result<()> {
     lua.globals().set(
         "with_lock",
         lua.create_function(move |_, (name, f): (String, Function)| {
-            validate_lock_name(&name)?;
+            let name = validate_runtime_key(&name).map_err(mlua::Error::external)?;
+            if name == "once" || name.starts_with("once/") {
+                return Err(mlua::Error::external(anyhow::anyhow!(
+                    "with_lock name '{name}' uses reserved lock namespace 'once'"
+                )));
+            }
             let layout = runtime_context::layout_from_host_root(&host_root)
                 .map_err(mlua::Error::external)?;
             let locks = layout.runtime_dir(RuntimeKind::Locks);
-            std::fs::create_dir_all(&locks).map_err(mlua::Error::external)?;
-            let path = locks.join(&name);
+            let path = locks.join(name);
+            let parent = path.parent().ok_or_else(|| {
+                mlua::Error::external(anyhow::anyhow!(
+                    "with_lock target '{}' has no parent",
+                    path.display()
+                ))
+            })?;
+            std::fs::create_dir_all(parent).map_err(mlua::Error::external)?;
             let file = std::fs::OpenOptions::new()
                 .create(true)
                 .truncate(false)
@@ -61,20 +72,6 @@ fn register_with_lock(lua: &Lua, host_root: PathBuf) -> Result<()> {
             result
         })?,
     )?;
-    Ok(())
-}
-
-fn validate_lock_name(name: &str) -> Result<()> {
-    let invalid = name.is_empty()
-        || Path::new(name).is_absolute()
-        || name.contains('/')
-        || name.contains('\\')
-        || name.contains("..");
-    if invalid {
-        return Err(mlua::Error::external(anyhow::anyhow!(
-            "with_lock name must be a single path segment"
-        )));
-    }
     Ok(())
 }
 

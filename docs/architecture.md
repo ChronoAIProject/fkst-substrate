@@ -171,6 +171,7 @@ run 模式未传 --project-root 时可从 Lua 路径推断
 说明:
 - **engine 自己只写 scratch 结构事实**(worktree / permit / lock / log / mark / cache)。package 不访问 `<RT>`，也不把 `<RT>` 当 inbox、完成态或业务 schema 数据库。
 - `RuntimeLayout` 只提供固定 runtime dir 解析，framework 先把相对 runtime root 锚到 `<HOST>` 再建路径。
+- `with_lock`、`once` 与 `cache` 共用 runtime key 合约：key / name 必须是非空相对 filesystem path，`/` 表示目录；每个 segment 非空、匹配 `[A-Za-z0-9._-]+`，且不是 `.` 或 `..`；禁止 leading / trailing `/`、`//`、反斜杠、NUL 与绝对路径。校验后的 key 直接 join 到 `<RT>/{locks,marks,cache}/<key>`，形成可人工浏览的目录树，不做 byte hex 编码。`locks/once/` 是 `once` 内部锁的保留子目录，不属于 `with_lock` 用户锁命名空间。
 - `file_watch` 只接受 host-root 相对或绝对 glob；不支持 runtime scheme。
 - codex log **不属** `RuntimeKind`/`<RT>`:`sdk_codex` 把它落到 `FKST_RUNTIME_LOG_DIR` 或平台默认目录(如 `~/Library/Logs/fkst`)下的 `codex/`。它与 `<RT>/logs` 同属 process-trace scratch(可 grep、非事实源),但落点不同,`supervise` 也不给 framework child 注入 `FKST_RUNTIME_LOG_DIR`。
 - engine **不写** runtime 持久状态；accepted-state / rollback 是外部 release pipeline 的事实，见 §13。
@@ -270,13 +271,13 @@ supervise 运行在 current-thread tokio runtime 内，但每个 Department even
 
 Codex SDK 也把 `codex exec` 放入 process group。stall 时 kill process group。permit 池使用 fcntl lock file，不是内存 semaphore。permit 数来自 registry 的 `codex_permit_slots`：env 或 host `fkst.env` 可覆盖，未设置时默认 `20`。
 
-`with_lock(name, fn)` 是跨 pipeline 互斥 primitive。它把锁名解析到 `<RT>/locks/<name>` 并打开，获取 exclusive flock，执行 Lua function，释放 file handle。进程死时 lock 自动释放。
+`with_lock(name, fn)` 是跨 pipeline 互斥 primitive。它把校验后的锁名解析到 `<RT>/locks/<name>` 并打开，获取 exclusive flock，执行 Lua function，释放 file handle。进程死时 lock 自动释放。
 
-`once(key, fn)` 是 best-effort per-key de-bounce primitive。它把非空 key 的 bytes hex 编码，在 `<RT>/locks/once-<hex>` 上获取 exclusive flock 后检查 `<RT>/marks/<hex>`；marker 存在则返回 `false`，不存在则执行 `fn`，成功后写 marker 并返回 `true`。marker 是 host-local scratch，不是 durable state；runtime root 被清空或换 host 后，`fn` 会重新运行，这由 at-least-once、下游 / package 幂等和从 durable 源重新推导来容纳。`fn` 失败时不写 marker，后续调用会重试。
+`once(key, fn)` 是 best-effort per-key de-bounce primitive。它把校验后的 key 作为相对路径，在 `<RT>/locks/once/<key>` 上获取 exclusive flock 后检查 `<RT>/marks/<key>`；marker 存在则返回 `false`，不存在则执行 `fn`，成功后写 marker 并返回 `true`。marker 是 host-local scratch，不是 durable state；runtime root 被清空或换 host 后，`fn` 会重新运行，这由 at-least-once、下游 / package 幂等和从 durable 源重新推导来容纳。`fn` 失败时不写 marker，后续调用会重试。
 
-`once` 决策通过 engine log 观察：`once decision=skip-marked key=...` 与 `once decision=ran-marked key=...` 提供可 grep trail。marker 内容只含人工提示（`key`、`marked_at`），不被解析；LIVE lock holder 用 `lsof <RT>/locks/once-<hex>` 查看。
+`once` 决策通过 engine log 观察：`once decision=skip-marked key=...` 与 `once decision=ran-marked key=...` 提供可 grep trail。marker 内容只含人工提示（`key`、`marked_at`），不被解析；LIVE lock holder 用 `lsof <RT>/locks/once/<key>` 查看。
 
-`cache_set(key, value)` / `cache_get(key)` 是 best-effort scratch KV primitive。它们把非空 key 的 bytes hex 编码到 `<RT>/cache/<hex>`；`cache_set` 用 temp file + rename 原子覆盖写入 string value，`cache_get` 命中返回 string，缺失返回 nil。cache 是 host-local scratch，不是 durable state；runtime root 被清空或换 host 后，`cache_get` 返回 nil，调用者必须从 durable source 重新推导。cache 操作内部不加锁，last-writer-wins；需要 read-compare-write 原子性时由调用者外层使用 `with_lock`。
+`cache_set(key, value)` / `cache_get(key)` 是 best-effort scratch KV primitive。它们把校验后的 key 作为相对路径读写 `<RT>/cache/<key>`；`cache_set` 用 temp file + rename 原子覆盖写入 string value，`cache_get` 命中返回 string，缺失返回 nil。cache 是 host-local scratch，不是 durable state；runtime root 被清空或换 host 后，`cache_get` 返回 nil，调用者必须从 durable source 重新推导。cache 操作内部不加锁，last-writer-wins；需要 read-compare-write 原子性时由调用者外层使用 `with_lock`。
 
 ## 12. Git 与 Worktree Primitives
 

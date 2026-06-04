@@ -3,6 +3,65 @@
 use crate::config::{Config, RaiserDecl};
 use crate::error::FkstError;
 
+/// Validate a runtime scratch key before joining it below a RuntimeLayout subdir.
+///
+/// Valid keys are non-empty relative filesystem paths. Each segment must match
+/// `[A-Za-z0-9._-]+`, must not be entirely dots, and must be at most 255 bytes.
+pub fn validate_runtime_key(key: &str) -> Result<&str, FkstError> {
+    if key.is_empty() {
+        return Err(FkstError::Schema(
+            "runtime key must not be empty".to_string(),
+        ));
+    }
+    if key.starts_with('/') || std::path::Path::new(key).is_absolute() {
+        return Err(FkstError::Schema(format!(
+            "runtime key '{key}' must be a relative path"
+        )));
+    }
+    if key.ends_with('/') {
+        return Err(FkstError::Schema(format!(
+            "runtime key '{key}' must not have a trailing slash"
+        )));
+    }
+    if key.contains('\\') {
+        return Err(FkstError::Schema(format!(
+            "runtime key '{key}' must not contain backslash"
+        )));
+    }
+    if key.contains('\0') {
+        return Err(FkstError::Schema(format!(
+            "runtime key '{key}' must not contain NUL"
+        )));
+    }
+
+    for segment in key.split('/') {
+        if segment.is_empty() {
+            return Err(FkstError::Schema(format!(
+                "runtime key '{key}' contains an empty path segment"
+            )));
+        }
+        if segment.bytes().all(|byte| byte == b'.') {
+            return Err(FkstError::Schema(format!(
+                "runtime key '{key}' contains all-dots path segment '{segment}'"
+            )));
+        }
+        if segment.len() > 255 {
+            return Err(FkstError::Schema(format!(
+                "runtime key '{key}' contains path segment longer than 255 bytes"
+            )));
+        }
+        if !segment.bytes().all(
+            |byte| matches!(byte, b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'.' | b'_' | b'-'),
+        ) {
+            return Err(FkstError::Schema(format!(
+                "runtime key '{key}' contains invalid path segment '{segment}'"
+            )));
+        }
+    }
+
+    Ok(key)
+}
+
 /// Validate cross-references and per-decl invariants.
 ///
 /// Rules:

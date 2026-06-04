@@ -44,7 +44,7 @@ fn once_runs_first_time_and_writes_marker() {
             lua.load(
                 r#"
                 local count = 0
-                local ran = once("k", function() count = count + 1 end)
+                local ran = once("github-proxy/issue/owner/repo/42", function() count = count + 1 end)
                 return ran, count
                 "#,
             )
@@ -55,10 +55,21 @@ fn once_runs_first_time_and_writes_marker() {
 
     assert!(ran);
     assert_eq!(count, 1);
-    let marker = std::fs::read_to_string(runtime.path().join("marks/6b")).unwrap();
-    assert!(marker.starts_with("key=k\nmarked_at="), "{marker}");
+    let marker = std::fs::read_to_string(
+        runtime
+            .path()
+            .join("marks/github-proxy/issue/owner/repo/42"),
+    )
+    .unwrap();
+    assert!(
+        marker.starts_with("key=github-proxy/issue/owner/repo/42\nmarked_at="),
+        "{marker}"
+    );
     assert!(marker.ends_with("Z\n"), "{marker}");
-    assert!(runtime.path().join("locks/once-6b").exists());
+    assert!(runtime
+        .path()
+        .join("locks/once/github-proxy/issue/owner/repo/42")
+        .exists());
 }
 
 #[test]
@@ -77,8 +88,8 @@ fn once_skips_second_time_without_running_callback() {
             lua.load(
                 r#"
                 local count = 0
-                local first = once("k", function() count = count + 1 end)
-                local second = once("k", function() count = count + 1 end)
+                local first = once("github-proxy/issue/owner/repo/42", function() count = count + 1 end)
+                local second = once("github-proxy/issue/owner/repo/42", function() count = count + 1 end)
                 return first, second, count
                 "#,
             )
@@ -107,7 +118,7 @@ fn once_error_does_not_write_marker_and_subsequent_call_retries() {
         || {
             lua.load(
                 r#"
-                return once("k", function()
+                return once("github-proxy/issue/owner/repo/42", function()
                     error("intentional once failure")
                 end)
                 "#,
@@ -118,7 +129,10 @@ fn once_error_does_not_write_marker_and_subsequent_call_retries() {
     );
 
     assert!(err.to_string().contains("intentional once failure"));
-    assert!(!runtime.path().join("marks/6b").exists());
+    assert!(!runtime
+        .path()
+        .join("marks/github-proxy/issue/owner/repo/42")
+        .exists());
 
     let (ran, count): (bool, i64) = in_sandbox(
         host.path(),
@@ -129,7 +143,7 @@ fn once_error_does_not_write_marker_and_subsequent_call_retries() {
             lua.load(
                 r#"
                 local count = 0
-                local ran = once("k", function() count = count + 1 end)
+                local ran = once("github-proxy/issue/owner/repo/42", function() count = count + 1 end)
                 return ran, count
                 "#,
             )
@@ -140,8 +154,16 @@ fn once_error_does_not_write_marker_and_subsequent_call_retries() {
 
     assert!(ran);
     assert_eq!(count, 1);
-    let marker = std::fs::read_to_string(runtime.path().join("marks/6b")).unwrap();
-    assert!(marker.starts_with("key=k\nmarked_at="), "{marker}");
+    let marker = std::fs::read_to_string(
+        runtime
+            .path()
+            .join("marks/github-proxy/issue/owner/repo/42"),
+    )
+    .unwrap();
+    assert!(
+        marker.starts_with("key=github-proxy/issue/owner/repo/42\nmarked_at="),
+        "{marker}"
+    );
     assert!(marker.ends_with("Z\n"), "{marker}");
 }
 
@@ -164,5 +186,31 @@ fn once_rejects_empty_key() {
         },
     );
 
-    assert!(err.to_string().contains("once key must not be empty"));
+    assert!(err.to_string().contains("runtime key must not be empty"));
+}
+
+#[test]
+fn once_rejects_invalid_path_keys() {
+    let lua = Lua::new();
+    let host = tempdir().unwrap();
+    let runtime = tempdir().unwrap();
+    register_for_host(&lua, host.path());
+
+    for key in [
+        "..", "a/../b", "/abs", "a//b", "a/", "", "bad key", "bad:key",
+    ] {
+        let err = in_sandbox(
+            host.path(),
+            |sandbox| {
+                sandbox.runtime_root(runtime.path());
+            },
+            || {
+                lua.load(format!("return once({key:?}, function() end)"))
+                    .eval::<bool>()
+                    .unwrap_err()
+            },
+        );
+
+        assert!(err.to_string().contains("runtime key"), "{key:?}: {err}");
+    }
 }
