@@ -109,6 +109,8 @@ Lua 单元测试由 `fkst-framework test` 执行。runner 只发现 package root
 
 `fkst.test` 只在 `test` 子命令的 Lua state 中注册，不属于 production Lua SDK surface；`run` 与 `supervise` 模式不可依赖它。当前断言只有 `eq(actual, expected[, msg])`、`is_true(value[, msg])`、`raises(fn[, msg])` 和 `is_nil(value[, msg])`。test-mode 还提供 `run_department(path, event[, opts])`，用 fresh Lua state、production SDK 和独立 raise buffer 执行一个 department entrypoint，返回 `{ exit_code = int, raises = { { queue = string, payload = table }, ... } }`；相对路径按 package root 解析，`opts.cwd`、`opts.env`、`opts.path_prepend` 只作用于该次执行并随后恢复。这是最小单测工具，不提供 fixture、mock、hook 或测试框架 DSL；除非有意验证真实 CLI 路径，Lua 单测不应调用 `spawn_codex_sync`。
 
+production Lua SDK 包含 `once(key, fn) -> boolean`。它是 best-effort per-key de-bounce scratch marker，不是 durable state。`key` 必须是非空字符串；framework 对 key bytes 做 hex 编码，在 `<RT>/locks/once-<hex>` 上获取 exclusive flock，再检查 `<RT>/marks/<hex>`。marker 已存在时返回 `false` 且不调用 `fn`；marker 不存在时调用 `fn`，成功后写入 marker 并返回 `true`；`fn` 失败时错误原样传播且不写 marker，后续调用会重试。
+
 ## 安装与更新
 
 `scripts/install.sh` 是 operator 便利脚本，和 `scripts/verify.sh` 同级，不是 engine surface：它只生成本机 operator 配置,不改 SPEC、conformance、supervisor 或任何二进制默认值。更新走独立的 `fkst-update` 二进制(见下)。

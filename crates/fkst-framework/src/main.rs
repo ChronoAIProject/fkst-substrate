@@ -29,6 +29,7 @@ mod sdk_fs;
 mod sdk_git;
 mod sdk_json;
 mod sdk_log;
+mod sdk_mark;
 mod self_test;
 mod supervise;
 mod test_runner;

@@ -99,6 +99,7 @@ impl HostConformanceSuite {
                 layout.runtime_dir(RuntimeKind::CodexPermits);
                 layout.runtime_dir(RuntimeKind::Locks);
                 layout.runtime_dir(RuntimeKind::Logs);
+                layout.runtime_dir(RuntimeKind::Marks);
                 Ok(layout)
             }) {
             Ok(layout) => HostCheck::pass(
