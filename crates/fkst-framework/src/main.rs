@@ -35,6 +35,11 @@ mod self_test;
 mod supervise;
 mod test_runner;
 
+#[cfg(test)]
+mod test_env {
+    pub(crate) static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+}
+
 use raise::RaiseBuffer;
 
 enum CliCommand {

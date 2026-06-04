@@ -24,10 +24,11 @@ fkst-substrate/
 │       ├── config_registry.rs
 │       ├── path_resolver.rs raise.rs mlua_init.rs
 │       ├── sdk_basic.rs sdk_codex.rs sdk_fs.rs sdk_git.rs sdk_log.rs
+│       ├── sdk_mark.rs sdk_cache.rs
 │       ├── host_conformance.rs runtime_context.rs self_test.rs
 │       └── supervise/
 │           ├── mod.rs graph_scan.rs source_runner.rs
-│           └── event_fanout.rs consumer.rs spawner.rs raised.rs
+│           └── event_fanout.rs consumer.rs spawner.rs raised.rs delivery_router.rs delivery_store.rs delivery_types.rs
 ├── examples/minimal-package/
 └── docs/architecture.md
 ```
@@ -143,13 +144,16 @@ run 模式未传 --project-root 时可从 Lua 路径推断
 
 引擎操作 knob 统一由 `config_registry.rs` 的静态 typed registry 声明，并通过显式 host root 构造的 `ConfigContext` 解析。读取优先级是 process env → host `fkst.env` → operational 默认。registry 不读 cwd、`tunables/*.txt`，也没有 set/write/dynamic registration、YAML、DSL、manifest、plugin 或 dashboard 入口。
 
-当前 registry 只有 5 项：
+当前 registry 只有 8 项：
 
 | name | env key | kind | type | default / required |
 |---|---|---|---|---|
 | `queue_capacity` | `FKST_QUEUE_CAPACITY` | Operational | `usize` | default `16` |
 | `department_default_stall_window` | `FKST_DEPARTMENT_DEFAULT_STALL_WINDOW` | Operational | duration string | default `30s` |
 | `codex_permit_slots` | `FKST_CODEX_PERMIT_SLOTS` | Operational | `usize` | default `20` |
+| `retry_default_max_attempts` | `FKST_RETRY_DEFAULT_MAX_ATTEMPTS` | Operational | `usize` | default `5` |
+| `retry_default_base` | `FKST_RETRY_DEFAULT_BASE` | Operational | duration string | default `60s` |
+| `retry_default_cap` | `FKST_RETRY_DEFAULT_CAP` | Operational | duration string | default `30m` |
 | `candidate_prefix` | `FKST_CANDIDATE_PREFIX` | HostFact | string | required |
 | `candidate_from_sep` | `FKST_CANDIDATE_FROM_SEP` | HostFact | string | required |
 
@@ -157,7 +161,7 @@ run 模式未传 --project-root 时可从 Lua 路径推断
 
 ## 6. Runtime I/O 与落点
 
-`RuntimeKind` 固定 6 类。它们都是 runtime scratch 落点；`Marks` 只承载 `once` 的 best-effort per-key de-bounce marker，`Cache` 只承载 `cache_get` / `cache_set` 的 best-effort scratch KV。marker 和 cache 可以跨 tick 保留以减少重复执行或重复推导，但它们和 locks / permits 一样不是 durable 真相、不是 package 状态层、业务 schema、accepted-state 或 rollback state。`<RT>` 表示引擎 runtime root，相对值会锚到 `<HOST>`。
+`RuntimeKind` 固定 6 类。它们都是 runtime scratch 落点；`Marks` 只承载 `once` success marker，`Cache` 只承载 `cache_get` / `cache_set` 的 best-effort scratch KV。marker 和 cache 可以跨 tick 保留以减少重复执行或重复计算，但它们和 locks / permits 一样不是 durable 真相、不是 package 状态层、业务 schema、accepted-state 或 rollback state。可靠 delivery 状态不在 `<RT>`，而在 `FKST_DURABLE_ROOT` 下的 redb delivery store。`<RT>` 表示引擎 runtime root，相对值会锚到 `<HOST>`。
 
 | RuntimeKind | 落点 | 用途 | 写入者(engine) | 读取者 |
 |---|---|---|---|---|
@@ -165,7 +169,7 @@ run 模式未传 --project-root 时可从 Lua 路径推断
 | `CodexPermits` | `<RT>/codex-permits` | `permit-*` fcntl codex 并发池 | `sdk_codex`(建池 + flock 占位) | `spawn_codex` 抢 permit |
 | `Locks` | `<RT>/locks` | fcntl 锁文件 | `sdk_git::with_lock` | 同 — 跨 pipeline 互斥 |
 | `Logs` | `<RT>/logs` | 过程日志 | `supervise::spawner`(framework-child;dept `log.*` 经 stderr 捕获于此) | 人手 / 调试,非 file_watch 输入 |
-| `Marks` | `<RT>/marks` | `once` per-key marker | `sdk_mark::once` | `once` marker check |
+| `Marks` | `<RT>/marks` | per-key success marker | `sdk_mark::once` | `once` |
 | `Cache` | `<RT>/cache` | best-effort scratch KV | `sdk_cache::cache_set` | `sdk_cache::cache_get` |
 
 说明:
@@ -215,7 +219,11 @@ durable 真相来自可观测事实：git commit、明确的 host filesystem fac
 
 恢复模型：package controller 用 cron / file_watch 读取 durable 源，推导未完成工作，并重新 enqueue 对应事件。崩溃等价于从 0 重来；in-flight 事件丢失后，下一拍从 durable 源重新推导。幂等由 package controller 保证；engine 只负责把重新派生的事件送入当前内存队列。
 
-engine 不维护消息状态。`处理中` 可以是 `with_lock` 租约（进程死后 fcntl lock 自动释放）或 worktree 等可观测事实；完成态是 commit、明确的 host filesystem fact 或外部源事实。engine 明确不提供 message state、ack / visibility timeout、dead-letter queue、状态队列或 durable broker。
+可靠 delivery 默认启用。Department 可用 `M.spec.ephemeral = {"queue"}` 将本 Department 对指定 consumed queue 的订阅降级为非可靠；`M.spec.retry = false` 只表示失败不重试，不再表示非可靠投递。可靠订阅启动时必须有 `FKST_DURABLE_ROOT`，缺失 fail-closed。`DeliveryRouter` 对可靠订阅写入 redb delivery store 后再唤醒 consumer；ephemeral 订阅仍直接走 `Fanout::send`。可靠 delivery 的 source event 必须带 `SourceRef{kind, reference}`，cron 由 raiser 名派生，file_watch 由绝对路径派生；Department `RAISED` 进入可靠 queue 时继承上游 source_ref，缺失则 publish fail-closed，上游 delivery 不 ack 并进入 retry。
+
+consumer 的可靠路径由定时 tick 和 Fanout 唤醒触发，调用 delivery store `lease` 取 due 或过期 lease 的记录，构造标准 `Event{queue,payload,ts}` 后 spawn framework。exit 0 且所有 RAISED publish 成功才 `ack`；spawn error、stall、非零退出或 RAISED publish 失败都调用 `retry`。retry 达到 `max_attempts` 时 delivery 移入 redb dead 表，并 best-effort 经 Router publish `dead_letter` 通知；当前 delivery 自身来自 `dead_letter` 时抑制再次发送 `dead_letter`，避免自环。`Fanout` 在可靠路径只承担进程内唤醒，不再承载可靠事实。
+
+engine 维护 durable 在途 delivery state，但它不是实体业务真相、accepted state 或 rollback state。`处理中` 可以是 redb delivery lease、`with_lock` 租约（进程死后 fcntl lock 自动释放）或 worktree 等可观测事实；完成态仍是 commit、明确的 host filesystem fact 或外部源事实。
 
 ## 9. SDK Surface
 
@@ -243,11 +251,13 @@ engine 不维护消息状态。`处理中` 可以是 `with_lock` 租约（进程
 | `log.info/warn/error` | `sdk_log.rs`，结构化行写 stderr，由 supervise 捕获进 framework-child log |
 | `now()` | `sdk_basic.rs`，Unix seconds |
 
-`spawn_codex` 的 handle 只能由同一个 Lua pipeline 的 `await_all` 消费。单 handle 等待用 `await_all({handle})`。没有 sleep timer、first-result fanout、业务 retry、provider abstraction 或动态 SDK extension。
+`M.spec.retry` 默认启用；`retry=false` 表示失败不重试；`retry={...}` 支持 `max_attempts`、`base`、`cap` 子集覆盖。全局默认由 registry 的 `retry_default_max_attempts`、`retry_default_base`、`retry_default_cap` 提供。可靠 / 非可靠投递由 `M.spec.ephemeral` 决定，不由 retry 决定。可靠路径不依赖 payload dedup key、runtime marker 或 retry scratch 文件；delivery store 使用 `delivery_id`、`lease_generation` 和 redb 事务提供 fencing、ack、retry 和 dead 表。
+
+`spawn_codex` 的 handle 只能由同一个 Lua pipeline 的 `await_all` 消费。单 handle 等待用 `await_all({handle})`。没有 sleep timer、first-result fanout、provider abstraction 或动态 SDK extension。
 
 ## 10. 事件与队列机制
 
-`Config` 包含 `queue`、`raiser`、`department`、`limits`。Queue 有 `capacity` 与 `fanout`。Raiser 只有 `Cron` 与 `FileWatch`。Department 有 `lua`、`consumes`、`produces`、`stall_window`。
+`Config` 包含 `queue`、`raiser`、`department`、`limits`。Queue 有 `capacity` 与 `fanout`。Raiser 只有 `Cron` 与 `FileWatch`。Department 有 `lua`、`consumes`、`produces`、`stall_window`、可选 `retry`。
 
 validation 规则：
 

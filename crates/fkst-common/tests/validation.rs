@@ -1,6 +1,6 @@
 // crate-level integration tests own behavior coverage while runtime modules keep runtime code.
 
-use fkst_common::config::{Config, DepartmentDecl, LimitsDecl, QueueDecl, RaiserDecl};
+use fkst_common::config::{Config, DepartmentDecl, LimitsDecl, QueueDecl, RaiserDecl, RetryDecl};
 use fkst_common::validation::{validate, validate_runtime_key};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -36,7 +36,9 @@ fn cfg_minimal(lua_file: &Path) -> Config {
             lua: lua_file.into(),
             consumes: vec!["tick".into()],
             produces: vec![],
+            ephemeral: vec![],
             stall_window: "30m".into(),
+            retry: None,
         },
     );
     Config {
@@ -89,8 +91,17 @@ fn runtime_key_accepts_readable_relative_paths() {
 fn runtime_key_rejects_traversal_and_invalid_segments() {
     let too_long_segment = "a".repeat(256);
     for key in [
-        "..", "a/../b", "/abs", "a//b", "a/", "", "bad key", "bad:key",
-        "a\\b", "a/.../b", too_long_segment.as_str(),
+        "..",
+        "a/../b",
+        "/abs",
+        "a//b",
+        "a/",
+        "",
+        "bad key",
+        "bad:key",
+        "a\\b",
+        "a/.../b",
+        too_long_segment.as_str(),
     ] {
         let err = validate_runtime_key(key).unwrap_err();
         assert!(err.to_string().contains("runtime key"), "{key:?}: {err}");
@@ -250,7 +261,9 @@ fn duplicate_consumers_without_fanout_rejected() {
             lua: lua.clone(),
             consumes: vec!["tick".into()],
             produces: vec![],
+            ephemeral: vec![],
             stall_window: "30m".into(),
+            retry: None,
         },
     );
 
@@ -272,13 +285,92 @@ fn duplicate_consumers_with_fanout_pass() {
             lua: lua.clone(),
             consumes: vec!["tick".into()],
             produces: vec![],
+            ephemeral: vec![],
             stall_window: "30m".into(),
+            retry: None,
         },
     );
 
     let warnings = validate(&cfg, tmp.path()).unwrap();
 
     assert!(warnings.is_empty(), "{warnings:?}");
+}
+
+#[test]
+fn mixed_retry_consumers_on_fanout_queue_pass() {
+    let tmp = tempdir().unwrap();
+    let lua = touch(tmp.path(), "d.lua");
+    let mut cfg = cfg_minimal(&lua);
+    cfg.queue.get_mut("tick").unwrap().fanout = true;
+    cfg.department.get_mut("d").unwrap().retry = Some(RetryDecl {
+        max_attempts: 5,
+        base: "60s".into(),
+        cap: "30m".into(),
+    });
+    cfg.department.insert(
+        "other".into(),
+        DepartmentDecl {
+            lua: lua.clone(),
+            consumes: vec!["tick".into()],
+            produces: vec![],
+            ephemeral: vec![],
+            stall_window: "30m".into(),
+            retry: None,
+        },
+    );
+
+    let warnings = validate(&cfg, tmp.path()).unwrap();
+
+    assert!(warnings.is_empty(), "{warnings:?}");
+}
+
+#[test]
+fn ephemeral_queue_must_be_consumed_by_department() {
+    let tmp = tempdir().unwrap();
+    let lua = touch(tmp.path(), "d.lua");
+    let mut cfg = cfg_minimal(&lua);
+    cfg.department
+        .get_mut("d")
+        .unwrap()
+        .ephemeral
+        .push("ghost".into());
+
+    let e = validate(&cfg, tmp.path()).unwrap_err();
+
+    assert!(
+        e.to_string().contains("marks queue 'ghost' ephemeral"),
+        "{e}"
+    );
+}
+
+#[test]
+fn retry_decl_validates_attempts_and_durations() {
+    let tmp = tempdir().unwrap();
+    let lua = touch(tmp.path(), "d.lua");
+    let mut cfg = cfg_minimal(&lua);
+    cfg.department.get_mut("d").unwrap().retry = Some(RetryDecl {
+        max_attempts: 0,
+        base: "60s".into(),
+        cap: "30m".into(),
+    });
+    let e = validate(&cfg, tmp.path()).unwrap_err();
+    assert!(e.to_string().contains("retry.max_attempts"), "{}", e);
+
+    cfg.department.get_mut("d").unwrap().retry = Some(RetryDecl {
+        max_attempts: 5,
+        base: "0s".into(),
+        cap: "30m".into(),
+    });
+    let e = validate(&cfg, tmp.path()).unwrap_err();
+    assert!(e.to_string().contains("retry.base"), "{}", e);
+
+    cfg.department.get_mut("d").unwrap().retry = Some(RetryDecl {
+        max_attempts: 5,
+        base: "30m".into(),
+        cap: "60s".into(),
+    });
+    let e = validate(&cfg, tmp.path()).unwrap_err();
+    assert!(e.to_string().contains("retry.cap"), "{}", e);
 }
 
 #[test]

@@ -1,11 +1,12 @@
 //! Raisers produce events into queues.
 
-use super::event_fanout::Fanout;
+use super::delivery_router::{DeliveryRouter, PublishEnvelope};
+use super::delivery_types::{SourceKind, SourceRef};
 use fkst_common::Event;
 use notify::{Config, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::time::Instant;
 use tracing::{info, warn};
 
@@ -17,7 +18,7 @@ pub fn spawn_cron(
     name: String,
     interval_str: &str,
     produces: String,
-    fanout: Fanout,
+    router: DeliveryRouter,
 ) -> anyhow::Result<tokio::task::JoinHandle<()>> {
     let interval = parse_duration(interval_str)?;
     let handle = tokio::spawn(async move {
@@ -27,8 +28,17 @@ pub fn spawn_cron(
             tokio::time::sleep_until(next).await;
             let payload = cron_payload(&name);
             let ev = Event::new(&produces, payload);
-            if let Err(e) = fanout.send(&produces, ev) {
-                warn!(raiser = %name, error = %e, "fanout send failed");
+            let slot = cron_slot_unix_millis(interval);
+            if let Err(e) = router.publish(PublishEnvelope {
+                event: ev,
+                source: Some(SourceRef {
+                    kind: SourceKind::Cron,
+                    reference: cron_source_reference(&name, slot),
+                }),
+                cron_payload: Some(cron_payload(&name)),
+                derived: None,
+            }) {
+                warn!(raiser = %name, error = %e, "delivery publish failed");
             }
             // Monotonic next-fire; missed ticks coalesce to one.
             let now = Instant::now();
@@ -51,14 +61,14 @@ pub fn spawn_file_watch(
     glob: &str,
     host_root: &Path,
     produces: String,
-    fanout: Fanout,
+    router: DeliveryRouter,
 ) -> anyhow::Result<tokio::task::JoinHandle<()>> {
     let glob = absolutize_glob(glob, host_root)?;
     let handle = tokio::spawn(async move {
         info!(raiser = %name, glob = %glob, "file_watch raiser starting");
 
         let mut seen = HashMap::new();
-        emit_scan(&name, &glob, &produces, &fanout, &mut seen);
+        emit_scan(&name, &glob, &produces, &router, &mut seen);
 
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let tx_for_watcher = tx.clone();
@@ -102,7 +112,7 @@ pub fn spawn_file_watch(
                         Some(Ok(event)) => {
                             if is_file_creation_like(&event.kind) {
                                 for path in event.paths {
-                                    emit_if_match(&name, &glob, &produces, &fanout, &path, &mut seen);
+                                    emit_if_match(&name, &glob, &produces, &router, &path, &mut seen);
                                 }
                             }
                         }
@@ -110,12 +120,12 @@ pub fn spawn_file_watch(
                             warn!(raiser = %name, error = %e, "file_watch notify event error");
                         }
                         None => {
-                            emit_scan(&name, &glob, &produces, &fanout, &mut seen);
+                            emit_scan(&name, &glob, &produces, &router, &mut seen);
                         }
                     }
                 }
                 _ = poll.tick() => {
-                    emit_scan(&name, &glob, &produces, &fanout, &mut seen);
+                    emit_scan(&name, &glob, &produces, &router, &mut seen);
                 }
             }
         }
@@ -143,11 +153,11 @@ fn emit_scan(
     name: &str,
     glob: &str,
     produces: &str,
-    fanout: &Fanout,
+    router: &DeliveryRouter,
     seen: &mut HashMap<PathBuf, FileIdentity>,
 ) {
     for path in existing_matches(glob) {
-        emit_changed_path(name, produces, fanout, path, seen);
+        emit_changed_path(name, produces, router, path, seen);
     }
 }
 
@@ -155,7 +165,7 @@ fn emit_if_match(
     name: &str,
     glob: &str,
     produces: &str,
-    fanout: &Fanout,
+    router: &DeliveryRouter,
     path: &Path,
     seen: &mut HashMap<PathBuf, FileIdentity>,
 ) {
@@ -166,14 +176,14 @@ fn emit_if_match(
         return;
     };
     if glob_matches_path(glob, &path) {
-        emit_changed_path(name, produces, fanout, path, seen);
+        emit_changed_path(name, produces, router, path, seen);
     }
 }
 
 fn emit_changed_path(
     name: &str,
     produces: &str,
-    fanout: &Fanout,
+    router: &DeliveryRouter,
     path: PathBuf,
     seen: &mut HashMap<PathBuf, FileIdentity>,
 ) {
@@ -184,7 +194,7 @@ fn emit_changed_path(
         return;
     }
     seen.insert(path.clone(), identity);
-    emit_abs_path(name, produces, fanout, path);
+    emit_abs_path(name, produces, router, path, identity);
 }
 
 fn file_identity(path: &Path) -> std::io::Result<FileIdentity> {
@@ -195,11 +205,59 @@ fn file_identity(path: &Path) -> std::io::Result<FileIdentity> {
     })
 }
 
-fn emit_abs_path(name: &str, produces: &str, fanout: &Fanout, path: PathBuf) {
+fn emit_abs_path(
+    name: &str,
+    produces: &str,
+    router: &DeliveryRouter,
+    path: PathBuf,
+    identity: FileIdentity,
+) {
     let payload = serde_json::json!({"path": path.to_string_lossy()});
     let ev = Event::new(produces, payload);
-    if let Err(e) = fanout.send(produces, ev) {
-        warn!(raiser = %name, error = %e, "fanout send failed");
+    if let Err(e) = router.publish(PublishEnvelope {
+        event: ev,
+        source: Some(SourceRef {
+            kind: SourceKind::File,
+            reference: file_source_reference(&path, identity),
+        }),
+        cron_payload: None,
+        derived: None,
+    }) {
+        warn!(raiser = %name, error = %e, "delivery publish failed");
+    }
+}
+
+fn cron_slot_unix_millis(interval: Duration) -> u64 {
+    let interval_ms = interval.as_millis().min(u64::MAX as u128) as u64;
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(u64::MAX as u128) as u64;
+    if interval_ms == 0 {
+        now_ms
+    } else {
+        (now_ms / interval_ms) * interval_ms
+    }
+}
+
+fn cron_source_reference(name: &str, slot_unix_ms: u64) -> String {
+    format!("{name}/slot/{slot_unix_ms}")
+}
+
+fn file_source_reference(path: &Path, identity: FileIdentity) -> String {
+    let modified_ms = identity
+        .modified
+        .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+        .map(|duration| duration.as_millis().min(u64::MAX as u128) as u64);
+    match modified_ms {
+        Some(modified_ms) => format!(
+            "{}/len/{}/mtime/{}",
+            path.to_string_lossy(),
+            identity.len,
+            modified_ms
+        ),
+        None => format!("{}/len/{}", path.to_string_lossy(), identity.len),
     }
 }
 
@@ -389,7 +447,10 @@ pub fn parse_duration(s: &str) -> anyhow::Result<Duration> {
 
 #[cfg(test)]
 mod tests {
+    use super::super::event_fanout::Fanout;
     use super::*;
+    use fkst_common::config::{Config, DepartmentDecl, LimitsDecl, QueueDecl};
+    use std::collections::BTreeMap;
     use std::path::{Path, PathBuf};
     use std::sync::{Mutex, OnceLock};
     use tokio::time::{timeout, Duration};
@@ -412,6 +473,40 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::env::set_current_dir(&self.original);
         }
+    }
+
+    fn fanout_router(queue_name: &str) -> (Fanout, DeliveryRouter) {
+        let fanout = Fanout::new();
+        let mut queue = BTreeMap::new();
+        queue.insert(
+            queue_name.to_string(),
+            QueueDecl {
+                capacity: 10,
+                fanout: false,
+            },
+        );
+        let mut department = BTreeMap::new();
+        department.insert(
+            "test".to_string(),
+            DepartmentDecl {
+                lua: "departments/test/main.lua".into(),
+                consumes: vec![queue_name.to_string()],
+                produces: Vec::new(),
+                ephemeral: vec![queue_name.to_string()],
+                stall_window: "30s".to_string(),
+                retry: None,
+            },
+        );
+        let cfg = Config {
+            queue,
+            raiser: BTreeMap::new(),
+            department,
+            limits: LimitsDecl {
+                global_codex_processes: 1,
+            },
+        };
+        let router = DeliveryRouter::new(&cfg, fanout.clone(), None);
+        (fanout, router)
     }
 
     #[test]
@@ -470,6 +565,24 @@ mod tests {
         assert!(payload.get("n").is_none());
     }
 
+    #[test]
+    fn cron_source_reference_uses_logical_slot() {
+        assert_eq!(cron_source_reference("tick", 1_000), "tick/slot/1000");
+        let slot = cron_slot_unix_millis(Duration::from_secs(60));
+        assert_eq!(slot % 60_000, 0);
+    }
+
+    #[test]
+    fn file_source_reference_includes_stable_change_version() {
+        let identity = FileIdentity {
+            len: 4,
+            modified: Some(UNIX_EPOCH + Duration::from_millis(1_234)),
+        };
+        let reference = file_source_reference(Path::new("/tmp/input.txt"), identity);
+
+        assert_eq!(reference, "/tmp/input.txt/len/4/mtime/1234");
+    }
+
     #[tokio::test]
     async fn file_watch_existing_file_emits_event() {
         let tmp = tempfile::tempdir().unwrap();
@@ -477,14 +590,14 @@ mod tests {
         std::fs::write(&file, "ready").unwrap();
         let glob = tmp.path().join("*.txt");
 
-        let fanout = Fanout::new();
+        let (fanout, router) = fanout_router("files");
         let mut rx = fanout.subscribe("files", 10).await;
         let handle = spawn_file_watch(
             "watch".to_string(),
             glob.to_str().unwrap(),
             tmp.path(),
             "files".to_string(),
-            fanout,
+            router,
         )
         .unwrap();
 
@@ -505,14 +618,14 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let glob = tmp.path().join("*.txt");
 
-        let fanout = Fanout::new();
+        let (fanout, router) = fanout_router("files");
         let mut rx = fanout.subscribe("files", 10).await;
         let handle = spawn_file_watch(
             "watch".to_string(),
             glob.to_str().unwrap(),
             tmp.path(),
             "files".to_string(),
-            fanout,
+            router,
         )
         .unwrap();
 
@@ -537,14 +650,14 @@ mod tests {
         std::fs::write(&file, "ready").unwrap();
         let glob = tmp.path().join("*.txt");
 
-        let fanout = Fanout::new();
+        let (fanout, router) = fanout_router("files");
         let mut rx = fanout.subscribe("files", 10).await;
         let handle = spawn_file_watch(
             "watch".to_string(),
             glob.to_str().unwrap(),
             tmp.path(),
             "files".to_string(),
-            fanout,
+            router,
         )
         .unwrap();
 
@@ -567,14 +680,14 @@ mod tests {
         std::fs::write(&file, "ready").unwrap();
         let glob = tmp.path().join("*.txt");
 
-        let fanout = Fanout::new();
+        let (fanout, router) = fanout_router("files");
         let mut rx = fanout.subscribe("files", 10).await;
         let handle = spawn_file_watch(
             "watch".to_string(),
             glob.to_str().unwrap(),
             tmp.path(),
             "files".to_string(),
-            fanout,
+            router,
         )
         .unwrap();
 
@@ -606,14 +719,14 @@ mod tests {
         std::fs::write(&file, "ready").unwrap();
         let glob = tmp.path().join("*.txt");
 
-        let fanout = Fanout::new();
+        let (fanout, router) = fanout_router("files");
         let mut rx = fanout.subscribe("files", 10).await;
         let handle = spawn_file_watch(
             "watch".to_string(),
             glob.to_str().unwrap(),
             tmp.path(),
             "files".to_string(),
-            fanout.clone(),
+            router.clone(),
         )
         .unwrap();
 
@@ -632,7 +745,7 @@ mod tests {
             glob.to_str().unwrap(),
             tmp.path(),
             "files".to_string(),
-            fanout,
+            router,
         )
         .unwrap();
         let replayed = timeout(Duration::from_secs(2), rx.recv())
