@@ -1,6 +1,6 @@
 //! Schema validation on config load. Refuse-to-start on any violation.
 
-use crate::config::{Config, RaiserDecl};
+use crate::config::{Config, RaiserDecl, RetryDecl};
 use crate::error::FkstError;
 
 /// Validate a runtime scratch key before joining it below a RuntimeLayout subdir.
@@ -126,6 +126,14 @@ pub fn validate(cfg: &Config, project_root: &std::path::Path) -> Result<Vec<Stri
                 )));
             }
         }
+        for q in &dept.ephemeral {
+            if !dept.consumes.iter().any(|consume| consume == q) {
+                return Err(FkstError::Schema(format!(
+                    "department '{}' marks queue '{}' ephemeral but does not consume it",
+                    name, q
+                )));
+            }
+        }
         let lua_full = project_root.join(&dept.lua);
         if !lua_full.is_file() {
             return Err(FkstError::Schema(format!(
@@ -143,6 +151,9 @@ pub fn validate(cfg: &Config, project_root: &std::path::Path) -> Result<Vec<Stri
                 "department '{}' stall_window '{}' must end with s/m/h",
                 name, dept.stall_window
             )));
+        }
+        if let Some(retry) = &dept.retry {
+            validate_retry_decl(name, retry)?;
         }
     }
 
@@ -209,6 +220,48 @@ fn validate_queue_contract(
     }
 
     Ok(())
+}
+
+fn validate_retry_decl(name: &str, retry: &RetryDecl) -> Result<(), FkstError> {
+    if retry.max_attempts == 0 {
+        return Err(FkstError::Schema(format!(
+            "department '{}' retry.max_attempts must be > 0",
+            name
+        )));
+    }
+    let base = parse_duration_millis(&retry.base).ok_or_else(|| {
+        FkstError::Schema(format!(
+            "department '{}' retry.base '{}' must be a positive s/m/h duration",
+            name, retry.base
+        ))
+    })?;
+    let cap = parse_duration_millis(&retry.cap).ok_or_else(|| {
+        FkstError::Schema(format!(
+            "department '{}' retry.cap '{}' must be a positive s/m/h duration",
+            name, retry.cap
+        ))
+    })?;
+    if cap < base {
+        return Err(FkstError::Schema(format!(
+            "department '{}' retry.cap '{}' must be >= retry.base '{}'",
+            name, retry.cap, retry.base
+        )));
+    }
+    Ok(())
+}
+
+fn parse_duration_millis(raw: &str) -> Option<u128> {
+    let unit = raw.chars().last()?;
+    let value = raw[..raw.len() - unit.len_utf8()].parse::<u128>().ok()?;
+    if value == 0 {
+        return None;
+    }
+    match unit {
+        's' => Some(value.saturating_mul(1_000)),
+        'm' => Some(value.saturating_mul(60_000)),
+        'h' => Some(value.saturating_mul(3_600_000)),
+        _ => None,
+    }
 }
 
 fn queue_is_fanout(cfg: &Config, qname: &str) -> bool {
@@ -302,7 +355,9 @@ mod tests {
                 lua: lua.file_name().unwrap().into(),
                 consumes: vec!["tick".into()],
                 produces: Vec::new(),
+                ephemeral: Vec::new(),
                 stall_window: "30s".into(),
+                retry: None,
             },
         );
         cfg

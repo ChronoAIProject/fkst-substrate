@@ -1,19 +1,26 @@
 use anyhow::Result;
 use fkst_common::config::{Config, RaiserDecl};
 use fkst_common::validation::validate;
+use fkst_common::DurableLayout;
 use std::path::PathBuf;
+use std::sync::Arc;
 use tracing::{error, info, warn};
 
 use crate::path_resolver::PackageRoots;
 
 mod consumer;
+mod delivery_router;
+pub(crate) mod delivery_store;
+pub(crate) mod delivery_types;
 pub mod event_fanout;
 mod graph_scan;
 mod raised;
-mod source_runner;
+pub(crate) mod source_runner;
 mod spawner;
 
 use consumer::spawn_consumer;
+use delivery_router::DeliveryRouter;
+use delivery_store::DeliveryStore;
 use event_fanout::Fanout;
 use source_runner::{spawn_cron, spawn_file_watch};
 
@@ -45,6 +52,8 @@ pub async fn supervise(roots: PackageRoots, framework_bin: PathBuf) -> Result<()
     info!("schema validation passed");
 
     let fanout = Fanout::new();
+    let delivery_store = delivery_store_for_config(&cfg)?;
+    let router = DeliveryRouter::new(&cfg, fanout.clone(), delivery_store.clone());
     let codex_permit_slots = cfg.limits.global_codex_processes;
     let mut handles = vec![];
 
@@ -71,6 +80,8 @@ pub async fn supervise(roots: PackageRoots, framework_bin: PathBuf) -> Result<()
                 package_root.clone(),
                 framework_bin.clone(),
                 fanout.clone(),
+                router.clone(),
+                delivery_store.clone(),
                 q_cap,
                 codex_permit_slots,
             )
@@ -89,7 +100,7 @@ pub async fn supervise(roots: PackageRoots, framework_bin: PathBuf) -> Result<()
                     name.clone(),
                     interval,
                     produces.clone(),
-                    fanout.clone(),
+                    router.clone(),
                 )?);
             }
             RaiserDecl::FileWatch { glob, produces } => {
@@ -98,7 +109,7 @@ pub async fn supervise(roots: PackageRoots, framework_bin: PathBuf) -> Result<()
                     glob,
                     &project_root,
                     produces.clone(),
-                    fanout.clone(),
+                    router.clone(),
                 )?);
             }
         }
@@ -115,4 +126,106 @@ pub async fn supervise(roots: PackageRoots, framework_bin: PathBuf) -> Result<()
         handle.abort();
     }
     Ok(())
+}
+
+fn delivery_store_for_config(cfg: &Config) -> Result<Option<Arc<DeliveryStore>>> {
+    if !DeliveryRouter::has_reliable_subscriptions(cfg) {
+        return Ok(None);
+    }
+    let durable = DurableLayout::from_env().map_err(|e| {
+        error!(error = %e, "durable layout required for reliable subscriptions");
+        e
+    })?;
+    Ok(Some(Arc::new(DeliveryStore::open(
+        durable.delivery_db_path(),
+    )?)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fkst_common::config::{DepartmentDecl, LimitsDecl, QueueDecl};
+    use fkst_common::DURABLE_ROOT_ENV;
+    use std::collections::BTreeMap;
+    use std::sync::{Mutex, OnceLock};
+
+    static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+    fn config(ephemeral: bool) -> Config {
+        let mut queue = BTreeMap::new();
+        queue.insert(
+            "jobs".to_string(),
+            QueueDecl {
+                capacity: 8,
+                fanout: false,
+            },
+        );
+        let mut department = BTreeMap::new();
+        department.insert(
+            "worker".to_string(),
+            DepartmentDecl {
+                lua: "departments/worker/main.lua".into(),
+                consumes: vec!["jobs".to_string()],
+                produces: Vec::new(),
+                ephemeral: if ephemeral {
+                    vec!["jobs".to_string()]
+                } else {
+                    Vec::new()
+                },
+                stall_window: "30s".to_string(),
+                retry: None,
+            },
+        );
+        Config {
+            queue,
+            raiser: BTreeMap::new(),
+            department,
+            limits: LimitsDecl {
+                global_codex_processes: 1,
+            },
+        }
+    }
+
+    struct EnvGuard {
+        old: Option<std::ffi::OsString>,
+    }
+
+    impl EnvGuard {
+        fn unset() -> Self {
+            let old = std::env::var_os(DURABLE_ROOT_ENV);
+            std::env::remove_var(DURABLE_ROOT_ENV);
+            Self { old }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            if let Some(old) = self.old.take() {
+                std::env::set_var(DURABLE_ROOT_ENV, old);
+            } else {
+                std::env::remove_var(DURABLE_ROOT_ENV);
+            }
+        }
+    }
+
+    #[test]
+    fn reliable_subscription_without_durable_root_fails_closed() {
+        let _lock = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+        let _guard = EnvGuard::unset();
+
+        let err = match delivery_store_for_config(&config(false)) {
+            Ok(_) => panic!("reliable config should require durable root"),
+            Err(err) => err,
+        };
+
+        assert!(format!("{err:#}").contains("FKST_DURABLE_ROOT must be set"));
+    }
+
+    #[test]
+    fn pure_ephemeral_config_does_not_require_durable_root() {
+        let _lock = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+        let _guard = EnvGuard::unset();
+
+        assert!(delivery_store_for_config(&config(true)).unwrap().is_none());
+    }
 }

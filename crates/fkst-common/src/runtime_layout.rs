@@ -144,6 +144,10 @@ mod tests {
             layout.runtime_dir(RuntimeKind::Worktrees),
             PathBuf::from("/tmp/fkst-runtime/repo-a/worktrees")
         );
+        assert_eq!(
+            layout.runtime_dir(RuntimeKind::Cache),
+            PathBuf::from("/tmp/fkst-runtime/repo-a/cache")
+        );
     }
 
     #[test]

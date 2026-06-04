@@ -35,6 +35,9 @@ pub(crate) enum ConfigKey {
     QueueCapacity,
     DepartmentDefaultStallWindow,
     CodexPermitSlots,
+    RetryDefaultMaxAttempts,
+    RetryDefaultBase,
+    RetryDefaultCap,
     CandidatePrefix,
     CandidateFromSep,
 }
@@ -148,6 +151,30 @@ pub(crate) static CONFIG_REGISTRY: &[ConfigEntry] = &[
         kind: ConfigKind::Operational { default: "20" },
         value_type: ConfigValueType::Usize,
         doc: "Global Codex process permit pool slot count.",
+    },
+    ConfigEntry {
+        key: ConfigKey::RetryDefaultMaxAttempts,
+        name: "retry_default_max_attempts",
+        env_key: "FKST_RETRY_DEFAULT_MAX_ATTEMPTS",
+        kind: ConfigKind::Operational { default: "5" },
+        value_type: ConfigValueType::Usize,
+        doc: "Default reliable retry max attempts for Departments without a custom value.",
+    },
+    ConfigEntry {
+        key: ConfigKey::RetryDefaultBase,
+        name: "retry_default_base",
+        env_key: "FKST_RETRY_DEFAULT_BASE",
+        kind: ConfigKind::Operational { default: "60s" },
+        value_type: ConfigValueType::DurationString,
+        doc: "Default reliable retry base backoff duration.",
+    },
+    ConfigEntry {
+        key: ConfigKey::RetryDefaultCap,
+        name: "retry_default_cap",
+        env_key: "FKST_RETRY_DEFAULT_CAP",
+        kind: ConfigKind::Operational { default: "30m" },
+        value_type: ConfigValueType::DurationString,
+        doc: "Default reliable retry capped backoff duration.",
     },
     ConfigEntry {
         key: ConfigKey::CandidatePrefix,
@@ -299,6 +326,27 @@ mod tests {
         let resolved = resolve(ConfigKey::QueueCapacity, &HashMap::new(), &HashMap::new()).unwrap();
         assert_eq!(resolved.value, "16");
         assert_eq!(resolved.source, ConfigSource::Default);
+
+        let resolved = resolve(
+            ConfigKey::RetryDefaultMaxAttempts,
+            &HashMap::new(),
+            &HashMap::new(),
+        )
+        .unwrap();
+        assert_eq!(resolved.value, "5");
+        assert_eq!(resolved.source, ConfigSource::Default);
+
+        let resolved = resolve(
+            ConfigKey::RetryDefaultBase,
+            &HashMap::new(),
+            &HashMap::new(),
+        )
+        .unwrap();
+        assert_eq!(resolved.value, "60s");
+
+        let resolved =
+            resolve(ConfigKey::RetryDefaultCap, &HashMap::new(), &HashMap::new()).unwrap();
+        assert_eq!(resolved.value, "30m");
     }
 
     #[test]

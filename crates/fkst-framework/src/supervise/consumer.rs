@@ -1,18 +1,24 @@
-//! Per-department consumer task. Subscribes to validated queues, pops events,
-//! hands static codex permit slots to framework, parses RAISED, fans produced events back into
-//! the physical Fanout.
+//! Per-department consumer task.
 
+use super::delivery_router::{now_unix_millis, DeliveryRouter, DerivedDelivery, PublishEnvelope};
+use super::delivery_store::{DeliveryStore, RetryOutcome};
+use super::delivery_types::{DeliveryRecord, RetryPolicy, SourceKind, SourceRef};
 use super::event_fanout::Fanout;
 use super::raised::parse_raised;
 use super::source_runner::parse_duration;
-use super::spawner::spawn_framework;
-use fkst_common::config::DepartmentDecl;
-use fkst_common::Event;
-use fkst_common::RuntimeKind;
+use super::spawner::{spawn_framework, SpawnResult};
+use fkst_common::config::{DepartmentDecl, RetryDecl};
+use fkst_common::{Event, RuntimeKind};
+use std::collections::BTreeMap;
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tracing::{error, info, warn};
+
+const DISPATCH_INTERVAL: Duration = Duration::from_secs(1);
+const DISPATCH_BATCH: usize = 16;
 
 #[allow(clippy::too_many_arguments)]
 pub async fn spawn_consumer(
@@ -22,220 +28,907 @@ pub async fn spawn_consumer(
     package_root: PathBuf,
     framework_binary: PathBuf,
     fanout: Fanout,
+    router: DeliveryRouter,
+    store: Option<Arc<DeliveryStore>>,
     queue_capacity: usize,
     codex_permit_slots: usize,
 ) -> JoinHandle<()> {
+    let reliable_queues: Vec<String> = decl
+        .consumes
+        .iter()
+        .filter(|queue| !decl.ephemeral.iter().any(|ephemeral| ephemeral == *queue))
+        .cloned()
+        .collect();
+    let ephemeral_queues: Vec<String> = decl
+        .consumes
+        .iter()
+        .filter(|queue| decl.ephemeral.iter().any(|ephemeral| ephemeral == *queue))
+        .cloned()
+        .collect();
+
     let mut receivers: Vec<mpsc::Receiver<Event>> = Vec::new();
-    for q in &decl.consumes {
-        let rx = fanout.subscribe(q, queue_capacity).await;
-        receivers.push(rx);
+    for q in &ephemeral_queues {
+        receivers.push(fanout.subscribe(q, queue_capacity).await);
     }
+
     tokio::spawn(async move {
         let stall_window =
             parse_duration(&decl.stall_window).expect("validation already accepted stall_window");
-        let framework_child_log_dir = crate::runtime_context::layout_from_host_root(&project_root)
-            .expect("runtime layout should be valid")
+        let layout = crate::runtime_context::layout_from_host_root(&project_root)
+            .expect("runtime layout should be valid");
+        let framework_child_log_dir = layout
             .runtime_dir(RuntimeKind::Logs)
             .join("framework-child");
-        let (inbox_tx, mut inbox_rx) = mpsc::channel::<Event>(queue_capacity);
+        let retry_policy = decl
+            .retry
+            .as_ref()
+            .map(policy_from_decl)
+            .transpose()
+            .expect("validation already accepted retry");
+
+        let (ephemeral_tx, mut ephemeral_rx) = mpsc::channel::<Event>(queue_capacity);
         for mut rx in receivers {
-            let tx = inbox_tx.clone();
+            let tx = ephemeral_tx.clone();
             let dept_name = name.clone();
             tokio::spawn(async move {
                 while let Some(ev) = rx.recv().await {
                     if tx.send(ev).await.is_err() {
-                        warn!(dept = %dept_name, "consumer inbox closed");
+                        warn!(dept = %dept_name, "consumer wake inbox closed");
                         return;
                     }
                 }
                 warn!(dept = %dept_name, "queue receiver disconnected");
             });
         }
-        drop(inbox_tx);
+        drop(ephemeral_tx);
+        let mut reliable_wake_rx = if reliable_queues.is_empty() {
+            None
+        } else {
+            let (tx, rx) = mpsc::channel::<()>(queue_capacity);
+            router.register_reliable_wake(&name, tx);
+            Some(rx)
+        };
+        let (complete_tx, mut complete_rx) = mpsc::channel::<CompletedDelivery>(queue_capacity);
+        let mut running: BTreeMap<String, RunningDelivery> = BTreeMap::new();
 
-        info!(dept = %name, queues = ?decl.consumes, "consumer started");
+        info!(
+            dept = %name,
+            reliable_queues = ?reliable_queues,
+            ephemeral_queues = ?ephemeral_queues,
+            "consumer started"
+        );
 
-        while let Some(ev) = inbox_rx.recv().await {
-            let lua_full = project_root.join(&decl.lua);
-            let event_json = match serde_json::to_string(&ev) {
-                Ok(s) => s,
-                Err(e) => {
-                    error!(error = %e, "serialize event");
-                    continue;
-                }
-            };
-            let fanout_clone = fanout.clone();
-            let dept_name = name.clone();
-            let framework_bin = framework_binary.clone();
-            let project_root = project_root.clone();
-            let package_root = package_root.clone();
-            let log_dir = framework_child_log_dir.clone();
-            tokio::spawn(async move {
-                match spawn_framework(
-                    &framework_bin,
-                    &lua_full,
-                    &project_root,
-                    &package_root,
-                    &event_json,
-                    stall_window,
-                    codex_permit_slots,
-                    &dept_name,
-                    &log_dir,
-                )
-                .await
-                {
-                    Ok(r) => {
-                        if r.exit_code != 0 {
-                            warn!(dept = %dept_name, exit = r.exit_code, stalled = r.stalled,
-                                  stall_window_ms = stall_window.as_millis(),
-                                  elapsed_ms = r.elapsed_ms,
-                                  last_output_age_ms = r.last_output_age_ms,
-                                  log_path = ?r.log_path,
-                                  stderr = %r.stderr,
-                                  "framework failed");
-                        } else {
-                            info!(dept = %dept_name,
-                                  stall_window_ms = stall_window.as_millis(),
-                                  elapsed_ms = r.elapsed_ms,
-                                  last_output_age_ms = r.last_output_age_ms,
-                                  log_path = ?r.log_path,
-                                  "framework ok");
+        let mut tick = tokio::time::interval(DISPATCH_INTERVAL);
+        tick.tick().await;
+        loop {
+            tokio::select! {
+                maybe_ev = ephemeral_rx.recv() => {
+                    let Some(ev) = maybe_ev else {
+                        if reliable_queues.is_empty() {
+                            warn!(dept = %name, "consumer ephemeral inbox disconnected");
+                            return;
                         }
-                        // Parse RAISED regardless of exit code (partial raise OK).
-                        for raised_ev in parse_raised(&r.stdout) {
-                            let queue = raised_ev.queue.clone();
-                            let _ = fanout_clone.send(&queue, raised_ev);
-                        }
-                    }
-                    Err(e) => {
-                        error!(dept = %dept_name, log_dir = %log_dir.display(), error = %e, "framework spawn error");
+                        continue;
+                    };
+                    if ephemeral_queues.iter().any(|queue| queue == &ev.queue) {
+                        spawn_ephemeral(
+                            &name,
+                            &decl,
+                            &project_root,
+                            &package_root,
+                            &framework_binary,
+                            &router,
+                            &framework_child_log_dir,
+                            ev,
+                            stall_window,
+                            codex_permit_slots,
+                        );
                     }
                 }
-            });
+                maybe_wake = recv_reliable_wake(&mut reliable_wake_rx), if reliable_wake_rx.is_some() => {
+                    if maybe_wake.is_none() {
+                        warn!(dept = %name, "consumer reliable wake inbox disconnected");
+                    }
+                    dispatch_due(
+                        &name,
+                        &decl,
+                        &project_root,
+                        &package_root,
+                        &framework_binary,
+                        &router,
+                        store.clone(),
+                        retry_policy.as_ref(),
+                        &framework_child_log_dir,
+                        stall_window,
+                        codex_permit_slots,
+                        &complete_tx,
+                        &mut running,
+                    );
+                }
+                _ = tick.tick(), if !reliable_queues.is_empty() => {
+                    renew_running(&name, store.as_deref(), stall_window, &running);
+                    dispatch_due(
+                        &name,
+                        &decl,
+                        &project_root,
+                        &package_root,
+                        &framework_binary,
+                        &router,
+                        store.clone(),
+                        retry_policy.as_ref(),
+                        &framework_child_log_dir,
+                        stall_window,
+                        codex_permit_slots,
+                        &complete_tx,
+                        &mut running,
+                    );
+                }
+                maybe_done = complete_rx.recv(), if !running.is_empty() => {
+                    if let Some(done) = maybe_done {
+                        running.remove(&done.record.delivery_id);
+                        finish_durable_record(&name, store.as_deref(), &router, retry_policy.as_ref(), done);
+                    }
+                }
+            }
         }
-        warn!(dept = %name, "consumer inbox disconnected");
+    })
+}
+
+async fn recv_reliable_wake(rx: &mut Option<mpsc::Receiver<()>>) -> Option<()> {
+    match rx {
+        Some(rx) => rx.recv().await,
+        None => None,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn spawn_ephemeral(
+    name: &str,
+    decl: &DepartmentDecl,
+    project_root: &std::path::Path,
+    package_root: &std::path::Path,
+    framework_binary: &std::path::Path,
+    router: &DeliveryRouter,
+    log_dir: &std::path::Path,
+    event: Event,
+    stall_window: Duration,
+    codex_permit_slots: usize,
+) {
+    let args = match spawn_args(
+        decl,
+        project_root,
+        package_root,
+        framework_binary,
+        log_dir,
+        event,
+        stall_window,
+        codex_permit_slots,
+    ) {
+        Ok(args) => args,
+        Err(err) => {
+            error!(dept = %name, error = %err, "build spawn args failed");
+            return;
+        }
+    };
+    let dept_name = name.to_string();
+    let router = router.clone();
+    tokio::spawn(async move {
+        match spawn_and_report(&dept_name, &args).await {
+            Ok(result) => {
+                if let Err(err) = publish_ephemeral_raised(&router, &result.stdout) {
+                    error!(dept = %dept_name, error = %err, "publish raised failed");
+                }
+            }
+            Err(err) => {
+                error!(
+                    dept = %dept_name,
+                    log_dir = %args.log_dir.display(),
+                    error = %err,
+                    "framework spawn error"
+                );
+            }
+        }
+    });
+}
+
+#[allow(clippy::too_many_arguments)]
+fn dispatch_due(
+    name: &str,
+    decl: &DepartmentDecl,
+    project_root: &std::path::Path,
+    package_root: &std::path::Path,
+    framework_binary: &std::path::Path,
+    router: &DeliveryRouter,
+    store: Option<Arc<DeliveryStore>>,
+    retry_policy: Option<&RetryPolicy>,
+    log_dir: &std::path::Path,
+    stall_window: Duration,
+    codex_permit_slots: usize,
+    complete_tx: &mpsc::Sender<CompletedDelivery>,
+    running: &mut BTreeMap<String, RunningDelivery>,
+) {
+    let Some(store) = store else {
+        error!(dept = %name, "reliable consumer missing delivery store");
+        return;
+    };
+    let lease = retry_lease(stall_window);
+    let excluded = running.keys().cloned().collect();
+    let leased = match store.lease_for_dept_excluding(
+        name,
+        now_unix_millis(),
+        DISPATCH_BATCH,
+        lease,
+        &excluded,
+    ) {
+        Ok(records) => records,
+        Err(err) => {
+            error!(dept = %name, error = %err, "delivery lease failed");
+            return;
+        }
+    };
+    for record in leased {
+        if running.contains_key(&record.delivery_id) {
+            continue;
+        }
+        let args = match spawn_args(
+            decl,
+            project_root,
+            package_root,
+            framework_binary,
+            log_dir,
+            event_from_record(&record),
+            stall_window,
+            codex_permit_slots,
+        ) {
+            Ok(args) => args,
+            Err(err) => {
+                retry_record(
+                    &store,
+                    router,
+                    retry_policy,
+                    &record,
+                    format!("build spawn args: {err}"),
+                );
+                continue;
+            }
+        };
+        let dept_name = name.to_string();
+        let router = router.clone();
+        let complete_tx = complete_tx.clone();
+        let running_record = record.clone();
+        let delivery_id = record.delivery_id.clone();
+        let handle = tokio::spawn(async move {
+            let result = run_durable_record(&dept_name, &router, record, args).await;
+            if complete_tx.send(result).await.is_err() {
+                warn!(dept = %dept_name, delivery_id = %delivery_id, "delivery completion receiver closed");
+            }
+        });
+        running.insert(
+            running_record.delivery_id.clone(),
+            RunningDelivery {
+                record: running_record,
+                handle,
+            },
+        );
+    }
+}
+
+async fn run_durable_record(
+    dept_name: &str,
+    router: &DeliveryRouter,
+    record: DeliveryRecord,
+    args: SpawnArgs,
+) -> CompletedDelivery {
+    let result = spawn_and_report(dept_name, &args).await;
+    let failure = match result {
+        Ok(result) if result.exit_code == 0 => {
+            match publish_raised(router, &result.stdout, &record) {
+                Ok(()) => None,
+                Err(err) => Some(format!("raised publish error: {err}")),
+            }
+        }
+        Ok(result) => Some(format!(
+            "exit={} stalled={} stderr={}",
+            result.exit_code, result.stalled, result.stderr
+        )),
+        Err(err) => {
+            error!(
+                dept = %dept_name,
+                log_dir = %args.log_dir.display(),
+                error = %err,
+                "framework spawn error"
+            );
+            Some(format!("spawn error: {err}"))
+        }
+    };
+
+    CompletedDelivery { record, failure }
+}
+
+fn finish_durable_record(
+    dept_name: &str,
+    store: Option<&DeliveryStore>,
+    router: &DeliveryRouter,
+    retry_policy: Option<&RetryPolicy>,
+    done: CompletedDelivery,
+) {
+    let Some(store) = store else {
+        error!(dept = %dept_name, "reliable consumer missing delivery store");
+        return;
+    };
+    if let Some(error) = done.failure {
+        retry_record(store, router, retry_policy, &done.record, error);
+        return;
+    }
+
+    match store.ack(&done.record.delivery_id, done.record.lease_generation) {
+        Ok(true) => {
+            info!(
+                dept = %dept_name,
+                delivery_id = %done.record.delivery_id,
+                generation = done.record.lease_generation,
+                "delivery acked"
+            );
+        }
+        Ok(false) => {
+            warn!(
+                dept = %dept_name,
+                delivery_id = %done.record.delivery_id,
+                generation = done.record.lease_generation,
+                "delivery ack stale or missing"
+            );
+        }
+        Err(err) => {
+            error!(
+                dept = %dept_name,
+                delivery_id = %done.record.delivery_id,
+                generation = done.record.lease_generation,
+                error = %err,
+                "delivery ack failed"
+            );
+        }
+    }
+}
+
+fn renew_running(
+    dept_name: &str,
+    store: Option<&DeliveryStore>,
+    stall_window: Duration,
+    running: &BTreeMap<String, RunningDelivery>,
+) {
+    let Some(store) = store else {
+        error!(dept = %dept_name, "reliable consumer missing delivery store");
+        return;
+    };
+    let lease_until = now_unix_millis().saturating_add(duration_millis(retry_lease(stall_window)));
+    for running_delivery in running.values() {
+        if running_delivery.handle.is_finished() {
+            continue;
+        }
+        match store.renew_lease(
+            &running_delivery.record.delivery_id,
+            running_delivery.record.lease_generation,
+            lease_until,
+        ) {
+            Ok(true) => {}
+            Ok(false) => {
+                warn!(
+                    dept = %dept_name,
+                    delivery_id = %running_delivery.record.delivery_id,
+                    generation = running_delivery.record.lease_generation,
+                    "delivery lease renewal stale or missing"
+                );
+            }
+            Err(err) => {
+                error!(
+                    dept = %dept_name,
+                    delivery_id = %running_delivery.record.delivery_id,
+                    generation = running_delivery.record.lease_generation,
+                    error = %err,
+                    "delivery lease renewal failed"
+                );
+            }
+        }
+    }
+}
+
+fn retry_record(
+    store: &DeliveryStore,
+    router: &DeliveryRouter,
+    retry_policy: Option<&RetryPolicy>,
+    record: &DeliveryRecord,
+    error: String,
+) {
+    let Some(policy) = retry_policy else {
+        if let Err(err) = store.ack(&record.delivery_id, record.lease_generation) {
+            error!(
+                delivery_id = %record.delivery_id,
+                generation = record.lease_generation,
+                error = %err,
+                "delivery drop ack failed"
+            );
+        }
+        return;
+    };
+    match store.retry(
+        &record.delivery_id,
+        record.lease_generation,
+        &error,
+        policy,
+        now_unix_millis(),
+    ) {
+        Ok(RetryOutcome::Dead) => publish_dead_letter(router, record, &error),
+        Ok(RetryOutcome::Scheduled | RetryOutcome::Stale | RetryOutcome::Missing) => {}
+        Err(err) => {
+            error!(
+                delivery_id = %record.delivery_id,
+                generation = record.lease_generation,
+                error = %err,
+                "delivery retry failed"
+            );
+        }
+    }
+}
+
+fn publish_dead_letter(router: &DeliveryRouter, record: &DeliveryRecord, error: &str) {
+    if record.queue == "dead_letter" {
+        return;
+    }
+    let event = Event::new(
+        "dead_letter",
+        serde_json::json!({
+            "delivery_id": record.delivery_id,
+            "queue": record.queue,
+            "dept": record.dept,
+            "attempt": record.attempt.saturating_add(1),
+            "error": error,
+        }),
+    );
+    if let Err(err) = router.publish(PublishEnvelope {
+        event,
+        source: Some(SourceRef {
+            kind: SourceKind::External,
+            reference: format!("dead/{}", record.delivery_id),
+        }),
+        cron_payload: None,
+        derived: None,
+    }) {
+        warn!(
+            delivery_id = %record.delivery_id,
+            error = %err,
+            "dead_letter publish failed"
+        );
+    }
+}
+
+fn publish_raised(
+    router: &DeliveryRouter,
+    stdout: &str,
+    parent: &DeliveryRecord,
+) -> anyhow::Result<()> {
+    for (ordinal, mut raised_ev) in parse_raised(stdout).into_iter().enumerate() {
+        raised_ev.ts = parent.observed_at_ms;
+        router.publish(PublishEnvelope {
+            event: raised_ev,
+            source: parent.source.clone(),
+            cron_payload: None,
+            derived: Some(DerivedDelivery {
+                parent_delivery_id: parent.delivery_id.clone(),
+                ordinal,
+            }),
+        })?;
+    }
+    Ok(())
+}
+
+fn publish_ephemeral_raised(router: &DeliveryRouter, stdout: &str) -> anyhow::Result<()> {
+    for raised_ev in parse_raised(stdout) {
+        router.publish(PublishEnvelope {
+            event: raised_ev,
+            source: None,
+            cron_payload: None,
+            derived: None,
+        })?;
+    }
+    Ok(())
+}
+
+fn event_from_record(record: &DeliveryRecord) -> Event {
+    Event {
+        queue: record.queue.clone(),
+        payload: record.payload.clone(),
+        ts: record.observed_at_ms,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn spawn_args(
+    decl: &DepartmentDecl,
+    project_root: &std::path::Path,
+    package_root: &std::path::Path,
+    framework_binary: &std::path::Path,
+    log_dir: &std::path::Path,
+    event: Event,
+    stall_window: Duration,
+    codex_permit_slots: usize,
+) -> anyhow::Result<SpawnArgs> {
+    Ok(SpawnArgs {
+        framework_bin: framework_binary.to_path_buf(),
+        lua_full: project_root.join(&decl.lua),
+        project_root: project_root.to_path_buf(),
+        package_root: package_root.to_path_buf(),
+        event_json: serde_json::to_string(&event)?,
+        stall_window,
+        codex_permit_slots,
+        log_dir: log_dir.to_path_buf(),
+    })
+}
+
+struct SpawnArgs {
+    framework_bin: PathBuf,
+    lua_full: PathBuf,
+    project_root: PathBuf,
+    package_root: PathBuf,
+    event_json: String,
+    stall_window: Duration,
+    codex_permit_slots: usize,
+    log_dir: PathBuf,
+}
+
+async fn spawn_and_report(dept_name: &str, args: &SpawnArgs) -> anyhow::Result<SpawnResult> {
+    let result = spawn_framework(
+        &args.framework_bin,
+        &args.lua_full,
+        &args.project_root,
+        &args.package_root,
+        &args.event_json,
+        args.stall_window,
+        args.codex_permit_slots,
+        dept_name,
+        &args.log_dir,
+    )
+    .await?;
+
+    if result.exit_code != 0 {
+        warn!(dept = %dept_name, exit = result.exit_code, stalled = result.stalled,
+              stall_window_ms = args.stall_window.as_millis(),
+              elapsed_ms = result.elapsed_ms,
+              last_output_age_ms = result.last_output_age_ms,
+              log_path = ?result.log_path,
+              stderr = %result.stderr,
+              "framework failed");
+    } else {
+        info!(dept = %dept_name,
+              stall_window_ms = args.stall_window.as_millis(),
+              elapsed_ms = result.elapsed_ms,
+              last_output_age_ms = result.last_output_age_ms,
+              log_path = ?result.log_path,
+              "framework ok");
+    }
+    Ok(result)
+}
+
+fn retry_lease(stall_window: Duration) -> Duration {
+    stall_window
+        .saturating_add(DISPATCH_INTERVAL)
+        .saturating_add(Duration::from_secs(5))
+}
+
+fn duration_millis(duration: Duration) -> u64 {
+    duration.as_millis().min(u64::MAX as u128) as u64
+}
+
+struct RunningDelivery {
+    record: DeliveryRecord,
+    handle: JoinHandle<()>,
+}
+
+struct CompletedDelivery {
+    record: DeliveryRecord,
+    failure: Option<String>,
+}
+
+fn policy_from_decl(decl: &RetryDecl) -> anyhow::Result<RetryPolicy> {
+    Ok(RetryPolicy {
+        max_attempts: decl.max_attempts,
+        base: parse_duration(&decl.base)?,
+        cap: parse_duration(&decl.cap)?,
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::supervise::event_fanout::Fanout;
+    use crate::supervise::delivery_store::DeliveryStore;
     use base64::Engine;
-    use std::path::PathBuf;
-    use std::time::Duration;
+    use fkst_common::config::{Config, LimitsDecl, QueueDecl};
+    use std::collections::BTreeMap;
+    use tempfile::TempDir;
 
-    struct RuntimeRootGuard(Option<String>);
-
-    impl RuntimeRootGuard {
-        fn set(value: String) -> Self {
-            let previous = std::env::var("FKST_RUNTIME_ROOT").ok();
-            std::env::set_var("FKST_RUNTIME_ROOT", value);
-            Self(previous)
+    fn record(id: &str) -> DeliveryRecord {
+        DeliveryRecord {
+            delivery_id: id.to_string(),
+            queue: "jobs".to_string(),
+            dept: "worker".to_string(),
+            payload: serde_json::json!({"n": 1}),
+            source: Some(SourceRef {
+                kind: SourceKind::Cron,
+                reference: "tick".to_string(),
+            }),
+            cron_payload: None,
+            observed_at_ms: now_unix_millis(),
+            attempt: 0,
+            lease_generation: 0,
+            lease_until_ms: None,
+            not_before_ms: 0,
+            last_error_excerpt: None,
         }
     }
 
-    impl Drop for RuntimeRootGuard {
-        fn drop(&mut self) {
-            match &self.0 {
-                Some(value) => std::env::set_var("FKST_RUNTIME_ROOT", value),
-                None => std::env::remove_var("FKST_RUNTIME_ROOT"),
-            }
+    fn policy(max_attempts: u64) -> RetryPolicy {
+        RetryPolicy {
+            max_attempts,
+            base: Duration::from_millis(1),
+            cap: Duration::from_millis(1),
         }
     }
 
-    fn raised_line(queue: &str, payload: serde_json::Value) -> String {
-        let entries = serde_json::json!([{ "queue": queue, "payload": payload }]);
-        let json = serde_json::to_string(&entries).unwrap();
-        base64::engine::general_purpose::URL_SAFE.encode(json.as_bytes())
-    }
-
-    #[tokio::test]
-    async fn consumer_wires_runtime_log_dir_and_handles_multiple_input_queues() {
-        let runtime = tempfile::tempdir().unwrap();
-        let _runtime_guard = RuntimeRootGuard::set(runtime.path().to_string_lossy().into_owned());
-        let project = tempfile::tempdir().unwrap();
-        let lua_path = project.path().join("departments/test.lua");
-        std::fs::create_dir_all(lua_path.parent().unwrap()).unwrap();
-        std::fs::write(&lua_path, "-- test department\n").unwrap();
-        let framework_dir = tempfile::tempdir().unwrap();
-        let framework_path = framework_dir.path().join("fkst-framework");
-        std::fs::write(
-            &framework_path,
-            format!(
-                "#!/bin/sh\nprintf 'consumer-stdout\\n'; printf 'consumer-stderr\\n' >&2; printf 'RAISED: {}\\n'\n",
-                raised_line("done", serde_json::json!({"status": "complete"}))
-            ),
-        )
-        .unwrap();
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&framework_path, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let fanout = Fanout::new();
-        let mut done_rx = fanout.subscribe("done", 8).await;
-        let handle = spawn_consumer(
-            "custom-dept".to_string(),
-            DepartmentDecl {
-                lua: PathBuf::from("departments/test.lua"),
-                consumes: vec!["input".to_string(), "second-input".to_string()],
-                produces: Vec::new(),
-                stall_window: "5s".to_string(),
+    fn router_with_dead_letter(store: Arc<DeliveryStore>) -> DeliveryRouter {
+        let mut queue = BTreeMap::new();
+        queue.insert(
+            "dead_letter".to_string(),
+            QueueDecl {
+                capacity: 8,
+                fanout: false,
             },
-            project.path().to_path_buf(),
-            project.path().to_path_buf(),
-            framework_path,
-            fanout.clone(),
-            8,
-            20,
-        )
-        .await;
-
-        fanout
-            .send(
-                "input",
-                Event::new("input", serde_json::json!({"kind": "test"})),
-            )
-            .unwrap();
-        fanout
-            .send(
-                "second-input",
-                Event::new("second-input", serde_json::json!({"kind": "test"})),
-            )
-            .unwrap();
-
-        let log_dir = runtime.path().join("logs/framework-child");
-        let done = tokio::time::timeout(Duration::from_secs(5), done_rx.recv())
-            .await
-            .expect("framework child did not raise completion event")
-            .expect("completion receiver closed before framework child completed");
-        assert_eq!(done.queue, "done");
-        assert_eq!(done.payload, serde_json::json!({"status": "complete"}));
-        let second_done = tokio::time::timeout(Duration::from_secs(5), done_rx.recv())
-            .await
-            .expect("second input queue did not raise completion event")
-            .expect("completion receiver closed before second input completed");
-        assert_eq!(second_done.queue, "done");
-        assert_eq!(
-            second_done.payload,
-            serde_json::json!({"status": "complete"})
         );
-        let log_path = std::fs::read_dir(&log_dir)
-            .unwrap_or_else(|err| panic!("failed reading log dir {}: {err}", log_dir.display()))
-            .map(|entry| entry.unwrap().path())
-            .find(|path| {
-                path.file_name()
-                    .unwrap()
-                    .to_string_lossy()
-                    .starts_with("custom-dept-")
-            })
-            .expect("framework child log should be written before completion event");
-        let body = std::fs::read_to_string(&log_path).unwrap();
+        let mut department = BTreeMap::new();
+        department.insert(
+            "dlq".to_string(),
+            DepartmentDecl {
+                lua: "departments/dlq/main.lua".into(),
+                consumes: vec!["dead_letter".to_string()],
+                produces: Vec::new(),
+                ephemeral: vec!["dead_letter".to_string()],
+                stall_window: "30s".to_string(),
+                retry: None,
+            },
+        );
+        let cfg = Config {
+            queue,
+            raiser: BTreeMap::new(),
+            department,
+            limits: LimitsDecl {
+                global_codex_processes: 1,
+            },
+        };
+        DeliveryRouter::new(&cfg, Fanout::new(), Some(store))
+    }
 
-        assert!(body.contains("DEPT=custom-dept\n"));
-        assert!(body.contains("EXIT=0\n"));
-        assert!(body.contains("STALLED=false\n"));
-        assert!(body.contains("consumer-stdout"));
-        assert!(body.contains("consumer-stderr"));
+    #[test]
+    fn durable_success_ack_removes_delivery() {
+        let temp = TempDir::new().unwrap();
+        let store = DeliveryStore::open(temp.path().join("delivery.redb")).unwrap();
+        store.enqueue(&record("one")).unwrap();
+        let leased = store
+            .lease_for_dept("worker", now_unix_millis(), 8, Duration::from_millis(50))
+            .unwrap();
 
-        handle.abort();
+        assert!(store
+            .ack(&leased[0].delivery_id, leased[0].lease_generation)
+            .unwrap());
+
+        assert!(store.get("one").unwrap().is_none());
+    }
+
+    #[test]
+    fn durable_failure_retries_then_success_acks() {
+        let temp = TempDir::new().unwrap();
+        let store = DeliveryStore::open(temp.path().join("delivery.redb")).unwrap();
+        store.enqueue(&record("one")).unwrap();
+        let first = store
+            .lease_for_dept("worker", now_unix_millis(), 8, Duration::from_millis(1))
+            .unwrap()
+            .remove(0);
+        assert_eq!(
+            store
+                .retry(
+                    &first.delivery_id,
+                    first.lease_generation,
+                    "failure",
+                    &policy(3),
+                    now_unix_millis()
+                )
+                .unwrap(),
+            RetryOutcome::Scheduled
+        );
+        std::thread::sleep(Duration::from_millis(3));
+        let second = store
+            .lease_for_dept("worker", now_unix_millis(), 8, Duration::from_millis(50))
+            .unwrap()
+            .remove(0);
+
+        assert_eq!(second.attempt, 1);
+        assert!(store
+            .ack(&second.delivery_id, second.lease_generation)
+            .unwrap());
+        assert!(store.get("one").unwrap().is_none());
+    }
+
+    #[test]
+    fn expired_lease_is_released_after_crash_like_gap() {
+        let temp = TempDir::new().unwrap();
+        let store = DeliveryStore::open(temp.path().join("delivery.redb")).unwrap();
+        store.enqueue(&record("one")).unwrap();
+        let first = store
+            .lease_for_dept("worker", now_unix_millis(), 8, Duration::from_millis(1))
+            .unwrap()
+            .remove(0);
+        std::thread::sleep(Duration::from_millis(3));
+
+        let second = store
+            .lease_for_dept("worker", now_unix_millis(), 8, Duration::from_millis(50))
+            .unwrap()
+            .remove(0);
+
+        assert_eq!(first.delivery_id, second.delivery_id);
+        assert!(second.lease_generation > first.lease_generation);
+    }
+
+    #[test]
+    fn retry_at_max_writes_dead_and_publishes_dead_letter_without_looping() {
+        let temp = TempDir::new().unwrap();
+        let store = Arc::new(DeliveryStore::open(temp.path().join("delivery.redb")).unwrap());
+        store.enqueue(&record("one")).unwrap();
+        let leased = store
+            .lease_for_dept("worker", now_unix_millis(), 8, Duration::from_millis(50))
+            .unwrap()
+            .remove(0);
+        let router = router_with_dead_letter(store.clone());
+
+        retry_record(
+            &store,
+            &router,
+            Some(&policy(1)),
+            &leased,
+            "failure".to_string(),
+        );
+
+        assert!(store.get("one").unwrap().is_none());
+        assert!(store.get_dead("one").unwrap().is_some());
+    }
+
+    #[test]
+    fn raised_to_reliable_queue_without_source_ref_returns_error() {
+        let mut queue = BTreeMap::new();
+        queue.insert(
+            "next".to_string(),
+            QueueDecl {
+                capacity: 8,
+                fanout: false,
+            },
+        );
+        let mut department = BTreeMap::new();
+        department.insert(
+            "next_worker".to_string(),
+            DepartmentDecl {
+                lua: "departments/next_worker/main.lua".into(),
+                consumes: vec!["next".to_string()],
+                produces: Vec::new(),
+                ephemeral: Vec::new(),
+                stall_window: "30s".to_string(),
+                retry: None,
+            },
+        );
+        let cfg = Config {
+            queue,
+            raiser: BTreeMap::new(),
+            department,
+            limits: LimitsDecl {
+                global_codex_processes: 1,
+            },
+        };
+        let temp = TempDir::new().unwrap();
+        let store = Arc::new(DeliveryStore::open(temp.path().join("delivery.redb")).unwrap());
+        let router = DeliveryRouter::new(&cfg, Fanout::new(), Some(store));
+        let stdout = format!(
+            "RAISED: {}\n",
+            base64::engine::general_purpose::URL_SAFE.encode(
+                serde_json::to_vec(&serde_json::json!([
+                    {"queue": "next", "payload": {"n": 2}}
+                ]))
+                .unwrap()
+            )
+        );
+
+        let mut parent = record("parent");
+        parent.source = None;
+        let err = publish_raised(&router, &stdout, &parent).unwrap_err();
+
+        assert!(err.to_string().contains("requires source_ref"), "{err}");
+    }
+
+    #[test]
+    fn raised_replay_to_reliable_queue_is_idempotent() {
+        let mut queue = BTreeMap::new();
+        queue.insert(
+            "next".to_string(),
+            QueueDecl {
+                capacity: 8,
+                fanout: false,
+            },
+        );
+        let mut department = BTreeMap::new();
+        department.insert(
+            "next_worker".to_string(),
+            DepartmentDecl {
+                lua: "departments/next_worker/main.lua".into(),
+                consumes: vec!["next".to_string()],
+                produces: Vec::new(),
+                ephemeral: Vec::new(),
+                stall_window: "30s".to_string(),
+                retry: None,
+            },
+        );
+        let cfg = Config {
+            queue,
+            raiser: BTreeMap::new(),
+            department,
+            limits: LimitsDecl {
+                global_codex_processes: 1,
+            },
+        };
+        let temp = TempDir::new().unwrap();
+        let store = Arc::new(DeliveryStore::open(temp.path().join("delivery.redb")).unwrap());
+        let router = DeliveryRouter::new(&cfg, Fanout::new(), Some(store.clone()));
+        let parent = record("parent");
+        let stdout = format!(
+            "RAISED: {}\n",
+            base64::engine::general_purpose::URL_SAFE.encode(
+                serde_json::to_vec(&serde_json::json!([
+                    {"queue": "next", "payload": {"n": 2}}
+                ]))
+                .unwrap()
+            )
+        );
+
+        publish_raised(&router, &stdout, &parent).unwrap();
+        publish_raised(&router, &stdout, &parent).unwrap();
+
+        let leased = store
+            .lease_for_dept(
+                "next_worker",
+                now_unix_millis(),
+                8,
+                Duration::from_millis(50),
+            )
+            .unwrap();
+        assert_eq!(leased.len(), 1);
+        assert_eq!(leased[0].payload, serde_json::json!({"n": 2}));
+    }
+
+    #[test]
+    fn lease_excluding_running_delivery_prevents_same_process_duplicate_dispatch() {
+        let temp = TempDir::new().unwrap();
+        let store = DeliveryStore::open(temp.path().join("delivery.redb")).unwrap();
+        store.enqueue(&record("one")).unwrap();
+        let first = store
+            .lease_for_dept("worker", now_unix_millis(), 8, Duration::from_millis(1))
+            .unwrap()
+            .remove(0);
+        std::thread::sleep(Duration::from_millis(3));
+        let excluded = [first.delivery_id.clone()].into_iter().collect();
+
+        let leased = store
+            .lease_for_dept_excluding(
+                "worker",
+                now_unix_millis(),
+                8,
+                Duration::from_millis(50),
+                &excluded,
+            )
+            .unwrap();
+
+        assert!(leased.is_empty());
     }
 }

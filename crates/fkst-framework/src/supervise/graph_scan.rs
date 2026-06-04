@@ -9,7 +9,7 @@
 //! `M.spec.fanout`. Host graph defaults are read before graph materialization.
 
 use anyhow::{anyhow, bail, Context, Result};
-use fkst_common::config::{Config, DepartmentDecl, LimitsDecl, QueueDecl, RaiserDecl};
+use fkst_common::config::{Config, DepartmentDecl, LimitsDecl, QueueDecl, RaiserDecl, RetryDecl};
 use mlua::{Lua, LuaSerdeExt, Table, Value as LuaValue};
 use serde::Deserialize;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -29,7 +29,26 @@ struct DeptSpec {
     #[serde(default)]
     fanout: Vec<String>,
     #[serde(default)]
+    ephemeral: Vec<String>,
+    #[serde(default)]
     stall_window: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DeptRetrySpec {
+    #[serde(default)]
+    max_attempts: Option<u64>,
+    #[serde(default)]
+    base: Option<String>,
+    #[serde(default)]
+    cap: Option<String>,
+}
+
+enum DeptRetrySetting {
+    Default,
+    Custom(DeptRetrySpec),
+    Disabled,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -37,6 +56,7 @@ struct HostGraphDefaults {
     queue_capacity: usize,
     department_default_stall_window: String,
     codex_permit_slots: usize,
+    retry: RetryDecl,
 }
 
 impl HostGraphDefaults {
@@ -49,6 +69,7 @@ impl HostGraphDefaults {
                 ConfigKey::DepartmentDefaultStallWindow,
             )?,
             codex_permit_slots: resolve_usize(&config, ConfigKey::CodexPermitSlots)?,
+            retry: resolve_retry_defaults(&config)?,
         })
     }
 }
@@ -63,6 +84,27 @@ fn resolve_stall_window(config: &ConfigContext, key: ConfigKey) -> Result<String
     let entry = crate::config_registry::entry(key);
     assert_eq!(entry.value_type, ConfigValueType::DurationString);
     config.resolved_duration_string(key)
+}
+
+fn resolve_retry_defaults(config: &ConfigContext) -> Result<RetryDecl> {
+    let retry = RetryDecl {
+        max_attempts: resolve_usize(config, ConfigKey::RetryDefaultMaxAttempts)? as u64,
+        base: resolve_stall_window(config, ConfigKey::RetryDefaultBase)?,
+        cap: resolve_stall_window(config, ConfigKey::RetryDefaultCap)?,
+    };
+    validate_retry_default(&retry)?;
+    Ok(retry)
+}
+
+fn validate_retry_default(retry: &RetryDecl) -> Result<()> {
+    let base = parse_duration_millis(&retry.base)
+        .ok_or_else(|| anyhow!("FKST_RETRY_DEFAULT_BASE must be a positive s/m/h duration"))?;
+    let cap = parse_duration_millis(&retry.cap)
+        .ok_or_else(|| anyhow!("FKST_RETRY_DEFAULT_CAP must be a positive s/m/h duration"))?;
+    if cap < base {
+        bail!("FKST_RETRY_DEFAULT_CAP must be >= FKST_RETRY_DEFAULT_BASE");
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -144,9 +186,16 @@ fn scan_departments(
         let spec_tbl: Table = module
             .get("spec")
             .with_context(|| format!("department `{}` missing `M.spec`", name))?;
+        let retry = parse_retry_setting(lua, &spec_tbl)
+            .with_context(|| format!("parse `{}.spec.retry`", name))?;
+        spec_tbl
+            .raw_remove("retry")
+            .with_context(|| format!("remove `{}.spec.retry` before spec parse", name))?;
         let spec: DeptSpec = lua
             .from_value(LuaValue::Table(spec_tbl))
             .with_context(|| format!("parse `{}.spec`", name))?;
+        let retry = materialize_retry(&retry, defaults, &spec.consumes)
+            .with_context(|| format!("materialize `{}.spec.retry`", name))?;
 
         let config_path = config_path(repo_root, graph_root.kind, &main_lua);
         insert_department_decl_with_root(
@@ -156,11 +205,13 @@ fn scan_departments(
                 lua: config_path.clone(),
                 consumes: spec.consumes,
                 produces: spec.produces,
+                ephemeral: spec.ephemeral,
                 stall_window: if spec.stall_window.trim().is_empty() {
                     defaults.department_default_stall_window.clone()
                 } else {
                     spec.stall_window
                 },
+                retry,
             },
             &config_path,
             graph_root.kind,
@@ -169,6 +220,52 @@ fn scan_departments(
     }
 
     Ok(())
+}
+
+fn parse_retry_setting(lua: &Lua, spec_tbl: &Table) -> Result<DeptRetrySetting> {
+    match spec_tbl.raw_get::<LuaValue>("retry")? {
+        LuaValue::Nil => Ok(DeptRetrySetting::Default),
+        LuaValue::Boolean(false) => Ok(DeptRetrySetting::Disabled),
+        LuaValue::Boolean(true) => bail!("retry=true is unsupported; use retry = {{}}"),
+        LuaValue::Table(table) => {
+            let spec: DeptRetrySpec = lua.from_value(LuaValue::Table(table))?;
+            Ok(DeptRetrySetting::Custom(spec))
+        }
+        other => bail!(
+            "retry must be nil, false, or table; got {}",
+            other.type_name()
+        ),
+    }
+}
+
+fn materialize_retry(
+    retry: &DeptRetrySetting,
+    defaults: &HostGraphDefaults,
+    consumes: &[String],
+) -> Result<Option<RetryDecl>> {
+    match retry {
+        DeptRetrySetting::Disabled => Ok(None),
+        DeptRetrySetting::Default if consumes.iter().any(|queue| queue == "dead_letter") => {
+            if consumes.iter().any(|queue| queue != "dead_letter") {
+                bail!(
+                    "department consumes `dead_letter` and another queue with retry unset; set M.spec.retry to a table or false"
+                );
+            }
+            Ok(None)
+        }
+        DeptRetrySetting::Default => Ok(Some(defaults.retry.clone())),
+        DeptRetrySetting::Custom(custom) => Ok(Some(RetryDecl {
+            max_attempts: custom.max_attempts.unwrap_or(defaults.retry.max_attempts),
+            base: custom
+                .base
+                .clone()
+                .unwrap_or_else(|| defaults.retry.base.clone()),
+            cap: custom
+                .cap
+                .clone()
+                .unwrap_or_else(|| defaults.retry.cap.clone()),
+        })),
+    }
 }
 
 fn scan_raisers(
@@ -345,12 +442,10 @@ const REMOVED_RUNTIME_SCHEME: &str = concat!("runtime", "://");
 fn reject_runtime_file_watch_glob(raiser: &RaiserDecl) -> Result<()> {
     if let RaiserDecl::FileWatch { glob, .. } = raiser {
         if glob.starts_with(REMOVED_RUNTIME_SCHEME) {
-            bail!(
-                concat!(
-                    "runtime",
-                    ":// file_watch glob is a removed surface; use a host-root relative or absolute glob"
-                )
-            );
+            bail!(concat!(
+                "runtime",
+                ":// file_watch glob is a removed surface; use a host-root relative or absolute glob"
+            ));
         }
     }
     Ok(())
@@ -448,5 +543,19 @@ fn raiser_produces(r: &RaiserDecl) -> &str {
     match r {
         RaiserDecl::Cron { produces, .. } => produces,
         RaiserDecl::FileWatch { produces, .. } => produces,
+    }
+}
+
+fn parse_duration_millis(raw: &str) -> Option<u128> {
+    let unit = raw.chars().last()?;
+    let value = raw[..raw.len() - unit.len_utf8()].parse::<u128>().ok()?;
+    if value == 0 {
+        return None;
+    }
+    match unit {
+        's' => Some(value.saturating_mul(1_000)),
+        'm' => Some(value.saturating_mul(60_000)),
+        'h' => Some(value.saturating_mul(3_600_000)),
+        _ => None,
     }
 }

@@ -20,6 +20,9 @@ const RUNTIME_ROOT_ENV: &str = "FKST_RUNTIME_ROOT";
 const QUEUE_CAPACITY_ENV: &str = "FKST_QUEUE_CAPACITY";
 const DEPARTMENT_DEFAULT_STALL_WINDOW_ENV: &str = "FKST_DEPARTMENT_DEFAULT_STALL_WINDOW";
 const CODEX_PERMIT_SLOTS_ENV: &str = "FKST_CODEX_PERMIT_SLOTS";
+const RETRY_DEFAULT_MAX_ATTEMPTS_ENV: &str = "FKST_RETRY_DEFAULT_MAX_ATTEMPTS";
+const RETRY_DEFAULT_BASE_ENV: &str = "FKST_RETRY_DEFAULT_BASE";
+const RETRY_DEFAULT_CAP_ENV: &str = "FKST_RETRY_DEFAULT_CAP";
 const PACKAGE_ROOT_ENV: &str = "FKST_PACKAGE_ROOT";
 
 static CURRENT_DIR_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -114,6 +117,30 @@ return M
     )
 }
 
+fn dept_with_retry(consumes: &str, retry: &str) -> String {
+    format!(
+        r#"
+local M = {{}}
+M.spec = {{ consumes = {{{}}}, stall_window = "30s", retry = {{{}}} }}
+function pipeline(_) end
+return M
+"#,
+        consumes, retry
+    )
+}
+
+fn dept_with_raw_retry(consumes: &str, retry: &str) -> String {
+    format!(
+        r#"
+local M = {{}}
+M.spec = {{ consumes = {{{}}}, stall_window = "30s", retry = {} }}
+function pipeline(_) end
+return M
+"#,
+        consumes, retry
+    )
+}
+
 fn write_package_helper(root: &std::path::Path) {
     fs::create_dir_all(root.join("fkst")).unwrap();
     fs::write(
@@ -145,6 +172,10 @@ return M
     assert!(!cfg.queue.get("tick").unwrap().fanout);
     assert_eq!(cfg.limits.global_codex_processes, 20);
     assert_eq!(cfg.department.get("hello").unwrap().consumes, vec!["tick"]);
+    let retry = cfg.department.get("hello").unwrap().retry.as_ref().unwrap();
+    assert_eq!(retry.max_attempts, 5);
+    assert_eq!(retry.base, "60s");
+    assert_eq!(retry.cap, "30m");
     assert_eq!(
         cfg.department.get("hello").unwrap().lua,
         PathBuf::from("departments/hello/main.lua")
@@ -161,6 +192,117 @@ return M
 }
 
 #[test]
+fn scans_department_retry_with_defaults() {
+    let dir = write_repo(
+        &[(
+            "hello",
+            &dept_with_retry(r#""tick""#, r#"max_attempts = 3"#),
+        )],
+        &[(
+            "cron_a",
+            r#"return { type = "cron", interval = "10s", produces = "tick" }"#,
+        )],
+    );
+
+    let cfg = load(dir.path()).unwrap();
+    let retry = cfg.department.get("hello").unwrap().retry.as_ref().unwrap();
+
+    assert_eq!(retry.max_attempts, 3);
+    assert_eq!(retry.base, "60s");
+    assert_eq!(retry.cap, "30m");
+}
+
+#[test]
+fn department_retry_false_disables_default_tracking() {
+    let dir = write_repo(
+        &[("hello", &dept_with_raw_retry(r#""tick""#, "false"))],
+        &[(
+            "cron_a",
+            r#"return { type = "cron", interval = "10s", produces = "tick" }"#,
+        )],
+    );
+
+    let cfg = load(dir.path()).unwrap();
+
+    assert_eq!(cfg.department.get("hello").unwrap().retry, None);
+}
+
+#[test]
+fn department_retry_table_merges_global_defaults() {
+    let _env_lock = CURRENT_DIR_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap();
+    let _attempts = EnvGuard::set(RETRY_DEFAULT_MAX_ATTEMPTS_ENV, "7");
+    let _base = EnvGuard::set(RETRY_DEFAULT_BASE_ENV, "11s");
+    let _cap = EnvGuard::set(RETRY_DEFAULT_CAP_ENV, "9m");
+    let dir = write_repo(
+        &[(
+            "hello",
+            &dept_with_retry(r#""tick""#, r#"max_attempts = 3"#),
+        )],
+        &[(
+            "cron_a",
+            r#"return { type = "cron", interval = "10s", produces = "tick" }"#,
+        )],
+    );
+
+    let cfg = load(dir.path()).unwrap();
+    let retry = cfg.department.get("hello").unwrap().retry.as_ref().unwrap();
+
+    assert_eq!(retry.max_attempts, 3);
+    assert_eq!(retry.base, "11s");
+    assert_eq!(retry.cap, "9m");
+}
+
+#[test]
+fn dead_letter_consumer_defaults_to_retry_disabled() {
+    let dir = write_repo(
+        &[(
+            "dead_handler",
+            r#"
+local M = {}
+M.spec = { consumes = {"dead_letter"}, stall_window = "30s" }
+function pipeline(_) end
+return M
+"#,
+        )],
+        &[],
+    );
+
+    let cfg = load(dir.path()).unwrap();
+
+    assert_eq!(cfg.department.get("dead_handler").unwrap().retry, None);
+}
+
+#[test]
+fn dead_letter_mixed_with_normal_queue_requires_explicit_retry() {
+    let dir = write_repo(
+        &[(
+            "dead_handler",
+            r#"
+local M = {}
+M.spec = { consumes = {"dead_letter", "tick"}, stall_window = "30s" }
+function pipeline(_) end
+return M
+"#,
+        )],
+        &[(
+            "cron_a",
+            r#"return { type = "cron", interval = "10s", produces = "tick" }"#,
+        )],
+    );
+
+    let err = load(dir.path()).unwrap_err();
+    let msg = format!("{err:#}");
+
+    assert!(msg.contains("dead_letter"), "got: {msg}");
+    assert!(msg.contains("another queue"), "got: {msg}");
+    assert!(msg.contains("M.spec.retry"), "got: {msg}");
+    assert!(msg.contains("table or false"), "got: {msg}");
+}
+
+#[test]
 fn host_graph_defaults_use_operational_defaults_when_env_and_fkst_env_are_absent() {
     let _env_lock = CURRENT_DIR_LOCK
         .get_or_init(|| Mutex::new(()))
@@ -169,6 +311,9 @@ fn host_graph_defaults_use_operational_defaults_when_env_and_fkst_env_are_absent
     let _queue = EnvGuard::unset(QUEUE_CAPACITY_ENV);
     let _stall_window = EnvGuard::unset(DEPARTMENT_DEFAULT_STALL_WINDOW_ENV);
     let _slots = EnvGuard::unset(CODEX_PERMIT_SLOTS_ENV);
+    let _attempts = EnvGuard::unset(RETRY_DEFAULT_MAX_ATTEMPTS_ENV);
+    let _retry_base = EnvGuard::unset(RETRY_DEFAULT_BASE_ENV);
+    let _retry_cap = EnvGuard::unset(RETRY_DEFAULT_CAP_ENV);
     let dir = TempDir::new().unwrap();
     let depts_root = dir.path().join("departments");
     fs::create_dir_all(depts_root.join("hello")).unwrap();
@@ -194,6 +339,10 @@ return M
     assert_eq!(cfg.queue.get("tick").unwrap().capacity, 16);
     assert_eq!(cfg.department.get("hello").unwrap().stall_window, "30s");
     assert_eq!(cfg.limits.global_codex_processes, 20);
+    let retry = cfg.department.get("hello").unwrap().retry.as_ref().unwrap();
+    assert_eq!(retry.max_attempts, 5);
+    assert_eq!(retry.base, "60s");
+    assert_eq!(retry.cap, "30m");
 }
 
 #[test]
@@ -205,6 +354,9 @@ fn host_graph_defaults_use_fkst_env() {
     let _queue = EnvGuard::unset(QUEUE_CAPACITY_ENV);
     let _stall_window = EnvGuard::unset(DEPARTMENT_DEFAULT_STALL_WINDOW_ENV);
     let _slots = EnvGuard::unset(CODEX_PERMIT_SLOTS_ENV);
+    let _attempts = EnvGuard::unset(RETRY_DEFAULT_MAX_ATTEMPTS_ENV);
+    let _retry_base = EnvGuard::unset(RETRY_DEFAULT_BASE_ENV);
+    let _retry_cap = EnvGuard::unset(RETRY_DEFAULT_CAP_ENV);
     let dir = write_repo(
         &[(
             "hello",
@@ -255,7 +407,7 @@ return M
     );
     fs::write(
         dir.path().join("fkst.env"),
-        "FKST_QUEUE_CAPACITY=21\nFKST_DEPARTMENT_DEFAULT_STALL_WINDOW=55m\nFKST_CODEX_PERMIT_SLOTS=22\n",
+        "FKST_QUEUE_CAPACITY=21\nFKST_DEPARTMENT_DEFAULT_STALL_WINDOW=55m\nFKST_CODEX_PERMIT_SLOTS=22\nFKST_RETRY_DEFAULT_MAX_ATTEMPTS=8\nFKST_RETRY_DEFAULT_BASE=2m\nFKST_RETRY_DEFAULT_CAP=1h\n",
     )
     .unwrap();
 
@@ -264,6 +416,43 @@ return M
     assert_eq!(cfg.queue.get("tick").unwrap().capacity, 31);
     assert_eq!(cfg.department.get("hello").unwrap().stall_window, "66h");
     assert_eq!(cfg.limits.global_codex_processes, 32);
+    let retry = cfg.department.get("hello").unwrap().retry.as_ref().unwrap();
+    assert_eq!(retry.max_attempts, 8);
+    assert_eq!(retry.base, "2m");
+    assert_eq!(retry.cap, "1h");
+}
+
+#[test]
+fn host_graph_retry_defaults_use_env_and_validate() {
+    let _env_lock = CURRENT_DIR_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap();
+    let _attempts = EnvGuard::set(RETRY_DEFAULT_MAX_ATTEMPTS_ENV, "12");
+    let _base = EnvGuard::set(RETRY_DEFAULT_BASE_ENV, "4s");
+    let _cap = EnvGuard::set(RETRY_DEFAULT_CAP_ENV, "2m");
+    let dir = write_repo(
+        &[(
+            "hello",
+            r#"
+local M = {}
+M.spec = { consumes = {"tick"} }
+function pipeline(_) end
+return M
+"#,
+        )],
+        &[(
+            "cron_a",
+            r#"return { type = "cron", interval = "10s", produces = "tick" }"#,
+        )],
+    );
+
+    let cfg = load(dir.path()).unwrap();
+    let retry = cfg.department.get("hello").unwrap().retry.as_ref().unwrap();
+
+    assert_eq!(retry.max_attempts, 12);
+    assert_eq!(retry.base, "4s");
+    assert_eq!(retry.cap, "2m");
 }
 
 #[test]
@@ -367,10 +556,16 @@ fn host_graph_defaults_fail_closed_when_configured_value_is_invalid() {
     let _queue = EnvGuard::unset(QUEUE_CAPACITY_ENV);
     let _stall_window = EnvGuard::unset(DEPARTMENT_DEFAULT_STALL_WINDOW_ENV);
     let _slots = EnvGuard::unset(CODEX_PERMIT_SLOTS_ENV);
+    let _attempts = EnvGuard::unset(RETRY_DEFAULT_MAX_ATTEMPTS_ENV);
+    let _retry_base = EnvGuard::unset(RETRY_DEFAULT_BASE_ENV);
+    let _retry_cap = EnvGuard::unset(RETRY_DEFAULT_CAP_ENV);
     let cases = [
         (QUEUE_CAPACITY_ENV, "not-a-number"),
         (DEPARTMENT_DEFAULT_STALL_WINDOW_ENV, "30x"),
         (CODEX_PERMIT_SLOTS_ENV, "0"),
+        (RETRY_DEFAULT_MAX_ATTEMPTS_ENV, "0"),
+        (RETRY_DEFAULT_BASE_ENV, "0s"),
+        (RETRY_DEFAULT_CAP_ENV, "bad"),
     ];
 
     for (key, value) in cases {
@@ -396,6 +591,32 @@ return M
 
         assert!(msg.contains(key), "got: {msg}");
     }
+
+    let dir = write_repo(
+        &[(
+            "hello",
+            r#"
+local M = {}
+M.spec = { consumes = {"tick"} }
+function pipeline(_) end
+return M
+"#,
+        )],
+        &[(
+            "cron_a",
+            r#"return { type = "cron", interval = "10s", produces = "tick" }"#,
+        )],
+    );
+    fs::write(
+        dir.path().join("fkst.env"),
+        "FKST_RETRY_DEFAULT_BASE=30m\nFKST_RETRY_DEFAULT_CAP=60s\n",
+    )
+    .unwrap();
+
+    let err = load(dir.path()).unwrap_err();
+    let msg = format!("{:#}", err);
+
+    assert!(msg.contains("FKST_RETRY_DEFAULT_CAP"), "got: {msg}");
 }
 
 #[test]
@@ -715,6 +936,26 @@ fn dept_spec_fanout_duplicate_declarations_are_idempotent() {
 }
 
 #[test]
+fn fanout_queue_allows_default_retry_mixed_with_retry_false() {
+    let dir = write_repo(
+        &[
+            ("alpha", &dept_with_fanout(r#""tick""#, "", r#""tick""#)),
+            ("beta", &dept_with_raw_retry(r#""tick""#, "false")),
+        ],
+        &[(
+            "cron_a",
+            r#"return { type = "cron", interval = "10s", produces = "tick" }"#,
+        )],
+    );
+
+    let cfg = load(dir.path()).unwrap();
+    let warnings = validate(&cfg, dir.path()).unwrap();
+
+    assert!(warnings.is_empty(), "{warnings:?}");
+    assert!(cfg.queue.get("tick").unwrap().fanout);
+}
+
+#[test]
 fn root_package_lua_is_removed_surface() {
     let dir = write_repo(&[("alpha", &dept(r#""tick""#, ""))], &[]);
     fs::write(dir.path().join("package.lua"), "return {}\n").unwrap();
@@ -741,7 +982,9 @@ fn duplicate_department_name_fails_closed() {
             lua: path.clone(),
             consumes: vec!["tick".into()],
             produces: Vec::new(),
+            ephemeral: Vec::new(),
             stall_window: "30s".into(),
+            retry: None,
         },
         &path,
     )
@@ -753,7 +996,9 @@ fn duplicate_department_name_fails_closed() {
             lua: path.clone(),
             consumes: vec!["tick".into()],
             produces: Vec::new(),
+            ephemeral: Vec::new(),
             stall_window: "30s".into(),
+            retry: None,
         },
         &path,
     )

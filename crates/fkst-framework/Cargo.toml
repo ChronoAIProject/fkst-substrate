@@ -22,6 +22,7 @@ base64 = { workspace = true }
 ulid = { workspace = true }
 tokio = { workspace = true }
 notify = { workspace = true }
+redb = "2.6.3"
 
 [dev-dependencies]
 tempfile = "3"

@@ -32,6 +32,10 @@ impl RaiseBuffer {
             .collect()
     }
 
+    pub(crate) fn push(&self, queue: String, payload: JsonValue) {
+        self.0.lock().unwrap().push(RaisedEntry { queue, payload });
+    }
+
     pub fn emit_stdout(&self) {
         let entries = self.0.lock().unwrap().clone();
         if entries.is_empty() {
@@ -49,10 +53,7 @@ pub fn register(lua: &Lua, buf: RaiseBuffer) -> Result<()> {
         "raise",
         lua.create_function(move |lua, (queue, payload): (String, mlua::Value)| {
             let p_json: JsonValue = lua.from_value(payload).unwrap_or(JsonValue::Null);
-            buf_clone.0.lock().unwrap().push(RaisedEntry {
-                queue,
-                payload: p_json,
-            });
+            buf_clone.push(queue, p_json);
             Ok(())
         })?,
     )?;

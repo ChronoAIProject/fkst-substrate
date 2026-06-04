@@ -101,6 +101,7 @@ return M
         .arg("--framework-bin")
         .arg(&fake)
         .env("FKST_RUNTIME_ROOT", ".fkst/runtime")
+        .env("FKST_DURABLE_ROOT", root.join(".fkst/durable"))
         .status()
         .unwrap();
 
@@ -181,6 +182,7 @@ return M
         .arg(env!("CARGO_BIN_EXE_fkst-framework"))
         .env("FKST_PACKAGE_ROOT", &package)
         .env("FKST_RUNTIME_ROOT", host.join(".fkst/runtime"))
+        .env("FKST_DURABLE_ROOT", host.join(".fkst/durable"))
         .status()
         .unwrap();
 

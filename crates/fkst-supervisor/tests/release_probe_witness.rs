@@ -12,6 +12,7 @@ use tempfile::TempDir;
 
 const RUNTIME_ROOT_ENV: &str = "FKST_RUNTIME_ROOT";
 const PACKAGE_ROOT_ENV: &str = "FKST_PACKAGE_ROOT";
+const DURABLE_ROOT_ENV: &str = "FKST_DURABLE_ROOT";
 const WITNESS_TIMEOUT: Duration = Duration::from_secs(60);
 const LOG_TAIL_BYTES: usize = 12 * 1024;
 
@@ -256,12 +257,17 @@ impl SupervisorHarness {
         framework_pid_file: &Path,
     ) -> Self {
         let root = tmp.path().to_path_buf();
+        // Default-reliable subscriptions require a durable root, else the
+        // framework fail-closes at supervise startup. Mirror supervise_smoke.
+        let durable_root = root.join("durable");
+        std::fs::create_dir_all(&durable_root).unwrap();
         let child = Command::new(supervisor_bin())
             .current_dir(&root)
             .env("FKST_FRAMEWORK_BIN", framework_wrapper)
             .env("FKST_TEST_REAL_FRAMEWORK", framework_bin())
             .env("FKST_TEST_FRAMEWORK_PID_FILE", framework_pid_file)
             .env(RUNTIME_ROOT_ENV, runtime_root)
+            .env(DURABLE_ROOT_ENV, &durable_root)
             .env(PACKAGE_ROOT_ENV, &root)
             .stdin(Stdio::null())
             .stdout(Stdio::from(File::create(supervisor_log).unwrap()))
