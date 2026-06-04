@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use mlua::{Function, Lua, Table, Value};
+use mlua::{Function, Lua, LuaSerdeExt, Table, Value};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
@@ -18,7 +18,8 @@ pub(crate) fn run_tests(roots: PackageRoots) -> Result<i32> {
             .with_context(|| format!("set package.path for tests in {}", relpath))?;
         crate::mlua_init::register_framework_sdk(&lua, RaiseBuffer::new(), roots.host_root())
             .with_context(|| format!("register SDK for {}", relpath))?;
-        register_test_sdk(&lua).with_context(|| format!("register fkst.test for {}", relpath))?;
+        register_test_sdk(&lua, roots.clone())
+            .with_context(|| format!("register fkst.test for {}", relpath))?;
 
         match load_test_table(&lua, &file) {
             Ok(tests) => {
@@ -130,7 +131,7 @@ fn load_test_table(lua: &Lua, file: &Path) -> Result<Vec<(String, Function)>> {
     Ok(tests.into_iter().collect())
 }
 
-fn register_test_sdk(lua: &Lua) -> mlua::Result<()> {
+fn register_test_sdk(lua: &Lua, roots: PackageRoots) -> mlua::Result<()> {
     let globals = lua.globals();
     let fkst = match globals.get::<Value>("fkst")? {
         Value::Table(table) => table,
@@ -200,9 +201,157 @@ fn register_test_sdk(lua: &Lua) -> mlua::Result<()> {
             ))
         })?,
     )?;
+    test.set(
+        "run_department",
+        lua.create_function(
+            move |lua, (path, event, opts): (String, Value, Option<Table>)| {
+                run_department(lua, &roots, path, event, opts)
+            },
+        )?,
+    )?;
     fkst.set("test", test)?;
     globals.set("fkst", fkst)?;
     Ok(())
+}
+
+fn run_department(
+    lua: &Lua,
+    roots: &PackageRoots,
+    path: String,
+    event: Value,
+    opts: Option<Table>,
+) -> mlua::Result<Table> {
+    let opts = DeptRunOptions::from_lua(opts)?;
+    let lua_path = resolve_department_path(roots.package_root(), &path);
+    let event_json: serde_json::Value = lua.from_value(event)?;
+    let _guard = DeptRunEnvGuard::apply(opts)?;
+
+    let dept_lua = crate::mlua_init::new_lua();
+    let raise_buf = RaiseBuffer::new();
+    crate::mlua_init::register_framework_sdk(&dept_lua, raise_buf.clone(), roots.host_root())?;
+
+    let exit_code =
+        match crate::mlua_init::run_dept_with_roots(&dept_lua, &lua_path, &event_json, roots) {
+            Ok(()) => 0,
+            Err(err) => {
+                eprintln!(
+                    "[framework:test] department failed {}: {err:#}",
+                    lua_path.display()
+                );
+                1
+            }
+        };
+
+    let result = lua.create_table()?;
+    result.set("exit_code", exit_code)?;
+    let raises = lua.create_table()?;
+    for (idx, (queue, payload)) in raise_buf.snapshot().into_iter().enumerate() {
+        let entry = lua.create_table()?;
+        entry.set("queue", queue)?;
+        entry.set("payload", lua.to_value(&payload)?)?;
+        raises.set(idx + 1, entry)?;
+    }
+    result.set("raises", raises)?;
+    Ok(result)
+}
+
+fn resolve_department_path(package_root: &Path, path: &str) -> PathBuf {
+    let path = PathBuf::from(path);
+    if path.is_absolute() {
+        path
+    } else {
+        package_root.join(path)
+    }
+}
+
+#[derive(Debug)]
+struct DeptRunOptions {
+    cwd: Option<PathBuf>,
+    env: Vec<(String, String)>,
+    path_prepend: Option<String>,
+}
+
+impl DeptRunOptions {
+    fn from_lua(opts: Option<Table>) -> mlua::Result<Self> {
+        let Some(opts) = opts else {
+            return Ok(Self {
+                cwd: None,
+                env: Vec::new(),
+                path_prepend: None,
+            });
+        };
+        let cwd = opts.get::<Option<String>>("cwd")?.map(PathBuf::from);
+        let env = match opts.get::<Option<Table>>("env")? {
+            Some(env_table) => env_table
+                .pairs::<String, String>()
+                .collect::<mlua::Result<Vec<(String, String)>>>()?,
+            None => Vec::new(),
+        };
+        let path_prepend = opts.get::<Option<String>>("path_prepend")?;
+        Ok(Self {
+            cwd,
+            env,
+            path_prepend,
+        })
+    }
+}
+
+struct DeptRunEnvGuard {
+    cwd: Option<PathBuf>,
+    env: Vec<(String, Option<std::ffi::OsString>)>,
+}
+
+impl DeptRunEnvGuard {
+    fn apply(opts: DeptRunOptions) -> mlua::Result<Self> {
+        let mut guard = Self {
+            cwd: if opts.cwd.is_some() {
+                Some(std::env::current_dir().map_err(mlua::Error::external)?)
+            } else {
+                None
+            },
+            env: Vec::new(),
+        };
+
+        for (key, value) in opts.env {
+            guard.env.push((key.clone(), std::env::var_os(&key)));
+            std::env::set_var(key, value);
+        }
+
+        if let Some(prepend) = opts.path_prepend {
+            let key = "PATH".to_string();
+            let previous = std::env::var_os(&key);
+            let mut paths = vec![PathBuf::from(prepend)];
+            if let Some(previous) = &previous {
+                paths.extend(std::env::split_paths(previous));
+            }
+            let next = std::env::join_paths(paths).map_err(mlua::Error::external)?;
+            guard.env.push((key.clone(), previous));
+            std::env::set_var(key, next);
+        }
+
+        if let Some(next_cwd) = opts.cwd {
+            if let Err(err) = std::env::set_current_dir(&next_cwd) {
+                drop(guard);
+                return Err(mlua::Error::external(err));
+            }
+        }
+
+        Ok(guard)
+    }
+}
+
+impl Drop for DeptRunEnvGuard {
+    fn drop(&mut self) {
+        for (key, value) in self.env.iter().rev() {
+            match value {
+                Some(value) => std::env::set_var(key, value),
+                None => std::env::remove_var(key),
+            }
+        }
+        if let Some(cwd) = &self.cwd {
+            let _ = std::env::set_current_dir(cwd);
+        }
+    }
 }
 
 fn lua_values_equal(lua: &Lua, actual: Value, expected: Value) -> mlua::Result<bool> {

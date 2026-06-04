@@ -93,7 +93,7 @@ fkst-framework --self-test
 
 runner 不全树递归，不扫描 `raisers/` 或 `fkst/`。每个测试文件在独立 Lua state 中执行，先注册 production SDK 以便测试可 `require` package 模块和调用固定 SDK，再注册 test-mode `fkst.test` 表。测试文件必须返回 table；runner 只执行排序后的 `test_*` key。单个测试失败后继续执行同文件其余测试和后续文件，最后输出 `N passed, M failed`；`M > 0` 时退出码非 0。
 
-`fkst.test` 只包含 `eq(actual, expected[, msg])`、`is_true(value[, msg])`、`raises(fn[, msg])`、`is_nil(value[, msg])` 四个断言。它是最小 Lua 单测工具，不提供 describe/it、hook、fixture、mock、stub 或测试框架 DSL。除非明确验证真实 CLI 路径，Lua 单测不应调用 codex。
+`fkst.test` 包含 `eq(actual, expected[, msg])`、`is_true(value[, msg])`、`raises(fn[, msg])`、`is_nil(value[, msg])` 四个断言，以及 test-mode-only `run_department(path, event[, opts])`。`run_department` 用 fresh Lua state 注册 production SDK 和独立 `RaiseBuffer`，再通过正常 department runner 注入 `event`；它返回 `{ exit_code = int, raises = { { queue = string, payload = table }, ... } }`。相对 `path` 按 package root 解析，`opts.cwd`、`opts.env`、`opts.path_prepend` 只作用于该次执行并随后恢复。它是最小 Lua 单测工具，不提供 describe/it、hook、fixture、mock、stub 或测试框架 DSL。除非明确验证真实 CLI 路径，Lua 单测不应调用 codex。
 
 ## 4. Package Root 与 Host Root
 
