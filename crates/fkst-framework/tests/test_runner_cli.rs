@@ -280,6 +280,369 @@ return {
 }
 
 #[test]
+fn run_department_records_declared_cross_package_raise_without_delivery() {
+    let host = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
+    let package = tempfile::Builder::new()
+        .prefix("autochrono")
+        .tempdir()
+        .unwrap();
+
+    fs::create_dir_all(package.path().join("departments/probe")).unwrap();
+    fs::write(
+        package.path().join("departments/probe/main.lua"),
+        r#"
+local M = {}
+M.spec = {
+  consumes = { "tick" },
+  produces = { "consensus.proposal" },
+}
+function pipeline(event)
+  raise("consensus.proposal", { source = event.payload.source })
+end
+return M
+"#,
+    )
+    .unwrap();
+    fs::create_dir_all(package.path().join("tests")).unwrap();
+    fs::write(
+        package.path().join("tests/cross_package_raise_test.lua"),
+        r#"
+local t = fkst.test
+return {
+  test_run_department_records_declared_cross_package_raise = function()
+    local result = fkst.test.run_department("departments/probe/main.lua", { payload = { source = "unit" } })
+    t.eq(result.exit_code, 0)
+    t.eq(#result.raises, 1)
+    t.eq(result.raises[1].queue, "consensus.proposal")
+    t.eq(result.raises[1].payload.source, "unit")
+  end,
+}
+"#,
+    )
+    .unwrap();
+
+    let output = run_lua_tests_with_packages(host.path(), &[package.path()]);
+
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}",
+        stdout(&output),
+        stderr(&output)
+    );
+    let out = stdout(&output);
+    assert!(
+        out.contains(
+            "PASS tests/cross_package_raise_test.lua::test_run_department_records_declared_cross_package_raise"
+        ),
+        "stdout: {out}"
+    );
+    assert!(out.contains("1 passed, 0 failed"), "stdout: {out}");
+}
+
+#[test]
+fn run_department_records_declared_cross_package_raise_in_legacy_flat() {
+    let package = tempfile::Builder::new()
+        .prefix("autochrono")
+        .tempdir()
+        .unwrap();
+
+    fs::create_dir_all(package.path().join("departments/probe")).unwrap();
+    fs::write(
+        package.path().join("departments/probe/main.lua"),
+        r#"
+local M = {}
+M.spec = {
+  consumes = { "tick" },
+  produces = { "consensus.proposal" },
+}
+function pipeline(event)
+  raise("consensus.proposal", { source = event.payload.source })
+end
+return M
+"#,
+    )
+    .unwrap();
+    fs::create_dir_all(package.path().join("tests")).unwrap();
+    fs::write(
+        package.path().join("tests/legacy_flat_raise_test.lua"),
+        r#"
+local t = fkst.test
+return {
+  test_run_department_records_declared_cross_package_raise = function()
+    local result = fkst.test.run_department("departments/probe/main.lua", { payload = { source = "unit" } })
+    t.eq(result.exit_code, 0)
+    t.eq(#result.raises, 1)
+    t.eq(result.raises[1].queue, "consensus.proposal")
+    t.eq(result.raises[1].payload.source, "unit")
+  end,
+}
+"#,
+    )
+    .unwrap();
+
+    let output = run_lua_tests(package.path(), package.path());
+
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}",
+        stdout(&output),
+        stderr(&output)
+    );
+    let out = stdout(&output);
+    assert!(
+        out.contains(
+            "PASS tests/legacy_flat_raise_test.lua::test_run_department_records_declared_cross_package_raise"
+        ),
+        "stdout: {out}"
+    );
+    assert!(out.contains("1 passed, 0 failed"), "stdout: {out}");
+}
+
+#[test]
+fn run_department_rejects_undeclared_cross_package_raise() {
+    let host = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
+    let package = tempfile::Builder::new()
+        .prefix("autochrono")
+        .tempdir()
+        .unwrap();
+
+    fs::create_dir_all(package.path().join("departments/probe")).unwrap();
+    fs::write(
+        package.path().join("departments/probe/main.lua"),
+        r#"
+local M = {}
+M.spec = {
+  consumes = { "tick" },
+  produces = { "consensus.proposal" },
+}
+function pipeline(event)
+  raise("consensus.typo", {})
+end
+return M
+"#,
+    )
+    .unwrap();
+    fs::create_dir_all(package.path().join("tests")).unwrap();
+    fs::write(
+        package
+            .path()
+            .join("tests/cross_package_raise_reject_test.lua"),
+        r#"
+local t = fkst.test
+return {
+  test_run_department_rejects_undeclared_cross_package_raise = function()
+    local result = fkst.test.run_department("departments/probe/main.lua", { payload = {} })
+    t.eq(result.exit_code, 1)
+    t.eq(#result.raises, 0)
+  end,
+}
+"#,
+    )
+    .unwrap();
+
+    let output = run_lua_tests_with_packages(host.path(), &[package.path()]);
+
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}",
+        stdout(&output),
+        stderr(&output)
+    );
+    let out = stdout(&output);
+    assert!(
+        out.contains(
+            "PASS tests/cross_package_raise_reject_test.lua::test_run_department_rejects_undeclared_cross_package_raise"
+        ),
+        "stdout: {out}"
+    );
+    assert!(out.contains("1 passed, 0 failed"), "stdout: {out}");
+    let err = stderr(&output);
+    assert!(err.contains("unknown namespace"), "stderr: {err}");
+}
+
+#[test]
+fn run_department_rejects_undeclared_cross_package_raise_in_legacy_flat() {
+    let package = tempfile::Builder::new()
+        .prefix("autochrono")
+        .tempdir()
+        .unwrap();
+
+    fs::create_dir_all(package.path().join("departments/probe")).unwrap();
+    fs::write(
+        package.path().join("departments/probe/main.lua"),
+        r#"
+local M = {}
+M.spec = {
+  consumes = { "tick" },
+  produces = { "consensus.proposal" },
+}
+function pipeline(event)
+  raise("consensus.typo", {})
+end
+return M
+"#,
+    )
+    .unwrap();
+    fs::create_dir_all(package.path().join("tests")).unwrap();
+    fs::write(
+        package
+            .path()
+            .join("tests/legacy_flat_raise_reject_test.lua"),
+        r#"
+local t = fkst.test
+return {
+  test_run_department_rejects_undeclared_cross_package_raise = function()
+    local result = fkst.test.run_department("departments/probe/main.lua", { payload = {} })
+    t.eq(result.exit_code, 1)
+    t.eq(#result.raises, 0)
+  end,
+}
+"#,
+    )
+    .unwrap();
+
+    let output = run_lua_tests(package.path(), package.path());
+
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}",
+        stdout(&output),
+        stderr(&output)
+    );
+    let out = stdout(&output);
+    assert!(
+        out.contains(
+            "PASS tests/legacy_flat_raise_reject_test.lua::test_run_department_rejects_undeclared_cross_package_raise"
+        ),
+        "stdout: {out}"
+    );
+    assert!(out.contains("1 passed, 0 failed"), "stdout: {out}");
+    let err = stderr(&output);
+    assert!(err.contains("legacy owner namespace"), "stderr: {err}");
+}
+
+#[test]
+fn run_department_gates_cross_package_raise_allowlist_in_legacy_flat() {
+    let package = tempfile::Builder::new()
+        .prefix("autochrono")
+        .tempdir()
+        .unwrap();
+
+    fs::write(
+        package.path().join("core.lua"),
+        r#"
+local M = {}
+M.spec = {
+  consumes = { "tick" },
+  produces = { "consensus.proposal" },
+}
+function pipeline(event)
+  raise("consensus.proposal", {})
+end
+return M
+"#,
+    )
+    .unwrap();
+    fs::create_dir_all(package.path().join("tests")).unwrap();
+    fs::write(
+        package
+            .path()
+            .join("tests/legacy_flat_non_department_raise_gate_test.lua"),
+        r#"
+local t = fkst.test
+return {
+  test_run_department_gates_cross_package_raise_allowlist = function()
+    local result = fkst.test.run_department("core.lua", { payload = {} })
+    t.eq(result.exit_code, 1)
+    t.eq(#result.raises, 0)
+  end,
+}
+"#,
+    )
+    .unwrap();
+
+    let output = run_lua_tests(package.path(), package.path());
+
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}",
+        stdout(&output),
+        stderr(&output)
+    );
+    let out = stdout(&output);
+    assert!(
+        out.contains(
+            "PASS tests/legacy_flat_non_department_raise_gate_test.lua::test_run_department_gates_cross_package_raise_allowlist"
+        ),
+        "stdout: {out}"
+    );
+    assert!(out.contains("1 passed, 0 failed"), "stdout: {out}");
+    let err = stderr(&output);
+    assert!(err.contains("legacy owner namespace"), "stderr: {err}");
+}
+
+#[test]
+fn run_department_rejects_cross_package_raise_from_non_department_subject() {
+    let host = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
+    let package = tempfile::Builder::new()
+        .prefix("autochrono")
+        .tempdir()
+        .unwrap();
+
+    fs::write(
+        package.path().join("core.lua"),
+        r#"
+local M = {}
+M.spec = {
+  consumes = { "tick" },
+  produces = { "consensus.proposal" },
+}
+function pipeline(event)
+  raise("consensus.proposal", {})
+end
+return M
+"#,
+    )
+    .unwrap();
+    fs::create_dir_all(package.path().join("tests")).unwrap();
+    fs::write(
+        package
+            .path()
+            .join("tests/non_department_raise_gate_test.lua"),
+        r#"
+local t = fkst.test
+return {
+  test_run_department_gates_cross_package_raise_allowlist_to_department_entrypoint = function()
+    local result = fkst.test.run_department("core.lua", { payload = {} })
+    t.eq(result.exit_code, 1)
+    t.eq(#result.raises, 0)
+  end,
+}
+"#,
+    )
+    .unwrap();
+
+    let output = run_lua_tests_with_packages(host.path(), &[package.path()]);
+
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}",
+        stdout(&output),
+        stderr(&output)
+    );
+    let out = stdout(&output);
+    assert!(
+        out.contains(
+            "PASS tests/non_department_raise_gate_test.lua::test_run_department_gates_cross_package_raise_allowlist_to_department_entrypoint"
+        ),
+        "stdout: {out}"
+    );
+    assert!(out.contains("1 passed, 0 failed"), "stdout: {out}");
+    let err = stderr(&output);
+    assert!(err.contains("unknown namespace"), "stderr: {err}");
+}
+
+#[test]
 fn test_runner_continues_after_failure() {
     let host = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
     fs::create_dir_all(host.path().join("tests")).unwrap();

@@ -125,9 +125,9 @@ impl PackageRoots {
         if owner_root == self.host_root {
             if !self.run_host_owner
                 && self
-                .package_roots
-                .iter()
-                .any(|root| root == &self.host_root)
+                    .package_roots
+                    .iter()
+                    .any(|root| root == &self.host_root)
             {
                 return vec![self.host_root.clone()];
             }
@@ -305,6 +305,7 @@ pub(crate) enum NameResolutionMode {
 pub(crate) struct NameResolver {
     mode: NameResolutionMode,
     namespaces: BTreeSet<String>,
+    recorded_only_queues: BTreeSet<String>,
 }
 
 impl NameResolver {
@@ -315,7 +316,16 @@ impl NameResolver {
         } else {
             NameResolutionMode::Namespaced
         };
-        Self { mode, namespaces }
+        Self {
+            mode,
+            namespaces,
+            recorded_only_queues: BTreeSet::new(),
+        }
+    }
+
+    pub(crate) fn with_recorded_only_queues(mut self, queues: BTreeSet<String>) -> Self {
+        self.recorded_only_queues = queues;
+        self
     }
 
     #[cfg(test)]
@@ -342,6 +352,10 @@ impl NameResolver {
         match (&self.mode, parsed) {
             (NameResolutionMode::LegacyFlat, ParsedName::Bare(name)) => Ok(name),
             (NameResolutionMode::LegacyFlat, ParsedName::Qualified { namespace, name }) => {
+                let qualified = format!("{namespace}.{name}");
+                if self.recorded_only_queues.contains(&qualified) {
+                    return Ok(qualified);
+                }
                 if namespace != owner_namespace {
                     bail!(
                         "qualified name `{raw}` uses namespace `{namespace}` but legacy owner namespace is `{owner_namespace}`"
@@ -353,10 +367,14 @@ impl NameResolver {
                 Ok(format!("{owner_namespace}.{name}"))
             }
             (NameResolutionMode::Namespaced, ParsedName::Qualified { namespace, name }) => {
+                let qualified = format!("{namespace}.{name}");
                 if !self.namespaces.contains(&namespace) {
+                    if self.recorded_only_queues.contains(&qualified) {
+                        return Ok(qualified);
+                    }
                     bail!("qualified name `{raw}` uses unknown namespace `{namespace}`");
                 }
-                Ok(format!("{namespace}.{name}"))
+                Ok(qualified)
             }
         }
     }
@@ -512,7 +530,12 @@ mod tests {
         let resolver = r.name_resolver();
 
         assert_eq!(resolver.mode(), &NameResolutionMode::LegacyFlat);
-        assert_eq!(resolver.resolve(&r.graph_roots()[0].namespace, "tick").unwrap(), "tick");
+        assert_eq!(
+            resolver
+                .resolve(&r.graph_roots()[0].namespace, "tick")
+                .unwrap(),
+            "tick"
+        );
     }
 
     #[test]
@@ -534,6 +557,52 @@ mod tests {
         assert_eq!(resolver.resolve(HOST_NAMESPACE, "q").unwrap(), "host.q");
         assert_eq!(resolver.resolve("pkg", "host.q").unwrap(), "host.q");
         assert!(resolver.resolve("pkg", "missing.q").is_err());
+    }
+
+    #[test]
+    fn resolver_namespaced_allows_exact_recorded_only_qualified_raise() {
+        let resolver = NameResolver::new(["autochrono".to_string(), HOST_NAMESPACE.to_string()])
+            .with_recorded_only_queues(BTreeSet::from(["consensus.proposal".to_string()]));
+
+        assert_eq!(resolver.mode(), &NameResolutionMode::Namespaced);
+        assert_eq!(
+            resolver
+                .resolve("autochrono", "consensus.proposal")
+                .unwrap(),
+            "consensus.proposal"
+        );
+        assert!(resolver.resolve("autochrono", "consensus.typo").is_err());
+        assert!(resolver.validate_owner("consensus").is_err());
+        assert_eq!(
+            resolver.resolve("autochrono", "proposal").unwrap(),
+            "autochrono.proposal"
+        );
+
+        let strict_resolver =
+            NameResolver::new(["autochrono".to_string(), HOST_NAMESPACE.to_string()]);
+        assert!(strict_resolver
+            .resolve("autochrono", "consensus.proposal")
+            .is_err());
+    }
+
+    #[test]
+    fn resolver_legacy_flat_allows_exact_recorded_only_qualified_raise() {
+        let resolver = NameResolver::new(["autochrono".to_string()])
+            .with_recorded_only_queues(BTreeSet::from(["consensus.proposal".to_string()]));
+
+        assert_eq!(resolver.mode(), &NameResolutionMode::LegacyFlat);
+        assert_eq!(
+            resolver
+                .resolve("autochrono", "consensus.proposal")
+                .unwrap(),
+            "consensus.proposal"
+        );
+        assert!(resolver.resolve("autochrono", "consensus.typo").is_err());
+
+        let strict_resolver = NameResolver::new(["autochrono".to_string()]);
+        assert!(strict_resolver
+            .resolve("autochrono", "consensus.proposal")
+            .is_err());
     }
 
     #[test]

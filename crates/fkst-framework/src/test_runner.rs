@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use mlua::{Function, Lua, LuaSerdeExt, Table, Value};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use crate::external_command::{MockCommandResult, MockCommandState};
@@ -324,6 +324,12 @@ fn run_department(
     let lua_path = resolve_department_path(owner_root, &path);
     let event_json: serde_json::Value = lua.from_value(event)?;
     let _guard = DeptRunEnvGuard::apply(opts)?;
+    let require_roots = roots.require_roots_for_owner(owner_root);
+    let qualified_produces = declared_qualified_produces(
+        owner_root,
+        &lua_path,
+        require_roots.iter().map(PathBuf::as_path),
+    )?;
 
     let dept_lua = crate::mlua_init::new_lua();
     let raise_buf = RaiseBuffer::new();
@@ -331,12 +337,13 @@ fn run_department(
         &dept_lua,
         raise_buf.clone(),
         roots.host_root(),
-        roots.name_resolver(),
+        roots
+            .name_resolver()
+            .with_recorded_only_queues(qualified_produces),
         owner_namespace.to_string(),
         Some(mock_commands),
     )?;
 
-    let require_roots = roots.require_roots_for_owner(owner_root);
     let exit_code = match crate::mlua_init::run_dept_with_require_roots(
         &dept_lua,
         &lua_path,
@@ -364,6 +371,65 @@ fn run_department(
     }
     result.set("raises", raises)?;
     Ok(result)
+}
+
+fn declared_qualified_produces<'a>(
+    owner_root: &Path,
+    lua_path: &Path,
+    require_roots: impl IntoIterator<Item = &'a Path>,
+) -> mlua::Result<BTreeSet<String>> {
+    if !is_department_entrypoint(owner_root, lua_path) {
+        return Ok(BTreeSet::new());
+    }
+
+    // Test-mode intentionally performs this bounded second eval before execution;
+    // department entrypoints have no top-level side effects by contract.
+    let lua = crate::mlua_init::new_lua();
+    crate::mlua_init::set_package_roots_path(&lua, require_roots)?;
+    let src = match std::fs::read_to_string(lua_path) {
+        Ok(src) => src,
+        Err(_) => return Ok(BTreeSet::new()),
+    };
+    let value = match lua
+        .load(&src)
+        .set_name(lua_path.to_string_lossy())
+        .eval::<Value>()
+    {
+        Ok(value) => value,
+        Err(_) => return Ok(BTreeSet::new()),
+    };
+    let Value::Table(module) = value else {
+        return Ok(BTreeSet::new());
+    };
+    let Some(spec) = module.get::<Option<Table>>("spec")? else {
+        return Ok(BTreeSet::new());
+    };
+    let Some(produces) = spec.get::<Option<Table>>("produces")? else {
+        return Ok(BTreeSet::new());
+    };
+    let mut qualified = BTreeSet::new();
+    for value in produces.sequence_values::<String>() {
+        let value = value?;
+        if value.contains('.') {
+            qualified.insert(value);
+        }
+    }
+    Ok(qualified)
+}
+
+fn is_department_entrypoint(owner_root: &Path, lua_path: &Path) -> bool {
+    let Ok(relative) = lua_path.strip_prefix(owner_root) else {
+        return false;
+    };
+    let components = relative.components().collect::<Vec<_>>();
+    match components.as_slice() {
+        [std::path::Component::Normal(departments), std::path::Component::Normal(name), std::path::Component::Normal(main)] => {
+            *departments == std::ffi::OsStr::new("departments")
+                && !name.is_empty()
+                && *main == std::ffi::OsStr::new("main.lua")
+        }
+        _ => false,
+    }
 }
 
 fn resolve_department_path(package_root: &Path, path: &str) -> PathBuf {
