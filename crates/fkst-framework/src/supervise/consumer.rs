@@ -7,6 +7,7 @@ use super::event_fanout::Fanout;
 use super::raised::parse_raised;
 use super::source_runner::parse_duration;
 use super::spawner::{spawn_framework, SpawnResult};
+use crate::path_resolver::PackageRoots;
 use fkst_common::config::{DepartmentDecl, RetryDecl};
 use fkst_common::{Event, RuntimeKind};
 use std::collections::BTreeMap;
@@ -25,7 +26,7 @@ pub async fn spawn_consumer(
     name: String,
     decl: DepartmentDecl,
     project_root: PathBuf,
-    package_root: PathBuf,
+    roots: PackageRoots,
     framework_binary: PathBuf,
     fanout: Fanout,
     router: DeliveryRouter,
@@ -115,7 +116,7 @@ pub async fn spawn_consumer(
                             &name,
                             &decl,
                             &project_root,
-                            &package_root,
+                            &roots,
                             &framework_binary,
                             &router,
                             &framework_child_log_dir,
@@ -133,7 +134,7 @@ pub async fn spawn_consumer(
                         &name,
                         &decl,
                         &project_root,
-                        &package_root,
+                        &roots,
                         &framework_binary,
                         &router,
                         store.clone(),
@@ -151,7 +152,7 @@ pub async fn spawn_consumer(
                         &name,
                         &decl,
                         &project_root,
-                        &package_root,
+                        &roots,
                         &framework_binary,
                         &router,
                         store.clone(),
@@ -186,7 +187,7 @@ fn spawn_ephemeral(
     name: &str,
     decl: &DepartmentDecl,
     project_root: &std::path::Path,
-    package_root: &std::path::Path,
+    roots: &PackageRoots,
     framework_binary: &std::path::Path,
     router: &DeliveryRouter,
     log_dir: &std::path::Path,
@@ -197,7 +198,7 @@ fn spawn_ephemeral(
     let args = match spawn_args(
         decl,
         project_root,
-        package_root,
+        roots,
         framework_binary,
         log_dir,
         event,
@@ -236,7 +237,7 @@ fn dispatch_due(
     name: &str,
     decl: &DepartmentDecl,
     project_root: &std::path::Path,
-    package_root: &std::path::Path,
+    roots: &PackageRoots,
     framework_binary: &std::path::Path,
     router: &DeliveryRouter,
     store: Option<Arc<DeliveryStore>>,
@@ -273,7 +274,7 @@ fn dispatch_due(
         let args = match spawn_args(
             decl,
             project_root,
-            package_root,
+            roots,
             framework_binary,
             log_dir,
             event_from_record(&record),
@@ -471,11 +472,28 @@ fn retry_record(
 }
 
 fn publish_dead_letter(router: &DeliveryRouter, record: &DeliveryRecord, error: &str) {
-    if record.queue == "dead_letter" {
+    let Some((namespace, _)) = record.dept.split_once('.') else {
+        if record.queue == "dead_letter" {
+            return;
+        }
+        publish_dead_letter_to(router, record, "dead_letter", error);
+        return;
+    };
+    let dead_letter = format!("{namespace}.dead_letter");
+    if record.queue == dead_letter {
         return;
     }
+    publish_dead_letter_to(router, record, &dead_letter, error);
+}
+
+fn publish_dead_letter_to(
+    router: &DeliveryRouter,
+    record: &DeliveryRecord,
+    queue: &str,
+    error: &str,
+) {
     let event = Event::new(
-        "dead_letter",
+        queue,
         serde_json::json!({
             "delivery_id": record.delivery_id,
             "queue": record.queue,
@@ -545,7 +563,7 @@ fn event_from_record(record: &DeliveryRecord) -> Event {
 fn spawn_args(
     decl: &DepartmentDecl,
     project_root: &std::path::Path,
-    package_root: &std::path::Path,
+    roots: &PackageRoots,
     framework_binary: &std::path::Path,
     log_dir: &std::path::Path,
     event: Event,
@@ -554,13 +572,18 @@ fn spawn_args(
 ) -> anyhow::Result<SpawnArgs> {
     Ok(SpawnArgs {
         framework_bin: framework_binary.to_path_buf(),
-        lua_full: project_root.join(&decl.lua),
+        lua_full: if decl.lua.is_absolute() {
+            decl.lua.clone()
+        } else {
+            project_root.join(&decl.lua)
+        },
         project_root: project_root.to_path_buf(),
-        package_root: package_root.to_path_buf(),
+        package_roots: roots.require_roots_for_owner(&decl.owner_root),
         event_json: serde_json::to_string(&event)?,
         stall_window,
         codex_permit_slots,
         log_dir: log_dir.to_path_buf(),
+        owner_namespace: decl.owner_namespace.clone(),
     })
 }
 
@@ -568,11 +591,12 @@ struct SpawnArgs {
     framework_bin: PathBuf,
     lua_full: PathBuf,
     project_root: PathBuf,
-    package_root: PathBuf,
+    package_roots: Vec<PathBuf>,
     event_json: String,
     stall_window: Duration,
     codex_permit_slots: usize,
     log_dir: PathBuf,
+    owner_namespace: String,
 }
 
 async fn spawn_and_report(dept_name: &str, args: &SpawnArgs) -> anyhow::Result<SpawnResult> {
@@ -580,7 +604,8 @@ async fn spawn_and_report(dept_name: &str, args: &SpawnArgs) -> anyhow::Result<S
         &args.framework_bin,
         &args.lua_full,
         &args.project_root,
-        &args.package_root,
+        &args.package_roots,
+        &args.owner_namespace,
         &args.event_json,
         args.stall_window,
         args.codex_permit_slots,
@@ -687,6 +712,8 @@ mod tests {
             "dlq".to_string(),
             DepartmentDecl {
                 lua: "departments/dlq/main.lua".into(),
+                owner_root: std::path::PathBuf::from("."),
+                owner_namespace: "pkg".to_string(),
                 consumes: vec!["dead_letter".to_string()],
                 produces: Vec::new(),
                 ephemeral: vec!["dead_letter".to_string()],
@@ -813,6 +840,8 @@ mod tests {
             "next_worker".to_string(),
             DepartmentDecl {
                 lua: "departments/next_worker/main.lua".into(),
+                owner_root: std::path::PathBuf::from("."),
+                owner_namespace: "pkg".to_string(),
                 consumes: vec!["next".to_string()],
                 produces: Vec::new(),
                 ephemeral: Vec::new(),
@@ -863,6 +892,8 @@ mod tests {
             "next_worker".to_string(),
             DepartmentDecl {
                 lua: "departments/next_worker/main.lua".into(),
+                owner_root: std::path::PathBuf::from("."),
+                owner_namespace: "pkg".to_string(),
                 consumes: vec!["next".to_string()],
                 produces: Vec::new(),
                 ephemeral: Vec::new(),

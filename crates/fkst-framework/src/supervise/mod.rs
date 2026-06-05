@@ -30,11 +30,10 @@ pub(crate) fn load_host_graph_for_conformance(roots: &PackageRoots) -> Result<Co
 
 pub async fn supervise(roots: PackageRoots, framework_bin: PathBuf) -> Result<()> {
     let project_root = roots.host_root().to_path_buf();
-    let package_root = roots.package_root().to_path_buf();
     info!(
-        package_root = %package_root.display(),
+        package_roots = ?roots.package_roots(),
         host_root = %project_root.display(),
-        "scanning graph from package root and host root"
+        "scanning graph from package roots and host root"
     );
 
     let cfg = graph_scan::load_roots(&roots).map_err(|e| {
@@ -77,7 +76,7 @@ pub async fn supervise(roots: PackageRoots, framework_bin: PathBuf) -> Result<()
                 name.clone(),
                 decl.clone(),
                 project_root.clone(),
-                package_root.clone(),
+                roots.clone(),
                 framework_bin.clone(),
                 fanout.clone(),
                 router.clone(),
@@ -165,6 +164,8 @@ mod tests {
             "worker".to_string(),
             DepartmentDecl {
                 lua: "departments/worker/main.lua".into(),
+                owner_root: std::path::PathBuf::from("."),
+                owner_namespace: "pkg".to_string(),
                 consumes: vec!["jobs".to_string()],
                 produces: Vec::new(),
                 ephemeral: if ephemeral {

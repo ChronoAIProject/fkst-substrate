@@ -9,7 +9,7 @@ fn framework_bin() -> &'static str {
 }
 
 fn run_conformance(args: &[&std::ffi::OsStr], cwd: &std::path::Path) -> Output {
-    let runtime = tempfile::tempdir().unwrap();
+    let runtime = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
     run_conformance_with_env(args, cwd, &[(RUNTIME_ROOT_ENV, runtime.path())])
 }
 
@@ -125,7 +125,7 @@ fn crate_fixture_root() -> PathBuf {
 
 #[test]
 fn valid_minimal_host_exits_zero() {
-    let host = tempfile::tempdir().unwrap();
+    let host = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
     write_minimal_host(host.path());
 
     let args = [
@@ -145,9 +145,9 @@ fn valid_minimal_host_exits_zero() {
 
 #[test]
 fn package_root_flag_supplies_standard_assets_for_host_department() {
-    let package = tempfile::tempdir().unwrap();
+    let package = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
     write_package_raiser(package.path());
-    let host = tempfile::tempdir().unwrap();
+    let host = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
     write_host_department(host.path());
 
     let args = [
@@ -166,7 +166,7 @@ fn package_root_flag_supplies_standard_assets_for_host_department() {
 
 #[test]
 fn rejected_package_root_env_exits_two() {
-    let host = tempfile::tempdir().unwrap();
+    let host = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
     write_minimal_host(host.path());
 
     let output = Command::new(framework_bin())
@@ -188,9 +188,9 @@ fn rejected_package_root_env_exits_two() {
 
 #[test]
 fn valid_host_with_custom_runtime_root_exits_zero() {
-    let host = tempfile::tempdir().unwrap();
+    let host = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
     write_minimal_host(host.path());
-    let runtime = tempfile::tempdir().unwrap();
+    let runtime = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
     let runtime_root = runtime.path().join("custom-runtime-root");
 
     let args = [
@@ -217,7 +217,7 @@ fn valid_host_with_custom_runtime_root_exits_zero() {
 
 #[test]
 fn missing_runtime_root_reports_runtime_scratch_unused() {
-    let host = tempfile::tempdir().unwrap();
+    let host = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
     write_minimal_host(host.path());
 
     let output = Command::new(framework_bin())
@@ -243,14 +243,14 @@ fn missing_runtime_root_reports_runtime_scratch_unused() {
 
 #[test]
 fn missing_project_root_exits_two() {
-    let cwd = tempfile::tempdir().unwrap();
+    let cwd = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
     let output = run_conformance(&[], cwd.path());
     assert_exit(&output, 2);
 }
 
 #[test]
 fn duplicate_project_root_exits_two() {
-    let host = tempfile::tempdir().unwrap();
+    let host = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
     write_minimal_host(host.path());
 
     let args = [
@@ -266,7 +266,7 @@ fn duplicate_project_root_exits_two() {
 
 #[test]
 fn output_json_exits_two() {
-    let host = tempfile::tempdir().unwrap();
+    let host = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
     write_minimal_host(host.path());
 
     let args = [
@@ -282,7 +282,7 @@ fn output_json_exits_two() {
 
 #[test]
 fn quick_exits_two() {
-    let host = tempfile::tempdir().unwrap();
+    let host = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
     write_minimal_host(host.path());
 
     let args = [
@@ -297,7 +297,7 @@ fn quick_exits_two() {
 
 #[test]
 fn nonexistent_project_root_exits_two() {
-    let cwd = tempfile::tempdir().unwrap();
+    let cwd = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
     let missing = cwd.path().join("missing");
     let args = [std::ffi::OsStr::new("--project-root"), path_arg(&missing)];
     let output = run_conformance(&args, cwd.path());
@@ -307,7 +307,7 @@ fn nonexistent_project_root_exits_two() {
 
 #[test]
 fn valid_cwd_without_project_root_exits_two() {
-    let host = tempfile::tempdir().unwrap();
+    let host = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
     write_minimal_host(host.path());
 
     let output = run_conformance(&[], host.path());
@@ -317,7 +317,7 @@ fn valid_cwd_without_project_root_exits_two() {
 
 #[test]
 fn invalid_cwd_plus_valid_project_root_uses_explicit_root() {
-    let host = tempfile::tempdir().unwrap();
+    let host = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
     write_minimal_host(host.path());
     let cwd = crate_fixture_root();
 
@@ -332,7 +332,7 @@ fn invalid_cwd_plus_valid_project_root_uses_explicit_root() {
 
 #[test]
 fn host_failures_exit_one_with_check_ids() {
-    let missing_departments = tempfile::tempdir().unwrap();
+    let missing_departments = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
     fs::create_dir_all(missing_departments.path().join("raisers")).unwrap();
     write_host_defaults(missing_departments.path());
     let args = [
@@ -345,7 +345,7 @@ fn host_failures_exit_one_with_check_ids() {
     assert!(log.contains("PASS project-layout"), "{log}");
     assert!(log.contains("FAIL department-non-empty"), "{log}");
 
-    let empty_graph = tempfile::tempdir().unwrap();
+    let empty_graph = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
     fs::create_dir_all(empty_graph.path().join("departments/empty")).unwrap();
     fs::create_dir_all(empty_graph.path().join("raisers")).unwrap();
     write_host_defaults(empty_graph.path());
@@ -358,7 +358,7 @@ fn host_failures_exit_one_with_check_ids() {
     let log = combined_log(&output);
     assert!(log.contains("FAIL department-non-empty"), "{log}");
 
-    let schema_invalid = tempfile::tempdir().unwrap();
+    let schema_invalid = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
     fs::create_dir_all(schema_invalid.path().join("departments/bad")).unwrap();
     write_host_defaults(schema_invalid.path());
     fs::write(

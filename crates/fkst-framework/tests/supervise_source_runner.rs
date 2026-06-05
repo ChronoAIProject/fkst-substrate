@@ -39,6 +39,8 @@ fn fanout_router(queue_name: &str) -> (Fanout, DeliveryRouter) {
             ephemeral: vec![queue_name.to_string()],
             stall_window: "30s".to_string(),
             retry: None,
+            owner_root: std::path::PathBuf::from("."),
+            owner_namespace: "pkg".to_string(),
         },
     );
     let cfg = Config {
@@ -55,7 +57,7 @@ fn fanout_router(queue_name: &str) -> (Fanout, DeliveryRouter) {
 
 #[tokio::test]
 async fn file_watch_existing_file_emits_event() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
     let file = tmp.path().join("existing.txt");
     std::fs::write(&file, "ready").unwrap();
     let glob = tmp.path().join("*.txt");
@@ -85,7 +87,7 @@ async fn file_watch_existing_file_emits_event() {
 
 #[tokio::test]
 async fn file_watch_new_file_emits_event() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
     let glob = tmp.path().join("*.txt");
 
     let (fanout, router) = fanout_router("files");
@@ -115,7 +117,7 @@ async fn file_watch_new_file_emits_event() {
 
 #[tokio::test]
 async fn file_watch_periodic_scan_dedupes_unchanged_file() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
     let file = tmp.path().join("stable.txt");
     std::fs::write(&file, "ready").unwrap();
     let glob = tmp.path().join("*.txt");
@@ -145,7 +147,7 @@ async fn file_watch_periodic_scan_dedupes_unchanged_file() {
 
 #[tokio::test]
 async fn file_watch_periodic_scan_reemits_changed_file() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
     let file = tmp.path().join("stable.txt");
     std::fs::write(&file, "ready").unwrap();
     let glob = tmp.path().join("*.txt");
@@ -184,7 +186,7 @@ async fn file_watch_periodic_scan_reemits_changed_file() {
 
 #[tokio::test]
 async fn file_watch_restart_startup_scan_replays_existing_file() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
     let file = tmp.path().join("stable.txt");
     std::fs::write(&file, "ready").unwrap();
     let glob = tmp.path().join("*.txt");

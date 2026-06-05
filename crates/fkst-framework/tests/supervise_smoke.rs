@@ -50,6 +50,15 @@ fn lua_string(path: &Path) -> String {
     format!("{:?}", path.to_string_lossy())
 }
 
+fn namespace(root: &Path) -> String {
+    root.canonicalize()
+        .unwrap()
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned()
+}
+
 #[test]
 fn supervise_dispatches_file_watch_event_to_department() {
     let tmp = tempfile::tempdir().unwrap();
@@ -156,7 +165,7 @@ return {
             r#"
 local standard = require("fkst.standard_asset")
 local M = {{}}
-M.spec = {{ consumes = {{"standard_input"}}, stall_window = standard.stall_window() }}
+M.spec = {{ consumes = {{"{}.standard_input"}}, stall_window = standard.stall_window() }}
 function pipeline(event)
   local f = assert(io.open({}, "w"))
   f:write("marker=" .. standard.marker() .. "\n")
@@ -168,6 +177,7 @@ kill -TERM "$supervise_pid"]])
 end
 return M
 "#,
+            namespace(&package),
             lua_string(&fact)
         ),
     )
@@ -214,7 +224,8 @@ async fn spawn_framework_passes_codex_permit_slots_env() {
         &binary,
         &lua_dummy,
         sandbox.root(),
-        sandbox.root(),
+        &[sandbox.root().to_path_buf()],
+        "pkg",
         "{}",
         Duration::from_secs(5),
         7,
@@ -240,7 +251,8 @@ async fn framework_child_log_records_final_metadata_for_exit_modes() {
         &success,
         &lua_dummy,
         sandbox.root(),
-        sandbox.root(),
+        &[sandbox.root().to_path_buf()],
+        "pkg",
         "{}",
         Duration::from_secs(5),
         20,
@@ -253,7 +265,8 @@ async fn framework_child_log_records_final_metadata_for_exit_modes() {
     assert!(success_log.contains("CMD="));
     assert!(success_log.contains("PID="));
     assert!(success_log.contains("LUA="));
-    assert!(success_log.contains("PACKAGE_ROOT="));
+    assert!(success_log.contains("PACKAGE_ROOTS="));
+    assert!(success_log.contains("OWNER_NAMESPACE=pkg"));
     assert!(success_log.contains("DEPT=success"));
     assert!(success_log.contains("EXIT=0\n"));
     assert!(success_log.contains("STALLED=false\n"));
@@ -265,7 +278,8 @@ async fn framework_child_log_records_final_metadata_for_exit_modes() {
         &nonzero,
         &lua_dummy,
         sandbox.root(),
-        sandbox.root(),
+        &[sandbox.root().to_path_buf()],
+        "pkg",
         "{}",
         Duration::from_secs(5),
         20,
@@ -289,7 +303,8 @@ async fn framework_child_log_records_final_metadata_for_exit_modes() {
         &stall,
         &lua_dummy,
         sandbox.root(),
-        sandbox.root(),
+        &[sandbox.root().to_path_buf()],
+        "pkg",
         "{}",
         Duration::from_millis(120),
         20,
@@ -326,7 +341,8 @@ async fn framework_child_log_failure_preserves_spawn_result() {
         &binary,
         &lua_dummy,
         sandbox.root(),
-        sandbox.root(),
+        &[sandbox.root().to_path_buf()],
+        "pkg",
         "{}",
         Duration::from_secs(5),
         20,

@@ -14,6 +14,7 @@ const CONFIG_ENVS: &[&str] = &[
     "FKST_CANDIDATE_PREFIX",
     "FKST_CANDIDATE_FROM_SEP",
     "FKST_PACKAGE_ROOT",
+    "FKST_PACKAGE_ROOTS",
 ];
 
 fn config_command(cwd: &std::path::Path) -> Command {
@@ -45,8 +46,8 @@ fn stderr(output: &Output) -> String {
 
 #[test]
 fn config_reads_host_fkst_env_from_project_root_when_cwd_differs() {
-    let host = tempfile::tempdir().unwrap();
-    let cwd = tempfile::tempdir().unwrap();
+    let host = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
+    let cwd = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
     std::fs::write(
         host.path().join("fkst.env"),
         "FKST_QUEUE_CAPACITY=31\nFKST_DEPARTMENT_DEFAULT_STALL_WINDOW=7m\nFKST_CODEX_PERMIT_SLOTS=9\nFKST_CANDIDATE_PREFIX=host-rc\nFKST_CANDIDATE_FROM_SEP=__from__\n",
@@ -74,8 +75,8 @@ fn config_reads_host_fkst_env_from_project_root_when_cwd_differs() {
 
 #[test]
 fn config_env_overrides_host_fkst_env() {
-    let host = tempfile::tempdir().unwrap();
-    let cwd = tempfile::tempdir().unwrap();
+    let host = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
+    let cwd = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
     std::fs::write(host.path().join("fkst.env"), "FKST_QUEUE_CAPACITY=31\n").unwrap();
 
     let output = config_command(cwd.path())
@@ -94,9 +95,129 @@ fn config_env_overrides_host_fkst_env() {
 }
 
 #[test]
+fn config_accepts_repeated_package_root_flags_over_package_roots_env() {
+    let host = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
+    let package_a = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
+    let package_b = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
+    let cwd = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
+    let joined_env = std::env::join_paths([package_b.path()]).unwrap();
+
+    let output = config_command(cwd.path())
+        .arg("--project-root")
+        .arg(host.path())
+        .arg("--package-root")
+        .arg(package_a.path())
+        .arg("--package-root")
+        .arg(package_b.path())
+        .env("FKST_PACKAGE_ROOTS", joined_env)
+        .output()
+        .unwrap();
+
+    assert_exit(&output, 0);
+}
+
+#[test]
+fn config_uses_package_roots_env_and_rejects_plural_singular_conflict() {
+    let host = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
+    let package_a = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
+    let package_b = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
+    let cwd = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
+    let joined = std::env::join_paths([package_a.path(), package_b.path()]).unwrap();
+
+    let output = config_command(cwd.path())
+        .arg("--project-root")
+        .arg(host.path())
+        .env("FKST_PACKAGE_ROOTS", &joined)
+        .output()
+        .unwrap();
+    assert_exit(&output, 0);
+
+    let conflict = config_command(cwd.path())
+        .arg("--project-root")
+        .arg(host.path())
+        .env("FKST_PACKAGE_ROOTS", joined)
+        .env("FKST_PACKAGE_ROOT", package_a.path())
+        .output()
+        .unwrap();
+    assert_exit(&conflict, 2);
+    let err = stderr(&conflict);
+    assert!(err.contains("FKST_PACKAGE_ROOTS"), "{err}");
+    assert!(err.contains("FKST_PACKAGE_ROOT"), "{err}");
+    assert!(err.contains("mutually exclusive"), "{err}");
+}
+
+#[test]
+fn config_rejects_duplicate_package_roots_after_canonicalization() {
+    let host = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
+    let package = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
+    let cwd = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
+
+    let duplicate_flags = config_command(cwd.path())
+        .arg("--project-root")
+        .arg(host.path())
+        .arg("--package-root")
+        .arg(package.path())
+        .arg("--package-root")
+        .arg(package.path())
+        .output()
+        .unwrap();
+    assert_exit(&duplicate_flags, 2);
+    let err = stderr(&duplicate_flags);
+    assert!(err.contains("duplicate package root:"), "{err}");
+    assert!(
+        err.contains(&package.path().canonicalize().unwrap().display().to_string()),
+        "{err}"
+    );
+
+    let joined = std::env::join_paths([package.path(), package.path()]).unwrap();
+    let duplicate_env = config_command(cwd.path())
+        .arg("--project-root")
+        .arg(host.path())
+        .env("FKST_PACKAGE_ROOTS", joined)
+        .output()
+        .unwrap();
+    assert_exit(&duplicate_env, 2);
+    assert!(stderr(&duplicate_env).contains("duplicate package root:"));
+}
+
+#[test]
+fn config_single_package_entrypoints_are_equivalent() {
+    let host = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
+    let package = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
+    let cwd = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
+
+    let flag = config_command(cwd.path())
+        .arg("--project-root")
+        .arg(host.path())
+        .arg("--package-root")
+        .arg(package.path())
+        .output()
+        .unwrap();
+    let singular = config_command(cwd.path())
+        .arg("--project-root")
+        .arg(host.path())
+        .env("FKST_PACKAGE_ROOT", package.path())
+        .output()
+        .unwrap();
+    let package_is_host = config_command(cwd.path())
+        .arg("--project-root")
+        .arg(package.path())
+        .arg("--package-root")
+        .arg(package.path())
+        .output()
+        .unwrap();
+
+    assert_exit(&flag, 0);
+    assert_exit(&singular, 0);
+    assert_exit(&package_is_host, 0);
+    assert_eq!(stdout(&flag), stdout(&singular));
+    assert_eq!(stdout(&flag), stdout(&package_is_host));
+}
+
+#[test]
 fn config_operational_defaults_and_missing_host_facts_are_reported() {
-    let host = tempfile::tempdir().unwrap();
-    let cwd = tempfile::tempdir().unwrap();
+    let host = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
+    let cwd = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
 
     let output = config_command(cwd.path())
         .arg("--project-root")
@@ -118,8 +239,8 @@ fn config_operational_defaults_and_missing_host_facts_are_reported() {
 
 #[test]
 fn config_rejects_duplicate_unknown_and_missing_project_root_flags() {
-    let host = tempfile::tempdir().unwrap();
-    let cwd = tempfile::tempdir().unwrap();
+    let host = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
+    let cwd = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
 
     let duplicate = config_command(cwd.path())
         .arg("--project-root")

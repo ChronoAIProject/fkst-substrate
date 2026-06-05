@@ -42,6 +42,8 @@ target/debug/fkst-framework config \
 
 `FKST_RUNTIME_ROOT` 仍是引擎 scratch 配置，用于 worktree、codex permit、lock 与 log 等运行时落点；这个 fixture 的 Lua 不读取它，也不把 `<RT>` 当 package 状态目录。fixture 只展示 package-root 独立加载、graph validation、两个 Department 的直接触发 pipeline 行为，以及 producer 真实 `RAISED:` 输出可被 consumer 作为标准事件消费的契约。
 
+package identity 是 canonical package-root basename。多 package-root 组合时，queue 是包内命名空间：裸名按 owner 解析为 `<pkg>.<queue>` 或 `host.<queue>`，host glue 要消费 package queue 时写 `pkg.queue`。折叠单包（`package-root == host-root`）保持旧字节：`tick`、`example_event`、`RAISED` 与 `Event.queue` 都仍是裸名，同包限定名只作为别名解析回裸名。
+
 下列命令证明的范围如下：
 
 - `conformance`：minimal-package 的单 source / 双 department / 双 queue 图通过 validation。
@@ -81,6 +83,7 @@ target/debug/fkst-framework test \
     "$tmp_host/departments/producer/main.lua" \
     --project-root "$tmp_host" \
     --package-root "$tmp_host" \
+    --owner-namespace "$(basename "$tmp_host")" \
     --event '{"queue":"tick","payload":{"raiser":"tick"}}'
 )
 (
@@ -89,6 +92,7 @@ target/debug/fkst-framework test \
     "$tmp_host/departments/consumer/main.lua" \
     --project-root "$tmp_host" \
     --package-root "$tmp_host" \
+    --owner-namespace "$(basename "$tmp_host")" \
     --event '{"queue":"example_event","payload":{"from":"producer","note":"opaque example payload","source_queue":"tick","source_raiser":"tick"},"ts":0}'
 )
 ```
@@ -107,7 +111,7 @@ consumer 的完整事件日志会落在 `<RT>/logs/framework-child/` 下。真�
 
 Lua 单元测试由 `fkst-framework test` 执行。runner 只发现 package root 和 host root 下的 `departments/*/*_test.lua` 与 `tests/*_test.lua`，不全树递归，也不扫描 `raisers/` 或 `fkst/`。测试文件应 `return { test_name = function() ... end }`；runner 按文件路径和 `test_*` key 排序，失败后继续执行后续测试，最后输出通过 / 失败汇总。
 
-`fkst.test` 只在 `test` 子命令的 Lua state 中注册，不属于 production Lua SDK surface；`run` 与 `supervise` 模式不可依赖它。当前断言只有 `eq(actual, expected[, msg])`、`is_true(value[, msg])`、`raises(fn[, msg])` 和 `is_nil(value[, msg])`。test-mode 还提供 `run_department(path, event[, opts])`，用 fresh Lua state、production SDK 和独立 raise buffer 执行一个 department entrypoint，返回 `{ exit_code = int, raises = { { queue = string, payload = table }, ... } }`；相对路径按 package root 解析，`opts.cwd`、`opts.env`、`opts.path_prepend` 只作用于该次执行并随后恢复。这是最小单测工具，不提供 fixture、mock、hook 或测试框架 DSL；除非有意验证真实 CLI 路径，Lua 单测不应调用 `spawn_codex_sync`。
+`fkst.test` 只在 `test` 子命令的 Lua state 中注册，不属于 production Lua SDK surface；`run` 与 `supervise` 模式不可依赖它。当前断言只有 `eq(actual, expected[, msg])`、`is_true(value[, msg])`、`raises(fn[, msg])` 和 `is_nil(value[, msg])`。test-mode 还提供 `run_department(path, event[, opts])`，用 fresh Lua state、production SDK 和独立 raise buffer 执行一个 department entrypoint，返回 `{ exit_code = int, raises = { { queue = string, payload = table }, ... } }`；queue 解析与 production 一致。每个测试文件按所属 graph root 隔离执行，相对路径按该测试文件所属 owner package root 解析，`opts.cwd`、`opts.env`、`opts.path_prepend` 只作用于该次执行并随后恢复。这是最小单测工具，不提供 fixture、mock、hook 或测试框架 DSL；除非有意验证真实 CLI 路径，Lua 单测不应调用 `spawn_codex_sync`。
 
 production Lua SDK 包含 `once(key, fn) -> boolean`。它是 best-effort per-key de-bounce scratch marker，不是 durable state。`key` 必须是非空相对 filesystem path，`/` 表示目录；每个 segment 非空、匹配 `[A-Za-z0-9._-]+`，且不是 `.` 或 `..`；禁止 leading / trailing `/`、`//`、反斜杠、NUL 与绝对路径。framework 直接使用校验后的 key，在 `<RT>/locks/once/<key>` 上获取 exclusive flock，再检查 `<RT>/marks/<key>`。`locks/once/` 是 once 内部锁的保留子目录，不属于 `with_lock` 用户锁命名空间。marker 已存在时返回 `false` 且不调用 `fn`；marker 不存在时调用 `fn`，成功后写入 marker 并返回 `true`；`fn` 失败时错误原样传播且不写 marker，后续调用会重试。
 

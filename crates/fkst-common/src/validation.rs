@@ -134,7 +134,11 @@ pub fn validate(cfg: &Config, project_root: &std::path::Path) -> Result<Vec<Stri
                 )));
             }
         }
-        let lua_full = project_root.join(&dept.lua);
+        let lua_full = if dept.lua.is_absolute() {
+            dept.lua.clone()
+        } else {
+            project_root.join(&dept.lua)
+        };
         if !lua_full.is_file() {
             return Err(FkstError::Schema(format!(
                 "department '{}' lua file '{}' does not exist (resolved: {})",
@@ -353,6 +357,8 @@ mod tests {
             "d".into(),
             DepartmentDecl {
                 lua: lua.file_name().unwrap().into(),
+                owner_root: std::path::PathBuf::from("."),
+                owner_namespace: "pkg".to_string(),
                 consumes: vec!["tick".into()],
                 produces: Vec::new(),
                 ephemeral: Vec::new(),

@@ -9,6 +9,8 @@ use serde::Serialize;
 use serde_json::Value as JsonValue;
 use std::sync::{Arc, Mutex};
 
+use crate::path_resolver::NameResolver;
+
 #[derive(Serialize, Debug, Clone)]
 struct RaisedEntry {
     queue: String,
@@ -47,11 +49,19 @@ impl RaiseBuffer {
     }
 }
 
-pub fn register(lua: &Lua, buf: RaiseBuffer) -> Result<()> {
+pub fn register(
+    lua: &Lua,
+    buf: RaiseBuffer,
+    resolver: NameResolver,
+    owner_namespace: String,
+) -> Result<()> {
     let buf_clone = buf.clone();
     lua.globals().set(
         "raise",
         lua.create_function(move |lua, (queue, payload): (String, mlua::Value)| {
+            let queue = resolver
+                .resolve(&owner_namespace, &queue)
+                .map_err(mlua::Error::external)?;
             let p_json: JsonValue = lua.from_value(payload).unwrap_or(JsonValue::Null);
             buf_clone.push(queue, p_json);
             Ok(())
@@ -69,7 +79,13 @@ mod tests {
     fn raise_adds_to_buffer() {
         let lua = Lua::new();
         let buf = RaiseBuffer::new();
-        register(&lua, buf.clone()).unwrap();
+        register(
+            &lua,
+            buf.clone(),
+            NameResolver::new(["pkg".to_string()]),
+            "pkg".to_string(),
+        )
+        .unwrap();
         lua.load(r#"raise("done", {n=42})"#).exec().unwrap();
         let entries = buf.0.lock().unwrap();
         assert_eq!(entries.len(), 1);
@@ -81,7 +97,13 @@ mod tests {
     fn multiple_raises_buffered() {
         let lua = Lua::new();
         let buf = RaiseBuffer::new();
-        register(&lua, buf.clone()).unwrap();
+        register(
+            &lua,
+            buf.clone(),
+            NameResolver::new(["pkg".to_string()]),
+            "pkg".to_string(),
+        )
+        .unwrap();
         lua.load(
             r#"
             raise("q1", {})
@@ -95,6 +117,42 @@ mod tests {
         assert_eq!(entries.len(), 3);
         assert_eq!(entries[0].queue, "q1");
         assert_eq!(entries[2].queue, "q1");
+    }
+
+    #[test]
+    fn namespaced_raise_qualifies_bare_and_rejects_unknown_namespace() {
+        let lua = Lua::new();
+        let buf = RaiseBuffer::new();
+        register(
+            &lua,
+            buf.clone(),
+            NameResolver::new(["pkg".to_string(), "host".to_string()]),
+            "pkg".to_string(),
+        )
+        .unwrap();
+
+        lua.load(
+            r#"
+            raise("done", {n=1})
+            raise("pkg.done", {n=2})
+        "#,
+        )
+        .exec()
+        .unwrap();
+
+        let err = lua
+            .load(r#"raise("missing.done", {})"#)
+            .exec()
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("unknown namespace"),
+            "got: {err}"
+        );
+
+        let entries = buf.0.lock().unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].queue, "pkg.done");
+        assert_eq!(entries[1].queue, "pkg.done");
     }
 
     #[test]

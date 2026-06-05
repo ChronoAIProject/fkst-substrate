@@ -1,9 +1,9 @@
 //! fkst-framework — Tier III one-shot Lua runner.
 //!
-//! CLI: `fkst-framework run <lua_file> --project-root <path> --event '<json>'`
+//! CLI: `fkst-framework run <lua_file> --project-root <path> --package-root <path> ... [--owner-namespace <id>] --event '<json>'`
 //! CLI: `fkst-framework supervise --project-root <path> --framework-bin <path>`
 //! CLI: `fkst-framework conformance --project-root <path>`
-//! CLI: `fkst-framework test --project-root <path> [--package-root <path>]`
+//! CLI: `fkst-framework test --project-root <path> [--package-root <path> ...]`
 //! CLI: `fkst-framework --self-test`
 //! Exit codes:
 //!   0 = pipeline ok
@@ -46,6 +46,7 @@ enum CliCommand {
     Run {
         lua_path: PathBuf,
         roots: PackageRoots,
+        owner_namespace: String,
         event: JsonValue,
     },
     Supervise {
@@ -63,7 +64,7 @@ fn parse_args() -> Result<CliCommand> {
     let mut args_iter = args.into_iter();
     let sub = args_iter.next().ok_or_else(|| {
         anyhow::anyhow!(
-            "usage: fkst-framework run <lua> --project-root <path> --event <json> | fkst-framework supervise --project-root <path> --framework-bin <path> | fkst-framework conformance --project-root <path> | fkst-framework config --project-root <path> [--package-root <path>] | fkst-framework test --project-root <path> [--package-root <path>] | fkst-framework --self-test"
+            "usage: fkst-framework run <lua> --project-root <path> --package-root <path> [--package-root <path> ...] [--owner-namespace <id>] --event <json> | fkst-framework supervise --project-root <path> --framework-bin <path> [--package-root <path> ...] | fkst-framework conformance --project-root <path> [--package-root <path> ...] | fkst-framework config --project-root <path> [--package-root <path> ...] | fkst-framework test --project-root <path> [--package-root <path> ...] | fkst-framework --self-test"
         )
     })?;
     if sub == "--self-test" {
@@ -74,19 +75,21 @@ fn parse_args() -> Result<CliCommand> {
     }
     if sub == "supervise" {
         let mut project_root: Option<PathBuf> = None;
-        let mut package_root: Option<PathBuf> = None;
+        let mut package_roots: Vec<PathBuf> = Vec::new();
         let mut framework_bin: Option<PathBuf> = None;
         while let Some(a) = args_iter.next() {
             match a.as_str() {
                 "--project-root" => project_root = args_iter.next().map(PathBuf::from),
-                "--package-root" => package_root = args_iter.next().map(PathBuf::from),
+                "--package-root" => {
+                    package_roots.push(next_iter_value(&mut args_iter, "--package-root")?.into())
+                }
                 "--framework-bin" => framework_bin = args_iter.next().map(PathBuf::from),
                 other => anyhow::bail!("unknown supervise argument: {}", other),
             }
         }
         let project_root = project_root.ok_or_else(|| anyhow::anyhow!("missing --project-root"))?;
         return Ok(CliCommand::Supervise {
-            roots: PackageRoots::resolve(project_root, package_root)?,
+            roots: PackageRoots::resolve(project_root, package_roots)?,
             framework_bin: framework_bin
                 .ok_or_else(|| anyhow::anyhow!("missing --framework-bin"))?,
         });
@@ -109,31 +112,50 @@ fn parse_args() -> Result<CliCommand> {
             .ok_or_else(|| anyhow::anyhow!("missing <lua_file> arg"))?
             .into();
         let mut project_root: Option<PathBuf> = None;
-        let mut package_root: Option<PathBuf> = None;
+        let mut package_roots: Vec<PathBuf> = Vec::new();
+        let mut owner_namespace: Option<String> = None;
         let mut event_json: Option<String> = None;
         while let Some(a) = args_iter.next() {
             match a.as_str() {
                 "--event" => event_json = args_iter.next(),
                 "--project-root" => project_root = args_iter.next().map(PathBuf::from),
-                "--package-root" => package_root = args_iter.next().map(PathBuf::from),
+                "--package-root" => {
+                    package_roots.push(next_iter_value(&mut args_iter, "--package-root")?.into());
+                }
+                "--owner-namespace" => {
+                    owner_namespace = Some(next_iter_value(&mut args_iter, "--owner-namespace")?)
+                }
                 other => anyhow::bail!("unknown run argument: {}", other),
             }
         }
         let event_str = event_json.unwrap_or_else(|| "{}".into());
         let event: JsonValue = serde_json::from_str(&event_str)
             .with_context(|| format!("--event not valid json: {}", event_str))?;
-        let inferred_project_root;
-        let project_root = match project_root {
-            Some(project_root) => project_root,
-            None => {
-                inferred_project_root = mlua_init::package_root_for_lua(&lua_path);
-                inferred_project_root
-            }
+        let project_root = project_root.ok_or_else(|| anyhow::anyhow!("missing --project-root"))?;
+        let roots = PackageRoots::resolve_run(project_root, package_roots)?;
+        // --owner-namespace is optional: a direct `run` with a single --package-root
+        // (dogfood, package departments) defaults to that package's namespace. The
+        // supervisor passes it explicitly when a department's require roots span
+        // several package roots (host departments).
+        let owner_namespace = match owner_namespace {
+            Some(namespace) => namespace,
+            None => roots
+                .sole_package_namespace()
+                .map(str::to_string)
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "--owner-namespace is required when multiple --package-root are given"
+                    )
+                })?,
         };
-        let roots = PackageRoots::resolve(project_root, package_root)?;
+        roots
+            .name_resolver()
+            .validate_owner(&owner_namespace)
+            .with_context(|| format!("validate --owner-namespace `{owner_namespace}`"))?;
         return Ok(CliCommand::Run {
             lua_path,
             roots,
+            owner_namespace,
             event,
         });
     }
@@ -152,7 +174,7 @@ struct TestCli {
 
 fn parse_conformance_args(args: &[String]) -> Result<HostConformanceOptions> {
     let mut project_root: Option<PathBuf> = None;
-    let mut package_root: Option<PathBuf> = None;
+    let mut package_roots: Vec<PathBuf> = Vec::new();
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -164,11 +186,8 @@ fn parse_conformance_args(args: &[String]) -> Result<HostConformanceOptions> {
                 project_root = Some(next_value(args, i, "--project-root")?.into());
             }
             "--package-root" => {
-                if package_root.is_some() {
-                    anyhow::bail!("duplicate --package-root");
-                }
                 i += 1;
-                package_root = Some(next_value(args, i, "--package-root")?.into());
+                package_roots.push(next_value(args, i, "--package-root")?.into());
             }
             other => anyhow::bail!("unknown conformance argument: {}", other),
         }
@@ -177,13 +196,13 @@ fn parse_conformance_args(args: &[String]) -> Result<HostConformanceOptions> {
 
     let root = project_root.ok_or_else(|| anyhow::anyhow!("missing --project-root"))?;
     Ok(HostConformanceOptions {
-        roots: PackageRoots::resolve(root, package_root)?,
+        roots: PackageRoots::resolve(root, package_roots)?,
     })
 }
 
 fn parse_config_args(args: &[String]) -> Result<ConfigCli> {
     let mut project_root: Option<PathBuf> = None;
-    let mut package_root: Option<PathBuf> = None;
+    let mut package_roots: Vec<PathBuf> = Vec::new();
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -195,11 +214,8 @@ fn parse_config_args(args: &[String]) -> Result<ConfigCli> {
                 project_root = Some(next_value(args, i, "--project-root")?.into());
             }
             "--package-root" => {
-                if package_root.is_some() {
-                    anyhow::bail!("duplicate --package-root");
-                }
                 i += 1;
-                package_root = Some(next_value(args, i, "--package-root")?.into());
+                package_roots.push(next_value(args, i, "--package-root")?.into());
             }
             other => anyhow::bail!("unknown config argument: {}", other),
         }
@@ -208,13 +224,13 @@ fn parse_config_args(args: &[String]) -> Result<ConfigCli> {
 
     let root = project_root.ok_or_else(|| anyhow::anyhow!("missing --project-root"))?;
     Ok(ConfigCli {
-        roots: PackageRoots::resolve(root, package_root)?,
+        roots: PackageRoots::resolve(root, package_roots)?,
     })
 }
 
 fn parse_test_args(args: &[String]) -> Result<TestCli> {
     let mut project_root: Option<PathBuf> = None;
-    let mut package_root: Option<PathBuf> = None;
+    let mut package_roots: Vec<PathBuf> = Vec::new();
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -226,11 +242,8 @@ fn parse_test_args(args: &[String]) -> Result<TestCli> {
                 project_root = Some(next_value(args, i, "--project-root")?.into());
             }
             "--package-root" => {
-                if package_root.is_some() {
-                    anyhow::bail!("duplicate --package-root");
-                }
                 i += 1;
-                package_root = Some(next_value(args, i, "--package-root")?.into());
+                package_roots.push(next_value(args, i, "--package-root")?.into());
             }
             other => anyhow::bail!("unknown test argument: {}", other),
         }
@@ -239,8 +252,14 @@ fn parse_test_args(args: &[String]) -> Result<TestCli> {
 
     let root = project_root.ok_or_else(|| anyhow::anyhow!("missing --project-root"))?;
     Ok(TestCli {
-        roots: PackageRoots::resolve(root, package_root)?,
+        roots: PackageRoots::resolve(root, package_roots)?,
     })
+}
+
+fn next_iter_value(args: &mut impl Iterator<Item = String>, flag: &str) -> Result<String> {
+    args.next()
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("missing {} value", flag))
 }
 
 fn next_value(args: &[String], index: usize, flag: &str) -> Result<String> {
@@ -250,13 +269,33 @@ fn next_value(args: &[String], index: usize, flag: &str) -> Result<String> {
         .ok_or_else(|| anyhow::anyhow!("missing {} value", flag))
 }
 
-fn run_pipeline(lua_path: PathBuf, roots: PackageRoots, event: JsonValue) -> Result<i32> {
+fn run_pipeline(
+    lua_path: PathBuf,
+    roots: PackageRoots,
+    owner_namespace: String,
+    event: JsonValue,
+) -> Result<i32> {
     let lua = mlua_init::new_lua();
     let raise_buf = RaiseBuffer::new();
+    let owner_root = roots
+        .owner_root_for_namespace(&owner_namespace)
+        .ok_or_else(|| anyhow::anyhow!("unknown owner namespace `{owner_namespace}`"))?;
+    let require_roots = roots.require_roots_for_owner(owner_root);
 
-    mlua_init::register_framework_sdk(&lua, raise_buf.clone(), roots.host_root())?;
+    mlua_init::register_framework_sdk(
+        &lua,
+        raise_buf.clone(),
+        roots.host_root(),
+        roots.name_resolver(),
+        owner_namespace,
+    )?;
 
-    let exit_code = match mlua_init::run_dept_with_roots(&lua, &lua_path, &event, &roots) {
+    let exit_code = match mlua_init::run_dept_with_require_roots(
+        &lua,
+        &lua_path,
+        &event,
+        require_roots.iter().map(|root| root.as_path()),
+    ) {
         Ok(()) => 0,
         Err(e) => {
             eprintln!("[framework] pipeline failed: {:#}", e);
@@ -300,8 +339,9 @@ fn run() -> Result<i32> {
         CliCommand::Run {
             lua_path,
             roots,
+            owner_namespace,
             event,
-        } => run_pipeline(lua_path, roots, event),
+        } => run_pipeline(lua_path, roots, owner_namespace, event),
         CliCommand::Supervise {
             roots,
             framework_bin,

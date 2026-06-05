@@ -1,6 +1,6 @@
-//! Graph scan derives the startup Config from the fixed package plus host layout.
+//! Graph scan derives the startup Config from the fixed packages plus host layout.
 //!
-//! The package root owns standard assets and the host root owns host
+//! Package roots own standard assets and the host root owns host
 //! departments and raisers. `package.lua` is not a supported graph input.
 //!
 //! Each department exposes `M.spec = { consumes, produces, fanout, stall_window }`
@@ -16,7 +16,9 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use crate::config_registry::{ConfigContext, ConfigKey, ConfigValueType};
-use crate::path_resolver::{GraphRoot, GraphRootKind, PackageRoots};
+use crate::path_resolver::{
+    package_root_path, validate_name_segment, GraphRoot, GraphRootKind, NameResolver, PackageRoots,
+};
 
 /// Deserialization helper for a department's `M.spec` table.
 #[derive(Deserialize)]
@@ -109,33 +111,35 @@ fn validate_retry_default(retry: &RetryDecl) -> Result<()> {
 
 #[cfg(test)]
 pub fn load(repo_root: &Path) -> Result<Config> {
-    let roots = PackageRoots::resolve(repo_root, Some(repo_root.to_path_buf()))?;
+    let roots = PackageRoots::resolve(repo_root, vec![repo_root.to_path_buf()])?;
     load_roots(&roots)
 }
 
 pub fn load_roots(roots: &PackageRoots) -> Result<Config> {
     let graph_roots = roots.graph_roots();
-    let lua_roots: Vec<&Path> = graph_roots.iter().map(|root| root.root.as_path()).collect();
     for graph_root in &graph_roots {
         reject_removed_surfaces(&graph_root)?;
     }
 
     let defaults = HostGraphDefaults::load(roots)?;
-    let lua = Lua::new();
+    let resolver = roots.name_resolver();
     let mut departments: BTreeMap<String, DepartmentDecl> = BTreeMap::new();
     let mut raisers: BTreeMap<String, RaiserDecl> = BTreeMap::new();
     let mut department_fanout: HashMap<String, Vec<String>> = HashMap::new();
 
     for graph_root in &graph_roots {
+        let lua = Lua::new();
+        let require_roots = roots.require_roots_for_owner(&graph_root.root);
         scan_departments(
             &lua,
             graph_root,
-            &lua_roots,
+            &require_roots,
+            &resolver,
             &defaults,
             &mut departments,
             &mut department_fanout,
         )?;
-        scan_raisers(&lua, graph_root, &lua_roots, &mut raisers)?;
+        scan_raisers(&lua, graph_root, &require_roots, &resolver, &mut raisers)?;
     }
 
     let queues = derive_queues(&departments, &raisers, &department_fanout, &defaults)?;
@@ -163,7 +167,8 @@ fn reject_removed_surfaces(graph_root: &GraphRoot) -> Result<()> {
 fn scan_departments(
     lua: &Lua,
     graph_root: &GraphRoot,
-    lua_roots: &[&Path],
+    require_roots: &[PathBuf],
+    resolver: &NameResolver,
     defaults: &HostGraphDefaults,
     departments: &mut BTreeMap<String, DepartmentDecl>,
     department_fanout: &mut HashMap<String, Vec<String>>,
@@ -176,12 +181,14 @@ fn scan_departments(
 
     for path in sorted_dirs(&dept_dir).with_context(|| format!("read {}", dept_dir.display()))? {
         let name = file_name(&path)?;
+        validate_name_segment("department name", &name)
+            .with_context(|| format!("validate department `{}`", name))?;
         let main_lua = path.join("main.lua");
         if !main_lua.is_file() {
             continue;
         }
 
-        let module = eval_lua_file(lua, lua_roots, &main_lua)
+        let module = eval_lua_file(lua, require_roots, &main_lua)
             .with_context(|| format!("eval department `{}` from {}", name, main_lua.display()))?;
         let spec_tbl: Table = module
             .get("spec")
@@ -194,18 +201,31 @@ fn scan_departments(
         let spec: DeptSpec = lua
             .from_value(LuaValue::Table(spec_tbl))
             .with_context(|| format!("parse `{}.spec`", name))?;
-        let retry = materialize_retry(&retry, defaults, &spec.consumes)
+        let consumes = resolve_queues(resolver, &graph_root.namespace, spec.consumes)
+            .with_context(|| format!("resolve `{}.spec.consumes`", name))?;
+        let produces = resolve_queues(resolver, &graph_root.namespace, spec.produces)
+            .with_context(|| format!("resolve `{}.spec.produces`", name))?;
+        let fanout = resolve_queues(resolver, &graph_root.namespace, spec.fanout)
+            .with_context(|| format!("resolve `{}.spec.fanout`", name))?;
+        let ephemeral = resolve_queues(resolver, &graph_root.namespace, spec.ephemeral)
+            .with_context(|| format!("resolve `{}.spec.ephemeral`", name))?;
+        let retry = materialize_retry(&retry, defaults, &consumes)
             .with_context(|| format!("materialize `{}.spec.retry`", name))?;
 
         let config_path = config_path(repo_root, graph_root.kind, &main_lua);
-        insert_department_decl_with_root(
+        let canonical_name = resolver
+            .canonical_decl_name(&graph_root.namespace, &name)
+            .with_context(|| format!("resolve department `{}`", name))?;
+        insert_department_decl(
             departments,
-            &name,
+            &canonical_name,
             DepartmentDecl {
                 lua: config_path.clone(),
-                consumes: spec.consumes,
-                produces: spec.produces,
-                ephemeral: spec.ephemeral,
+                owner_root: repo_root.clone(),
+                owner_namespace: graph_root.namespace.clone(),
+                consumes,
+                produces,
+                ephemeral,
                 stall_window: if spec.stall_window.trim().is_empty() {
                     defaults.department_default_stall_window.clone()
                 } else {
@@ -214,9 +234,8 @@ fn scan_departments(
                 retry,
             },
             &config_path,
-            graph_root.kind,
         )?;
-        department_fanout.insert(name, spec.fanout);
+        department_fanout.insert(canonical_name, fanout);
     }
 
     Ok(())
@@ -245,8 +264,8 @@ fn materialize_retry(
 ) -> Result<Option<RetryDecl>> {
     match retry {
         DeptRetrySetting::Disabled => Ok(None),
-        DeptRetrySetting::Default if consumes.iter().any(|queue| queue == "dead_letter") => {
-            if consumes.iter().any(|queue| queue != "dead_letter") {
+        DeptRetrySetting::Default if consumes.iter().any(|queue| is_dead_letter_queue(queue)) => {
+            if consumes.iter().any(|queue| !is_dead_letter_queue(queue)) {
                 bail!(
                     "department consumes `dead_letter` and another queue with retry unset; set M.spec.retry to a table or false"
                 );
@@ -271,7 +290,8 @@ fn materialize_retry(
 fn scan_raisers(
     lua: &Lua,
     graph_root: &GraphRoot,
-    lua_roots: &[&Path],
+    require_roots: &[PathBuf],
+    resolver: &NameResolver,
     raisers: &mut BTreeMap<String, RaiserDecl>,
 ) -> Result<()> {
     let repo_root = &graph_root.root;
@@ -288,86 +308,90 @@ fn scan_raisers(
             .ok_or_else(|| anyhow!("raiser file no stem"))?
             .to_string_lossy()
             .into_owned();
-        let val = eval_lua_value(lua, lua_roots, &path)
+        validate_name_segment("raiser name", &stem)
+            .with_context(|| format!("validate raiser `{}`", stem))?;
+        let val = eval_lua_value(lua, require_roots, &path)
             .with_context(|| format!("eval raiser `{}` from {}", stem, path.display()))?;
         let r: RaiserDecl = lua
             .from_value(val)
             .with_context(|| format!("parse raisers/{}.lua", stem))?;
         reject_runtime_file_watch_glob(&r)?;
+        let r = resolve_raiser(resolver, &graph_root.namespace, r)
+            .with_context(|| format!("resolve raiser `{}`", stem))?;
 
         let config_path = config_path(repo_root, graph_root.kind, &path);
-        insert_raiser_decl_with_root(raisers, &stem, r, &config_path, graph_root.kind)?;
+        let canonical_name = resolver
+            .canonical_decl_name(&graph_root.namespace, &stem)
+            .with_context(|| format!("resolve raiser `{}`", stem))?;
+        insert_raiser_decl(raisers, &canonical_name, r, &config_path)?;
     }
 
     Ok(())
 }
 
-#[cfg(test)]
 pub(crate) fn insert_department_decl(
     departments: &mut BTreeMap<String, DepartmentDecl>,
     name: &str,
     decl: DepartmentDecl,
     config_path: &Path,
 ) -> Result<()> {
-    insert_department_decl_with_root(
-        departments,
-        name,
-        decl,
-        config_path,
-        GraphRootKind::PackageAndHost,
-    )
-}
-
-fn insert_department_decl_with_root(
-    departments: &mut BTreeMap<String, DepartmentDecl>,
-    name: &str,
-    decl: DepartmentDecl,
-    config_path: &Path,
-    root_kind: GraphRootKind,
-) -> Result<()> {
-    if departments.insert(name.to_string(), decl).is_some() {
+    if departments.contains_key(name) {
         bail!(
-            "duplicate department `{}` in {} at {}",
+            "duplicate department `{}` at {}",
             name,
-            root_kind.label(),
-            config_path.display(),
+            config_path.display()
         );
     }
+    departments.insert(name.to_string(), decl);
     Ok(())
 }
 
-#[cfg(test)]
 pub(crate) fn insert_raiser_decl(
     raisers: &mut BTreeMap<String, RaiserDecl>,
     name: &str,
     decl: RaiserDecl,
     config_path: &Path,
 ) -> Result<()> {
-    insert_raiser_decl_with_root(
-        raisers,
-        name,
-        decl,
-        config_path,
-        GraphRootKind::PackageAndHost,
-    )
+    if raisers.contains_key(name) {
+        bail!("duplicate raiser `{}` at {}", name, config_path.display());
+    }
+    raisers.insert(name.to_string(), decl);
+    Ok(())
 }
 
-fn insert_raiser_decl_with_root(
-    raisers: &mut BTreeMap<String, RaiserDecl>,
-    name: &str,
-    decl: RaiserDecl,
-    config_path: &Path,
-    root_kind: GraphRootKind,
-) -> Result<()> {
-    if raisers.insert(name.to_string(), decl).is_some() {
-        bail!(
-            "duplicate raiser `{}` in {} at {}",
-            name,
-            root_kind.label(),
-            config_path.display()
-        );
+fn is_dead_letter_queue(queue: &str) -> bool {
+    queue
+        .rsplit_once('.')
+        .map(|(_, name)| name == "dead_letter")
+        .unwrap_or(queue == "dead_letter")
+}
+
+fn resolve_queues(
+    resolver: &NameResolver,
+    owner_namespace: &str,
+    queues: Vec<String>,
+) -> Result<Vec<String>> {
+    queues
+        .into_iter()
+        .map(|queue| resolver.resolve(owner_namespace, &queue))
+        .collect()
+}
+
+fn resolve_raiser(
+    resolver: &NameResolver,
+    owner_namespace: &str,
+    raiser: RaiserDecl,
+) -> Result<RaiserDecl> {
+    match raiser {
+        RaiserDecl::Cron { interval, produces } => Ok(RaiserDecl::Cron {
+            interval,
+            produces: resolver.resolve(owner_namespace, &produces)?,
+        }),
+        RaiserDecl::FileWatch { glob, produces } => Ok(RaiserDecl::FileWatch {
+            glob,
+            produces: resolver.resolve(owner_namespace, &produces)?,
+        }),
     }
-    Ok(())
 }
 
 fn derive_queues(
@@ -451,47 +475,38 @@ fn reject_runtime_file_watch_glob(raiser: &RaiserDecl) -> Result<()> {
     Ok(())
 }
 
-fn eval_lua_file(lua: &Lua, lua_roots: &[&Path], path: &Path) -> Result<Table> {
-    match eval_lua_value(lua, lua_roots, path)? {
+fn eval_lua_file(lua: &Lua, require_roots: &[PathBuf], path: &Path) -> Result<Table> {
+    match eval_lua_value(lua, require_roots, path)? {
         LuaValue::Table(t) => Ok(t),
         _ => Err(anyhow!("{} did not return a table", path.display())),
     }
 }
 
-fn eval_lua_value(lua: &Lua, lua_roots: &[&Path], path: &Path) -> Result<LuaValue> {
+fn eval_lua_value(lua: &Lua, require_roots: &[PathBuf], path: &Path) -> Result<LuaValue> {
     let source =
         std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
-    set_package_path(lua, lua_roots)?;
+    set_package_roots_path(lua, require_roots.iter().map(PathBuf::as_path))?;
     lua.load(&source)
         .set_name(path.display().to_string())
         .eval()
         .with_context(|| format!("eval {}", path.display()))
 }
 
-fn set_package_path(lua: &Lua, lua_roots: &[&Path]) -> Result<()> {
+fn set_package_roots_path<'a>(
+    lua: &Lua,
+    package_roots: impl IntoIterator<Item = &'a Path>,
+) -> Result<()> {
+    let roots_path = package_roots
+        .into_iter()
+        .map(package_root_path)
+        .collect::<Vec<_>>()
+        .join(";");
     lua.load(format!(
-        "package.path = {:?}",
-        lua_package_root_path(lua_roots.iter().copied())
+        "package.path = {:?}; package.cpath = \"\"",
+        roots_path
     ))
     .exec()
     .context("set package.path")
-}
-
-#[cfg(not(test))]
-fn lua_package_root_path<'a>(roots: impl IntoIterator<Item = &'a Path>) -> String {
-    crate::mlua_init::package_roots_path(roots)
-}
-
-#[cfg(test)]
-fn lua_package_root_path<'a>(roots: impl IntoIterator<Item = &'a Path>) -> String {
-    roots
-        .into_iter()
-        .map(|repo_root| {
-            let root = repo_root.display();
-            format!("{root}/?.lua;{root}/?/init.lua;{root}/?/main.lua")
-        })
-        .collect::<Vec<_>>()
-        .join(";")
 }
 
 fn sorted_dirs(root: &Path) -> Result<Vec<PathBuf>> {

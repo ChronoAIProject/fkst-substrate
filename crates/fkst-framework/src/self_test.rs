@@ -7,6 +7,7 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::path_resolver::NameResolver;
 use crate::raise::RaiseBuffer;
 
 pub struct Failure {
@@ -75,14 +76,14 @@ fn validate_minimal_config() -> Result<()> {
     std::fs::write(root.join(&lua_rel), "-- self-test department\n")
         .with_context(|| format!("write temporary lua file {}", lua_rel.display()))?;
 
-    let cfg = minimal_config(lua_rel);
+    let cfg = minimal_config(lua_rel, &root);
     let result = validate(&cfg, &root).context("validate minimal in-memory config");
     let cleanup = std::fs::remove_dir_all(&root)
         .with_context(|| format!("remove temporary validation root {}", root.display()));
     result.and(cleanup)
 }
 
-fn minimal_config(lua_rel: PathBuf) -> Config {
+fn minimal_config(lua_rel: PathBuf, owner_root: &std::path::Path) -> Config {
     let mut queue = BTreeMap::new();
     queue.insert(
         "self_test".into(),
@@ -106,6 +107,8 @@ fn minimal_config(lua_rel: PathBuf) -> Config {
         "self_test_department".into(),
         DepartmentDecl {
             lua: lua_rel,
+            owner_root: owner_root.to_path_buf(),
+            owner_namespace: "pkg".to_string(),
             consumes: vec!["self_test".into()],
             produces: vec![],
             ephemeral: vec![],
@@ -127,8 +130,14 @@ fn minimal_config(lua_rel: PathBuf) -> Config {
 // the self-test pins the fixed `file.read`, `file.write`, and `file.exists` table shape.
 fn check_sdk_registration(host_root: &std::path::Path) -> Result<()> {
     let lua = crate::mlua_init::new_lua();
-    crate::mlua_init::register_framework_sdk(&lua, RaiseBuffer::new(), host_root)
-        .context("register framework SDK")?;
+    crate::mlua_init::register_framework_sdk(
+        &lua,
+        RaiseBuffer::new(),
+        host_root,
+        NameResolver::new(["pkg".to_string()]),
+        "pkg".to_string(),
+    )
+    .context("register framework SDK")?;
     lua.load(
         r#"
         local function expect_type(name, value, expected)

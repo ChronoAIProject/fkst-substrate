@@ -1,9 +1,12 @@
-//! Resolve the fixed package root plus host root graph inputs.
+//! Resolve fixed package roots, host graph inputs, and package-local names.
 
 use anyhow::{bail, Context, Result};
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 pub(crate) const PACKAGE_ROOT_ENV: &str = "FKST_PACKAGE_ROOT";
+pub(crate) const PACKAGE_ROOTS_ENV: &str = "FKST_PACKAGE_ROOTS";
+pub(crate) const HOST_NAMESPACE: &str = "host";
 
 const REJECTED_PACKAGE_ROOT_ENVS: &[&str] = &[
     "FKST_STDLIB_ROOT",
@@ -11,61 +14,188 @@ const REJECTED_PACKAGE_ROOT_ENVS: &[&str] = &[
     "FKST_GRAPH_ROOTS",
 ];
 
+/// Build the Lua search path for one graph root.
+pub(crate) fn package_root_path(package_root: &Path) -> String {
+    let root = package_root.display();
+    format!("{root}/?.lua;{root}/?/init.lua;{root}/?/main.lua")
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct PackageRoots {
-    package_root: PathBuf,
+    package_roots: Vec<PathBuf>,
     host_root: PathBuf,
+    package_namespaces: Vec<String>,
+    run_host_owner: bool,
 }
 
 impl PackageRoots {
     pub(crate) fn resolve(
         host_root: impl AsRef<Path>,
-        explicit_package_root: Option<PathBuf>,
+        explicit_package_roots: Vec<PathBuf>,
     ) -> Result<Self> {
         reject_removed_package_root_envs()?;
         let host_root = canonical_dir(host_root.as_ref(), "--project-root")?;
-        let package_root = match explicit_package_root {
-            Some(root) => canonical_dir(&root, "--package-root")?,
-            None => match std::env::var_os(PACKAGE_ROOT_ENV) {
+        let package_roots = if explicit_package_roots.is_empty() {
+            roots_from_env()?
+        } else {
+            canonical_dirs(explicit_package_roots, "--package-root")?
+        };
+        Self::from_canonical(host_root, package_roots, false)
+    }
+
+    pub(crate) fn resolve_run(
+        host_root: impl AsRef<Path>,
+        explicit_package_roots: Vec<PathBuf>,
+    ) -> Result<Self> {
+        reject_removed_package_root_envs()?;
+        if std::env::var_os(PACKAGE_ROOTS_ENV).is_some() {
+            bail!("{PACKAGE_ROOTS_ENV} is not valid for `run`; pass one --package-root");
+        }
+        let host_root = canonical_dir(host_root.as_ref(), "--project-root")?;
+        let package_roots = if explicit_package_roots.is_empty() {
+            match std::env::var_os(PACKAGE_ROOT_ENV) {
                 Some(root) if !root.is_empty() => {
-                    canonical_dir(Path::new(&root), PACKAGE_ROOT_ENV)?
+                    vec![canonical_dir(Path::new(&root), PACKAGE_ROOT_ENV)?]
                 }
                 Some(_) => bail!("{PACKAGE_ROOT_ENV} must not be empty"),
                 None => bail!("{PACKAGE_ROOT_ENV} or --package-root is required"),
-            },
+            }
+        } else {
+            canonical_dirs(explicit_package_roots, "--package-root")?
         };
-        Ok(Self {
-            package_root,
-            host_root,
-        })
+        let run_host_owner =
+            package_roots.len() > 1 && package_roots.iter().any(|root| root == &host_root);
+        Self::from_canonical(host_root, package_roots, run_host_owner)
     }
 
-    pub(crate) fn package_root(&self) -> &Path {
-        &self.package_root
+    pub(crate) fn package_roots(&self) -> &[PathBuf] {
+        &self.package_roots
     }
 
     pub(crate) fn host_root(&self) -> &Path {
         &self.host_root
     }
 
-    pub(crate) fn graph_roots(&self) -> Vec<GraphRoot> {
-        if self.package_root == self.host_root {
-            vec![GraphRoot {
-                root: self.package_root.clone(),
-                kind: GraphRootKind::PackageAndHost,
-            }]
-        } else {
-            vec![
-                GraphRoot {
-                    root: self.package_root.clone(),
-                    kind: GraphRootKind::Package,
-                },
-                GraphRoot {
-                    root: self.host_root.clone(),
-                    kind: GraphRootKind::Host,
-                },
-            ]
+    /// The owner namespace for a direct `run` when `--owner-namespace` is omitted:
+    /// a single package root unambiguously owns the spawned department. Returns
+    /// None when several package roots are present (the supervisor then passes the
+    /// owner namespace explicitly, e.g. `host` for host departments).
+    pub(crate) fn sole_package_namespace(&self) -> Option<&str> {
+        match self.package_namespaces.as_slice() {
+            [only] => Some(only),
+            _ => None,
         }
+    }
+
+    fn from_canonical(
+        host_root: PathBuf,
+        package_roots: Vec<PathBuf>,
+        run_host_owner: bool,
+    ) -> Result<Self> {
+        let package_namespaces = package_namespaces(&host_root, &package_roots, run_host_owner)?;
+        let host_is_folded = package_roots.iter().any(|root| root == &host_root);
+        // Package basenames become queue/dept qualifiers only when more than one
+        // graph root is composed. A single folded package==host root stays in
+        // LegacyFlat and never uses its basename as a name, so its directory name
+        // is unconstrained (e.g. tempdir names beginning with a dot).
+        let namespaced = package_roots.len() + usize::from(!host_is_folded) > 1;
+        if namespaced {
+            for namespace in &package_namespaces {
+                validate_name_segment("package root basename", namespace)?;
+            }
+            if !host_is_folded
+                && package_namespaces
+                    .iter()
+                    .any(|namespace| namespace == HOST_NAMESPACE)
+            {
+                bail!(
+                    "package root basename `{HOST_NAMESPACE}` conflicts with independent host namespace `{HOST_NAMESPACE}`"
+                );
+            }
+        }
+        Ok(Self {
+            package_roots,
+            host_root,
+            package_namespaces,
+            run_host_owner,
+        })
+    }
+
+    pub(crate) fn require_roots_for_owner(&self, owner_root: &Path) -> Vec<PathBuf> {
+        if owner_root == self.host_root {
+            if !self.run_host_owner
+                && self
+                .package_roots
+                .iter()
+                .any(|root| root == &self.host_root)
+            {
+                return vec![self.host_root.clone()];
+            }
+            let mut roots = vec![self.host_root.clone()];
+            roots.extend(
+                self.package_roots
+                    .iter()
+                    .filter(|root| *root != &self.host_root)
+                    .cloned(),
+            );
+            return roots;
+        }
+        vec![owner_root.to_path_buf()]
+    }
+
+    pub(crate) fn graph_roots(&self) -> Vec<GraphRoot> {
+        let mut roots = Vec::new();
+        let mut host_folded = false;
+        for (package_root, namespace) in self.package_roots.iter().zip(&self.package_namespaces) {
+            if package_root == &self.host_root {
+                roots.push(GraphRoot {
+                    root: package_root.clone(),
+                    kind: if self.run_host_owner {
+                        GraphRootKind::Host
+                    } else {
+                        GraphRootKind::PackageAndHost
+                    },
+                    namespace: namespace.clone(),
+                });
+                host_folded = true;
+            } else {
+                roots.push(GraphRoot {
+                    root: package_root.clone(),
+                    kind: GraphRootKind::Package,
+                    namespace: namespace.clone(),
+                });
+            }
+        }
+        if !host_folded {
+            roots.push(GraphRoot {
+                root: self.host_root.clone(),
+                kind: GraphRootKind::Host,
+                namespace: HOST_NAMESPACE.to_string(),
+            });
+        }
+        roots
+    }
+
+    pub(crate) fn name_resolver(&self) -> NameResolver {
+        let graph_roots = self.graph_roots();
+        NameResolver::new(graph_roots.iter().map(|root| root.namespace.clone()))
+    }
+
+    pub(crate) fn owner_root_for_namespace(&self, namespace: &str) -> Option<&Path> {
+        self.graph_roots()
+            .into_iter()
+            .find(|root| root.namespace == namespace)
+            .map(|root| {
+                if root.root == self.host_root {
+                    self.host_root.as_path()
+                } else {
+                    self.package_roots
+                        .iter()
+                        .find(|package_root| *package_root == &root.root)
+                        .map(PathBuf::as_path)
+                        .unwrap_or(self.host_root.as_path())
+                }
+            })
     }
 }
 
@@ -73,6 +203,7 @@ impl PackageRoots {
 pub(crate) struct GraphRoot {
     pub(crate) root: PathBuf,
     pub(crate) kind: GraphRootKind,
+    pub(crate) namespace: String,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -82,23 +213,199 @@ pub(crate) enum GraphRootKind {
     PackageAndHost,
 }
 
-impl GraphRootKind {
-    pub(crate) fn label(self) -> &'static str {
-        match self {
-            Self::Package => "package root",
-            Self::Host => "host root",
-            Self::PackageAndHost => "package/host root",
-        }
-    }
-}
-
 fn reject_removed_package_root_envs() -> Result<()> {
     for key in REJECTED_PACKAGE_ROOT_ENVS {
         if std::env::var_os(key).is_some() {
             bail!(
-                "{key} is a removed package root surface; use {PACKAGE_ROOT_ENV} or --package-root"
+                "{key} is a removed package root surface; use {PACKAGE_ROOTS_ENV}, {PACKAGE_ROOT_ENV}, or --package-root"
             );
         }
+    }
+    Ok(())
+}
+
+fn roots_from_env() -> Result<Vec<PathBuf>> {
+    let plural = std::env::var_os(PACKAGE_ROOTS_ENV);
+    let singular = std::env::var_os(PACKAGE_ROOT_ENV);
+    match (plural, singular) {
+        (Some(_), Some(_)) => bail!(
+            "{PACKAGE_ROOTS_ENV} and {PACKAGE_ROOT_ENV} are mutually exclusive without --package-root"
+        ),
+        (Some(raw), None) if raw.is_empty() => bail!("{PACKAGE_ROOTS_ENV} must not be empty"),
+        (Some(raw), None) => {
+            let roots = std::env::split_paths(&raw).collect::<Vec<_>>();
+            if roots.is_empty() {
+                bail!("{PACKAGE_ROOTS_ENV} must contain at least one path");
+            }
+            canonical_dirs(roots, PACKAGE_ROOTS_ENV)
+        }
+        (None, Some(root)) if root.is_empty() => bail!("{PACKAGE_ROOT_ENV} must not be empty"),
+        (None, Some(root)) => Ok(vec![canonical_dir(Path::new(&root), PACKAGE_ROOT_ENV)?]),
+        (None, None) => bail!(
+            "{PACKAGE_ROOTS_ENV}, {PACKAGE_ROOT_ENV}, or --package-root is required"
+        ),
+    }
+}
+
+fn canonical_dirs(roots: Vec<PathBuf>, label: &str) -> Result<Vec<PathBuf>> {
+    if roots.is_empty() {
+        bail!("{label} must contain at least one path");
+    }
+    let roots = roots
+        .into_iter()
+        .map(|root| canonical_dir(&root, label))
+        .collect::<Result<Vec<_>>>()?;
+    reject_duplicate_roots(&roots)?;
+    Ok(roots)
+}
+
+fn package_namespaces(
+    host_root: &Path,
+    package_roots: &[PathBuf],
+    run_host_owner: bool,
+) -> Result<Vec<String>> {
+    let mut seen = BTreeSet::new();
+    let mut namespaces = Vec::new();
+    for root in package_roots {
+        let namespace = if run_host_owner && root == host_root {
+            HOST_NAMESPACE.to_string()
+        } else {
+            let namespace = root
+                .file_name()
+                .and_then(|name| name.to_str())
+                .ok_or_else(|| anyhow::anyhow!("package root has no basename: {}", root.display()))?
+                .to_string();
+            namespace
+        };
+        if !seen.insert(namespace.clone()) {
+            bail!("duplicate package root basename `{namespace}`");
+        }
+        namespaces.push(namespace);
+    }
+    Ok(namespaces)
+}
+
+fn reject_duplicate_roots(roots: &[PathBuf]) -> Result<()> {
+    let mut seen = BTreeSet::new();
+    for root in roots {
+        if !seen.insert(root.clone()) {
+            bail!("duplicate package root: {}", root.display());
+        }
+    }
+    Ok(())
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum NameResolutionMode {
+    LegacyFlat,
+    Namespaced,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct NameResolver {
+    mode: NameResolutionMode,
+    namespaces: BTreeSet<String>,
+}
+
+impl NameResolver {
+    pub(crate) fn new(namespaces: impl IntoIterator<Item = String>) -> Self {
+        let namespaces = namespaces.into_iter().collect::<BTreeSet<_>>();
+        let mode = if namespaces.len() == 1 {
+            NameResolutionMode::LegacyFlat
+        } else {
+            NameResolutionMode::Namespaced
+        };
+        Self { mode, namespaces }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn mode(&self) -> &NameResolutionMode {
+        &self.mode
+    }
+
+    pub(crate) fn validate_owner(&self, owner_namespace: &str) -> Result<()> {
+        // The owner namespace is only used as a qualifier in Namespaced mode; in
+        // LegacyFlat it is an inert label (the folded root basename), so it is not
+        // charset-constrained.
+        if self.mode == NameResolutionMode::Namespaced {
+            validate_name_segment("owner namespace", owner_namespace)?;
+        }
+        if !self.namespaces.contains(owner_namespace) {
+            bail!("unknown owner namespace `{owner_namespace}`");
+        }
+        Ok(())
+    }
+
+    pub(crate) fn resolve(&self, owner_namespace: &str, raw: &str) -> Result<String> {
+        self.validate_owner(owner_namespace)?;
+        let parsed = parse_name(raw)?;
+        match (&self.mode, parsed) {
+            (NameResolutionMode::LegacyFlat, ParsedName::Bare(name)) => Ok(name),
+            (NameResolutionMode::LegacyFlat, ParsedName::Qualified { namespace, name }) => {
+                if namespace != owner_namespace {
+                    bail!(
+                        "qualified name `{raw}` uses namespace `{namespace}` but legacy owner namespace is `{owner_namespace}`"
+                    );
+                }
+                Ok(name)
+            }
+            (NameResolutionMode::Namespaced, ParsedName::Bare(name)) => {
+                Ok(format!("{owner_namespace}.{name}"))
+            }
+            (NameResolutionMode::Namespaced, ParsedName::Qualified { namespace, name }) => {
+                if !self.namespaces.contains(&namespace) {
+                    bail!("qualified name `{raw}` uses unknown namespace `{namespace}`");
+                }
+                Ok(format!("{namespace}.{name}"))
+            }
+        }
+    }
+
+    pub(crate) fn canonical_decl_name(&self, owner_namespace: &str, raw: &str) -> Result<String> {
+        if self.mode == NameResolutionMode::Namespaced {
+            validate_name_segment("owner namespace", owner_namespace)?;
+        }
+        validate_name_segment("declaration name", raw)?;
+        match self.mode {
+            NameResolutionMode::LegacyFlat => Ok(raw.to_string()),
+            NameResolutionMode::Namespaced => Ok(format!("{owner_namespace}.{raw}")),
+        }
+    }
+}
+
+enum ParsedName {
+    Bare(String),
+    Qualified { namespace: String, name: String },
+}
+
+fn parse_name(raw: &str) -> Result<ParsedName> {
+    let parts = raw.split('.').collect::<Vec<_>>();
+    match parts.as_slice() {
+        [name] => {
+            validate_name_segment("name", name)?;
+            Ok(ParsedName::Bare((*name).to_string()))
+        }
+        [namespace, name] => {
+            validate_name_segment("namespace", namespace)?;
+            validate_name_segment("name", name)?;
+            Ok(ParsedName::Qualified {
+                namespace: (*namespace).to_string(),
+                name: (*name).to_string(),
+            })
+        }
+        _ => bail!("name `{raw}` must be bare `name` or qualified `namespace.name`"),
+    }
+}
+
+pub(crate) fn validate_name_segment(label: &str, value: &str) -> Result<()> {
+    if value.is_empty() {
+        bail!("{label} must not be empty");
+    }
+    if !value
+        .bytes()
+        .all(|byte| matches!(byte, b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'_' | b'-'))
+    {
+        bail!("{label} `{value}` must match [A-Za-z0-9_-]+");
     }
     Ok(())
 }
@@ -113,4 +420,128 @@ fn canonical_dir(path: &Path, label: &str) -> Result<PathBuf> {
     std::fs::read_dir(&canonical)
         .with_context(|| format!("read {label} {}", canonical.display()))?;
     Ok(canonical)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn roots(package_roots: &[&str], host_root: &str) -> PackageRoots {
+        PackageRoots {
+            package_roots: package_roots.iter().map(PathBuf::from).collect(),
+            host_root: PathBuf::from(host_root),
+            package_namespaces: package_roots
+                .iter()
+                .map(|root| {
+                    Path::new(root)
+                        .file_name()
+                        .unwrap()
+                        .to_string_lossy()
+                        .into_owned()
+                })
+                .collect(),
+            run_host_owner: false,
+        }
+    }
+
+    // A package department resolves require() against its own package root only,
+    // even when other package roots are present: package-private modules such as
+    // `core` must never leak across packages via the spawn require-root set.
+    #[test]
+    fn package_owner_require_roots_are_its_own_root_only() {
+        let r = roots(&["/pkg/a", "/pkg/b"], "/host");
+        assert_eq!(
+            r.require_roots_for_owner(Path::new("/pkg/a")),
+            vec![PathBuf::from("/pkg/a")]
+        );
+        assert_eq!(
+            r.require_roots_for_owner(Path::new("/pkg/b")),
+            vec![PathBuf::from("/pkg/b")]
+        );
+    }
+
+    // A host department is the composition layer: it resolves standard assets
+    // (`fkst.*`) from every package root, with the host root first.
+    #[test]
+    fn host_owner_require_roots_are_host_then_all_package_roots() {
+        let r = roots(&["/pkg/a", "/pkg/b"], "/host");
+        assert_eq!(
+            r.require_roots_for_owner(Path::new("/host")),
+            vec![
+                PathBuf::from("/host"),
+                PathBuf::from("/pkg/a"),
+                PathBuf::from("/pkg/b"),
+            ]
+        );
+    }
+
+    // Single package + host: host gets [host, package], package gets [package];
+    // this matches the standard-asset contract while keeping the package sealed.
+    #[test]
+    fn single_package_require_roots_match_standard_asset_contract() {
+        let r = roots(&["/pkg"], "/host");
+        assert_eq!(
+            r.require_roots_for_owner(Path::new("/host")),
+            vec![PathBuf::from("/host"), PathBuf::from("/pkg")]
+        );
+        assert_eq!(
+            r.require_roots_for_owner(Path::new("/pkg")),
+            vec![PathBuf::from("/pkg")]
+        );
+    }
+
+    // When the package root folds into the host root (package == host), the
+    // single combined root is the only require root.
+    #[test]
+    fn package_and_host_fold_yields_single_root() {
+        let r = roots(&["/combined"], "/combined");
+        assert_eq!(
+            r.require_roots_for_owner(Path::new("/combined")),
+            vec![PathBuf::from("/combined")]
+        );
+    }
+
+    #[test]
+    fn folded_single_package_with_dotted_basename_stays_legacy_flat() {
+        let temp = tempfile::Builder::new()
+            .prefix("repo.with.dot")
+            .tempdir()
+            .unwrap();
+
+        let r = PackageRoots::resolve(temp.path(), vec![temp.path().to_path_buf()]).unwrap();
+        let resolver = r.name_resolver();
+
+        assert_eq!(resolver.mode(), &NameResolutionMode::LegacyFlat);
+        assert_eq!(resolver.resolve(&r.graph_roots()[0].namespace, "tick").unwrap(), "tick");
+    }
+
+    #[test]
+    fn resolver_legacy_flat_keeps_bare_names_and_same_package_alias() {
+        let resolver = NameResolver::new(["pkg".to_string()]);
+
+        assert_eq!(resolver.mode(), &NameResolutionMode::LegacyFlat);
+        assert_eq!(resolver.resolve("pkg", "q").unwrap(), "q");
+        assert_eq!(resolver.resolve("pkg", "pkg.q").unwrap(), "q");
+        assert!(resolver.resolve("pkg", "other.q").is_err());
+    }
+
+    #[test]
+    fn resolver_namespaced_qualifies_bare_names_and_accepts_known_qualified_names() {
+        let resolver = NameResolver::new(["pkg".to_string(), HOST_NAMESPACE.to_string()]);
+
+        assert_eq!(resolver.mode(), &NameResolutionMode::Namespaced);
+        assert_eq!(resolver.resolve("pkg", "q").unwrap(), "pkg.q");
+        assert_eq!(resolver.resolve(HOST_NAMESPACE, "q").unwrap(), "host.q");
+        assert_eq!(resolver.resolve("pkg", "host.q").unwrap(), "host.q");
+        assert!(resolver.resolve("pkg", "missing.q").is_err());
+    }
+
+    #[test]
+    fn resolver_rejects_dot_inside_segments() {
+        let resolver = NameResolver::new(["pkg".to_string(), HOST_NAMESPACE.to_string()]);
+
+        assert!(resolver.resolve("pkg", "bad.name.extra").is_err());
+        assert!(resolver.resolve("pkg", "bad name").is_err());
+        assert!(resolver.resolve("pkg", ".q").is_err());
+    }
 }

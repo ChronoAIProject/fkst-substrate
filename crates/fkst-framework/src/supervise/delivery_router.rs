@@ -297,6 +297,8 @@ mod tests {
             "worker".to_string(),
             DepartmentDecl {
                 lua: "departments/worker/main.lua".into(),
+                owner_root: std::path::PathBuf::from("."),
+                owner_namespace: "pkg".to_string(),
                 consumes: vec!["jobs".to_string()],
                 produces: Vec::new(),
                 ephemeral: if ephemeral {
@@ -308,6 +310,46 @@ mod tests {
                 retry: None,
             },
         );
+        Config {
+            queue,
+            raiser: BTreeMap::new(),
+            department,
+            limits: LimitsDecl {
+                global_codex_processes: 1,
+            },
+        }
+    }
+
+    fn namespaced_config() -> Config {
+        let mut queue = BTreeMap::new();
+        for name in ["pkg.jobs", "other.jobs"] {
+            queue.insert(
+                name.to_string(),
+                QueueDecl {
+                    capacity: 8,
+                    fanout: false,
+                },
+            );
+        }
+        let mut department = BTreeMap::new();
+        for (dept, queue_name, owner_namespace) in [
+            ("pkg.worker", "pkg.jobs", "pkg"),
+            ("other.worker", "other.jobs", "other"),
+        ] {
+            department.insert(
+                dept.to_string(),
+                DepartmentDecl {
+                    lua: format!("departments/{dept}/main.lua").into(),
+                    owner_root: std::path::PathBuf::from("."),
+                    owner_namespace: owner_namespace.to_string(),
+                    consumes: vec![queue_name.to_string()],
+                    produces: Vec::new(),
+                    ephemeral: Vec::new(),
+                    stall_window: "30s".to_string(),
+                    retry: None,
+                },
+            );
+        }
         Config {
             queue,
             raiser: BTreeMap::new(),
@@ -387,6 +429,55 @@ mod tests {
             leased[0].delivery_id,
             "delivery/v1/source/cron/queue/jobs/dept/worker/ref/tick"
         );
+    }
+
+    #[test]
+    fn reliable_publish_uses_namespaced_queue_and_dept_in_delivery_id() {
+        let cfg = namespaced_config();
+        let temp = TempDir::new().unwrap();
+        let store = Arc::new(DeliveryStore::open(temp.path().join("delivery.redb")).unwrap());
+        let router = DeliveryRouter::new(&cfg, Fanout::new(), Some(store.clone()));
+        let source = SourceRef {
+            kind: SourceKind::Cron,
+            reference: "pkg.tick".to_string(),
+        };
+
+        for queue in ["pkg.jobs", "other.jobs"] {
+            router
+                .publish(PublishEnvelope {
+                    event: Event::new(queue, serde_json::json!({"queue": queue})),
+                    source: Some(source.clone()),
+                    cron_payload: None,
+                    derived: None,
+                })
+                .unwrap();
+        }
+
+        let pkg = store
+            .lease_for_dept("pkg.worker", now_unix_millis(), 8, Duration::from_secs(30))
+            .unwrap();
+        let other = store
+            .lease_for_dept("other.worker", now_unix_millis(), 8, Duration::from_secs(30))
+            .unwrap();
+
+        assert_eq!(pkg.len(), 1);
+        assert_eq!(pkg[0].queue, "pkg.jobs");
+        assert_eq!(pkg[0].dept, "pkg.worker");
+        assert_eq!(pkg[0].source.as_ref().unwrap().reference, "pkg.tick");
+        assert_eq!(
+            pkg[0].delivery_id,
+            "delivery/v1/source/cron/queue/pkg.jobs/dept/pkg.worker/ref/pkg.tick"
+        );
+
+        assert_eq!(other.len(), 1);
+        assert_eq!(other[0].queue, "other.jobs");
+        assert_eq!(other[0].dept, "other.worker");
+        assert_eq!(other[0].source.as_ref().unwrap().reference, "pkg.tick");
+        assert_eq!(
+            other[0].delivery_id,
+            "delivery/v1/source/cron/queue/other.jobs/dept/other.worker/ref/pkg.tick"
+        );
+        assert_ne!(pkg[0].delivery_id, other[0].delivery_id);
     }
 
     #[test]
