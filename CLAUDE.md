@@ -106,6 +106,8 @@ Department execution 由 supervise spawn `fkst-framework run <lua> --project-roo
 
 Codex 调用固定为 `codex exec --dangerously-bypass-approvals-and-sandbox [-C worktree] [--context context] -`。prompt 写入 stdin；stdin EOF 是调用边界。stdout、stderr、exit_code、cmd、done time、stall window 必须写入 codex log。`spawn_codex` 返回的 handle 只能由同一 pipeline 的 `await_all` 消费，不能跨 pipeline 复用。
 
+`fkst-framework test` 注册 test-mode-only `fkst.test.mock_command(pattern, result)` 与 `fkst.test.command_calls()`，和 `run_department` 并列。test mode 劫持 `exec_sync`、codex SDK 与 git SDK 的外部命令调用，按渲染命令行前缀或子串匹配 mock，按注册顺序一次性消费；未 mock 的外部命令 fail closed，不启动真实进程。production `run`、`supervise`、`--self-test` 与 conformance 不注册 mock state。`setup_worktree` 在 test mode 通过同一 git mock runner fail closed，但不模拟 worktree 副作用。
+
 ## 单 repo 单实例
 
 一个 host git repo 对应一个 supervisor、一个 framework binary、一组 package+host composed graph 和一个 `FKST_RUNTIME_ROOT`。多 repo 或多业务是多次部署，不是在同一 framework 进程里跑多套主链路。

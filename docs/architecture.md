@@ -94,7 +94,9 @@ fkst-framework --self-test
 
 runner 不全树递归，不扫描 `raisers/` 或 `fkst/`。每个测试文件在独立 Lua state 中执行，先注册 production SDK 以便测试可 `require` package 模块和调用固定 SDK，再注册 test-mode `fkst.test` 表。测试文件必须返回 table；runner 只执行排序后的 `test_*` key。单个测试失败后继续执行同文件其余测试和后续文件，最后输出 `N passed, M failed`；`M > 0` 时退出码非 0。
 
-`fkst.test` 包含 `eq(actual, expected[, msg])`、`is_true(value[, msg])`、`raises(fn[, msg])`、`is_nil(value[, msg])` 四个断言，以及 test-mode-only `run_department(path, event[, opts])`。`run_department` 用 fresh Lua state 注册 production SDK 和独立 `RaiseBuffer`，再通过正常 department runner 注入 `event`；它返回 `{ exit_code = int, raises = { { queue = string, payload = table }, ... } }`。每个测试文件按所属 graph root 隔离执行；相对 `path` 按该测试文件所属的 owner package root 解析，运行期 `package.path` 也只指向该 owner root。绝对 `path` 仍按绝对路径处理。`opts.cwd`、`opts.env`、`opts.path_prepend` 只作用于该次执行并随后恢复。它是最小 Lua 单测工具，不提供 describe/it、hook、fixture、mock、stub 或测试框架 DSL。除非明确验证真实 CLI 路径，Lua 单测不应调用 codex。
+`fkst.test` 包含 `eq(actual, expected[, msg])`、`is_true(value[, msg])`、`raises(fn[, msg])`、`is_nil(value[, msg])` 四个断言，以及 test-mode-only `run_department(path, event[, opts])`。`run_department` 用 fresh Lua state 注册 production SDK 和独立 `RaiseBuffer`，再通过正常 department runner 注入 `event`；它返回 `{ exit_code = int, raises = { { queue = string, payload = table }, ... } }`。每个测试文件按所属 graph root 隔离执行；相对 `path` 按该测试文件所属的 owner package root 解析，运行期 `package.path` 也只指向该 owner root。绝对 `path` 仍按绝对路径处理。`opts.cwd`、`opts.env`、`opts.path_prepend` 只作用于该次执行并随后恢复。
+
+`fkst.test.mock_command(pattern, result)` 与 `fkst.test.command_calls()` 只在 test mode 注册。mock runner 劫持 `exec_sync`、codex SDK 与 git SDK 的外部命令调用；渲染命令行按前缀或子串匹配，mock 按注册顺序一次性消费，未 mock 的外部命令 fail closed 且不启动真实进程。`command_calls()` 返回每次调用的 rendered、program、args、stdin、stdout、stderr 与 exit_code。`run_department` 创建的 fresh Lua state 与测试文件共享同一个 mock state；每个 test function 开始前清空 mocks 与 calls。`setup_worktree` 在 test mode 也经过同一 git mock runner，但 mock 不模拟 worktree filesystem 副作用。
 
 ## 4. Package Root 与 Host Root
 

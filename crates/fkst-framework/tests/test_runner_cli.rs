@@ -321,6 +321,208 @@ return {
 }
 
 #[test]
+fn test_runner_mocks_external_commands_fail_closed_and_isolates_tests() {
+    let host = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
+    fs::write(
+        host.path().join("fkst.env"),
+        "FKST_CANDIDATE_PREFIX=test-rc\nFKST_CANDIDATE_FROM_SEP=__base__\n",
+    )
+    .unwrap();
+    fs::create_dir_all(host.path().join("departments/probe")).unwrap();
+    fs::write(
+        host.path().join("departments/probe/main.lua"),
+        r#"
+function pipeline(event)
+  local result = exec_sync(event.payload.cmd)
+  raise("seen", { stdout = result.stdout, exit_code = result.exit_code })
+end
+"#,
+    )
+    .unwrap();
+    fs::create_dir_all(host.path().join("tests")).unwrap();
+    fs::write(
+        host.path().join("tests/mock_command_test.lua"),
+        r#"
+local t = fkst.test
+
+return {
+  test_01_exec_sync_uses_mock_and_records_call = function()
+    t.mock_command("gh issue list", { stdout = "[{\"number\":7}]\n", exit_code = 0 })
+    local result = exec_sync("gh issue list --json number")
+    t.eq(result.stdout, "[{\"number\":7}]\n")
+    t.eq(result.exit_code, 0)
+    local calls = t.command_calls()
+    t.eq(#calls, 1)
+    t.eq(calls[1].rendered, "gh issue list --json number")
+    t.eq(calls[1].program, "/bin/sh")
+    t.eq(calls[1].args[1], "-c")
+    t.eq(calls[1].args[2], "gh issue list --json number")
+  end,
+
+  test_02_codex_sync_uses_mock_and_records_prompt = function()
+    t.mock_command("codex exec", { stdout = "draft", exit_code = 0 })
+    local result = spawn_codex_sync({ prompt = "write draft" })
+    t.eq(result.stdout, "draft")
+    t.eq(result.stderr, "")
+    t.eq(result.exit_code, 0)
+    local calls = t.command_calls()
+    t.eq(#calls, 1)
+    t.eq(calls[1].program, "codex")
+    t.eq(calls[1].stdin, "write draft")
+    t.is_true(string.find(calls[1].rendered, "codex exec", 1, true) ~= nil)
+    t.eq(calls[1].args[#calls[1].args], "-")
+  end,
+
+  test_03_codex_sync_nonzero_and_empty_stdout_pass_through = function()
+    t.mock_command("codex exec", { stderr = "nope", exit_code = 12 })
+    local result = spawn_codex_sync({ prompt = "fail draft" })
+    t.eq(result.stdout, "")
+    t.eq(result.stderr, "nope")
+    t.eq(result.exit_code, 12)
+  end,
+
+  test_04_git_log_count_uses_mock_stdout = function()
+    t.mock_command("git -C", { stdout = "a\nb\nc\n" })
+    local count = git_log_count("topic", "1970-01-01T00:00:00Z")
+    t.eq(count, 3)
+    local calls = t.command_calls()
+    t.is_true(string.find(calls[1].rendered, "git -C", 1, true) ~= nil)
+    t.is_true(string.find(calls[1].rendered, "log", 1, true) ~= nil)
+  end,
+
+  test_05_git_read_primitives_parse_mocked_stdout = function()
+    local worktree_stdout = table.concat({
+      "worktree /repo",
+      "HEAD aaaaaaaaaaaa",
+      "",
+      "worktree /repo/.fkst/runtime/worktrees/probe-1",
+      "HEAD bbbbbbbbbbbb",
+      "",
+      "worktree /repo/.fkst/runtime/worktrees/probe-2",
+      "HEAD cccccccccccc",
+      "",
+    }, "\n")
+    t.mock_command("git -C", { stdout = worktree_stdout })
+    t.eq(count_worktrees(), 2)
+
+    t.mock_command("git -C", { stdout = "abc123\n\n def456 \n" })
+    local shas = git_log_grep("topic", "1970-01-01T00:00:00Z")
+    t.eq(#shas, 2)
+    t.eq(shas[1], "abc123")
+    t.eq(shas[2], "def456")
+
+    local calls = t.command_calls()
+    t.eq(#calls, 2)
+    t.is_true(string.find(calls[1].rendered, "worktree list --porcelain", 1, true) ~= nil)
+    t.is_true(string.find(calls[2].rendered, "--format=%H", 1, true) ~= nil)
+  end,
+
+  test_06_mock_commands_are_fifo_and_single_use = function()
+    t.mock_command("git -C", { stdout = "first\n" })
+    t.mock_command("git -C", { stdout = "second\nthird\n" })
+    t.eq(git_log_count("topic", "now"), 1)
+    t.eq(git_log_count("topic", "now"), 2)
+
+    local ok, err = pcall(function()
+      git_log_count("topic", "now")
+    end)
+    t.eq(ok, false)
+    t.is_true(string.find(tostring(err), "unmocked external command: git -C", 1, true) ~= nil)
+  end,
+
+  test_07_setup_worktree_fails_closed_when_later_git_call_is_unmocked = function()
+    t.mock_command("git -C", { stdout = "main\n" })
+    local ok, err = pcall(function()
+      setup_worktree("mocked")
+    end)
+    t.eq(ok, false)
+    t.is_true(string.find(tostring(err), "unmocked external command: git -C", 1, true) ~= nil)
+
+    local calls = t.command_calls()
+    t.eq(#calls, 1)
+    t.is_true(string.find(calls[1].rendered, "rev-parse --abbrev-ref HEAD", 1, true) ~= nil)
+  end,
+
+  test_08_unmocked_exec_sync_fails_closed = function()
+    local ok, err = pcall(function()
+      exec_sync("printf should-not-run")
+    end)
+    t.eq(ok, false)
+    t.is_true(string.find(tostring(err), "unmocked external command: printf should-not-run", 1, true) ~= nil)
+  end,
+
+  test_09_unmocked_codex_sync_fails_closed = function()
+    local ok, err = pcall(function()
+      spawn_codex_sync({ prompt = "unmocked" })
+    end)
+    t.eq(ok, false)
+    t.is_true(string.find(tostring(err), "unmocked external command: codex exec", 1, true) ~= nil)
+  end,
+
+  test_10_unmocked_git_fails_closed = function()
+    local ok, err = pcall(function()
+      git_log_count("topic", "now")
+    end)
+    t.eq(ok, false)
+    t.is_true(string.find(tostring(err), "unmocked external command: git -C", 1, true) ~= nil)
+  end,
+
+  test_11_spawn_codex_await_all_uses_mock = function()
+    t.mock_command("codex exec", { stdout = "async draft", exit_code = 0 })
+    local handle = spawn_codex({ prompt = "async prompt" })
+    local results = await_all({ handle })
+    t.eq(results[1].stdout, "async draft")
+    t.eq(results[1].stderr, "")
+    t.eq(results[1].exit_code, 0)
+    local calls = t.command_calls()
+    t.eq(calls[1].stdin, "async prompt")
+  end,
+
+  test_12_unmocked_spawn_codex_fails_on_await = function()
+    local handle = spawn_codex({ prompt = "async unmocked" })
+    local ok, err = pcall(function()
+      await_all({ handle })
+    end)
+    t.eq(ok, false)
+    t.is_true(string.find(tostring(err), "unmocked external command: codex exec", 1, true) ~= nil)
+  end,
+
+  test_13_run_department_shares_mock_state = function()
+    t.mock_command("gh issue list", { stdout = "dept\n", exit_code = 0 })
+    local result = t.run_department("departments/probe/main.lua", { payload = { cmd = "gh issue list" } })
+    t.eq(result.exit_code, 0)
+    t.eq(result.raises[1].payload.stdout, "dept\n")
+    local calls = t.command_calls()
+    t.eq(#calls, 1)
+    t.eq(calls[1].rendered, "gh issue list")
+  end,
+
+  test_14_per_test_isolation_clears_prior_mocks_and_calls = function()
+    t.eq(#t.command_calls(), 0)
+    local ok, err = pcall(function()
+      exec_sync("gh issue list --json number")
+    end)
+    t.eq(ok, false)
+    t.is_true(string.find(tostring(err), "unmocked external command: gh issue list --json number", 1, true) ~= nil)
+  end,
+}
+"#,
+    )
+    .unwrap();
+
+    let output = run_lua_tests(host.path(), host.path());
+
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}",
+        stdout(&output),
+        stderr(&output)
+    );
+    let out = stdout(&output);
+    assert!(out.contains("14 passed, 0 failed"), "stdout: {out}");
+}
+
+#[test]
 fn test_surface_does_not_leak_to_production_run() {
     let host = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
     fs::create_dir_all(host.path().join("departments/probe")).unwrap();

@@ -9,6 +9,8 @@ use std::process::{Command, Stdio};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+use crate::external_command::MockCommandState;
+
 struct ExecOptions {
     cmd: String,
     cwd: Option<String>,
@@ -25,6 +27,10 @@ struct ExecResult {
 
 // Lua SDK registration and self-test match the fixed CLAUDE.md surface exactly; human notification, if needed, is represented through existing git/fs/log facts rather than a new SDK function.
 pub fn register(lua: &Lua) -> Result<()> {
+    register_with_runner(lua, None)
+}
+
+pub(crate) fn register_with_runner(lua: &Lua, runner: Option<MockCommandState>) -> Result<()> {
     lua.globals().set(
         "now",
         lua.create_function(|_, ()| {
@@ -38,9 +44,9 @@ pub fn register(lua: &Lua) -> Result<()> {
 
     lua.globals().set(
         "exec_sync",
-        lua.create_function(|lua, arg: Value| {
+        lua.create_function(move |lua, arg: Value| {
             let opts = parse_exec_options(arg)?;
-            let out = run_exec_sync(opts)?;
+            let out = run_exec_sync(opts, runner.as_ref())?;
             let t = lua.create_table()?;
             t.set("stdout", out.stdout)?;
             t.set("stderr", out.stderr)?;
@@ -123,7 +129,22 @@ fn kill_process_group(child_pid: u32) {
 #[cfg(not(unix))]
 fn kill_process_group(_child_pid: u32) {}
 
-fn run_exec_sync(opts: ExecOptions) -> Result<ExecResult> {
+fn run_exec_sync(opts: ExecOptions, runner: Option<&MockCommandState>) -> Result<ExecResult> {
+    if let Some(runner) = runner {
+        let result = runner.execute(
+            opts.cmd.clone(),
+            "/bin/sh".to_string(),
+            vec!["-c".to_string(), opts.cmd],
+            String::new(),
+        )?;
+        return Ok(ExecResult {
+            stdout: result.stdout,
+            stderr: result.stderr,
+            exit_code: result.exit_code,
+            timed_out: None,
+        });
+    }
+
     match opts.timeout {
         Some(timeout) => run_exec_sync_with_timeout(&opts, timeout),
         None => {

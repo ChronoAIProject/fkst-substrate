@@ -18,6 +18,7 @@ use serde_json::Value as JsonValue;
 use std::path::PathBuf;
 
 mod config_registry;
+mod external_command;
 mod host_conformance;
 mod mlua_init;
 mod path_resolver;

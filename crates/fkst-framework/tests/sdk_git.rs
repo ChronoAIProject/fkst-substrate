@@ -2,6 +2,8 @@
 
 #[path = "../src/config_registry.rs"]
 mod config_registry;
+#[path = "../src/external_command.rs"]
+mod external_command;
 #[path = "../src/runtime_context.rs"]
 mod runtime_context;
 #[path = "../src/sdk_git.rs"]

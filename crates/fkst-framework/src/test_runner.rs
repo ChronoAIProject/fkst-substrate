@@ -3,6 +3,7 @@ use mlua::{Function, Lua, LuaSerdeExt, Table, Value};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+use crate::external_command::{MockCommandResult, MockCommandState};
 use crate::path_resolver::PackageRoots;
 use crate::raise::RaiseBuffer;
 
@@ -13,15 +14,17 @@ pub(crate) fn run_tests(roots: PackageRoots) -> Result<i32> {
 
     for file in files {
         let relpath = display_path(&file.path, &file.owner_root);
+        let mock_commands = MockCommandState::new();
         let lua = crate::mlua_init::new_lua();
         crate::mlua_init::set_package_roots_path(&lua, [file.owner_root.as_path()])
             .with_context(|| format!("set package.path for tests in {}", relpath))?;
-        crate::mlua_init::register_framework_sdk(
+        crate::mlua_init::register_framework_sdk_with_runner(
             &lua,
             RaiseBuffer::new(),
             roots.host_root(),
             roots.name_resolver(),
             file.owner_namespace.clone(),
+            Some(mock_commands.clone()),
         )
         .with_context(|| format!("register SDK for {}", relpath))?;
         register_test_sdk(
@@ -29,12 +32,16 @@ pub(crate) fn run_tests(roots: PackageRoots) -> Result<i32> {
             roots.clone(),
             file.owner_root.clone(),
             file.owner_namespace.clone(),
+            mock_commands.clone(),
         )
         .with_context(|| format!("register fkst.test for {}", relpath))?;
 
         match load_test_table(&lua, &file.path) {
             Ok(tests) => {
                 for (name, func) in tests {
+                    mock_commands
+                        .reset()
+                        .with_context(|| format!("reset mock commands for {relpath}::{name}"))?;
                     match func.call::<()>(()) {
                         Ok(()) => {
                             println!("PASS {relpath}::{name}");
@@ -172,6 +179,7 @@ fn register_test_sdk(
     roots: PackageRoots,
     owner_root: PathBuf,
     owner_namespace: String,
+    mock_commands: MockCommandState,
 ) -> mlua::Result<()> {
     let globals = lua.globals();
     let fkst = match globals.get::<Value>("fkst")? {
@@ -242,8 +250,46 @@ fn register_test_sdk(
             ))
         })?,
     )?;
-    test.set(
-        "run_department",
+    test.set("mock_command", {
+        let mock_commands = mock_commands.clone();
+        lua.create_function(move |_, (pattern, result): (String, Table)| {
+            let stdout = result.get::<Option<String>>("stdout")?.unwrap_or_default();
+            let stderr = result.get::<Option<String>>("stderr")?.unwrap_or_default();
+            let exit_code = result.get::<Option<i32>>("exit_code")?.unwrap_or(0);
+            mock_commands.push_mock(
+                pattern,
+                MockCommandResult {
+                    stdout,
+                    stderr,
+                    exit_code,
+                },
+            )
+        })?
+    })?;
+    test.set("command_calls", {
+        let mock_commands = mock_commands.clone();
+        lua.create_function(move |lua, ()| {
+            let calls = lua.create_table()?;
+            for (idx, call) in mock_commands.calls()?.into_iter().enumerate() {
+                let entry = lua.create_table()?;
+                entry.set("rendered", call.rendered)?;
+                entry.set("program", call.program)?;
+                let args = lua.create_table()?;
+                for (arg_idx, arg) in call.args.into_iter().enumerate() {
+                    args.set(arg_idx + 1, arg)?;
+                }
+                entry.set("args", args)?;
+                entry.set("stdin", call.stdin)?;
+                entry.set("stdout", call.stdout)?;
+                entry.set("stderr", call.stderr)?;
+                entry.set("exit_code", call.exit_code)?;
+                calls.set(idx + 1, entry)?;
+            }
+            Ok(calls)
+        })?
+    })?;
+    test.set("run_department", {
+        let mock_commands = mock_commands.clone();
         lua.create_function(
             move |lua, (path, event, opts): (String, Value, Option<Table>)| {
                 run_department(
@@ -251,13 +297,14 @@ fn register_test_sdk(
                     &roots,
                     &owner_root,
                     &owner_namespace,
+                    mock_commands.clone(),
                     path,
                     event,
                     opts,
                 )
             },
-        )?,
-    )?;
+        )?
+    })?;
     fkst.set("test", test)?;
     globals.set("fkst", fkst)?;
     Ok(())
@@ -268,6 +315,7 @@ fn run_department(
     roots: &PackageRoots,
     owner_root: &Path,
     owner_namespace: &str,
+    mock_commands: MockCommandState,
     path: String,
     event: Value,
     opts: Option<Table>,
@@ -279,12 +327,13 @@ fn run_department(
 
     let dept_lua = crate::mlua_init::new_lua();
     let raise_buf = RaiseBuffer::new();
-    crate::mlua_init::register_framework_sdk(
+    crate::mlua_init::register_framework_sdk_with_runner(
         &dept_lua,
         raise_buf.clone(),
         roots.host_root(),
         roots.name_resolver(),
         owner_namespace.to_string(),
+        Some(mock_commands),
     )?;
 
     let require_roots = roots.require_roots_for_owner(owner_root);

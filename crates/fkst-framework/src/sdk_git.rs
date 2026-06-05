@@ -11,20 +11,30 @@ use mlua::{Function, Lua, Result};
 use nix::fcntl::{flock, FlockArg};
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Output};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::config_registry::{ConfigContext, ConfigKey};
+use crate::external_command::{format_command, MockCommandState};
 use crate::runtime_context;
 
 pub fn register(lua: &Lua, host_root: &Path, config: ConfigContext) -> Result<()> {
+    register_with_runner(lua, host_root, config, None)
+}
+
+pub(crate) fn register_with_runner(
+    lua: &Lua,
+    host_root: &Path,
+    config: ConfigContext,
+    runner: Option<MockCommandState>,
+) -> Result<()> {
     let host_root = host_root.to_path_buf();
     register_with_lock(lua, host_root.clone())?;
-    register_setup_worktree(lua, host_root.clone(), config)?;
-    register_git_log_count(lua, host_root.clone())?;
-    register_git_log_grep(lua, host_root.clone())?;
-    register_count_worktrees(lua, host_root.clone())?;
-    register_list_orphan_worktrees(lua, host_root)?;
+    register_setup_worktree(lua, host_root.clone(), config, runner.clone())?;
+    register_git_log_count(lua, host_root.clone(), runner.clone())?;
+    register_git_log_grep(lua, host_root.clone(), runner.clone())?;
+    register_count_worktrees(lua, host_root.clone(), runner.clone())?;
+    register_list_orphan_worktrees(lua, host_root, runner)?;
     Ok(())
 }
 
@@ -75,7 +85,12 @@ fn register_with_lock(lua: &Lua, host_root: PathBuf) -> Result<()> {
     Ok(())
 }
 
-fn register_setup_worktree(lua: &Lua, host_root: PathBuf, config: ConfigContext) -> Result<()> {
+fn register_setup_worktree(
+    lua: &Lua,
+    host_root: PathBuf,
+    config: ConfigContext,
+    runner: Option<MockCommandState>,
+) -> Result<()> {
     lua.globals().set(
         "setup_worktree",
         lua.create_function(move |_, prefix: String| {
@@ -86,7 +101,7 @@ fn register_setup_worktree(lua: &Lua, host_root: PathBuf, config: ConfigContext)
             let worktrees = layout.runtime_dir(RuntimeKind::Worktrees);
             let path = worktrees.join(format!("{}-{}", prefix, ulid));
             let path = path.to_string_lossy().into_owned();
-            let parent_ref = current_parent_ref(&host_root)?;
+            let parent_ref = current_parent_ref_with_runner(&host_root, runner.as_ref())?;
             let parent_name = branch_slug(&parent_ref);
             let branch = format!(
                 "{}-{}-{}-{}{}{}",
@@ -101,10 +116,11 @@ fn register_setup_worktree(lua: &Lua, host_root: PathBuf, config: ConfigContext)
             // worktrees live below RuntimeLayout worktrees dir.
             std::fs::create_dir_all(worktrees).map_err(mlua::Error::external)?;
 
-            let out = git_command(&host_root)
-                .args(["worktree", "add", "-b", &branch, &path, &parent_ref])
-                .output()
-                .map_err(mlua::Error::external)?;
+            let out = run_git_command(
+                &host_root,
+                ["worktree", "add", "-b", &branch, &path, &parent_ref],
+                runner.as_ref(),
+            )?;
 
             if !out.status.success() {
                 let err = String::from_utf8_lossy(&out.stderr);
@@ -152,11 +168,11 @@ fn validate_branch_fragment(name: &str, value: &str) -> Result<()> {
     Ok(())
 }
 
-fn current_parent_ref(host_root: &Path) -> Result<String> {
-    let branch = git_command(host_root)
-        .args(["rev-parse", "--abbrev-ref", "HEAD"])
-        .output()
-        .map_err(mlua::Error::external)?;
+fn current_parent_ref_with_runner(
+    host_root: &Path,
+    runner: Option<&MockCommandState>,
+) -> Result<String> {
+    let branch = run_git_command(host_root, ["rev-parse", "--abbrev-ref", "HEAD"], runner)?;
     if !branch.status.success() {
         return Err(read_failure("git-current-branch-failed", &branch.stderr));
     }
@@ -165,10 +181,7 @@ fn current_parent_ref(host_root: &Path) -> Result<String> {
         return Ok(branch);
     }
 
-    let sha = git_command(host_root)
-        .args(["rev-parse", "--short=12", "HEAD"])
-        .output()
-        .map_err(mlua::Error::external)?;
+    let sha = run_git_command(host_root, ["rev-parse", "--short=12", "HEAD"], runner)?;
     if !sha.status.success() {
         return Err(read_failure("git-current-sha-failed", &sha.stderr));
     }
@@ -226,19 +239,24 @@ fn civil_from_days(days_since_epoch: i64) -> (i32, u32, u32) {
     (year as i32, month as u32, day as u32)
 }
 
-fn register_git_log_count(lua: &Lua, host_root: PathBuf) -> Result<()> {
+fn register_git_log_count(
+    lua: &Lua,
+    host_root: PathBuf,
+    runner: Option<MockCommandState>,
+) -> Result<()> {
     lua.globals().set(
         "git_log_count",
         lua.create_function(move |_, (grep, since): (String, String)| {
-            let out = git_command(&host_root)
-                .args([
+            let out = run_git_command(
+                &host_root,
+                [
                     "log",
                     &format!("--grep={}", grep),
                     &format!("--since={}", since),
                     "--oneline",
-                ])
-                .output()
-                .map_err(mlua::Error::external)?;
+                ],
+                runner.as_ref(),
+            )?;
 
             if !out.status.success() {
                 return Err(read_failure("git-log-count-failed", &out.stderr));
@@ -251,19 +269,24 @@ fn register_git_log_count(lua: &Lua, host_root: PathBuf) -> Result<()> {
     Ok(())
 }
 
-fn register_git_log_grep(lua: &Lua, host_root: PathBuf) -> Result<()> {
+fn register_git_log_grep(
+    lua: &Lua,
+    host_root: PathBuf,
+    runner: Option<MockCommandState>,
+) -> Result<()> {
     lua.globals().set(
         "git_log_grep",
         lua.create_function(move |_, (grep, since): (String, String)| {
-            let out = git_command(&host_root)
-                .args([
+            let out = run_git_command(
+                &host_root,
+                [
                     "log",
                     &format!("--grep={}", grep),
                     &format!("--since={}", since),
                     "--format=%H",
-                ])
-                .output()
-                .map_err(mlua::Error::external)?;
+                ],
+                runner.as_ref(),
+            )?;
 
             if !out.status.success() {
                 return Err(read_failure("git-log-grep-failed", &out.stderr));
@@ -290,14 +313,19 @@ pub(crate) fn parse_worktree_paths(stdout: &[u8]) -> Vec<String> {
         .collect()
 }
 
-fn register_count_worktrees(lua: &Lua, host_root: PathBuf) -> Result<()> {
+fn register_count_worktrees(
+    lua: &Lua,
+    host_root: PathBuf,
+    runner: Option<MockCommandState>,
+) -> Result<()> {
     lua.globals().set(
         "count_worktrees",
         lua.create_function(move |_, ()| {
-            let out = git_command(&host_root)
-                .args(["worktree", "list", "--porcelain"])
-                .output()
-                .map_err(mlua::Error::external)?;
+            let out = run_git_command(
+                &host_root,
+                ["worktree", "list", "--porcelain"],
+                runner.as_ref(),
+            )?;
 
             if !out.status.success() {
                 return Err(read_failure("git-worktree-list-failed", &out.stderr));
@@ -310,14 +338,19 @@ fn register_count_worktrees(lua: &Lua, host_root: PathBuf) -> Result<()> {
     Ok(())
 }
 
-fn register_list_orphan_worktrees(lua: &Lua, host_root: PathBuf) -> Result<()> {
+fn register_list_orphan_worktrees(
+    lua: &Lua,
+    host_root: PathBuf,
+    runner: Option<MockCommandState>,
+) -> Result<()> {
     lua.globals().set(
         "list_orphan_worktrees",
         lua.create_function(move |_, prefix: String| {
-            let out = git_command(&host_root)
-                .args(["worktree", "list", "--porcelain"])
-                .output()
-                .map_err(mlua::Error::external)?;
+            let out = run_git_command(
+                &host_root,
+                ["worktree", "list", "--porcelain"],
+                runner.as_ref(),
+            )?;
 
             if !out.status.success() {
                 return Err(read_failure("git-worktree-list-failed", &out.stderr));
@@ -346,6 +379,78 @@ fn git_command(host_root: &Path) -> Command {
     let mut command = Command::new("git");
     command.arg("-C").arg(host_root);
     command
+}
+
+fn run_git_command<'a>(
+    host_root: &Path,
+    args: impl IntoIterator<Item = &'a str>,
+    runner: Option<&MockCommandState>,
+) -> Result<Output> {
+    let mut rendered_args = vec!["-C".to_string(), host_root.to_string_lossy().into_owned()];
+    rendered_args.extend(args.into_iter().map(ToOwned::to_owned));
+    if let Some(runner) = runner {
+        let result = runner.execute(
+            format_command("git", &rendered_args),
+            "git".to_string(),
+            rendered_args,
+            String::new(),
+        )?;
+        return Ok(mock_output(result.stdout, result.stderr, result.exit_code));
+    }
+
+    git_command(host_root)
+        .args(rendered_args.iter().skip(2))
+        .output()
+        .map_err(mlua::Error::external)
+}
+
+#[cfg(unix)]
+fn mock_output(stdout: String, stderr: String, exit_code: i32) -> Output {
+    use std::os::unix::process::ExitStatusExt;
+
+    Output {
+        status: std::process::ExitStatus::from_raw(exit_code << 8),
+        stdout: stdout.into_bytes(),
+        stderr: stderr.into_bytes(),
+    }
+}
+
+#[cfg(not(unix))]
+fn mock_output(stdout: String, stderr: String, exit_code: i32) -> Output {
+    Output {
+        status: portable_exit_status(exit_code),
+        stdout: stdout.into_bytes(),
+        stderr: stderr.into_bytes(),
+    }
+}
+
+#[cfg(not(unix))]
+fn portable_exit_status(exit_code: i32) -> std::process::ExitStatus {
+    let code = exit_code.clamp(0, 255).to_string();
+    std::process::Command::new(platform_shell())
+        .args(platform_shell_exit_args(code))
+        .status()
+        .expect("platform shell must produce mock command exit status")
+}
+
+#[cfg(all(not(unix), windows))]
+fn platform_shell() -> &'static str {
+    "cmd"
+}
+
+#[cfg(all(not(unix), windows))]
+fn platform_shell_exit_args(code: String) -> Vec<String> {
+    vec!["/C".to_string(), "exit".to_string(), code]
+}
+
+#[cfg(all(not(unix), not(windows)))]
+fn platform_shell() -> &'static str {
+    "sh"
+}
+
+#[cfg(all(not(unix), not(windows)))]
+fn platform_shell_exit_args(code: String) -> Vec<String> {
+    vec!["-c".to_string(), format!("exit {code}")]
 }
 
 fn runtime_dir_abs(layout: &RuntimeLayout, kind: RuntimeKind) -> std::path::PathBuf {
