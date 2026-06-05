@@ -457,7 +457,12 @@ mod tests {
             .lease_for_dept("pkg.worker", now_unix_millis(), 8, Duration::from_secs(30))
             .unwrap();
         let other = store
-            .lease_for_dept("other.worker", now_unix_millis(), 8, Duration::from_secs(30))
+            .lease_for_dept(
+                "other.worker",
+                now_unix_millis(),
+                8,
+                Duration::from_secs(30),
+            )
             .unwrap();
 
         assert_eq!(pkg.len(), 1);

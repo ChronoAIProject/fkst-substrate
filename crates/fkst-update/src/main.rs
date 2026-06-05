@@ -130,9 +130,9 @@ fn parse_options(args: &[String]) -> UpdateResult<Option<Options>> {
             "--bin-dir" => bin_dir = Some(PathBuf::from(next_value(&mut iter, "--bin-dir")?)),
             "--repo" => repo = next_value(&mut iter, "--repo")?,
             "--timeout" => {
-                let secs: u64 = next_value(&mut iter, "--timeout")?
-                    .parse()
-                    .map_err(|_| UpdateError::new(ErrorClass::BadArgs, "--timeout expects seconds"))?;
+                let secs: u64 = next_value(&mut iter, "--timeout")?.parse().map_err(|_| {
+                    UpdateError::new(ErrorClass::BadArgs, "--timeout expects seconds")
+                })?;
                 timeout = Duration::from_secs(secs);
             }
             other => {
@@ -155,10 +155,7 @@ fn parse_options(args: &[String]) -> UpdateResult<Option<Options>> {
     }))
 }
 
-fn next_value<'a>(
-    iter: &mut impl Iterator<Item = &'a String>,
-    flag: &str,
-) -> UpdateResult<String> {
+fn next_value<'a>(iter: &mut impl Iterator<Item = &'a String>, flag: &str) -> UpdateResult<String> {
     iter.next()
         .cloned()
         .ok_or_else(|| UpdateError::new(ErrorClass::BadArgs, format!("{flag} expects a value")))
@@ -226,8 +223,14 @@ fn install_asset(options: &Options, asset: &ReleaseAsset, work: &Path) -> Update
 
 fn resolve_release(options: &Options) -> UpdateResult<ReleaseAsset> {
     let api_url = match &options.tag {
-        Some(tag) => format!("https://api.github.com/repos/{}/releases/tags/{tag}", options.repo),
-        None => format!("https://api.github.com/repos/{}/releases/latest", options.repo),
+        Some(tag) => format!(
+            "https://api.github.com/repos/{}/releases/tags/{tag}",
+            options.repo
+        ),
+        None => format!(
+            "https://api.github.com/repos/{}/releases/latest",
+            options.repo
+        ),
     };
     let outcome = run_command("curl", &["-fsSL", &api_url], options.timeout)
         .map_err(|err| UpdateError::new(ErrorClass::ReleaseQueryFailed, err.to_string()))?;
@@ -300,7 +303,10 @@ fn download_to(url: &str, path: &Path, timeout: Duration) -> UpdateResult<()> {
     let outcome = run_command("curl", &["-fsSL", url, "-o", &out], timeout)
         .map_err(|err| UpdateError::new(ErrorClass::DownloadFailed, err.to_string()))?;
     if outcome.timed_out {
-        return Err(UpdateError::new(ErrorClass::DownloadFailed, format!("timeout: {url}")));
+        return Err(UpdateError::new(
+            ErrorClass::DownloadFailed,
+            format!("timeout: {url}"),
+        ));
     }
     if outcome.status != Some(0) {
         return Err(UpdateError::new(
@@ -507,7 +513,10 @@ mod tests {
             expected_digest(body, "fkst-aarch64-apple-darwin.tar.gz"),
             Some("abc123".to_string())
         );
-        assert_eq!(expected_digest(body, "SHA256SUMS"), Some("def456".to_string()));
+        assert_eq!(
+            expected_digest(body, "SHA256SUMS"),
+            Some("def456".to_string())
+        );
         assert_eq!(expected_digest(body, "missing.tar.gz"), None);
     }
 

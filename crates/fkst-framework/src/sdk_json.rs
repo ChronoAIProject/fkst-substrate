@@ -31,7 +31,10 @@ mod tests {
     fn object_decodes_to_table() {
         let lua = Lua::new();
         register(&lua).unwrap();
-        let value: i64 = lua.load(r#"return json.decode('{"a":1}').a"#).eval().unwrap();
+        let value: i64 = lua
+            .load(r#"return json.decode('{"a":1}').a"#)
+            .eval()
+            .unwrap();
         assert_eq!(value, 1);
     }
 
@@ -39,7 +42,10 @@ mod tests {
     fn array_decodes_to_one_indexed_sequence() {
         let lua = Lua::new();
         register(&lua).unwrap();
-        let value: i64 = lua.load(r#"return json.decode('[1,2,3]')[2]"#).eval().unwrap();
+        let value: i64 = lua
+            .load(r#"return json.decode('[1,2,3]')[2]"#)
+            .eval()
+            .unwrap();
         assert_eq!(value, 2);
     }
 
@@ -64,7 +70,10 @@ mod tests {
     fn malformed_input_raises_json_decode_error() {
         let lua = Lua::new();
         register(&lua).unwrap();
-        let err = lua.load(r#"return json.decode("{bad")"#).eval::<mlua::Value>().unwrap_err();
+        let err = lua
+            .load(r#"return json.decode("{bad")"#)
+            .eval::<mlua::Value>()
+            .unwrap_err();
         assert!(err.to_string().contains("json.decode invalid-json:"));
     }
 
@@ -72,7 +81,10 @@ mod tests {
     fn empty_string_raises_json_decode_error() {
         let lua = Lua::new();
         register(&lua).unwrap();
-        let err = lua.load(r#"return json.decode("")"#).eval::<mlua::Value>().unwrap_err();
+        let err = lua
+            .load(r#"return json.decode("")"#)
+            .eval::<mlua::Value>()
+            .unwrap_err();
         assert!(err.to_string().contains("json.decode invalid-json:"));
     }
 
@@ -101,7 +113,10 @@ mod tests {
         // (mlua_init::json_to_lua), yielding the null sentinel rather than Lua nil.
         let lua = Lua::new();
         register(&lua).unwrap();
-        let is_lua_nil: bool = lua.load(r#"return json.decode("null") == nil"#).eval().unwrap();
+        let is_lua_nil: bool = lua
+            .load(r#"return json.decode("null") == nil"#)
+            .eval()
+            .unwrap();
         assert!(!is_lua_nil);
     }
 }

@@ -140,14 +140,8 @@ mod tests {
         .exec()
         .unwrap();
 
-        let err = lua
-            .load(r#"raise("missing.done", {})"#)
-            .exec()
-            .unwrap_err();
-        assert!(
-            err.to_string().contains("unknown namespace"),
-            "got: {err}"
-        );
+        let err = lua.load(r#"raise("missing.done", {})"#).exec().unwrap_err();
+        assert!(err.to_string().contains("unknown namespace"), "got: {err}");
 
         let entries = buf.0.lock().unwrap();
         assert_eq!(entries.len(), 2);
