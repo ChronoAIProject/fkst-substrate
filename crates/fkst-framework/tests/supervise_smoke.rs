@@ -214,7 +214,7 @@ async fn spawn_framework_passes_codex_permit_slots_env() {
         &binary,
         &lua_dummy,
         sandbox.root(),
-        sandbox.root(),
+        &[sandbox.root().to_path_buf()],
         "{}",
         Duration::from_secs(5),
         7,
@@ -240,7 +240,7 @@ async fn framework_child_log_records_final_metadata_for_exit_modes() {
         &success,
         &lua_dummy,
         sandbox.root(),
-        sandbox.root(),
+        &[sandbox.root().to_path_buf()],
         "{}",
         Duration::from_secs(5),
         20,
@@ -253,7 +253,7 @@ async fn framework_child_log_records_final_metadata_for_exit_modes() {
     assert!(success_log.contains("CMD="));
     assert!(success_log.contains("PID="));
     assert!(success_log.contains("LUA="));
-    assert!(success_log.contains("PACKAGE_ROOT="));
+    assert!(success_log.contains("PACKAGE_ROOTS="));
     assert!(success_log.contains("DEPT=success"));
     assert!(success_log.contains("EXIT=0\n"));
     assert!(success_log.contains("STALLED=false\n"));
@@ -265,7 +265,7 @@ async fn framework_child_log_records_final_metadata_for_exit_modes() {
         &nonzero,
         &lua_dummy,
         sandbox.root(),
-        sandbox.root(),
+        &[sandbox.root().to_path_buf()],
         "{}",
         Duration::from_secs(5),
         20,
@@ -289,7 +289,7 @@ async fn framework_child_log_records_final_metadata_for_exit_modes() {
         &stall,
         &lua_dummy,
         sandbox.root(),
-        sandbox.root(),
+        &[sandbox.root().to_path_buf()],
         "{}",
         Duration::from_millis(120),
         20,
@@ -326,7 +326,7 @@ async fn framework_child_log_failure_preserves_spawn_result() {
         &binary,
         &lua_dummy,
         sandbox.root(),
-        sandbox.root(),
+        &[sandbox.root().to_path_buf()],
         "{}",
         Duration::from_secs(5),
         20,

@@ -1,6 +1,6 @@
 //! fkst-framework — Tier III one-shot Lua runner.
 //!
-//! CLI: `fkst-framework run <lua_file> --project-root <path> --event '<json>'`
+//! CLI: `fkst-framework run <lua_file> --project-root <path> --package-root <path> ... --event '<json>'`
 //! CLI: `fkst-framework supervise --project-root <path> --framework-bin <path>`
 //! CLI: `fkst-framework conformance --project-root <path>`
 //! CLI: `fkst-framework test --project-root <path> [--package-root <path> ...]`
@@ -63,7 +63,7 @@ fn parse_args() -> Result<CliCommand> {
     let mut args_iter = args.into_iter();
     let sub = args_iter.next().ok_or_else(|| {
         anyhow::anyhow!(
-            "usage: fkst-framework run <lua> --project-root <path> --package-root <path> --event <json> | fkst-framework supervise --project-root <path> --framework-bin <path> [--package-root <path> ...] | fkst-framework conformance --project-root <path> [--package-root <path> ...] | fkst-framework config --project-root <path> [--package-root <path> ...] | fkst-framework test --project-root <path> [--package-root <path> ...] | fkst-framework --self-test"
+            "usage: fkst-framework run <lua> --project-root <path> --package-root <path> [--package-root <path> ...] --event <json> | fkst-framework supervise --project-root <path> --framework-bin <path> [--package-root <path> ...] | fkst-framework conformance --project-root <path> [--package-root <path> ...] | fkst-framework config --project-root <path> [--package-root <path> ...] | fkst-framework test --project-root <path> [--package-root <path> ...] | fkst-framework --self-test"
         )
     })?;
     if sub == "--self-test" {
@@ -111,17 +111,14 @@ fn parse_args() -> Result<CliCommand> {
             .ok_or_else(|| anyhow::anyhow!("missing <lua_file> arg"))?
             .into();
         let mut project_root: Option<PathBuf> = None;
-        let mut package_root: Option<PathBuf> = None;
+        let mut package_roots: Vec<PathBuf> = Vec::new();
         let mut event_json: Option<String> = None;
         while let Some(a) = args_iter.next() {
             match a.as_str() {
                 "--event" => event_json = args_iter.next(),
                 "--project-root" => project_root = args_iter.next().map(PathBuf::from),
                 "--package-root" => {
-                    if package_root.is_some() {
-                        anyhow::bail!("duplicate --package-root for run");
-                    }
-                    package_root = Some(next_iter_value(&mut args_iter, "--package-root")?.into());
+                    package_roots.push(next_iter_value(&mut args_iter, "--package-root")?.into());
                 }
                 other => anyhow::bail!("unknown run argument: {}", other),
             }
@@ -130,7 +127,7 @@ fn parse_args() -> Result<CliCommand> {
         let event: JsonValue = serde_json::from_str(&event_str)
             .with_context(|| format!("--event not valid json: {}", event_str))?;
         let project_root = project_root.ok_or_else(|| anyhow::anyhow!("missing --project-root"))?;
-        let roots = PackageRoots::resolve_run(project_root, package_root)?;
+        let roots = PackageRoots::resolve_run(project_root, package_roots)?;
         return Ok(CliCommand::Run {
             lua_path,
             roots,

@@ -1,6 +1,6 @@
 //! Framework spawn with new process group + SIGKILL -pgid on stall.
 //!
-//! Spawn `fkst-framework run <lua_path> --project-root <path> --package-root <path> --event <json>` with setsid.
+//! Spawn `fkst-framework run <lua_path> --project-root <path> --package-root <path> ... --event <json>` with setsid.
 //! On no-output stall, send SIGKILL to -pgid so codex subprocess children are collected too.
 
 use anyhow::{Context, Result};
@@ -51,7 +51,7 @@ pub async fn spawn_framework(
     binary: &Path,
     lua_path: &Path,
     host_root: &Path,
-    package_root: &Path,
+    package_roots: &[PathBuf],
     event_json: &str,
     stall_window: Duration,
     codex_permit_slots: usize,
@@ -60,17 +60,17 @@ pub async fn spawn_framework(
 ) -> Result<SpawnResult> {
     let start = std::time::Instant::now();
     let cmd_line = format!(
-        "{} run {} --project-root {} --package-root {} --event <json>",
+        "{} run {} --project-root {} {} --event <json>",
         binary.display(),
         lua_path.display(),
         host_root.display(),
-        package_root.display()
+        package_root_flags(package_roots)
     );
     let mut log = FrameworkChildLog::open(log_dir, child_label);
     log.write_line(&format!("CMD={cmd_line}"));
     log.write_line(&format!("LUA={}", lua_path.display()));
     log.write_line(&format!("HOST_ROOT={}", host_root.display()));
-    log.write_line(&format!("PACKAGE_ROOT={}", package_root.display()));
+    log.write_line(&format!("PACKAGE_ROOTS={}", package_root_list(package_roots)));
     log.write_line(&format!("DEPT={child_label}"));
     log.write_line(&format!("STALL_WINDOW_MS={}", stall_window.as_millis()));
 
@@ -78,10 +78,11 @@ pub async fn spawn_framework(
     cmd.arg("run")
         .arg(lua_path)
         .arg("--project-root")
-        .arg(host_root)
-        .arg("--package-root")
-        .arg(package_root)
-        .arg("--event")
+        .arg(host_root);
+    for package_root in package_roots {
+        cmd.arg("--package-root").arg(package_root);
+    }
+    cmd.arg("--event")
         .arg(event_json)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -110,6 +111,22 @@ pub async fn spawn_framework(
     info!(pid = pid, lua = %lua_path.display(), stall_window_ms = stall_window.as_millis(), "framework spawned");
 
     wait_with_stall_window(child, pid, stall_window, start, log).await
+}
+
+fn package_root_flags(package_roots: &[PathBuf]) -> String {
+    package_roots
+        .iter()
+        .map(|root| format!("--package-root {}", root.display()))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn package_root_list(package_roots: &[PathBuf]) -> String {
+    package_roots
+        .iter()
+        .map(|root| root.display().to_string())
+        .collect::<Vec<_>>()
+        .join(";")
 }
 
 // stdout/stderr output resets a no-output stall window.

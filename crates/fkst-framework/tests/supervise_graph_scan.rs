@@ -728,6 +728,99 @@ fn multiple_package_roots_and_host_form_one_graph() {
 }
 
 #[test]
+fn host_department_uses_package_standard_asset_in_multi_package_graph() {
+    let _root = EnvGuard::set("FKST_RUNTIME_ROOT", ".fkst/runtime");
+    let package_a = write_repo(
+        &[],
+        &[(
+            "tick_a",
+            r#"return { type = "cron", interval = "10s", produces = "tick_a" }"#,
+        )],
+    );
+    fs::create_dir_all(package_a.path().join("fkst")).unwrap();
+    fs::write(
+        package_a.path().join("fkst/standard_asset.lua"),
+        r#"return { stall_window = function() return "45s" end }"#,
+    )
+    .unwrap();
+    let package_b = write_repo(
+        &[],
+        &[(
+            "tick_b",
+            r#"return { type = "cron", interval = "20s", produces = "tick_b" }"#,
+        )],
+    );
+    let host = write_repo(
+        &[(
+            "host_worker",
+            r#"
+local standard = require("fkst.standard_asset")
+local M = {}
+M.spec = { consumes = {"tick_a"}, produces = {"done"}, stall_window = standard.stall_window() }
+function pipeline(_) end
+return M
+"#,
+        )],
+        &[],
+    );
+
+    let roots = PackageRoots::resolve(
+        host.path(),
+        vec![
+            package_a.path().to_path_buf(),
+            package_b.path().to_path_buf(),
+        ],
+    )
+    .unwrap();
+    let cfg = graph_scan::load_roots(&roots).unwrap();
+
+    assert_eq!(cfg.department["host_worker"].stall_window, "45s");
+    validate(&cfg, host.path()).unwrap();
+}
+
+#[test]
+fn package_department_cannot_require_another_package_private_module() {
+    let _root = EnvGuard::set("FKST_RUNTIME_ROOT", ".fkst/runtime");
+    let package_a = write_repo(
+        &[(
+            "alpha",
+            r#"
+local core = require("core")
+local M = {}
+M.spec = { consumes = {"tick_a"}, produces = {core.queue()}, stall_window = "30s" }
+function pipeline(_) end
+return M
+"#,
+        )],
+        &[(
+            "tick_a",
+            r#"return { type = "cron", interval = "10s", produces = "tick_a" }"#,
+        )],
+    );
+    let package_b = write_repo(&[], &[]);
+    fs::write(
+        package_b.path().join("core.lua"),
+        r#"return { queue = function() return "b_done" end }"#,
+    )
+    .unwrap();
+    let host = write_repo(&[], &[]);
+    let roots = PackageRoots::resolve(
+        host.path(),
+        vec![
+            package_a.path().to_path_buf(),
+            package_b.path().to_path_buf(),
+        ],
+    )
+    .unwrap();
+
+    let err = graph_scan::load_roots(&roots).unwrap_err();
+    let msg = format!("{err:#}");
+
+    assert!(msg.contains("module 'core' not found"), "got: {msg}");
+    assert!(!msg.contains("b_done"), "got: {msg}");
+}
+
+#[test]
 fn graph_scan_uses_fresh_lua_state_and_root_local_require_path() {
     let _root = EnvGuard::set("FKST_RUNTIME_ROOT", ".fkst/runtime");
     let package_a = write_repo(

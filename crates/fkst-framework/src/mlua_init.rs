@@ -70,8 +70,23 @@ pub fn run_dept_with_package_root(
     event: &JsonValue,
     package_root: &Path,
 ) -> Result<()> {
-    set_package_roots_path(lua, [package_root])
-        .with_context(|| format!("set package.path for {}", package_root.display()))?;
+    run_dept_with_require_roots(lua, lua_path, event, [package_root])
+}
+
+pub fn run_dept_with_require_roots<'a>(
+    lua: &Lua,
+    lua_path: &Path,
+    event: &JsonValue,
+    package_roots: impl IntoIterator<Item = &'a Path>,
+) -> Result<()> {
+    let package_roots = package_roots.into_iter().collect::<Vec<_>>();
+    let roots_label = package_roots
+        .iter()
+        .map(|root| root.display().to_string())
+        .collect::<Vec<_>>()
+        .join(";");
+    set_package_roots_path(lua, package_roots.iter().copied())
+        .with_context(|| format!("set package.path for {}", roots_label))?;
 
     let src = std::fs::read_to_string(lua_path)
         .with_context(|| format!("read {}", lua_path.display()))?;
@@ -100,7 +115,12 @@ pub fn run_dept_with_roots(
     event: &JsonValue,
     roots: &PackageRoots,
 ) -> Result<()> {
-    run_dept_with_package_root(lua, lua_path, event, roots.single_package_root()?)
+    run_dept_with_require_roots(
+        lua,
+        lua_path,
+        event,
+        roots.package_roots().iter().map(|root| root.as_path()),
+    )
 }
 
 #[cfg(test)]

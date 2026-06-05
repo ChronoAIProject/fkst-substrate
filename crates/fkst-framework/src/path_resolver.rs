@@ -45,25 +45,26 @@ impl PackageRoots {
 
     pub(crate) fn resolve_run(
         host_root: impl AsRef<Path>,
-        explicit_package_root: Option<PathBuf>,
+        explicit_package_roots: Vec<PathBuf>,
     ) -> Result<Self> {
         reject_removed_package_root_envs()?;
         if std::env::var_os(PACKAGE_ROOTS_ENV).is_some() {
             bail!("{PACKAGE_ROOTS_ENV} is not valid for `run`; pass one --package-root");
         }
         let host_root = canonical_dir(host_root.as_ref(), "--project-root")?;
-        let package_root = match explicit_package_root {
-            Some(root) => canonical_dir(&root, "--package-root")?,
-            None => match std::env::var_os(PACKAGE_ROOT_ENV) {
+        let package_roots = if explicit_package_roots.is_empty() {
+            match std::env::var_os(PACKAGE_ROOT_ENV) {
                 Some(root) if !root.is_empty() => {
-                    canonical_dir(Path::new(&root), PACKAGE_ROOT_ENV)?
+                    vec![canonical_dir(Path::new(&root), PACKAGE_ROOT_ENV)?]
                 }
                 Some(_) => bail!("{PACKAGE_ROOT_ENV} must not be empty"),
                 None => bail!("{PACKAGE_ROOT_ENV} or --package-root is required"),
-            },
+            }
+        } else {
+            canonical_dirs(explicit_package_roots, "--package-root")?
         };
         Ok(Self {
-            package_roots: vec![package_root],
+            package_roots,
             host_root,
         })
     }
@@ -72,18 +73,20 @@ impl PackageRoots {
         &self.package_roots
     }
 
-    pub(crate) fn single_package_root(&self) -> Result<&Path> {
-        match self.package_roots.as_slice() {
-            [root] => Ok(root.as_path()),
-            _ => bail!(
-                "single package root required, got {} package roots",
-                self.package_roots.len()
-            ),
-        }
-    }
-
     pub(crate) fn host_root(&self) -> &Path {
         &self.host_root
+    }
+
+    pub(crate) fn require_roots_for_owner(&self, owner_root: &Path) -> Vec<PathBuf> {
+        if owner_root == self.host_root {
+            if self.package_roots.iter().any(|root| root == &self.host_root) {
+                return vec![self.host_root.clone()];
+            }
+            let mut roots = vec![self.host_root.clone()];
+            roots.extend(self.package_roots.iter().cloned());
+            return roots;
+        }
+        vec![owner_root.to_path_buf()]
     }
 
     pub(crate) fn graph_roots(&self) -> Vec<GraphRoot> {
@@ -192,4 +195,73 @@ fn canonical_dir(path: &Path, label: &str) -> Result<PathBuf> {
     std::fs::read_dir(&canonical)
         .with_context(|| format!("read {label} {}", canonical.display()))?;
     Ok(canonical)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn roots(package_roots: &[&str], host_root: &str) -> PackageRoots {
+        PackageRoots {
+            package_roots: package_roots.iter().map(PathBuf::from).collect(),
+            host_root: PathBuf::from(host_root),
+        }
+    }
+
+    // A package department resolves require() against its own package root only,
+    // even when other package roots are present: package-private modules such as
+    // `core` must never leak across packages via the spawn require-root set.
+    #[test]
+    fn package_owner_require_roots_are_its_own_root_only() {
+        let r = roots(&["/pkg/a", "/pkg/b"], "/host");
+        assert_eq!(
+            r.require_roots_for_owner(Path::new("/pkg/a")),
+            vec![PathBuf::from("/pkg/a")]
+        );
+        assert_eq!(
+            r.require_roots_for_owner(Path::new("/pkg/b")),
+            vec![PathBuf::from("/pkg/b")]
+        );
+    }
+
+    // A host department is the composition layer: it resolves standard assets
+    // (`fkst.*`) from every package root, with the host root first.
+    #[test]
+    fn host_owner_require_roots_are_host_then_all_package_roots() {
+        let r = roots(&["/pkg/a", "/pkg/b"], "/host");
+        assert_eq!(
+            r.require_roots_for_owner(Path::new("/host")),
+            vec![
+                PathBuf::from("/host"),
+                PathBuf::from("/pkg/a"),
+                PathBuf::from("/pkg/b"),
+            ]
+        );
+    }
+
+    // Single package + host: host gets [host, package], package gets [package];
+    // this matches the standard-asset contract while keeping the package sealed.
+    #[test]
+    fn single_package_require_roots_match_standard_asset_contract() {
+        let r = roots(&["/pkg"], "/host");
+        assert_eq!(
+            r.require_roots_for_owner(Path::new("/host")),
+            vec![PathBuf::from("/host"), PathBuf::from("/pkg")]
+        );
+        assert_eq!(
+            r.require_roots_for_owner(Path::new("/pkg")),
+            vec![PathBuf::from("/pkg")]
+        );
+    }
+
+    // When the package root folds into the host root (package == host), the
+    // single combined root is the only require root.
+    #[test]
+    fn package_and_host_fold_yields_single_root() {
+        let r = roots(&["/combined"], "/combined");
+        assert_eq!(
+            r.require_roots_for_owner(Path::new("/combined")),
+            vec![PathBuf::from("/combined")]
+        );
+    }
 }

@@ -335,13 +335,27 @@ end
 }
 
 #[test]
-fn run_rejects_multiple_package_root_flags() {
+fn run_accepts_multiple_package_root_flags_as_require_roots() {
     let host = tempfile::tempdir().unwrap();
     let package_a = tempfile::tempdir().unwrap();
     let package_b = tempfile::tempdir().unwrap();
     fs::create_dir_all(package_a.path().join("departments/probe")).unwrap();
+    fs::write(
+        package_b.path().join("core.lua"),
+        r#"return { value = "from-package-b" }"#,
+    )
+    .unwrap();
     let probe = package_a.path().join("departments/probe/main.lua");
-    fs::write(&probe, "function pipeline(event) end\n").unwrap();
+    fs::write(
+        &probe,
+        r#"
+local core = require("core")
+function pipeline(event)
+  raise("seen", { value = core.value })
+end
+"#,
+    )
+    .unwrap();
 
     let output = run_command(host.path(), &probe)
         .arg("--package-root")
@@ -353,12 +367,11 @@ fn run_rejects_multiple_package_root_flags() {
 
     assert_eq!(
         output.status.code(),
-        Some(2),
+        Some(0),
         "stdout: {}\nstderr: {}",
         stdout(&output),
         stderr(&output)
     );
-    assert!(stderr(&output).contains("duplicate --package-root for run"));
 }
 
 #[test]

@@ -128,15 +128,23 @@ pub fn load_roots(roots: &PackageRoots) -> Result<Config> {
 
     for graph_root in &graph_roots {
         let lua = Lua::new();
+        let require_roots = roots.require_roots_for_owner(&graph_root.root);
         scan_departments(
             &lua,
             graph_root,
+            &require_roots,
             &defaults,
             &mut departments,
             &mut department_owners,
             &mut department_fanout,
         )?;
-        scan_raisers(&lua, graph_root, &mut raisers, &mut raiser_owners)?;
+        scan_raisers(
+            &lua,
+            graph_root,
+            &require_roots,
+            &mut raisers,
+            &mut raiser_owners,
+        )?;
     }
 
     let queues = derive_queues(&departments, &raisers, &department_fanout, &defaults)?;
@@ -164,6 +172,7 @@ fn reject_removed_surfaces(graph_root: &GraphRoot) -> Result<()> {
 fn scan_departments(
     lua: &Lua,
     graph_root: &GraphRoot,
+    require_roots: &[PathBuf],
     defaults: &HostGraphDefaults,
     departments: &mut BTreeMap<String, DepartmentDecl>,
     department_owners: &mut BTreeMap<String, PathBuf>,
@@ -182,7 +191,7 @@ fn scan_departments(
             continue;
         }
 
-        let module = eval_lua_file(lua, repo_root, &main_lua)
+        let module = eval_lua_file(lua, require_roots, &main_lua)
             .with_context(|| format!("eval department `{}` from {}", name, main_lua.display()))?;
         let spec_tbl: Table = module
             .get("spec")
@@ -274,6 +283,7 @@ fn materialize_retry(
 fn scan_raisers(
     lua: &Lua,
     graph_root: &GraphRoot,
+    require_roots: &[PathBuf],
     raisers: &mut BTreeMap<String, RaiserDecl>,
     raiser_owners: &mut BTreeMap<String, PathBuf>,
 ) -> Result<()> {
@@ -291,7 +301,7 @@ fn scan_raisers(
             .ok_or_else(|| anyhow!("raiser file no stem"))?
             .to_string_lossy()
             .into_owned();
-        let val = eval_lua_value(lua, repo_root, &path)
+        let val = eval_lua_value(lua, require_roots, &path)
             .with_context(|| format!("eval raiser `{}` from {}", stem, path.display()))?;
         let r: RaiserDecl = lua
             .from_value(val)
@@ -478,17 +488,17 @@ fn reject_runtime_file_watch_glob(raiser: &RaiserDecl) -> Result<()> {
     Ok(())
 }
 
-fn eval_lua_file(lua: &Lua, lua_root: &Path, path: &Path) -> Result<Table> {
-    match eval_lua_value(lua, lua_root, path)? {
+fn eval_lua_file(lua: &Lua, require_roots: &[PathBuf], path: &Path) -> Result<Table> {
+    match eval_lua_value(lua, require_roots, path)? {
         LuaValue::Table(t) => Ok(t),
         _ => Err(anyhow!("{} did not return a table", path.display())),
     }
 }
 
-fn eval_lua_value(lua: &Lua, lua_root: &Path, path: &Path) -> Result<LuaValue> {
+fn eval_lua_value(lua: &Lua, require_roots: &[PathBuf], path: &Path) -> Result<LuaValue> {
     let source =
         std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
-    set_package_roots_path(lua, [lua_root])?;
+    set_package_roots_path(lua, require_roots.iter().map(PathBuf::as_path))?;
     lua.load(&source)
         .set_name(path.display().to_string())
         .eval()

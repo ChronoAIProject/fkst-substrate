@@ -76,6 +76,7 @@ pub async fn supervise(roots: PackageRoots, framework_bin: PathBuf) -> Result<()
                 name.clone(),
                 decl.clone(),
                 project_root.clone(),
+                roots.clone(),
                 framework_bin.clone(),
                 fanout.clone(),
                 router.clone(),

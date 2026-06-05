@@ -7,6 +7,7 @@ use super::event_fanout::Fanout;
 use super::raised::parse_raised;
 use super::source_runner::parse_duration;
 use super::spawner::{spawn_framework, SpawnResult};
+use crate::path_resolver::PackageRoots;
 use fkst_common::config::{DepartmentDecl, RetryDecl};
 use fkst_common::{Event, RuntimeKind};
 use std::collections::BTreeMap;
@@ -25,6 +26,7 @@ pub async fn spawn_consumer(
     name: String,
     decl: DepartmentDecl,
     project_root: PathBuf,
+    roots: PackageRoots,
     framework_binary: PathBuf,
     fanout: Fanout,
     router: DeliveryRouter,
@@ -114,6 +116,7 @@ pub async fn spawn_consumer(
                             &name,
                             &decl,
                             &project_root,
+                            &roots,
                             &framework_binary,
                             &router,
                             &framework_child_log_dir,
@@ -131,6 +134,7 @@ pub async fn spawn_consumer(
                         &name,
                         &decl,
                         &project_root,
+                        &roots,
                         &framework_binary,
                         &router,
                         store.clone(),
@@ -148,6 +152,7 @@ pub async fn spawn_consumer(
                         &name,
                         &decl,
                         &project_root,
+                        &roots,
                         &framework_binary,
                         &router,
                         store.clone(),
@@ -182,6 +187,7 @@ fn spawn_ephemeral(
     name: &str,
     decl: &DepartmentDecl,
     project_root: &std::path::Path,
+    roots: &PackageRoots,
     framework_binary: &std::path::Path,
     router: &DeliveryRouter,
     log_dir: &std::path::Path,
@@ -192,6 +198,7 @@ fn spawn_ephemeral(
     let args = match spawn_args(
         decl,
         project_root,
+        roots,
         framework_binary,
         log_dir,
         event,
@@ -230,6 +237,7 @@ fn dispatch_due(
     name: &str,
     decl: &DepartmentDecl,
     project_root: &std::path::Path,
+    roots: &PackageRoots,
     framework_binary: &std::path::Path,
     router: &DeliveryRouter,
     store: Option<Arc<DeliveryStore>>,
@@ -266,6 +274,7 @@ fn dispatch_due(
         let args = match spawn_args(
             decl,
             project_root,
+            roots,
             framework_binary,
             log_dir,
             event_from_record(&record),
@@ -537,6 +546,7 @@ fn event_from_record(record: &DeliveryRecord) -> Event {
 fn spawn_args(
     decl: &DepartmentDecl,
     project_root: &std::path::Path,
+    roots: &PackageRoots,
     framework_binary: &std::path::Path,
     log_dir: &std::path::Path,
     event: Event,
@@ -551,7 +561,7 @@ fn spawn_args(
             project_root.join(&decl.lua)
         },
         project_root: project_root.to_path_buf(),
-        package_root: decl.owner_root.clone(),
+        package_roots: roots.require_roots_for_owner(&decl.owner_root),
         event_json: serde_json::to_string(&event)?,
         stall_window,
         codex_permit_slots,
@@ -563,7 +573,7 @@ struct SpawnArgs {
     framework_bin: PathBuf,
     lua_full: PathBuf,
     project_root: PathBuf,
-    package_root: PathBuf,
+    package_roots: Vec<PathBuf>,
     event_json: String,
     stall_window: Duration,
     codex_permit_slots: usize,
@@ -575,7 +585,7 @@ async fn spawn_and_report(dept_name: &str, args: &SpawnArgs) -> anyhow::Result<S
         &args.framework_bin,
         &args.lua_full,
         &args.project_root,
-        &args.package_root,
+        &args.package_roots,
         &args.event_json,
         args.stall_window,
         args.codex_permit_slots,
