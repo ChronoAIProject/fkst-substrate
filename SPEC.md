@@ -9,11 +9,11 @@
 - fkst-substrate 是稳定发布的受监督事件 / SDK / 进程衬底。
 - Tier I 是 process-root supervisor 源码；它只定位 framework binary、启动 `fkst-framework supervise`、继承 stdout/stderr、等待退出、处理进程级 signal 与 reap 子进程。
 - Tier II 是身份锚点：`SPEC.md`、conformance 入口以及不可覆盖 gate 的承诺。
-- Tier III 是 `crates/fkst-framework`、`crates/fkst-common` 与由 installed package root / host root 注入的 Lua graph。Rust framework 与 common 是引擎代码，Lua package 是外部行为层。
-- installed package root 由 `FKST_PACKAGE_ROOT` 或 `--package-root` 定位，承载 package-owned 标准 `departments/`、`raisers/`、`fkst/`、`scripts/`；host root 承载 host-owned 扩展、业务代码和 `fkst.env`。
+- Tier III 是 `crates/fkst-framework`、`crates/fkst-common` 与由 installed package roots input set / host root 注入的 Lua graph。Rust framework 与 common 是引擎代码，Lua package 是外部行为层。
+- installed package roots input set 由可重复 `--package-root`、`FKST_PACKAGE_ROOTS` 或旧单值 `FKST_PACKAGE_ROOT` 定位，承载 package-owned 标准 `departments/`、`raisers/`、`fkst/`、`scripts/`；host root 承载 host-owned 扩展、业务代码和 `fkst.env`。`FKST_PACKAGE_ROOTS` 使用平台 path list 分隔符，不使用逗号。
 - engine operation knob 由 source-owned typed registry 声明；解析顺序是 process env、host `fkst.env`、Operational 默认。HostFact 缺失 fail closed。registry 不读取 `tunables/*.txt`，不提供 set/write/dynamic registration/YAML/DSL/manifest/plugin。
 - layout collision 只拒绝会改变 behavior graph 或 package Lua module identity 的同名 `departments/*`、`raisers/*`；host `scripts/*` 与 `conformance/*` 同名普通文件不构成 package identity collision。
-- 不存在第二 package/root 语义；`FKST_STDLIB_ROOT`、`FKST_RUNTIME_PACKAGE_ROOT`、`FKST_GRAPH_ROOTS` 不是合法 contract。
+- 不存在 package manifest、依赖、order、override 或跨包 require 语义；`FKST_STDLIB_ROOT`、`FKST_RUNTIME_PACKAGE_ROOT`、`FKST_GRAPH_ROOTS` 不是合法 contract。一个 supervisor 仍只组合出一张 composed graph。
 - 当前 fkst-substrate 仓库把 Tier II 身份锚点物化在根目录 `SPEC.md`；Rust `fkst-framework conformance` 是 engine host-conformance。
 - 根目录 SPEC/conformance 只是当前 fkst-substrate 物化，不是所有 host project 的路径本体论。
 - Tier II 身份不得依赖仓库内提交的派生 hash 摘要。
@@ -51,7 +51,7 @@
 
 ## Conformance
 
-- 当前 fkst-substrate 的 engine host-conformance 入口是 Rust CLI `fkst-framework conformance --project-root <path> [--package-root <path>]`。
+- 当前 fkst-substrate 的 engine host-conformance 入口是 Rust CLI `fkst-framework conformance --project-root <path> [--package-root <path> ...]`。
 - 当前 conformance check 是 `runtime-layout`、`project-layout`、`graph-scan`、`department-non-empty`、`schema-validation`。
 - conformance 读取仓库文件与 Lua graph 来执行上述 check。
 - conformance 不得调度工作、重试 pipeline、调用 GitHub、写隐藏状态、维护队列或承担 workflow engine 职责。

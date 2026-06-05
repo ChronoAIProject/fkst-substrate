@@ -1,6 +1,6 @@
-//! Graph scan derives the startup Config from the fixed package plus host layout.
+//! Graph scan derives the startup Config from the fixed packages plus host layout.
 //!
-//! The package root owns standard assets and the host root owns host
+//! Package roots own standard assets and the host root owns host
 //! departments and raisers. `package.lua` is not a supported graph input.
 //!
 //! Each department exposes `M.spec = { consumes, produces, fanout, stall_window }`
@@ -16,7 +16,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use crate::config_registry::{ConfigContext, ConfigKey, ConfigValueType};
-use crate::path_resolver::{GraphRoot, GraphRootKind, PackageRoots};
+use crate::path_resolver::{package_root_path, GraphRoot, GraphRootKind, PackageRoots};
 
 /// Deserialization helper for a department's `M.spec` table.
 #[derive(Deserialize)]
@@ -109,33 +109,34 @@ fn validate_retry_default(retry: &RetryDecl) -> Result<()> {
 
 #[cfg(test)]
 pub fn load(repo_root: &Path) -> Result<Config> {
-    let roots = PackageRoots::resolve(repo_root, Some(repo_root.to_path_buf()))?;
+    let roots = PackageRoots::resolve(repo_root, vec![repo_root.to_path_buf()])?;
     load_roots(&roots)
 }
 
 pub fn load_roots(roots: &PackageRoots) -> Result<Config> {
     let graph_roots = roots.graph_roots();
-    let lua_roots: Vec<&Path> = graph_roots.iter().map(|root| root.root.as_path()).collect();
     for graph_root in &graph_roots {
         reject_removed_surfaces(&graph_root)?;
     }
 
     let defaults = HostGraphDefaults::load(roots)?;
-    let lua = Lua::new();
     let mut departments: BTreeMap<String, DepartmentDecl> = BTreeMap::new();
     let mut raisers: BTreeMap<String, RaiserDecl> = BTreeMap::new();
+    let mut department_owners: BTreeMap<String, PathBuf> = BTreeMap::new();
+    let mut raiser_owners: BTreeMap<String, PathBuf> = BTreeMap::new();
     let mut department_fanout: HashMap<String, Vec<String>> = HashMap::new();
 
     for graph_root in &graph_roots {
+        let lua = Lua::new();
         scan_departments(
             &lua,
             graph_root,
-            &lua_roots,
             &defaults,
             &mut departments,
+            &mut department_owners,
             &mut department_fanout,
         )?;
-        scan_raisers(&lua, graph_root, &lua_roots, &mut raisers)?;
+        scan_raisers(&lua, graph_root, &mut raisers, &mut raiser_owners)?;
     }
 
     let queues = derive_queues(&departments, &raisers, &department_fanout, &defaults)?;
@@ -163,9 +164,9 @@ fn reject_removed_surfaces(graph_root: &GraphRoot) -> Result<()> {
 fn scan_departments(
     lua: &Lua,
     graph_root: &GraphRoot,
-    lua_roots: &[&Path],
     defaults: &HostGraphDefaults,
     departments: &mut BTreeMap<String, DepartmentDecl>,
+    department_owners: &mut BTreeMap<String, PathBuf>,
     department_fanout: &mut HashMap<String, Vec<String>>,
 ) -> Result<()> {
     let repo_root = &graph_root.root;
@@ -181,7 +182,7 @@ fn scan_departments(
             continue;
         }
 
-        let module = eval_lua_file(lua, lua_roots, &main_lua)
+        let module = eval_lua_file(lua, repo_root, &main_lua)
             .with_context(|| format!("eval department `{}` from {}", name, main_lua.display()))?;
         let spec_tbl: Table = module
             .get("spec")
@@ -203,6 +204,7 @@ fn scan_departments(
             &name,
             DepartmentDecl {
                 lua: config_path.clone(),
+                owner_root: repo_root.clone(),
                 consumes: spec.consumes,
                 produces: spec.produces,
                 ephemeral: spec.ephemeral,
@@ -214,7 +216,8 @@ fn scan_departments(
                 retry,
             },
             &config_path,
-            graph_root.kind,
+            repo_root,
+            department_owners,
         )?;
         department_fanout.insert(name, spec.fanout);
     }
@@ -271,8 +274,8 @@ fn materialize_retry(
 fn scan_raisers(
     lua: &Lua,
     graph_root: &GraphRoot,
-    lua_roots: &[&Path],
     raisers: &mut BTreeMap<String, RaiserDecl>,
+    raiser_owners: &mut BTreeMap<String, PathBuf>,
 ) -> Result<()> {
     let repo_root = &graph_root.root;
     let raisers_dir = repo_root.join("raisers");
@@ -288,7 +291,7 @@ fn scan_raisers(
             .ok_or_else(|| anyhow!("raiser file no stem"))?
             .to_string_lossy()
             .into_owned();
-        let val = eval_lua_value(lua, lua_roots, &path)
+        let val = eval_lua_value(lua, repo_root, &path)
             .with_context(|| format!("eval raiser `{}` from {}", stem, path.display()))?;
         let r: RaiserDecl = lua
             .from_value(val)
@@ -296,7 +299,7 @@ fn scan_raisers(
         reject_runtime_file_watch_glob(&r)?;
 
         let config_path = config_path(repo_root, graph_root.kind, &path);
-        insert_raiser_decl_with_root(raisers, &stem, r, &config_path, graph_root.kind)?;
+        insert_raiser_decl_with_root(raisers, &stem, r, &config_path, repo_root, raiser_owners)?;
     }
 
     Ok(())
@@ -309,12 +312,20 @@ pub(crate) fn insert_department_decl(
     decl: DepartmentDecl,
     config_path: &Path,
 ) -> Result<()> {
+    let mut owners = departments
+        .iter()
+        .map(|(existing_name, existing_decl)| {
+            (existing_name.clone(), existing_decl.owner_root.clone())
+        })
+        .collect();
+    let owner_root = decl.owner_root.clone();
     insert_department_decl_with_root(
         departments,
         name,
         decl,
         config_path,
-        GraphRootKind::PackageAndHost,
+        &owner_root,
+        &mut owners,
     )
 }
 
@@ -323,16 +334,20 @@ fn insert_department_decl_with_root(
     name: &str,
     decl: DepartmentDecl,
     config_path: &Path,
-    root_kind: GraphRootKind,
+    owner_root: &Path,
+    department_owners: &mut BTreeMap<String, PathBuf>,
 ) -> Result<()> {
-    if departments.insert(name.to_string(), decl).is_some() {
+    if let Some(previous_root) = department_owners.get(name) {
         bail!(
-            "duplicate department `{}` in {} at {}",
+            "duplicate department `{}`: previous root {} new root {} at {}",
             name,
-            root_kind.label(),
+            previous_root.display(),
+            owner_root.display(),
             config_path.display(),
         );
     }
+    department_owners.insert(name.to_string(), owner_root.to_path_buf());
+    departments.insert(name.to_string(), decl);
     Ok(())
 }
 
@@ -343,13 +358,21 @@ pub(crate) fn insert_raiser_decl(
     decl: RaiserDecl,
     config_path: &Path,
 ) -> Result<()> {
-    insert_raiser_decl_with_root(
-        raisers,
-        name,
-        decl,
-        config_path,
-        GraphRootKind::PackageAndHost,
-    )
+    let mut owners = raisers
+        .keys()
+        .map(|existing_name| {
+            (
+                existing_name.clone(),
+                PathBuf::from("<existing raiser test root>"),
+            )
+        })
+        .collect();
+    let owner_root = config_path
+        .parent()
+        .and_then(Path::parent)
+        .unwrap_or(config_path)
+        .to_path_buf();
+    insert_raiser_decl_with_root(raisers, name, decl, config_path, &owner_root, &mut owners)
 }
 
 fn insert_raiser_decl_with_root(
@@ -357,16 +380,20 @@ fn insert_raiser_decl_with_root(
     name: &str,
     decl: RaiserDecl,
     config_path: &Path,
-    root_kind: GraphRootKind,
+    owner_root: &Path,
+    raiser_owners: &mut BTreeMap<String, PathBuf>,
 ) -> Result<()> {
-    if raisers.insert(name.to_string(), decl).is_some() {
+    if let Some(previous_root) = raiser_owners.get(name) {
         bail!(
-            "duplicate raiser `{}` in {} at {}",
+            "duplicate raiser `{}`: previous root {} new root {} at {}",
             name,
-            root_kind.label(),
+            previous_root.display(),
+            owner_root.display(),
             config_path.display()
         );
     }
+    raiser_owners.insert(name.to_string(), owner_root.to_path_buf());
+    raisers.insert(name.to_string(), decl);
     Ok(())
 }
 
@@ -451,47 +478,38 @@ fn reject_runtime_file_watch_glob(raiser: &RaiserDecl) -> Result<()> {
     Ok(())
 }
 
-fn eval_lua_file(lua: &Lua, lua_roots: &[&Path], path: &Path) -> Result<Table> {
-    match eval_lua_value(lua, lua_roots, path)? {
+fn eval_lua_file(lua: &Lua, lua_root: &Path, path: &Path) -> Result<Table> {
+    match eval_lua_value(lua, lua_root, path)? {
         LuaValue::Table(t) => Ok(t),
         _ => Err(anyhow!("{} did not return a table", path.display())),
     }
 }
 
-fn eval_lua_value(lua: &Lua, lua_roots: &[&Path], path: &Path) -> Result<LuaValue> {
+fn eval_lua_value(lua: &Lua, lua_root: &Path, path: &Path) -> Result<LuaValue> {
     let source =
         std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
-    set_package_path(lua, lua_roots)?;
+    set_package_roots_path(lua, [lua_root])?;
     lua.load(&source)
         .set_name(path.display().to_string())
         .eval()
         .with_context(|| format!("eval {}", path.display()))
 }
 
-fn set_package_path(lua: &Lua, lua_roots: &[&Path]) -> Result<()> {
+fn set_package_roots_path<'a>(
+    lua: &Lua,
+    package_roots: impl IntoIterator<Item = &'a Path>,
+) -> Result<()> {
+    let roots_path = package_roots
+        .into_iter()
+        .map(package_root_path)
+        .collect::<Vec<_>>()
+        .join(";");
     lua.load(format!(
-        "package.path = {:?}",
-        lua_package_root_path(lua_roots.iter().copied())
+        "package.path = {:?}; package.cpath = \"\"",
+        roots_path
     ))
     .exec()
     .context("set package.path")
-}
-
-#[cfg(not(test))]
-fn lua_package_root_path<'a>(roots: impl IntoIterator<Item = &'a Path>) -> String {
-    crate::mlua_init::package_roots_path(roots)
-}
-
-#[cfg(test)]
-fn lua_package_root_path<'a>(roots: impl IntoIterator<Item = &'a Path>) -> String {
-    roots
-        .into_iter()
-        .map(|repo_root| {
-            let root = repo_root.display();
-            format!("{root}/?.lua;{root}/?/init.lua;{root}/?/main.lua")
-        })
-        .collect::<Vec<_>>()
-        .join(";")
 }
 
 fn sorted_dirs(root: &Path) -> Result<Vec<PathBuf>> {

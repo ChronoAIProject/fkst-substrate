@@ -3,10 +3,10 @@
 use anyhow::{Context, Result};
 use mlua::{Lua, LuaSerdeExt, Value as LuaValue};
 use serde_json::Value as JsonValue;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use crate::config_registry::ConfigContext;
-use crate::path_resolver::PackageRoots;
+use crate::path_resolver::{package_root_path, PackageRoots};
 use crate::raise::RaiseBuffer;
 
 /// Create a Lua state with stdlib enabled.
@@ -38,12 +38,6 @@ pub fn json_to_lua(lua: &Lua, v: &JsonValue) -> mlua::Result<LuaValue> {
     lua.to_value(v)
 }
 
-/// Build the Lua search path for one root.
-pub(crate) fn package_root_path(package_root: &Path) -> String {
-    let root = package_root.display();
-    format!("{root}/?.lua;{root}/?/init.lua;{root}/?/main.lua")
-}
-
 /// Build the Lua search path for fixed graph roots in lookup order.
 pub(crate) fn package_roots_path<'a>(roots: impl IntoIterator<Item = &'a Path>) -> String {
     roots
@@ -53,43 +47,16 @@ pub(crate) fn package_roots_path<'a>(roots: impl IntoIterator<Item = &'a Path>) 
         .join(";")
 }
 
-/// Find the host root that owns a Lua entrypoint.
-pub(crate) fn package_root_for_lua(lua_path: &Path) -> PathBuf {
-    let Some(parent) = lua_path.parent() else {
-        return PathBuf::from(".");
-    };
-    if parent.file_name().and_then(|s| s.to_str()) == Some("raisers") {
-        return parent.parent().unwrap_or(parent).to_path_buf();
-    }
-    if parent.file_name().and_then(|s| s.to_str()) == Some("fkst") {
-        return parent.parent().unwrap_or(parent).to_path_buf();
-    }
-    if parent.file_name().and_then(|s| s.to_str()) == Some("departments") {
-        return parent.parent().unwrap_or(parent).to_path_buf();
-    }
-    match parent.parent() {
-        Some(grandparent)
-            if grandparent.file_name().and_then(|s| s.to_str()) == Some("departments") =>
-        {
-            grandparent.parent().unwrap_or(grandparent).to_path_buf()
-        }
-        _ => parent.to_path_buf(),
-    }
-}
-
 pub(crate) fn set_package_roots_path<'a>(
     lua: &Lua,
     package_roots: impl IntoIterator<Item = &'a Path>,
 ) -> mlua::Result<()> {
-    let package: mlua::Table = lua.globals().get("package")?;
-    let existing: String = package.get("path")?;
     let roots_path = package_roots_path(package_roots);
-    let next = if existing.is_empty() {
+    lua.load(format!(
+        "package.path = {:?}; package.cpath = \"\"",
         roots_path
-    } else {
-        format!("{};{}", roots_path, existing)
-    };
-    lua.load(format!("package.path = {:?}", next)).exec()
+    ))
+    .exec()
 }
 
 /// Load the lua file at `path`, execute its top-level chunk, then call `pipeline(event)`.
@@ -103,13 +70,7 @@ pub fn run_dept_with_package_root(
     event: &JsonValue,
     package_root: &Path,
 ) -> Result<()> {
-    let inferred_root = package_root_for_lua(lua_path);
-    let roots: Vec<&Path> = if inferred_root == package_root {
-        vec![package_root]
-    } else {
-        vec![package_root, inferred_root.as_path()]
-    };
-    set_package_roots_path(lua, roots)
+    set_package_roots_path(lua, [package_root])
         .with_context(|| format!("set package.path for {}", package_root.display()))?;
 
     let src = std::fs::read_to_string(lua_path)
@@ -139,7 +100,7 @@ pub fn run_dept_with_roots(
     event: &JsonValue,
     roots: &PackageRoots,
 ) -> Result<()> {
-    run_dept_with_package_root(lua, lua_path, event, roots.package_root())
+    run_dept_with_package_root(lua, lua_path, event, roots.single_package_root()?)
 }
 
 #[cfg(test)]
@@ -167,12 +128,12 @@ mod tests {
             end
         "#,
         );
-        let package_root = package_root_for_lua(f.path());
+        let package_root = f.path().parent().unwrap();
         run_dept_with_package_root(
             &lua,
             f.path(),
             &serde_json::json!({"foo": "bar"}),
-            &package_root,
+            package_root,
         )
         .unwrap();
         let called: i64 = lua.globals().get("called").unwrap();
@@ -183,8 +144,8 @@ mod tests {
     fn missing_pipeline_returns_err() {
         let lua = new_lua();
         let f = write_lua("x = 1\n");
-        let package_root = package_root_for_lua(f.path());
-        let err = run_dept_with_package_root(&lua, f.path(), &serde_json::json!({}), &package_root)
+        let package_root = f.path().parent().unwrap();
+        let err = run_dept_with_package_root(&lua, f.path(), &serde_json::json!({}), package_root)
             .unwrap_err();
         assert!(format!("{}", err).contains("pipeline"));
     }
@@ -193,8 +154,8 @@ mod tests {
     fn lua_syntax_error_returns_err() {
         let lua = new_lua();
         let f = write_lua("this is = not valid {{ lua");
-        let package_root = package_root_for_lua(f.path());
-        let err = run_dept_with_package_root(&lua, f.path(), &serde_json::json!({}), &package_root)
+        let package_root = f.path().parent().unwrap();
+        let err = run_dept_with_package_root(&lua, f.path(), &serde_json::json!({}), package_root)
             .unwrap_err();
         assert!(format!("{}", err).contains("exec"));
     }
@@ -228,7 +189,7 @@ mod tests {
     }
 
     #[test]
-    fn set_package_root_path_preserves_existing_search_path() {
+    fn set_package_root_path_replaces_existing_search_path() {
         let dir = TempDir::new().unwrap();
         let lua = new_lua();
         lua.load(r#"package.path = "prior/?.lua""#).exec().unwrap();
@@ -237,7 +198,72 @@ mod tests {
 
         let package: mlua::Table = lua.globals().get("package").unwrap();
         let path: String = package.get("path").unwrap();
-        assert!(path.starts_with(&package_root_path(dir.path())));
-        assert!(path.ends_with(";prior/?.lua"));
+        let cpath: String = package.get("cpath").unwrap();
+        assert_eq!(path, package_root_path(dir.path()));
+        assert_eq!(cpath, "");
+    }
+
+    #[test]
+    fn package_root_path_resolves_module_main_lua() {
+        let dir = TempDir::new().unwrap();
+        std::fs::create_dir_all(dir.path().join("departments/demo")).unwrap();
+        std::fs::create_dir_all(dir.path().join("core")).unwrap();
+        std::fs::write(
+            dir.path().join("core/main.lua"),
+            r#"return { marker = "from-main" }"#,
+        )
+        .unwrap();
+        let main = dir.path().join("departments/demo/main.lua");
+        std::fs::write(
+            &main,
+            r#"
+            local core = require("core")
+            function pipeline(event)
+                called = core.marker
+            end
+        "#,
+        )
+        .unwrap();
+
+        let lua = new_lua();
+        run_dept_with_package_root(&lua, &main, &serde_json::json!({}), dir.path()).unwrap();
+        let called: String = lua.globals().get("called").unwrap();
+        assert_eq!(called, "from-main");
+    }
+
+    #[test]
+    fn run_dept_does_not_fall_back_to_cwd_or_existing_search_path() {
+        let _env_lock = crate::test_env::ENV_LOCK.lock().unwrap();
+        let owner = TempDir::new().unwrap();
+        let cwd = TempDir::new().unwrap();
+        std::fs::create_dir_all(owner.path().join("departments/demo")).unwrap();
+        std::fs::write(cwd.path().join("core.lua"), r#"return { value = "cwd" }"#).unwrap();
+        let main = owner.path().join("departments/demo/main.lua");
+        std::fs::write(
+            &main,
+            r#"
+            local core = require("core")
+            function pipeline(event)
+                called = core.value
+            end
+        "#,
+        )
+        .unwrap();
+
+        let prior_cwd = std::env::current_dir().unwrap();
+        std::env::set_current_dir(cwd.path()).unwrap();
+        let lua = new_lua();
+        lua.load(format!(
+            "package.path = {:?}",
+            cwd.path().join("?.lua").display().to_string()
+        ))
+        .exec()
+        .unwrap();
+        let err = run_dept_with_package_root(&lua, &main, &serde_json::json!({}), owner.path())
+            .unwrap_err();
+        std::env::set_current_dir(prior_cwd).unwrap();
+
+        let msg = format!("{err:#}");
+        assert!(msg.contains("module 'core' not found"), "{msg}");
     }
 }

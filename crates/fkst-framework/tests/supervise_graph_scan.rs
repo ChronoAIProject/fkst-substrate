@@ -24,6 +24,7 @@ const RETRY_DEFAULT_MAX_ATTEMPTS_ENV: &str = "FKST_RETRY_DEFAULT_MAX_ATTEMPTS";
 const RETRY_DEFAULT_BASE_ENV: &str = "FKST_RETRY_DEFAULT_BASE";
 const RETRY_DEFAULT_CAP_ENV: &str = "FKST_RETRY_DEFAULT_CAP";
 const PACKAGE_ROOT_ENV: &str = "FKST_PACKAGE_ROOT";
+const PACKAGE_ROOTS_ENV: &str = "FKST_PACKAGE_ROOTS";
 
 static CURRENT_DIR_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
@@ -669,8 +670,9 @@ return M
         )],
         &[],
     );
+    write_package_helper(host.path());
 
-    let roots = PackageRoots::resolve(host.path(), Some(package.path().to_path_buf())).unwrap();
+    let roots = PackageRoots::resolve(host.path(), vec![package.path().to_path_buf()]).unwrap();
     let cfg = graph_scan::load_roots(&roots).unwrap();
 
     assert!(cfg.raiser.contains_key("standard_tick"));
@@ -689,6 +691,252 @@ return M
 }
 
 #[test]
+fn multiple_package_roots_and_host_form_one_graph() {
+    let _root = EnvGuard::set("FKST_RUNTIME_ROOT", ".fkst/runtime");
+    let package_a = write_repo(
+        &[("producer", &dept("", r#""handoff""#))],
+        &[(
+            "tick_a",
+            r#"return { type = "cron", interval = "10s", produces = "start_a" }"#,
+        )],
+    );
+    let package_b = write_repo(
+        &[("consumer", &dept(r#""handoff""#, r#""done_b""#))],
+        &[(
+            "tick_b",
+            r#"return { type = "cron", interval = "20s", produces = "start_b" }"#,
+        )],
+    );
+    let host = write_repo(&[("host_worker", &dept(r#""done_b""#, ""))], &[]);
+
+    let roots = PackageRoots::resolve(
+        host.path(),
+        vec![
+            package_a.path().to_path_buf(),
+            package_b.path().to_path_buf(),
+        ],
+    )
+    .unwrap();
+    let cfg = graph_scan::load_roots(&roots).unwrap();
+
+    assert!(cfg.raiser.contains_key("tick_a"));
+    assert!(cfg.raiser.contains_key("tick_b"));
+    assert!(cfg.department.contains_key("producer"));
+    assert!(cfg.department.contains_key("consumer"));
+    assert!(cfg.department.contains_key("host_worker"));
+    validate(&cfg, host.path()).unwrap();
+}
+
+#[test]
+fn graph_scan_uses_fresh_lua_state_and_root_local_require_path() {
+    let _root = EnvGuard::set("FKST_RUNTIME_ROOT", ".fkst/runtime");
+    let package_a = write_repo(
+        &[(
+            "alpha",
+            r#"
+local core = require("core")
+local M = {}
+M.spec = { consumes = {"tick_a"}, produces = {core.queue()}, stall_window = "30s" }
+function pipeline(_) end
+return M
+"#,
+        )],
+        &[(
+            "tick_a",
+            r#"return { type = "cron", interval = "10s", produces = "tick_a" }"#,
+        )],
+    );
+    fs::write(
+        package_a.path().join("core.lua"),
+        r#"return { queue = function() return "a_done" end }"#,
+    )
+    .unwrap();
+    let package_b = write_repo(
+        &[(
+            "beta",
+            r#"
+local core = require("core")
+local M = {}
+M.spec = { consumes = {"tick_b"}, produces = {core.queue()}, stall_window = "30s" }
+function pipeline(_) end
+return M
+"#,
+        )],
+        &[(
+            "tick_b",
+            r#"return { type = "cron", interval = "10s", produces = "tick_b" }"#,
+        )],
+    );
+    fs::write(
+        package_b.path().join("core.lua"),
+        r#"return { queue = function() return "b_done" end }"#,
+    )
+    .unwrap();
+    let host = write_repo(&[], &[]);
+
+    let roots = PackageRoots::resolve(
+        host.path(),
+        vec![
+            package_a.path().to_path_buf(),
+            package_b.path().to_path_buf(),
+        ],
+    )
+    .unwrap();
+    let cfg = graph_scan::load_roots(&roots).unwrap();
+
+    assert_eq!(cfg.department["alpha"].produces, vec!["a_done"]);
+    assert_eq!(cfg.department["beta"].produces, vec!["b_done"]);
+}
+
+#[test]
+fn graph_scan_does_not_fall_back_to_host_or_cwd_require_path() {
+    let _env_lock = CURRENT_DIR_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap();
+    let _root = EnvGuard::set("FKST_RUNTIME_ROOT", ".fkst/runtime");
+    let package = write_repo(
+        &[(
+            "alpha",
+            r#"
+local core = require("core")
+local M = {}
+M.spec = { consumes = {"tick"}, produces = {core.queue()}, stall_window = "30s" }
+function pipeline(_) end
+return M
+"#,
+        )],
+        &[(
+            "tick",
+            r#"return { type = "cron", interval = "10s", produces = "tick" }"#,
+        )],
+    );
+    let host = write_repo(&[], &[]);
+    fs::write(
+        host.path().join("core.lua"),
+        r#"return { queue = function() return "host_done" end }"#,
+    )
+    .unwrap();
+    let cwd = TempDir::new().unwrap();
+    fs::write(
+        cwd.path().join("core.lua"),
+        r#"return { queue = function() return "cwd_done" end }"#,
+    )
+    .unwrap();
+    let roots = PackageRoots::resolve(host.path(), vec![package.path().to_path_buf()]).unwrap();
+
+    let prior_cwd = std::env::current_dir().unwrap();
+    std::env::set_current_dir(cwd.path()).unwrap();
+    let err = graph_scan::load_roots(&roots).unwrap_err();
+    std::env::set_current_dir(prior_cwd).unwrap();
+    let msg = format!("{err:#}");
+
+    assert!(msg.contains("module 'core' not found"), "got: {msg}");
+    assert!(
+        !msg.contains("host_done") && !msg.contains("cwd_done"),
+        "got: {msg}"
+    );
+}
+
+#[test]
+fn duplicate_department_across_package_roots_reports_both_roots() {
+    let _root = EnvGuard::set("FKST_RUNTIME_ROOT", ".fkst/runtime");
+    let package_a = write_repo(&[("same", &dept(r#""tick""#, ""))], &[]);
+    let package_b = write_repo(&[("same", &dept(r#""tick""#, ""))], &[]);
+    let host = write_repo(&[], &[]);
+    let roots = PackageRoots::resolve(
+        host.path(),
+        vec![
+            package_a.path().to_path_buf(),
+            package_b.path().to_path_buf(),
+        ],
+    )
+    .unwrap();
+
+    let err = graph_scan::load_roots(&roots).unwrap_err();
+    let msg = format!("{:#}", err);
+
+    assert!(msg.contains("duplicate department `same`"), "got: {msg}");
+    assert!(
+        msg.contains(
+            &package_a
+                .path()
+                .canonicalize()
+                .unwrap()
+                .display()
+                .to_string()
+        ),
+        "got: {msg}"
+    );
+    assert!(
+        msg.contains(
+            &package_b
+                .path()
+                .canonicalize()
+                .unwrap()
+                .display()
+                .to_string()
+        ),
+        "got: {msg}"
+    );
+}
+
+#[test]
+fn duplicate_raiser_across_package_roots_reports_both_roots() {
+    let _root = EnvGuard::set("FKST_RUNTIME_ROOT", ".fkst/runtime");
+    let package_a = write_repo(
+        &[],
+        &[(
+            "same",
+            r#"return { type = "cron", interval = "10s", produces = "tick" }"#,
+        )],
+    );
+    let package_b = write_repo(
+        &[],
+        &[(
+            "same",
+            r#"return { type = "cron", interval = "20s", produces = "tick" }"#,
+        )],
+    );
+    let host = write_repo(&[], &[]);
+    let roots = PackageRoots::resolve(
+        host.path(),
+        vec![
+            package_a.path().to_path_buf(),
+            package_b.path().to_path_buf(),
+        ],
+    )
+    .unwrap();
+
+    let err = graph_scan::load_roots(&roots).unwrap_err();
+    let msg = format!("{:#}", err);
+
+    assert!(msg.contains("duplicate raiser `same`"), "got: {msg}");
+    assert!(
+        msg.contains(
+            &package_a
+                .path()
+                .canonicalize()
+                .unwrap()
+                .display()
+                .to_string()
+        ),
+        "got: {msg}"
+    );
+    assert!(
+        msg.contains(
+            &package_b
+                .path()
+                .canonicalize()
+                .unwrap()
+                .display()
+                .to_string()
+        ),
+        "got: {msg}"
+    );
+}
+
+#[test]
 fn package_root_env_is_used_when_flag_is_absent() {
     let _root = EnvGuard::set("FKST_RUNTIME_ROOT", ".fkst/runtime");
     let package = write_repo(
@@ -701,8 +949,12 @@ fn package_root_env_is_used_when_flag_is_absent() {
     let host = write_repo(&[("host_worker", &dept(r#""standard_tick""#, ""))], &[]);
     let _env = EnvGuard::set(PACKAGE_ROOT_ENV, package.path());
 
-    let roots = PackageRoots::resolve(host.path(), None).unwrap();
-    assert_eq!(roots.package_root(), package.path().canonicalize().unwrap());
+    let _plural_env = EnvGuard::unset(PACKAGE_ROOTS_ENV);
+    let roots = PackageRoots::resolve(host.path(), Vec::new()).unwrap();
+    assert_eq!(
+        roots.package_roots()[0],
+        package.path().canonicalize().unwrap()
+    );
     assert_eq!(roots.host_root(), host.path().canonicalize().unwrap());
     let cfg = graph_scan::load_roots(&roots).unwrap();
 
@@ -723,11 +975,12 @@ fn missing_package_root_fails_closed_even_when_share_tree_exists() {
     let _runtime_package = EnvGuard::unset("FKST_RUNTIME_PACKAGE_ROOT");
     let _graph_roots = EnvGuard::unset("FKST_GRAPH_ROOTS");
 
-    let err = PackageRoots::resolve(host.path(), None).unwrap_err();
+    let _plural_env = EnvGuard::unset(PACKAGE_ROOTS_ENV);
+    let err = PackageRoots::resolve(host.path(), Vec::new()).unwrap_err();
     let msg = format!("{:#}", err);
 
     assert!(
-        msg.contains("FKST_PACKAGE_ROOT or --package-root is required"),
+        msg.contains("FKST_PACKAGE_ROOTS, FKST_PACKAGE_ROOT, or --package-root is required"),
         "got: {msg}"
     );
 }
@@ -737,7 +990,7 @@ fn removed_package_root_envs_fail_closed() {
     let host = write_repo(&[("host_worker", &dept(r#""tick""#, ""))], &[]);
     let _env = EnvGuard::set("FKST_STDLIB_ROOT", host.path());
 
-    let err = PackageRoots::resolve(host.path(), None).unwrap_err();
+    let err = PackageRoots::resolve(host.path(), Vec::new()).unwrap_err();
     let msg = format!("{:#}", err);
 
     assert!(msg.contains("FKST_STDLIB_ROOT"), "got: {}", msg);
@@ -749,7 +1002,7 @@ fn duplicate_package_and_host_department_name_fails_closed() {
     let _root = EnvGuard::set("FKST_RUNTIME_ROOT", ".fkst/runtime");
     let package = write_repo(&[("same", &dept(r#""tick""#, ""))], &[]);
     let host = write_repo(&[("same", &dept(r#""tick""#, ""))], &[]);
-    let roots = PackageRoots::resolve(host.path(), Some(package.path().to_path_buf())).unwrap();
+    let roots = PackageRoots::resolve(host.path(), vec![package.path().to_path_buf()]).unwrap();
 
     let err = graph_scan::load_roots(&roots).unwrap_err();
     let msg = format!("{:#}", err);
@@ -980,6 +1233,7 @@ fn duplicate_department_name_fails_closed() {
         "alpha",
         DepartmentDecl {
             lua: path.clone(),
+            owner_root: PathBuf::from("first-root"),
             consumes: vec!["tick".into()],
             produces: Vec::new(),
             ephemeral: Vec::new(),
@@ -994,6 +1248,7 @@ fn duplicate_department_name_fails_closed() {
         "alpha",
         DepartmentDecl {
             lua: path.clone(),
+            owner_root: PathBuf::from("second-root"),
             consumes: vec!["tick".into()],
             produces: Vec::new(),
             ephemeral: Vec::new(),
@@ -1025,6 +1280,7 @@ fn duplicate_raiser_name_fails_closed() {
         &path,
     )
     .unwrap();
+    let second_path = PathBuf::from("other/raisers/cron_a.lua");
     let err = graph_scan::insert_raiser_decl(
         &mut raisers,
         "cron_a",
@@ -1032,7 +1288,7 @@ fn duplicate_raiser_name_fails_closed() {
             interval: "20s".into(),
             produces: "tick".into(),
         },
-        &path,
+        &second_path,
     )
     .unwrap_err();
     let msg = format!("{:#}", err);

@@ -297,6 +297,7 @@ mod tests {
             "worker".to_string(),
             DepartmentDecl {
                 lua: "departments/worker/main.lua".into(),
+                owner_root: std::path::PathBuf::from("."),
                 consumes: vec!["jobs".to_string()],
                 produces: Vec::new(),
                 ephemeral: if ephemeral {

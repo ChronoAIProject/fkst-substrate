@@ -38,6 +38,7 @@ pub enum RaiserDecl {
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 pub struct DepartmentDecl {
     pub lua: PathBuf,
+    pub owner_root: PathBuf,
     #[serde(default)]
     pub consumes: Vec<String>,
     #[serde(default)]

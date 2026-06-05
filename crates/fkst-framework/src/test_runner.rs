@@ -12,16 +12,16 @@ pub(crate) fn run_tests(roots: PackageRoots) -> Result<i32> {
     let mut failed = 0usize;
 
     for file in files {
-        let relpath = display_path(&file, &roots);
+        let relpath = display_path(&file.path, &file.owner_root);
         let lua = crate::mlua_init::new_lua();
-        crate::mlua_init::set_package_roots_path(&lua, package_paths(&roots))
+        crate::mlua_init::set_package_roots_path(&lua, [file.owner_root.as_path()])
             .with_context(|| format!("set package.path for tests in {}", relpath))?;
         crate::mlua_init::register_framework_sdk(&lua, RaiseBuffer::new(), roots.host_root())
             .with_context(|| format!("register SDK for {}", relpath))?;
-        register_test_sdk(&lua, roots.clone())
+        register_test_sdk(&lua, roots.clone(), file.owner_root.clone())
             .with_context(|| format!("register fkst.test for {}", relpath))?;
 
-        match load_test_table(&lua, &file) {
+        match load_test_table(&lua, &file.path) {
             Ok(tests) => {
                 for (name, func) in tests {
                     match func.call::<()>(()) {
@@ -47,18 +47,24 @@ pub(crate) fn run_tests(roots: PackageRoots) -> Result<i32> {
     Ok(if failed == 0 { 0 } else { 1 })
 }
 
-fn discover_test_files(roots: &PackageRoots) -> Result<Vec<PathBuf>> {
-    let mut files = BTreeMap::<PathBuf, ()>::new();
+#[derive(Clone, Debug)]
+struct TestFile {
+    path: PathBuf,
+    owner_root: PathBuf,
+}
+
+fn discover_test_files(roots: &PackageRoots) -> Result<Vec<TestFile>> {
+    let mut files = BTreeMap::<PathBuf, TestFile>::new();
     for root in roots.graph_roots() {
         collect_department_tests(&root.root, &mut files)
             .with_context(|| format!("scan department tests in {}", root.root.display()))?;
         collect_top_tests(&root.root, &mut files)
             .with_context(|| format!("scan top-level tests in {}", root.root.display()))?;
     }
-    Ok(files.into_keys().collect())
+    Ok(files.into_values().collect())
 }
 
-fn collect_department_tests(root: &Path, files: &mut BTreeMap<PathBuf, ()>) -> Result<()> {
+fn collect_department_tests(root: &Path, files: &mut BTreeMap<PathBuf, TestFile>) -> Result<()> {
     let departments = root.join("departments");
     if !departments.exists() {
         return Ok(());
@@ -75,14 +81,14 @@ fn collect_department_tests(root: &Path, files: &mut BTreeMap<PathBuf, ()>) -> R
             let file = file?;
             let path = file.path();
             if path.is_file() && is_test_file(&path) {
-                files.insert(path.canonicalize()?, ());
+                insert_test_file(files, root, &path)?;
             }
         }
     }
     Ok(())
 }
 
-fn collect_top_tests(root: &Path, files: &mut BTreeMap<PathBuf, ()>) -> Result<()> {
+fn collect_top_tests(root: &Path, files: &mut BTreeMap<PathBuf, TestFile>) -> Result<()> {
     let tests = root.join("tests");
     if !tests.exists() {
         return Ok(());
@@ -91,9 +97,25 @@ fn collect_top_tests(root: &Path, files: &mut BTreeMap<PathBuf, ()>) -> Result<(
         let file = file?;
         let path = file.path();
         if path.is_file() && is_test_file(&path) {
-            files.insert(path.canonicalize()?, ());
+            insert_test_file(files, root, &path)?;
         }
     }
+    Ok(())
+}
+
+fn insert_test_file(
+    files: &mut BTreeMap<PathBuf, TestFile>,
+    owner_root: &Path,
+    path: &Path,
+) -> Result<()> {
+    let canonical_path = path.canonicalize()?;
+    files.insert(
+        canonical_path.clone(),
+        TestFile {
+            path: canonical_path,
+            owner_root: owner_root.to_path_buf(),
+        },
+    );
     Ok(())
 }
 
@@ -101,14 +123,6 @@ fn is_test_file(path: &Path) -> bool {
     path.file_name()
         .and_then(|name| name.to_str())
         .is_some_and(|name| name.ends_with("_test.lua"))
-}
-
-fn package_paths(roots: &PackageRoots) -> Vec<&Path> {
-    let mut paths = vec![roots.package_root()];
-    if roots.package_root() != roots.host_root() {
-        paths.push(roots.host_root());
-    }
-    paths
 }
 
 fn load_test_table(lua: &Lua, file: &Path) -> Result<Vec<(String, Function)>> {
@@ -131,7 +145,7 @@ fn load_test_table(lua: &Lua, file: &Path) -> Result<Vec<(String, Function)>> {
     Ok(tests.into_iter().collect())
 }
 
-fn register_test_sdk(lua: &Lua, roots: PackageRoots) -> mlua::Result<()> {
+fn register_test_sdk(lua: &Lua, roots: PackageRoots, owner_root: PathBuf) -> mlua::Result<()> {
     let globals = lua.globals();
     let fkst = match globals.get::<Value>("fkst")? {
         Value::Table(table) => table,
@@ -205,7 +219,7 @@ fn register_test_sdk(lua: &Lua, roots: PackageRoots) -> mlua::Result<()> {
         "run_department",
         lua.create_function(
             move |lua, (path, event, opts): (String, Value, Option<Table>)| {
-                run_department(lua, &roots, path, event, opts)
+                run_department(lua, &roots, &owner_root, path, event, opts)
             },
         )?,
     )?;
@@ -217,12 +231,13 @@ fn register_test_sdk(lua: &Lua, roots: PackageRoots) -> mlua::Result<()> {
 fn run_department(
     lua: &Lua,
     roots: &PackageRoots,
+    owner_root: &Path,
     path: String,
     event: Value,
     opts: Option<Table>,
 ) -> mlua::Result<Table> {
     let opts = DeptRunOptions::from_lua(opts)?;
-    let lua_path = resolve_department_path(roots.package_root(), &path);
+    let lua_path = resolve_department_path(owner_root, &path);
     let event_json: serde_json::Value = lua.from_value(event)?;
     let _guard = DeptRunEnvGuard::apply(opts)?;
 
@@ -230,17 +245,21 @@ fn run_department(
     let raise_buf = RaiseBuffer::new();
     crate::mlua_init::register_framework_sdk(&dept_lua, raise_buf.clone(), roots.host_root())?;
 
-    let exit_code =
-        match crate::mlua_init::run_dept_with_roots(&dept_lua, &lua_path, &event_json, roots) {
-            Ok(()) => 0,
-            Err(err) => {
-                eprintln!(
-                    "[framework:test] department failed {}: {err:#}",
-                    lua_path.display()
-                );
-                1
-            }
-        };
+    let exit_code = match crate::mlua_init::run_dept_with_package_root(
+        &dept_lua,
+        &lua_path,
+        &event_json,
+        owner_root,
+    ) {
+        Ok(()) => 0,
+        Err(err) => {
+            eprintln!(
+                "[framework:test] department failed {}: {err:#}",
+                lua_path.display()
+            );
+            1
+        }
+    };
 
     let result = lua.create_table()?;
     result.set("exit_code", exit_code)?;
@@ -388,13 +407,8 @@ fn display_value(value: Value) -> String {
     }
 }
 
-fn display_path(path: &Path, roots: &PackageRoots) -> String {
-    let root = if path.starts_with(roots.host_root()) {
-        roots.host_root()
-    } else {
-        roots.package_root()
-    };
-    path.strip_prefix(root)
+fn display_path(path: &Path, owner_root: &Path) -> String {
+    path.strip_prefix(owner_root)
         .unwrap_or(path)
         .to_string_lossy()
         .trim_start_matches(std::path::MAIN_SEPARATOR)

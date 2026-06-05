@@ -139,6 +139,8 @@ end
     let output = Command::new(framework_bin())
         .arg("run")
         .arg(&lua)
+        .arg("--project-root")
+        .arg(tmp.path())
         .arg("--event")
         .arg(r#"{"name":"ok"}"#)
         .env(PACKAGE_ROOT_ENV, tmp.path())

@@ -1,6 +1,6 @@
 # fkst-substrate 引擎架构
 
-本库是稳定发布的受监督事件 / SDK / 进程衬底；业务 Lua package 不在本库内，由独立仓库或 host 通过 `FKST_PACKAGE_ROOT` / `--package-root` 注入。
+本库是稳定发布的受监督事件 / SDK / 进程衬底；业务 Lua package 不在本库内，由独立仓库或 host 通过 `FKST_PACKAGE_ROOTS` / `FKST_PACKAGE_ROOT` / `--package-root` 注入。
 
 本文只描述 fkst-substrate 当前引擎事实。源码权威在 `crates/`；`README.md` 说明验证命令；`SPEC.md` 是身份锚点；业务部门拓扑、host 运行流程和具体研发策略不属于本文。
 
@@ -75,17 +75,17 @@ workspace 只包含这三个 crate。没有业务 Lua package crate，也没有 
 `fkst-framework` 当前 surface：
 
 ```text
-fkst-framework run <lua> --project-root <path> [--package-root <path>] --event <json>
-fkst-framework supervise --project-root <path> [--package-root <path>] --framework-bin <path>
-fkst-framework conformance --project-root <path> [--package-root <path>]
-fkst-framework config --project-root <path> [--package-root <path>]
-fkst-framework test --project-root <path> [--package-root <path>]
+fkst-framework run <lua> --project-root <path> --package-root <owner-root> --event <json>
+fkst-framework supervise --project-root <path> [--package-root <path> ...] --framework-bin <path>
+fkst-framework conformance --project-root <path> [--package-root <path> ...]
+fkst-framework config --project-root <path> [--package-root <path> ...]
+fkst-framework test --project-root <path> [--package-root <path> ...]
 fkst-framework --self-test
 ```
 
 `fkst-supervisor` 没有业务子命令；它只把当前目录作为 host root，启动 `fkst-framework supervise`。
 
-`fkst-framework test` 是 Tier III test-mode runner，不启动 supervise，不执行 dispatcher，也不把 `fkst.test` 加入 production Lua SDK。它用 `PackageRoots::resolve` 得到 package root 和 host root，只发现两类文件：
+`fkst-framework test` 是 Tier III test-mode runner，不启动 supervise，不执行 dispatcher，也不把 `fkst.test` 加入 production Lua SDK。它用 `PackageRoots::resolve` 得到 package roots input set 和 host root，只发现两类文件：
 
 ```text
 <ROOT>/departments/*/*_test.lua
@@ -94,26 +94,29 @@ fkst-framework --self-test
 
 runner 不全树递归，不扫描 `raisers/` 或 `fkst/`。每个测试文件在独立 Lua state 中执行，先注册 production SDK 以便测试可 `require` package 模块和调用固定 SDK，再注册 test-mode `fkst.test` 表。测试文件必须返回 table；runner 只执行排序后的 `test_*` key。单个测试失败后继续执行同文件其余测试和后续文件，最后输出 `N passed, M failed`；`M > 0` 时退出码非 0。
 
-`fkst.test` 包含 `eq(actual, expected[, msg])`、`is_true(value[, msg])`、`raises(fn[, msg])`、`is_nil(value[, msg])` 四个断言，以及 test-mode-only `run_department(path, event[, opts])`。`run_department` 用 fresh Lua state 注册 production SDK 和独立 `RaiseBuffer`，再通过正常 department runner 注入 `event`；它返回 `{ exit_code = int, raises = { { queue = string, payload = table }, ... } }`。相对 `path` 按 package root 解析，`opts.cwd`、`opts.env`、`opts.path_prepend` 只作用于该次执行并随后恢复。它是最小 Lua 单测工具，不提供 describe/it、hook、fixture、mock、stub 或测试框架 DSL。除非明确验证真实 CLI 路径，Lua 单测不应调用 codex。
+`fkst.test` 包含 `eq(actual, expected[, msg])`、`is_true(value[, msg])`、`raises(fn[, msg])`、`is_nil(value[, msg])` 四个断言，以及 test-mode-only `run_department(path, event[, opts])`。`run_department` 用 fresh Lua state 注册 production SDK 和独立 `RaiseBuffer`，再通过正常 department runner 注入 `event`；它返回 `{ exit_code = int, raises = { { queue = string, payload = table }, ... } }`。每个测试文件按所属 graph root 隔离执行；相对 `path` 按该测试文件所属的 owner package root 解析，运行期 `package.path` 也只指向该 owner root。绝对 `path` 仍按绝对路径处理。`opts.cwd`、`opts.env`、`opts.path_prepend` 只作用于该次执行并随后恢复。它是最小 Lua 单测工具，不提供 describe/it、hook、fixture、mock、stub 或测试框架 DSL。除非明确验证真实 CLI 路径，Lua 单测不应调用 codex。
 
 ## 4. Package Root 与 Host Root
 
-`PackageRoots::resolve` 产生一个 package root 和一个 host root：
+`PackageRoots::resolve` 产生 package roots input set 和一个 host root：
 
 ```text
---package-root <path> 优先
-否则 FKST_PACKAGE_ROOT
+显式可重复 --package-root <path> 优先
+否则 FKST_PACKAGE_ROOTS，按平台 path list 分隔符解析
+否则旧单值 FKST_PACKAGE_ROOT
 host root 来自显式 --project-root
-run 模式未传 --project-root 时可从 Lua 路径推断
+同时设置 FKST_PACKAGE_ROOTS 与 FKST_PACKAGE_ROOT 且没有显式 --package-root 时 fail closed
 ```
 
-如果 `<PKG> == <HOST>`，graph root 只有一个 `PackageAndHost`。否则扫描顺序是 package root 后 host root。重复 Department 名或 Raiser 名直接拒绝启动。`package.lua` 是被移除的 surface，存在即拒绝启动。
+`run` 模式永远只接收单个 owner-root；`supervise`、`test`、`conformance`、`config` 可接收多个 package root。如果某个 `<PKG> == <HOST>`，该 graph root 折叠为 `PackageAndHost`。否则扫描顺序是 package roots 后 host root。每个 graph root 使用 fresh Lua state，`package.path` 只指向当前 root；运行期 Department 和测试文件的相对路径按所属 owner package root 解析，不存在 package manifest、依赖、order、override 或跨包 require。重复 package root 在 canonicalize 后拒绝；重复 Department 名或 Raiser 名直接拒绝启动。`package.lua` 是被移除的 surface，存在即拒绝启动。
 
 合法 graph 输入：
 
 ```text
 <PKG>/departments/<dept>/main.lua
 <PKG>/raisers/*.lua
+<PKG_N>/departments/<dept>/main.lua
+<PKG_N>/raisers/*.lua
 <HOST>/departments/<dept>/main.lua
 <HOST>/raisers/*.lua
 ```

@@ -34,6 +34,7 @@ fn cfg_minimal(lua_file: &Path) -> Config {
         "d".into(),
         DepartmentDecl {
             lua: lua_file.into(),
+            owner_root: lua_file.parent().unwrap().into(),
             consumes: vec!["tick".into()],
             produces: vec![],
             ephemeral: vec![],
@@ -55,6 +56,7 @@ fn cfg_minimal(lua_file: &Path) -> Config {
 fn direct_deserialize_requires_department_stall_window() {
     let err = serde_json::from_value::<DepartmentDecl>(serde_json::json!({
         "lua": "d.lua",
+        "owner_root": ".",
         "consumes": ["tick"]
     }))
     .unwrap_err();
@@ -259,6 +261,7 @@ fn duplicate_consumers_without_fanout_rejected() {
         "other".into(),
         DepartmentDecl {
             lua: lua.clone(),
+            owner_root: tmp.path().into(),
             consumes: vec!["tick".into()],
             produces: vec![],
             ephemeral: vec![],
@@ -283,6 +286,7 @@ fn duplicate_consumers_with_fanout_pass() {
         "other".into(),
         DepartmentDecl {
             lua: lua.clone(),
+            owner_root: tmp.path().into(),
             consumes: vec!["tick".into()],
             produces: vec![],
             ephemeral: vec![],
@@ -311,6 +315,7 @@ fn mixed_retry_consumers_on_fanout_queue_pass() {
         "other".into(),
         DepartmentDecl {
             lua: lua.clone(),
+            owner_root: tmp.path().into(),
             consumes: vec!["tick".into()],
             produces: vec![],
             ephemeral: vec![],

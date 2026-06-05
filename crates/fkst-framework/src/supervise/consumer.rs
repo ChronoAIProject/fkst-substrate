@@ -25,7 +25,6 @@ pub async fn spawn_consumer(
     name: String,
     decl: DepartmentDecl,
     project_root: PathBuf,
-    package_root: PathBuf,
     framework_binary: PathBuf,
     fanout: Fanout,
     router: DeliveryRouter,
@@ -115,7 +114,6 @@ pub async fn spawn_consumer(
                             &name,
                             &decl,
                             &project_root,
-                            &package_root,
                             &framework_binary,
                             &router,
                             &framework_child_log_dir,
@@ -133,7 +131,6 @@ pub async fn spawn_consumer(
                         &name,
                         &decl,
                         &project_root,
-                        &package_root,
                         &framework_binary,
                         &router,
                         store.clone(),
@@ -151,7 +148,6 @@ pub async fn spawn_consumer(
                         &name,
                         &decl,
                         &project_root,
-                        &package_root,
                         &framework_binary,
                         &router,
                         store.clone(),
@@ -186,7 +182,6 @@ fn spawn_ephemeral(
     name: &str,
     decl: &DepartmentDecl,
     project_root: &std::path::Path,
-    package_root: &std::path::Path,
     framework_binary: &std::path::Path,
     router: &DeliveryRouter,
     log_dir: &std::path::Path,
@@ -197,7 +192,6 @@ fn spawn_ephemeral(
     let args = match spawn_args(
         decl,
         project_root,
-        package_root,
         framework_binary,
         log_dir,
         event,
@@ -236,7 +230,6 @@ fn dispatch_due(
     name: &str,
     decl: &DepartmentDecl,
     project_root: &std::path::Path,
-    package_root: &std::path::Path,
     framework_binary: &std::path::Path,
     router: &DeliveryRouter,
     store: Option<Arc<DeliveryStore>>,
@@ -273,7 +266,6 @@ fn dispatch_due(
         let args = match spawn_args(
             decl,
             project_root,
-            package_root,
             framework_binary,
             log_dir,
             event_from_record(&record),
@@ -545,7 +537,6 @@ fn event_from_record(record: &DeliveryRecord) -> Event {
 fn spawn_args(
     decl: &DepartmentDecl,
     project_root: &std::path::Path,
-    package_root: &std::path::Path,
     framework_binary: &std::path::Path,
     log_dir: &std::path::Path,
     event: Event,
@@ -554,9 +545,13 @@ fn spawn_args(
 ) -> anyhow::Result<SpawnArgs> {
     Ok(SpawnArgs {
         framework_bin: framework_binary.to_path_buf(),
-        lua_full: project_root.join(&decl.lua),
+        lua_full: if decl.lua.is_absolute() {
+            decl.lua.clone()
+        } else {
+            project_root.join(&decl.lua)
+        },
         project_root: project_root.to_path_buf(),
-        package_root: package_root.to_path_buf(),
+        package_root: decl.owner_root.clone(),
         event_json: serde_json::to_string(&event)?,
         stall_window,
         codex_permit_slots,
@@ -687,6 +682,7 @@ mod tests {
             "dlq".to_string(),
             DepartmentDecl {
                 lua: "departments/dlq/main.lua".into(),
+                owner_root: std::path::PathBuf::from("."),
                 consumes: vec!["dead_letter".to_string()],
                 produces: Vec::new(),
                 ephemeral: vec!["dead_letter".to_string()],
@@ -813,6 +809,7 @@ mod tests {
             "next_worker".to_string(),
             DepartmentDecl {
                 lua: "departments/next_worker/main.lua".into(),
+                owner_root: std::path::PathBuf::from("."),
                 consumes: vec!["next".to_string()],
                 produces: Vec::new(),
                 ephemeral: Vec::new(),
@@ -863,6 +860,7 @@ mod tests {
             "next_worker".to_string(),
             DepartmentDecl {
                 lua: "departments/next_worker/main.lua".into(),
+                owner_root: std::path::PathBuf::from("."),
                 consumes: vec!["next".to_string()],
                 produces: Vec::new(),
                 ephemeral: Vec::new(),

@@ -64,7 +64,7 @@ Codex 全局上限由 `<RT>/codex-permits/permit-*` 的 fcntl permit 池强制�
 
 ## Pipeline / 事件 / 路由
 
-事件流是 `source -> fanout -> route -> spawn -> RAISED`。`cron` 和 `file_watch` source 由 `raisers/*.lua` 静态声明；Department 的 `M.spec` 静态声明 consumes/produces/fanout/stall_window。启动时 graph scan 一次性求值 package root 与 host root 中固定目录，构造 Config。
+事件流是 `source -> fanout -> route -> spawn -> RAISED`。`cron` 和 `file_watch` source 由 `raisers/*.lua` 静态声明；Department 的 `M.spec` 静态声明 consumes/produces/fanout/stall_window。启动时 graph scan 一次性求值 package roots input set 与 host root 中固定目录，构造一张 composed Config。
 
 路由按 queue 和消费者集合发生。普通 queue 只能有一个 active consumer；fanout queue 必须由相关 Department 的 `M.spec.fanout` 显式声明。重复声明幂等，未声明多消费者或同队列反馈会在启动 validation 阶段拒绝。
 
@@ -72,7 +72,7 @@ Codex 全局上限由 `<RT>/codex-permits/permit-*` 的 fcntl permit 池强制�
 
 Source 只能来自 `cron` 与 `file_watch`。复杂日历、时区、退避、业务轮询、HTTP ingress 都不进入 source kind；用现有 source + Lua + 文件落盘组合。新增 source kind 是 trusted base 扩张，必须有真实 evidence、设计闭包和 conformance。
 
-启动图固定来自 `FKST_PACKAGE_ROOT` 或 `--package-root` 指向的 package root，再加 host root。合法输入是 `departments/`、`raisers/` 和可被 Lua `require` 的 package 文件。`package.lua`、package manifest、root list、dependency/order/override DSL、`FKST_STDLIB_ROOT`、`FKST_RUNTIME_PACKAGE_ROOT`、`FKST_GRAPH_ROOTS` 都不是合法 surface。
+启动图固定来自可重复 `--package-root`、`FKST_PACKAGE_ROOTS` 或旧单值 `FKST_PACKAGE_ROOT` 指向的 installed package roots input set，再加 host root。`FKST_PACKAGE_ROOTS` 使用平台 path list 分隔符，不使用逗号。显式 `--package-root` 优先；无显式参数时同时设置 `FKST_PACKAGE_ROOTS` 与 `FKST_PACKAGE_ROOT` 必须 fail closed。`run` 永远只接收单个 owner-root；`supervise`、`test`、`conformance`、`config` 可接收多个 package root。合法输入是各 root 下的 `departments/`、`raisers/` 和该 root 自己可被 Lua `require` 的 package 文件；每个 graph root 用 fresh Lua state 且 `package.path` 只指向自身 root。`package.lua`、package manifest、dependency/order/override DSL、跨包 require、`FKST_STDLIB_ROOT`、`FKST_RUNTIME_PACKAGE_ROOT`、`FKST_GRAPH_ROOTS` 都不是合法 surface。一个 supervisor 仍只组合出一张 composed graph。
 
 ## 边界
 

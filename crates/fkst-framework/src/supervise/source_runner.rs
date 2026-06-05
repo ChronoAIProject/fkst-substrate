@@ -490,6 +490,7 @@ mod tests {
             "test".to_string(),
             DepartmentDecl {
                 lua: "departments/test/main.lua".into(),
+                owner_root: std::path::PathBuf::from("."),
                 consumes: vec![queue_name.to_string()],
                 produces: Vec::new(),
                 ephemeral: vec![queue_name.to_string()],

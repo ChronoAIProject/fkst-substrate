@@ -39,6 +39,7 @@ fn fanout_router(queue_name: &str) -> (Fanout, DeliveryRouter) {
             ephemeral: vec![queue_name.to_string()],
             stall_window: "30s".to_string(),
             retry: None,
+            owner_root: std::path::PathBuf::from("."),
         },
     );
     let cfg = Config {
