@@ -39,6 +39,7 @@ pub enum RaiserDecl {
 pub struct DepartmentDecl {
     pub lua: PathBuf,
     pub owner_root: PathBuf,
+    pub owner_namespace: String,
     #[serde(default)]
     pub consumes: Vec<String>,
     #[serde(default)]

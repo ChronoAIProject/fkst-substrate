@@ -6,7 +6,7 @@ use serde_json::Value as JsonValue;
 use std::path::Path;
 
 use crate::config_registry::ConfigContext;
-use crate::path_resolver::{package_root_path, PackageRoots};
+use crate::path_resolver::{package_root_path, NameResolver};
 use crate::raise::RaiseBuffer;
 
 /// Create a Lua state with stdlib enabled.
@@ -19,6 +19,8 @@ pub fn register_framework_sdk(
     lua: &Lua,
     raise_buf: RaiseBuffer,
     host_root: &Path,
+    resolver: NameResolver,
+    owner_namespace: String,
 ) -> mlua::Result<()> {
     let config = ConfigContext::from_host_root(host_root).map_err(mlua::Error::external)?;
     crate::sdk_log::register(lua)?;
@@ -29,7 +31,7 @@ pub fn register_framework_sdk(
     crate::sdk_mark::register(lua, host_root)?;
     crate::sdk_cache::register(lua, host_root)?;
     crate::sdk_codex::register(lua, host_root, config)?;
-    crate::raise::register(lua, raise_buf)?;
+    crate::raise::register(lua, raise_buf, resolver, owner_namespace)?;
     Ok(())
 }
 
@@ -64,7 +66,8 @@ pub(crate) fn set_package_roots_path<'a>(
 /// (and also pass as the argument to `pipeline`).
 ///
 /// Returns Ok on success; errors propagate (script errors, missing pipeline fn, etc.).
-pub fn run_dept_with_package_root(
+#[cfg(test)]
+fn run_dept_with_package_root(
     lua: &Lua,
     lua_path: &Path,
     event: &JsonValue,
@@ -107,20 +110,6 @@ pub fn run_dept_with_require_roots<'a>(
         .call::<()>(event_lua)
         .context("pipeline(event) call")?;
     Ok(())
-}
-
-pub fn run_dept_with_roots(
-    lua: &Lua,
-    lua_path: &Path,
-    event: &JsonValue,
-    roots: &PackageRoots,
-) -> Result<()> {
-    run_dept_with_require_roots(
-        lua,
-        lua_path,
-        event,
-        roots.package_roots().iter().map(|root| root.as_path()),
-    )
 }
 
 #[cfg(test)]

@@ -72,7 +72,11 @@ Codex 全局上限由 `<RT>/codex-permits/permit-*` 的 fcntl permit 池强制�
 
 Source 只能来自 `cron` 与 `file_watch`。复杂日历、时区、退避、业务轮询、HTTP ingress 都不进入 source kind；用现有 source + Lua + 文件落盘组合。新增 source kind 是 trusted base 扩张，必须有真实 evidence、设计闭包和 conformance。
 
-启动图固定来自可重复 `--package-root`、`FKST_PACKAGE_ROOTS` 或旧单值 `FKST_PACKAGE_ROOT` 指向的 installed package roots input set，再加 host root。`FKST_PACKAGE_ROOTS` 使用平台 path list 分隔符，不使用逗号。显式 `--package-root` 优先；无显式参数时同时设置 `FKST_PACKAGE_ROOTS` 与 `FKST_PACKAGE_ROOT` 必须 fail closed。`run` 永远只接收单个 owner-root；`supervise`、`test`、`conformance`、`config` 可接收多个 package root。合法输入是各 root 下的 `departments/`、`raisers/` 和该 root 自己可被 Lua `require` 的 package 文件；每个 graph root 用 fresh Lua state 且 `package.path` 只指向自身 root。`package.lua`、package manifest、dependency/order/override DSL、跨包 require、`FKST_STDLIB_ROOT`、`FKST_RUNTIME_PACKAGE_ROOT`、`FKST_GRAPH_ROOTS` 都不是合法 surface。一个 supervisor 仍只组合出一张 composed graph。
+启动图固定来自可重复 `--package-root`、`FKST_PACKAGE_ROOTS` 或旧单值 `FKST_PACKAGE_ROOT` 指向的 installed package roots input set，再加 host root。`FKST_PACKAGE_ROOTS` 使用平台 path list 分隔符，不使用逗号。显式 `--package-root` 优先；无显式参数时同时设置 `FKST_PACKAGE_ROOTS` 与 `FKST_PACKAGE_ROOT` 必须 fail closed。package identity 是 canonical package-root basename；package id、Department、Raiser 和 queue 段名都必须匹配 `[A-Za-z0-9_-]+`，`.` 只作为 `pkg.queue` 跨包限定符。两个 package root basename 相同 fail closed；独立 host root 存在时 package basename `host` fail closed，`host` 是固定 host namespace。
+
+queue 是包内命名空间。多 graph-root 组合时，裸 queue 名按 owner namespace 解析为 `<pkg>.<queue>` 或 `host.<queue>`；跨包消费必须显式写 `pkg.queue`。折叠单包（`package-root == host-root` 且只有一个 graph root）保持 LegacyFlat 字节等价：裸 queue、RAISED、Event.queue、delivery id、source_ref 和日志仍是裸名，同包限定名只作为幂等别名解析回裸名。
+
+`run` 接收 `--owner-namespace <id>` 并按 owner root 构造 require roots；package owner 只看自己的 root，host owner 看 `[host]+packages`，folded owner 看 combined root。`supervise`、`test`、`conformance`、`config` 可接收多个 package root。合法输入是各 root 下的 `departments/`、`raisers/` 和该 root 自己可被 Lua `require` 的 package 文件；每个 graph root 用 fresh Lua state 且 `package.path` 只指向自身 root。`package.lua`、package manifest、dependency/order/override DSL、跨包 require、`FKST_STDLIB_ROOT`、`FKST_RUNTIME_PACKAGE_ROOT`、`FKST_GRAPH_ROOTS` 都不是合法 surface。一个 supervisor 仍只组合出一张 composed graph。
 
 ## 边界
 
@@ -98,7 +102,7 @@ Producer 对 queue 调用 `try_send`。某个慢消费者 `Full` 或 `Closed` �
 
 supervisor spawn framework 时使用独立 process group，但收到 `SIGINT` 或 `SIGTERM` 时只退出自己，不向 event runtime 发送信号。restart 不杀 in-flight framework/codex；在飞工作可以自然完成并留下事实，后续事件若丢失应由 package/host scanner 从事实源恢复。
 
-Department execution 由 supervise spawn `fkst-framework run <lua> --package-root <path> --event <json>`。每个 framework child 有独立 process group、具名 log、stdout/stderr 捕获和 no-output stall window。stall window 是无输出卡死检测，不是总时长上限；有持续输出就等自然退出。stall 时发送 `SIGKILL` 到整个 process group，退出码映射为 `124`。
+Department execution 由 supervise spawn `fkst-framework run <lua> --project-root <HOST> --package-root <ROOT> ... --owner-namespace <id> --event <json>`。每个 framework child 有独立 process group、具名 log、stdout/stderr 捕获和 no-output stall window；child log 写入 `OWNER_NAMESPACE=...`。stall window 是无输出卡死检测，不是总时长上限；有持续输出就等自然退出。stall 时发送 `SIGKILL` 到整个 process group，退出码映射为 `124`。
 
 Codex 调用固定为 `codex exec --dangerously-bypass-approvals-and-sandbox [-C worktree] [--context context] -`。prompt 写入 stdin；stdin EOF 是调用边界。stdout、stderr、exit_code、cmd、done time、stall window 必须写入 codex log。`spawn_codex` 返回的 handle 只能由同一 pipeline 的 `await_all` 消费，不能跨 pipeline 复用。
 

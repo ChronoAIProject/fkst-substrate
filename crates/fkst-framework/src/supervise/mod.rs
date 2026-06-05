@@ -165,6 +165,7 @@ mod tests {
             DepartmentDecl {
                 lua: "departments/worker/main.lua".into(),
                 owner_root: std::path::PathBuf::from("."),
+                owner_namespace: "pkg".to_string(),
                 consumes: vec!["jobs".to_string()],
                 produces: Vec::new(),
                 ephemeral: if ephemeral {

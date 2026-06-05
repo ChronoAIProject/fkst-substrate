@@ -5,6 +5,15 @@ fn framework_bin() -> &'static str {
     env!("CARGO_BIN_EXE_fkst-framework")
 }
 
+fn namespace(root: &Path) -> String {
+    root.canonicalize()
+        .unwrap()
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned()
+}
+
 const CODEX_PERMIT_SLOTS_ENV: &str = "FKST_CODEX_PERMIT_SLOTS";
 const PACKAGE_ROOT_ENV: &str = "FKST_PACKAGE_ROOT";
 const RUNTIME_ROOT_ENV: &str = "FKST_RUNTIME_ROOT";
@@ -37,7 +46,7 @@ fn init_repo(repo: &Path) {
 
 #[test]
 fn self_test_succeeds_in_temp_cwd() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
 
     let output = Command::new(framework_bin())
         .arg("--self-test")
@@ -64,7 +73,7 @@ fn self_test_succeeds_in_temp_cwd() {
 
 #[test]
 fn self_test_rejects_config_file_input() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
 
     let output = Command::new(framework_bin())
         .arg("--self-test")
@@ -84,7 +93,7 @@ fn self_test_rejects_config_file_input() {
 
 #[test]
 fn self_test_reports_permit_pool_failure() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
     std::fs::create_dir_all(tmp.path().join(".fkst/runtime")).unwrap();
     std::fs::write(
         tmp.path().join(".fkst/runtime/codex-permits"),
@@ -106,7 +115,7 @@ fn self_test_reports_permit_pool_failure() {
 
 #[test]
 fn self_test_reports_permit_pool_slot_env_failure() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
 
     let output = Command::new(framework_bin())
         .arg("--self-test")
@@ -124,7 +133,7 @@ fn self_test_reports_permit_pool_slot_env_failure() {
 
 #[test]
 fn run_subcommand_still_executes_pipeline() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
     let lua = tmp.path().join("dept.lua");
     std::fs::write(
         &lua,
@@ -141,6 +150,8 @@ end
         .arg(&lua)
         .arg("--project-root")
         .arg(tmp.path())
+        .arg("--owner-namespace")
+        .arg(namespace(tmp.path()))
         .arg("--event")
         .arg(r#"{"name":"ok"}"#)
         .env(PACKAGE_ROOT_ENV, tmp.path())
@@ -157,7 +168,7 @@ end
 
 #[test]
 fn run_project_root_controls_host_facts_and_git_sdk_when_cwd_differs() {
-    let root = tempfile::tempdir().unwrap();
+    let root = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
     let host = root.path().join("host");
     let cwd = root.path().join("unrelated");
     std::fs::create_dir_all(host.join("departments/worker")).unwrap();
@@ -197,6 +208,8 @@ end
         .arg(&host)
         .arg("--package-root")
         .arg(&host)
+        .arg("--owner-namespace")
+        .arg(namespace(&host))
         .arg("--event")
         .arg(r#"{"name":"ok"}"#)
         .env(RUNTIME_ROOT_ENV, &runtime_root)

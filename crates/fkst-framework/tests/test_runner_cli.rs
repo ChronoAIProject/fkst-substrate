@@ -81,9 +81,18 @@ fn run_command(host: &Path, lua: &Path) -> Command {
     cmd
 }
 
+fn namespace(root: &Path) -> String {
+    root.canonicalize()
+        .unwrap()
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned()
+}
+
 #[test]
 fn test_runner_runs_codex_package_tests() {
-    let host = tempfile::tempdir().unwrap();
+    let host = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
     copy_codex_package(host.path());
 
     let output = run_lua_tests(host.path(), host.path());
@@ -144,9 +153,9 @@ fn test_runner_runs_minimal_package_sanity_tests() {
 
 #[test]
 fn test_runner_isolates_each_test_file_to_its_owner_root() {
-    let host = tempfile::tempdir().unwrap();
-    let package_a = tempfile::tempdir().unwrap();
-    let package_b = tempfile::tempdir().unwrap();
+    let host = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
+    let package_a = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
+    let package_b = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
 
     for (package, label) in [(package_a.path(), "a"), (package_b.path(), "b")] {
         fs::create_dir_all(package.join("departments/probe")).unwrap();
@@ -214,8 +223,65 @@ return {{
 }
 
 #[test]
+fn test_runner_host_department_uses_package_standard_asset() {
+    let host = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
+    let package = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
+
+    fs::create_dir_all(package.path().join("fkst")).unwrap();
+    fs::write(
+        package.path().join("fkst/standard_asset.lua"),
+        r#"return { value = function() return "from-package" end }"#,
+    )
+    .unwrap();
+    fs::create_dir_all(host.path().join("departments/probe")).unwrap();
+    fs::write(
+        host.path().join("departments/probe/main.lua"),
+        r#"
+local standard = require("fkst.standard_asset")
+function pipeline(event)
+  raise("seen", { value = standard.value() })
+end
+"#,
+    )
+    .unwrap();
+    fs::create_dir_all(host.path().join("tests")).unwrap();
+    fs::write(
+        host.path().join("tests/host_department_test.lua"),
+        r#"
+local t = fkst.test
+return {
+  test_run_department_uses_package_standard_asset = function()
+    local result = fkst.test.run_department("departments/probe/main.lua", { payload = {} })
+    t.eq(result.exit_code, 0)
+    t.eq(result.raises[1].queue, "host.seen")
+    t.eq(result.raises[1].payload.value, "from-package")
+  end,
+}
+"#,
+    )
+    .unwrap();
+
+    let output = run_lua_tests_with_packages(host.path(), &[package.path()]);
+
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}",
+        stdout(&output),
+        stderr(&output)
+    );
+    let out = stdout(&output);
+    assert!(
+        out.contains(
+            "PASS tests/host_department_test.lua::test_run_department_uses_package_standard_asset"
+        ),
+        "stdout: {out}"
+    );
+    assert!(out.contains("1 passed, 0 failed"), "stdout: {out}");
+}
+
+#[test]
 fn test_runner_continues_after_failure() {
-    let host = tempfile::tempdir().unwrap();
+    let host = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
     fs::create_dir_all(host.path().join("tests")).unwrap();
     fs::write(
         host.path().join("tests/failure_test.lua"),
@@ -256,7 +322,7 @@ return {
 
 #[test]
 fn test_surface_does_not_leak_to_production_run() {
-    let host = tempfile::tempdir().unwrap();
+    let host = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
     fs::create_dir_all(host.path().join("departments/probe")).unwrap();
     let probe = host.path().join("departments/probe/main.lua");
     fs::write(
@@ -276,6 +342,8 @@ end
         .arg(host.path())
         .arg("--package-root")
         .arg(host.path())
+        .arg("--owner-namespace")
+        .arg(namespace(host.path()))
         .arg("--event")
         .arg("{}")
         .current_dir(host.path())
@@ -293,8 +361,8 @@ end
 
 #[test]
 fn production_run_does_not_require_from_host_cwd_when_owner_lacks_module() {
-    let host = tempfile::tempdir().unwrap();
-    let package = tempfile::tempdir().unwrap();
+    let host = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
+    let package = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
     fs::create_dir_all(package.path().join("departments/probe")).unwrap();
     fs::write(host.path().join("core.lua"), r#"return { value = "host" }"#).unwrap();
     let probe = package.path().join("departments/probe/main.lua");
@@ -316,6 +384,8 @@ end
         .arg(host.path())
         .arg("--package-root")
         .arg(package.path())
+        .arg("--owner-namespace")
+        .arg(namespace(package.path()))
         .arg("--event")
         .arg("{}")
         .current_dir(host.path())
@@ -335,17 +405,17 @@ end
 }
 
 #[test]
-fn run_accepts_multiple_package_root_flags_as_require_roots() {
-    let host = tempfile::tempdir().unwrap();
-    let package_a = tempfile::tempdir().unwrap();
-    let package_b = tempfile::tempdir().unwrap();
-    fs::create_dir_all(package_a.path().join("departments/probe")).unwrap();
+fn run_accepts_host_owner_with_multiple_package_root_flags_as_require_roots() {
+    let host = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
+    let package_a = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
+    let package_b = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
+    fs::create_dir_all(host.path().join("departments/probe")).unwrap();
     fs::write(
         package_b.path().join("core.lua"),
         r#"return { value = "from-package-b" }"#,
     )
     .unwrap();
-    let probe = package_a.path().join("departments/probe/main.lua");
+    let probe = host.path().join("departments/probe/main.lua");
     fs::write(
         &probe,
         r#"
@@ -359,9 +429,13 @@ end
 
     let output = run_command(host.path(), &probe)
         .arg("--package-root")
+        .arg(host.path())
+        .arg("--package-root")
         .arg(package_a.path())
         .arg("--package-root")
         .arg(package_b.path())
+        .arg("--owner-namespace")
+        .arg("host")
         .output()
         .unwrap();
 
@@ -376,8 +450,8 @@ end
 
 #[test]
 fn run_rejects_package_roots_env_even_with_singular_env() {
-    let host = tempfile::tempdir().unwrap();
-    let package = tempfile::tempdir().unwrap();
+    let host = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
+    let package = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
     fs::create_dir_all(package.path().join("departments/probe")).unwrap();
     let probe = package.path().join("departments/probe/main.lua");
     fs::write(&probe, "function pipeline(event) end\n").unwrap();
@@ -405,8 +479,8 @@ fn run_rejects_package_roots_env_even_with_singular_env() {
 
 #[test]
 fn run_single_package_entrypoints_are_equivalent() {
-    let host = tempfile::tempdir().unwrap();
-    let package = tempfile::tempdir().unwrap();
+    let host = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
+    let package = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
     fs::create_dir_all(package.path().join("departments/probe")).unwrap();
     fs::write(
         package.path().join("core.lua"),
@@ -428,15 +502,21 @@ end
     let flag = run_command(host.path(), &probe)
         .arg("--package-root")
         .arg(package.path())
+        .arg("--owner-namespace")
+        .arg(namespace(package.path()))
         .output()
         .unwrap();
     let singular = run_command(host.path(), &probe)
+        .arg("--owner-namespace")
+        .arg(namespace(package.path()))
         .env("FKST_PACKAGE_ROOT", package.path())
         .output()
         .unwrap();
     let package_is_host = run_command(package.path(), &probe)
         .arg("--package-root")
         .arg(package.path())
+        .arg("--owner-namespace")
+        .arg(namespace(package.path()))
         .output()
         .unwrap();
 
@@ -449,5 +529,10 @@ end
         );
     }
     assert_eq!(stdout(&flag), stdout(&singular));
-    assert_eq!(stdout(&flag), stdout(&package_is_host));
+    assert_ne!(stdout(&flag), stdout(&package_is_host));
+    assert!(
+        stdout(&package_is_host).contains("RAISED: W3sicXVldWUiOiJzZWVuIiw"),
+        "stdout: {}",
+        stdout(&package_is_host)
+    );
 }

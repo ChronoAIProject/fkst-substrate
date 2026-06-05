@@ -358,6 +358,7 @@ mod tests {
             DepartmentDecl {
                 lua: lua.file_name().unwrap().into(),
                 owner_root: std::path::PathBuf::from("."),
+                owner_namespace: "pkg".to_string(),
                 consumes: vec!["tick".into()],
                 produces: Vec::new(),
                 ephemeral: Vec::new(),

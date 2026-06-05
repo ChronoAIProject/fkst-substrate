@@ -1,6 +1,6 @@
 //! Framework spawn with new process group + SIGKILL -pgid on stall.
 //!
-//! Spawn `fkst-framework run <lua_path> --project-root <path> --package-root <path> ... --event <json>` with setsid.
+//! Spawn `fkst-framework run <lua_path> --project-root <path> --package-root <path> ... --owner-namespace <id> --event <json>` with setsid.
 //! On no-output stall, send SIGKILL to -pgid so codex subprocess children are collected too.
 
 use anyhow::{Context, Result};
@@ -52,6 +52,7 @@ pub async fn spawn_framework(
     lua_path: &Path,
     host_root: &Path,
     package_roots: &[PathBuf],
+    owner_namespace: &str,
     event_json: &str,
     stall_window: Duration,
     codex_permit_slots: usize,
@@ -60,17 +61,22 @@ pub async fn spawn_framework(
 ) -> Result<SpawnResult> {
     let start = std::time::Instant::now();
     let cmd_line = format!(
-        "{} run {} --project-root {} {} --event <json>",
+        "{} run {} --project-root {} {} --owner-namespace {} --event <json>",
         binary.display(),
         lua_path.display(),
         host_root.display(),
-        package_root_flags(package_roots)
+        package_root_flags(package_roots),
+        owner_namespace,
     );
     let mut log = FrameworkChildLog::open(log_dir, child_label);
     log.write_line(&format!("CMD={cmd_line}"));
     log.write_line(&format!("LUA={}", lua_path.display()));
     log.write_line(&format!("HOST_ROOT={}", host_root.display()));
-    log.write_line(&format!("PACKAGE_ROOTS={}", package_root_list(package_roots)));
+    log.write_line(&format!(
+        "PACKAGE_ROOTS={}",
+        package_root_list(package_roots)
+    ));
+    log.write_line(&format!("OWNER_NAMESPACE={owner_namespace}"));
     log.write_line(&format!("DEPT={child_label}"));
     log.write_line(&format!("STALL_WINDOW_MS={}", stall_window.as_millis()));
 
@@ -82,7 +88,9 @@ pub async fn spawn_framework(
     for package_root in package_roots {
         cmd.arg("--package-root").arg(package_root);
     }
-    cmd.arg("--event")
+    cmd.arg("--owner-namespace")
+        .arg(owner_namespace)
+        .arg("--event")
         .arg(event_json)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())

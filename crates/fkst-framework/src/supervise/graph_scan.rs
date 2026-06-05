@@ -16,7 +16,9 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use crate::config_registry::{ConfigContext, ConfigKey, ConfigValueType};
-use crate::path_resolver::{package_root_path, GraphRoot, GraphRootKind, PackageRoots};
+use crate::path_resolver::{
+    package_root_path, validate_name_segment, GraphRoot, GraphRootKind, NameResolver, PackageRoots,
+};
 
 /// Deserialization helper for a department's `M.spec` table.
 #[derive(Deserialize)]
@@ -120,10 +122,9 @@ pub fn load_roots(roots: &PackageRoots) -> Result<Config> {
     }
 
     let defaults = HostGraphDefaults::load(roots)?;
+    let resolver = roots.name_resolver();
     let mut departments: BTreeMap<String, DepartmentDecl> = BTreeMap::new();
     let mut raisers: BTreeMap<String, RaiserDecl> = BTreeMap::new();
-    let mut department_owners: BTreeMap<String, PathBuf> = BTreeMap::new();
-    let mut raiser_owners: BTreeMap<String, PathBuf> = BTreeMap::new();
     let mut department_fanout: HashMap<String, Vec<String>> = HashMap::new();
 
     for graph_root in &graph_roots {
@@ -133,18 +134,12 @@ pub fn load_roots(roots: &PackageRoots) -> Result<Config> {
             &lua,
             graph_root,
             &require_roots,
+            &resolver,
             &defaults,
             &mut departments,
-            &mut department_owners,
             &mut department_fanout,
         )?;
-        scan_raisers(
-            &lua,
-            graph_root,
-            &require_roots,
-            &mut raisers,
-            &mut raiser_owners,
-        )?;
+        scan_raisers(&lua, graph_root, &require_roots, &resolver, &mut raisers)?;
     }
 
     let queues = derive_queues(&departments, &raisers, &department_fanout, &defaults)?;
@@ -173,9 +168,9 @@ fn scan_departments(
     lua: &Lua,
     graph_root: &GraphRoot,
     require_roots: &[PathBuf],
+    resolver: &NameResolver,
     defaults: &HostGraphDefaults,
     departments: &mut BTreeMap<String, DepartmentDecl>,
-    department_owners: &mut BTreeMap<String, PathBuf>,
     department_fanout: &mut HashMap<String, Vec<String>>,
 ) -> Result<()> {
     let repo_root = &graph_root.root;
@@ -186,6 +181,8 @@ fn scan_departments(
 
     for path in sorted_dirs(&dept_dir).with_context(|| format!("read {}", dept_dir.display()))? {
         let name = file_name(&path)?;
+        validate_name_segment("department name", &name)
+            .with_context(|| format!("validate department `{}`", name))?;
         let main_lua = path.join("main.lua");
         if !main_lua.is_file() {
             continue;
@@ -204,19 +201,31 @@ fn scan_departments(
         let spec: DeptSpec = lua
             .from_value(LuaValue::Table(spec_tbl))
             .with_context(|| format!("parse `{}.spec`", name))?;
-        let retry = materialize_retry(&retry, defaults, &spec.consumes)
+        let consumes = resolve_queues(resolver, &graph_root.namespace, spec.consumes)
+            .with_context(|| format!("resolve `{}.spec.consumes`", name))?;
+        let produces = resolve_queues(resolver, &graph_root.namespace, spec.produces)
+            .with_context(|| format!("resolve `{}.spec.produces`", name))?;
+        let fanout = resolve_queues(resolver, &graph_root.namespace, spec.fanout)
+            .with_context(|| format!("resolve `{}.spec.fanout`", name))?;
+        let ephemeral = resolve_queues(resolver, &graph_root.namespace, spec.ephemeral)
+            .with_context(|| format!("resolve `{}.spec.ephemeral`", name))?;
+        let retry = materialize_retry(&retry, defaults, &consumes)
             .with_context(|| format!("materialize `{}.spec.retry`", name))?;
 
         let config_path = config_path(repo_root, graph_root.kind, &main_lua);
-        insert_department_decl_with_root(
+        let canonical_name = resolver
+            .canonical_decl_name(&graph_root.namespace, &name)
+            .with_context(|| format!("resolve department `{}`", name))?;
+        insert_department_decl(
             departments,
-            &name,
+            &canonical_name,
             DepartmentDecl {
                 lua: config_path.clone(),
                 owner_root: repo_root.clone(),
-                consumes: spec.consumes,
-                produces: spec.produces,
-                ephemeral: spec.ephemeral,
+                owner_namespace: graph_root.namespace.clone(),
+                consumes,
+                produces,
+                ephemeral,
                 stall_window: if spec.stall_window.trim().is_empty() {
                     defaults.department_default_stall_window.clone()
                 } else {
@@ -225,10 +234,8 @@ fn scan_departments(
                 retry,
             },
             &config_path,
-            repo_root,
-            department_owners,
         )?;
-        department_fanout.insert(name, spec.fanout);
+        department_fanout.insert(canonical_name, fanout);
     }
 
     Ok(())
@@ -257,8 +264,8 @@ fn materialize_retry(
 ) -> Result<Option<RetryDecl>> {
     match retry {
         DeptRetrySetting::Disabled => Ok(None),
-        DeptRetrySetting::Default if consumes.iter().any(|queue| queue == "dead_letter") => {
-            if consumes.iter().any(|queue| queue != "dead_letter") {
+        DeptRetrySetting::Default if consumes.iter().any(|queue| is_dead_letter_queue(queue)) => {
+            if consumes.iter().any(|queue| !is_dead_letter_queue(queue)) {
                 bail!(
                     "department consumes `dead_letter` and another queue with retry unset; set M.spec.retry to a table or false"
                 );
@@ -284,8 +291,8 @@ fn scan_raisers(
     lua: &Lua,
     graph_root: &GraphRoot,
     require_roots: &[PathBuf],
+    resolver: &NameResolver,
     raisers: &mut BTreeMap<String, RaiserDecl>,
-    raiser_owners: &mut BTreeMap<String, PathBuf>,
 ) -> Result<()> {
     let repo_root = &graph_root.root;
     let raisers_dir = repo_root.join("raisers");
@@ -301,110 +308,90 @@ fn scan_raisers(
             .ok_or_else(|| anyhow!("raiser file no stem"))?
             .to_string_lossy()
             .into_owned();
+        validate_name_segment("raiser name", &stem)
+            .with_context(|| format!("validate raiser `{}`", stem))?;
         let val = eval_lua_value(lua, require_roots, &path)
             .with_context(|| format!("eval raiser `{}` from {}", stem, path.display()))?;
         let r: RaiserDecl = lua
             .from_value(val)
             .with_context(|| format!("parse raisers/{}.lua", stem))?;
         reject_runtime_file_watch_glob(&r)?;
+        let r = resolve_raiser(resolver, &graph_root.namespace, r)
+            .with_context(|| format!("resolve raiser `{}`", stem))?;
 
         let config_path = config_path(repo_root, graph_root.kind, &path);
-        insert_raiser_decl_with_root(raisers, &stem, r, &config_path, repo_root, raiser_owners)?;
+        let canonical_name = resolver
+            .canonical_decl_name(&graph_root.namespace, &stem)
+            .with_context(|| format!("resolve raiser `{}`", stem))?;
+        insert_raiser_decl(raisers, &canonical_name, r, &config_path)?;
     }
 
     Ok(())
 }
 
-#[cfg(test)]
 pub(crate) fn insert_department_decl(
     departments: &mut BTreeMap<String, DepartmentDecl>,
     name: &str,
     decl: DepartmentDecl,
     config_path: &Path,
 ) -> Result<()> {
-    let mut owners = departments
-        .iter()
-        .map(|(existing_name, existing_decl)| {
-            (existing_name.clone(), existing_decl.owner_root.clone())
-        })
-        .collect();
-    let owner_root = decl.owner_root.clone();
-    insert_department_decl_with_root(
-        departments,
-        name,
-        decl,
-        config_path,
-        &owner_root,
-        &mut owners,
-    )
-}
-
-fn insert_department_decl_with_root(
-    departments: &mut BTreeMap<String, DepartmentDecl>,
-    name: &str,
-    decl: DepartmentDecl,
-    config_path: &Path,
-    owner_root: &Path,
-    department_owners: &mut BTreeMap<String, PathBuf>,
-) -> Result<()> {
-    if let Some(previous_root) = department_owners.get(name) {
+    if departments.contains_key(name) {
         bail!(
-            "duplicate department `{}`: previous root {} new root {} at {}",
+            "duplicate department `{}` at {}",
             name,
-            previous_root.display(),
-            owner_root.display(),
-            config_path.display(),
+            config_path.display()
         );
     }
-    department_owners.insert(name.to_string(), owner_root.to_path_buf());
     departments.insert(name.to_string(), decl);
     Ok(())
 }
 
-#[cfg(test)]
 pub(crate) fn insert_raiser_decl(
     raisers: &mut BTreeMap<String, RaiserDecl>,
     name: &str,
     decl: RaiserDecl,
     config_path: &Path,
 ) -> Result<()> {
-    let mut owners = raisers
-        .keys()
-        .map(|existing_name| {
-            (
-                existing_name.clone(),
-                PathBuf::from("<existing raiser test root>"),
-            )
-        })
-        .collect();
-    let owner_root = config_path
-        .parent()
-        .and_then(Path::parent)
-        .unwrap_or(config_path)
-        .to_path_buf();
-    insert_raiser_decl_with_root(raisers, name, decl, config_path, &owner_root, &mut owners)
-}
-
-fn insert_raiser_decl_with_root(
-    raisers: &mut BTreeMap<String, RaiserDecl>,
-    name: &str,
-    decl: RaiserDecl,
-    config_path: &Path,
-    owner_root: &Path,
-    raiser_owners: &mut BTreeMap<String, PathBuf>,
-) -> Result<()> {
-    if let Some(previous_root) = raiser_owners.get(name) {
-        bail!(
-            "duplicate raiser `{}`: previous root {} new root {} at {}",
-            name,
-            previous_root.display(),
-            owner_root.display(),
-            config_path.display()
-        );
+    if raisers.contains_key(name) {
+        bail!("duplicate raiser `{}` at {}", name, config_path.display());
     }
-    raiser_owners.insert(name.to_string(), owner_root.to_path_buf());
     raisers.insert(name.to_string(), decl);
     Ok(())
+}
+
+fn is_dead_letter_queue(queue: &str) -> bool {
+    queue
+        .rsplit_once('.')
+        .map(|(_, name)| name == "dead_letter")
+        .unwrap_or(queue == "dead_letter")
+}
+
+fn resolve_queues(
+    resolver: &NameResolver,
+    owner_namespace: &str,
+    queues: Vec<String>,
+) -> Result<Vec<String>> {
+    queues
+        .into_iter()
+        .map(|queue| resolver.resolve(owner_namespace, &queue))
+        .collect()
+}
+
+fn resolve_raiser(
+    resolver: &NameResolver,
+    owner_namespace: &str,
+    raiser: RaiserDecl,
+) -> Result<RaiserDecl> {
+    match raiser {
+        RaiserDecl::Cron { interval, produces } => Ok(RaiserDecl::Cron {
+            interval,
+            produces: resolver.resolve(owner_namespace, &produces)?,
+        }),
+        RaiserDecl::FileWatch { glob, produces } => Ok(RaiserDecl::FileWatch {
+            glob,
+            produces: resolver.resolve(owner_namespace, &produces)?,
+        }),
+    }
 }
 
 fn derive_queues(

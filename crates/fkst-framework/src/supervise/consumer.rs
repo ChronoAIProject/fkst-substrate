@@ -472,11 +472,28 @@ fn retry_record(
 }
 
 fn publish_dead_letter(router: &DeliveryRouter, record: &DeliveryRecord, error: &str) {
-    if record.queue == "dead_letter" {
+    let Some((namespace, _)) = record.dept.split_once('.') else {
+        if record.queue == "dead_letter" {
+            return;
+        }
+        publish_dead_letter_to(router, record, "dead_letter", error);
+        return;
+    };
+    let dead_letter = format!("{namespace}.dead_letter");
+    if record.queue == dead_letter {
         return;
     }
+    publish_dead_letter_to(router, record, &dead_letter, error);
+}
+
+fn publish_dead_letter_to(
+    router: &DeliveryRouter,
+    record: &DeliveryRecord,
+    queue: &str,
+    error: &str,
+) {
     let event = Event::new(
-        "dead_letter",
+        queue,
         serde_json::json!({
             "delivery_id": record.delivery_id,
             "queue": record.queue,
@@ -566,6 +583,7 @@ fn spawn_args(
         stall_window,
         codex_permit_slots,
         log_dir: log_dir.to_path_buf(),
+        owner_namespace: decl.owner_namespace.clone(),
     })
 }
 
@@ -578,6 +596,7 @@ struct SpawnArgs {
     stall_window: Duration,
     codex_permit_slots: usize,
     log_dir: PathBuf,
+    owner_namespace: String,
 }
 
 async fn spawn_and_report(dept_name: &str, args: &SpawnArgs) -> anyhow::Result<SpawnResult> {
@@ -586,6 +605,7 @@ async fn spawn_and_report(dept_name: &str, args: &SpawnArgs) -> anyhow::Result<S
         &args.lua_full,
         &args.project_root,
         &args.package_roots,
+        &args.owner_namespace,
         &args.event_json,
         args.stall_window,
         args.codex_permit_slots,
@@ -693,6 +713,7 @@ mod tests {
             DepartmentDecl {
                 lua: "departments/dlq/main.lua".into(),
                 owner_root: std::path::PathBuf::from("."),
+                owner_namespace: "pkg".to_string(),
                 consumes: vec!["dead_letter".to_string()],
                 produces: Vec::new(),
                 ephemeral: vec!["dead_letter".to_string()],
@@ -820,6 +841,7 @@ mod tests {
             DepartmentDecl {
                 lua: "departments/next_worker/main.lua".into(),
                 owner_root: std::path::PathBuf::from("."),
+                owner_namespace: "pkg".to_string(),
                 consumes: vec!["next".to_string()],
                 produces: Vec::new(),
                 ephemeral: Vec::new(),
@@ -871,6 +893,7 @@ mod tests {
             DepartmentDecl {
                 lua: "departments/next_worker/main.lua".into(),
                 owner_root: std::path::PathBuf::from("."),
+                owner_namespace: "pkg".to_string(),
                 consumes: vec!["next".to_string()],
                 produces: Vec::new(),
                 ephemeral: Vec::new(),

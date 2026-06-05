@@ -1,6 +1,6 @@
 //! fkst-framework — Tier III one-shot Lua runner.
 //!
-//! CLI: `fkst-framework run <lua_file> --project-root <path> --package-root <path> ... --event '<json>'`
+//! CLI: `fkst-framework run <lua_file> --project-root <path> --package-root <path> ... [--owner-namespace <id>] --event '<json>'`
 //! CLI: `fkst-framework supervise --project-root <path> --framework-bin <path>`
 //! CLI: `fkst-framework conformance --project-root <path>`
 //! CLI: `fkst-framework test --project-root <path> [--package-root <path> ...]`
@@ -46,6 +46,7 @@ enum CliCommand {
     Run {
         lua_path: PathBuf,
         roots: PackageRoots,
+        owner_namespace: String,
         event: JsonValue,
     },
     Supervise {
@@ -63,7 +64,7 @@ fn parse_args() -> Result<CliCommand> {
     let mut args_iter = args.into_iter();
     let sub = args_iter.next().ok_or_else(|| {
         anyhow::anyhow!(
-            "usage: fkst-framework run <lua> --project-root <path> --package-root <path> [--package-root <path> ...] --event <json> | fkst-framework supervise --project-root <path> --framework-bin <path> [--package-root <path> ...] | fkst-framework conformance --project-root <path> [--package-root <path> ...] | fkst-framework config --project-root <path> [--package-root <path> ...] | fkst-framework test --project-root <path> [--package-root <path> ...] | fkst-framework --self-test"
+            "usage: fkst-framework run <lua> --project-root <path> --package-root <path> [--package-root <path> ...] [--owner-namespace <id>] --event <json> | fkst-framework supervise --project-root <path> --framework-bin <path> [--package-root <path> ...] | fkst-framework conformance --project-root <path> [--package-root <path> ...] | fkst-framework config --project-root <path> [--package-root <path> ...] | fkst-framework test --project-root <path> [--package-root <path> ...] | fkst-framework --self-test"
         )
     })?;
     if sub == "--self-test" {
@@ -112,6 +113,7 @@ fn parse_args() -> Result<CliCommand> {
             .into();
         let mut project_root: Option<PathBuf> = None;
         let mut package_roots: Vec<PathBuf> = Vec::new();
+        let mut owner_namespace: Option<String> = None;
         let mut event_json: Option<String> = None;
         while let Some(a) = args_iter.next() {
             match a.as_str() {
@@ -119,6 +121,9 @@ fn parse_args() -> Result<CliCommand> {
                 "--project-root" => project_root = args_iter.next().map(PathBuf::from),
                 "--package-root" => {
                     package_roots.push(next_iter_value(&mut args_iter, "--package-root")?.into());
+                }
+                "--owner-namespace" => {
+                    owner_namespace = Some(next_iter_value(&mut args_iter, "--owner-namespace")?)
                 }
                 other => anyhow::bail!("unknown run argument: {}", other),
             }
@@ -128,9 +133,29 @@ fn parse_args() -> Result<CliCommand> {
             .with_context(|| format!("--event not valid json: {}", event_str))?;
         let project_root = project_root.ok_or_else(|| anyhow::anyhow!("missing --project-root"))?;
         let roots = PackageRoots::resolve_run(project_root, package_roots)?;
+        // --owner-namespace is optional: a direct `run` with a single --package-root
+        // (dogfood, package departments) defaults to that package's namespace. The
+        // supervisor passes it explicitly when a department's require roots span
+        // several package roots (host departments).
+        let owner_namespace = match owner_namespace {
+            Some(namespace) => namespace,
+            None => roots
+                .sole_package_namespace()
+                .map(str::to_string)
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "--owner-namespace is required when multiple --package-root are given"
+                    )
+                })?,
+        };
+        roots
+            .name_resolver()
+            .validate_owner(&owner_namespace)
+            .with_context(|| format!("validate --owner-namespace `{owner_namespace}`"))?;
         return Ok(CliCommand::Run {
             lua_path,
             roots,
+            owner_namespace,
             event,
         });
     }
@@ -244,13 +269,33 @@ fn next_value(args: &[String], index: usize, flag: &str) -> Result<String> {
         .ok_or_else(|| anyhow::anyhow!("missing {} value", flag))
 }
 
-fn run_pipeline(lua_path: PathBuf, roots: PackageRoots, event: JsonValue) -> Result<i32> {
+fn run_pipeline(
+    lua_path: PathBuf,
+    roots: PackageRoots,
+    owner_namespace: String,
+    event: JsonValue,
+) -> Result<i32> {
     let lua = mlua_init::new_lua();
     let raise_buf = RaiseBuffer::new();
+    let owner_root = roots
+        .owner_root_for_namespace(&owner_namespace)
+        .ok_or_else(|| anyhow::anyhow!("unknown owner namespace `{owner_namespace}`"))?;
+    let require_roots = roots.require_roots_for_owner(owner_root);
 
-    mlua_init::register_framework_sdk(&lua, raise_buf.clone(), roots.host_root())?;
+    mlua_init::register_framework_sdk(
+        &lua,
+        raise_buf.clone(),
+        roots.host_root(),
+        roots.name_resolver(),
+        owner_namespace,
+    )?;
 
-    let exit_code = match mlua_init::run_dept_with_roots(&lua, &lua_path, &event, &roots) {
+    let exit_code = match mlua_init::run_dept_with_require_roots(
+        &lua,
+        &lua_path,
+        &event,
+        require_roots.iter().map(|root| root.as_path()),
+    ) {
         Ok(()) => 0,
         Err(e) => {
             eprintln!("[framework] pipeline failed: {:#}", e);
@@ -294,8 +339,9 @@ fn run() -> Result<i32> {
         CliCommand::Run {
             lua_path,
             roots,
+            owner_namespace,
             event,
-        } => run_pipeline(lua_path, roots, event),
+        } => run_pipeline(lua_path, roots, owner_namespace, event),
         CliCommand::Supervise {
             roots,
             framework_bin,

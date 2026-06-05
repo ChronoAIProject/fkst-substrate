@@ -16,10 +16,21 @@ pub(crate) fn run_tests(roots: PackageRoots) -> Result<i32> {
         let lua = crate::mlua_init::new_lua();
         crate::mlua_init::set_package_roots_path(&lua, [file.owner_root.as_path()])
             .with_context(|| format!("set package.path for tests in {}", relpath))?;
-        crate::mlua_init::register_framework_sdk(&lua, RaiseBuffer::new(), roots.host_root())
-            .with_context(|| format!("register SDK for {}", relpath))?;
-        register_test_sdk(&lua, roots.clone(), file.owner_root.clone())
-            .with_context(|| format!("register fkst.test for {}", relpath))?;
+        crate::mlua_init::register_framework_sdk(
+            &lua,
+            RaiseBuffer::new(),
+            roots.host_root(),
+            roots.name_resolver(),
+            file.owner_namespace.clone(),
+        )
+        .with_context(|| format!("register SDK for {}", relpath))?;
+        register_test_sdk(
+            &lua,
+            roots.clone(),
+            file.owner_root.clone(),
+            file.owner_namespace.clone(),
+        )
+        .with_context(|| format!("register fkst.test for {}", relpath))?;
 
         match load_test_table(&lua, &file.path) {
             Ok(tests) => {
@@ -51,20 +62,25 @@ pub(crate) fn run_tests(roots: PackageRoots) -> Result<i32> {
 struct TestFile {
     path: PathBuf,
     owner_root: PathBuf,
+    owner_namespace: String,
 }
 
 fn discover_test_files(roots: &PackageRoots) -> Result<Vec<TestFile>> {
     let mut files = BTreeMap::<PathBuf, TestFile>::new();
     for root in roots.graph_roots() {
-        collect_department_tests(&root.root, &mut files)
+        collect_department_tests(&root.root, &root.namespace, &mut files)
             .with_context(|| format!("scan department tests in {}", root.root.display()))?;
-        collect_top_tests(&root.root, &mut files)
+        collect_top_tests(&root.root, &root.namespace, &mut files)
             .with_context(|| format!("scan top-level tests in {}", root.root.display()))?;
     }
     Ok(files.into_values().collect())
 }
 
-fn collect_department_tests(root: &Path, files: &mut BTreeMap<PathBuf, TestFile>) -> Result<()> {
+fn collect_department_tests(
+    root: &Path,
+    namespace: &str,
+    files: &mut BTreeMap<PathBuf, TestFile>,
+) -> Result<()> {
     let departments = root.join("departments");
     if !departments.exists() {
         return Ok(());
@@ -81,14 +97,18 @@ fn collect_department_tests(root: &Path, files: &mut BTreeMap<PathBuf, TestFile>
             let file = file?;
             let path = file.path();
             if path.is_file() && is_test_file(&path) {
-                insert_test_file(files, root, &path)?;
+                insert_test_file(files, root, namespace, &path)?;
             }
         }
     }
     Ok(())
 }
 
-fn collect_top_tests(root: &Path, files: &mut BTreeMap<PathBuf, TestFile>) -> Result<()> {
+fn collect_top_tests(
+    root: &Path,
+    namespace: &str,
+    files: &mut BTreeMap<PathBuf, TestFile>,
+) -> Result<()> {
     let tests = root.join("tests");
     if !tests.exists() {
         return Ok(());
@@ -97,7 +117,7 @@ fn collect_top_tests(root: &Path, files: &mut BTreeMap<PathBuf, TestFile>) -> Re
         let file = file?;
         let path = file.path();
         if path.is_file() && is_test_file(&path) {
-            insert_test_file(files, root, &path)?;
+            insert_test_file(files, root, namespace, &path)?;
         }
     }
     Ok(())
@@ -106,6 +126,7 @@ fn collect_top_tests(root: &Path, files: &mut BTreeMap<PathBuf, TestFile>) -> Re
 fn insert_test_file(
     files: &mut BTreeMap<PathBuf, TestFile>,
     owner_root: &Path,
+    owner_namespace: &str,
     path: &Path,
 ) -> Result<()> {
     let canonical_path = path.canonicalize()?;
@@ -114,6 +135,7 @@ fn insert_test_file(
         TestFile {
             path: canonical_path,
             owner_root: owner_root.to_path_buf(),
+            owner_namespace: owner_namespace.to_string(),
         },
     );
     Ok(())
@@ -145,7 +167,12 @@ fn load_test_table(lua: &Lua, file: &Path) -> Result<Vec<(String, Function)>> {
     Ok(tests.into_iter().collect())
 }
 
-fn register_test_sdk(lua: &Lua, roots: PackageRoots, owner_root: PathBuf) -> mlua::Result<()> {
+fn register_test_sdk(
+    lua: &Lua,
+    roots: PackageRoots,
+    owner_root: PathBuf,
+    owner_namespace: String,
+) -> mlua::Result<()> {
     let globals = lua.globals();
     let fkst = match globals.get::<Value>("fkst")? {
         Value::Table(table) => table,
@@ -219,7 +246,15 @@ fn register_test_sdk(lua: &Lua, roots: PackageRoots, owner_root: PathBuf) -> mlu
         "run_department",
         lua.create_function(
             move |lua, (path, event, opts): (String, Value, Option<Table>)| {
-                run_department(lua, &roots, &owner_root, path, event, opts)
+                run_department(
+                    lua,
+                    &roots,
+                    &owner_root,
+                    &owner_namespace,
+                    path,
+                    event,
+                    opts,
+                )
             },
         )?,
     )?;
@@ -232,6 +267,7 @@ fn run_department(
     lua: &Lua,
     roots: &PackageRoots,
     owner_root: &Path,
+    owner_namespace: &str,
     path: String,
     event: Value,
     opts: Option<Table>,
@@ -243,13 +279,20 @@ fn run_department(
 
     let dept_lua = crate::mlua_init::new_lua();
     let raise_buf = RaiseBuffer::new();
-    crate::mlua_init::register_framework_sdk(&dept_lua, raise_buf.clone(), roots.host_root())?;
+    crate::mlua_init::register_framework_sdk(
+        &dept_lua,
+        raise_buf.clone(),
+        roots.host_root(),
+        roots.name_resolver(),
+        owner_namespace.to_string(),
+    )?;
 
-    let exit_code = match crate::mlua_init::run_dept_with_package_root(
+    let require_roots = roots.require_roots_for_owner(owner_root);
+    let exit_code = match crate::mlua_init::run_dept_with_require_roots(
         &dept_lua,
         &lua_path,
         &event_json,
-        owner_root,
+        require_roots.iter().map(PathBuf::as_path),
     ) {
         Ok(()) => 0,
         Err(err) => {

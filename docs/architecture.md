@@ -108,7 +108,11 @@ host root 来自显式 --project-root
 同时设置 FKST_PACKAGE_ROOTS 与 FKST_PACKAGE_ROOT 且没有显式 --package-root 时 fail closed
 ```
 
-`run` 模式永远只接收单个 owner-root；`supervise`、`test`、`conformance`、`config` 可接收多个 package root。如果某个 `<PKG> == <HOST>`，该 graph root 折叠为 `PackageAndHost`。否则扫描顺序是 package roots 后 host root。每个 graph root 使用 fresh Lua state，`package.path` 只指向当前 root；运行期 Department 和测试文件的相对路径按所属 owner package root 解析，不存在 package manifest、依赖、order、override 或跨包 require。重复 package root 在 canonicalize 后拒绝；重复 Department 名或 Raiser 名直接拒绝启动。`package.lua` 是被移除的 surface，存在即拒绝启动。
+package identity 是 canonical package-root basename。package id、Department name、Raiser name 与 queue 段名都必须匹配 `[A-Za-z0-9_-]+`；`.` 只作为 `pkg.queue` 限定符。两个 package root 的 basename 相同 fail closed；独立 host root 存在时，package basename `host` fail closed，因为 `host` 是固定 host namespace。
+
+`run` 模式接收一个 owner namespace，并按 owner root 构造 require roots；host owner 可使用 `[host]+packages`，package owner 只使用自己的 package root。`supervise`、`test`、`conformance`、`config` 可接收多个 package root。如果某个 `<PKG> == <HOST>`，该 graph root 折叠为 `PackageAndHost`。否则扫描顺序是 package roots 后 host root。每个 graph root 使用 fresh Lua state，`package.path` 只指向当前 root；运行期 Department 和测试文件的相对路径按所属 owner package root 解析，不存在 package manifest、依赖、order、override 或跨包 require。重复 package root 在 canonicalize 后拒绝；同名 Department 或 Raiser 只要 owner namespace 不同即可共存。`package.lua` 是被移除的 surface，存在即拒绝启动。
+
+queue 是包内命名空间。多 graph-root 组合时，裸 queue 名按 owner namespace 归一化为 `<pkg>.<queue>` 或 `host.<queue>`；跨包消费必须显式写 `pkg.queue`。折叠单包使用 LegacyFlat：裸名输出仍是裸名，同包限定名解析回裸名，`RAISED`、`Event.queue`、delivery id 与 source reference 字节保持单包旧形态。
 
 合法 graph 输入：
 
@@ -195,7 +199,7 @@ Vec<mpsc::Sender<Event>>
     ↓
 consumer inbox
     ↓
-spawn fkst-framework run <department main.lua> --project-root <HOST> --package-root <PKG> --event <json>
+spawn fkst-framework run <department main.lua> --project-root <HOST> --package-root <ROOT> ... --owner-namespace <id> --event <json>
     ↓
 single Lua state + pipeline(event)
     ↓
@@ -260,7 +264,7 @@ engine 维护 durable 在途 delivery state，但它不是实体业务真相、a
 
 ## 10. 事件与队列机制
 
-`Config` 包含 `queue`、`raiser`、`department`、`limits`。Queue 有 `capacity` 与 `fanout`。Raiser 只有 `Cron` 与 `FileWatch`。Department 有 `lua`、`consumes`、`produces`、`stall_window`、可选 `retry`。
+`Config` 包含 `queue`、`raiser`、`department`、`limits`。Queue 有 `capacity` 与 `fanout`。Raiser 只有 `Cron` 与 `FileWatch`。Department 有 `lua`、`owner_root`、`owner_namespace`、`consumes`、`produces`、`ephemeral`、`stall_window`、可选 `retry`。多 graph-root 下，Config 的 queue、raiser、department key 都是 canonical name；折叠单包仍是裸名。
 
 validation 规则：
 
