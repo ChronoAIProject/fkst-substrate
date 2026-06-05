@@ -6,6 +6,7 @@ use serde_json::Value as JsonValue;
 use std::path::Path;
 
 use crate::config_registry::ConfigContext;
+use crate::external_command::MockCommandState;
 use crate::path_resolver::{package_root_path, NameResolver};
 use crate::raise::RaiseBuffer;
 
@@ -31,6 +32,27 @@ pub fn register_framework_sdk(
     crate::sdk_mark::register(lua, host_root)?;
     crate::sdk_cache::register(lua, host_root)?;
     crate::sdk_codex::register(lua, host_root, config)?;
+    crate::raise::register(lua, raise_buf, resolver, owner_namespace)?;
+    Ok(())
+}
+
+pub(crate) fn register_framework_sdk_with_runner(
+    lua: &Lua,
+    raise_buf: RaiseBuffer,
+    host_root: &Path,
+    resolver: NameResolver,
+    owner_namespace: String,
+    runner: Option<MockCommandState>,
+) -> mlua::Result<()> {
+    let config = ConfigContext::from_host_root(host_root).map_err(mlua::Error::external)?;
+    crate::sdk_log::register(lua)?;
+    crate::sdk_basic::register_with_runner(lua, runner.clone())?;
+    crate::sdk_fs::register(lua)?;
+    crate::sdk_json::register(lua)?;
+    crate::sdk_git::register_with_runner(lua, host_root, config.clone(), runner.clone())?;
+    crate::sdk_mark::register(lua, host_root)?;
+    crate::sdk_cache::register(lua, host_root)?;
+    crate::sdk_codex::register_with_runner(lua, host_root, config, runner)?;
     crate::raise::register(lua, raise_buf, resolver, owner_namespace)?;
     Ok(())
 }

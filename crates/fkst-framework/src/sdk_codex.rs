@@ -22,6 +22,7 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::config_registry::{ConfigContext, ConfigKey};
+use crate::external_command::{format_command, MockCommandState};
 use crate::runtime_context;
 
 pub(crate) const CODEX_PERMIT_SLOTS_ENV: &str = "FKST_CODEX_PERMIT_SLOTS";
@@ -140,6 +141,18 @@ impl CodexResult {
         }
     }
 
+    fn mock_error(err: mlua::Error) -> Self {
+        let message = err.to_string();
+        Self {
+            stdout: String::new(),
+            stderr: message.clone(),
+            exit_code: -1,
+            log_path: String::new(),
+            error_kind: Some("mock".to_string()),
+            error: Some(message),
+        }
+    }
+
     fn into_lua_table(self, lua: &Lua) -> Result<Table> {
         let t = result_table(lua, self.stdout, self.stderr, self.exit_code, self.log_path)?;
         if let Some(kind) = self.error_kind {
@@ -168,29 +181,46 @@ fn result_table(
 }
 
 pub fn register(lua: &Lua, host_root: &Path, config: ConfigContext) -> Result<()> {
+    register_with_runner(lua, host_root, config, None)
+}
+
+pub(crate) fn register_with_runner(
+    lua: &Lua,
+    host_root: &Path,
+    config: ConfigContext,
+    runner: Option<MockCommandState>,
+) -> Result<()> {
     let owner_id = NEXT_PIPELINE_OWNER_ID.fetch_add(1, Ordering::Relaxed);
     let next_task_id = Arc::new(AtomicU64::new(1));
     let host_root = Arc::new(host_root.to_path_buf());
     let config = Arc::new(config);
+    let runner = Arc::new(runner);
 
     lua.globals().set("spawn_codex_sync", {
         let host_root = Arc::clone(&host_root);
         let config = Arc::clone(&config);
+        let runner = Arc::clone(&runner);
         lua.create_function(move |lua, opts: Table| {
             let request = codex_request_from_opts(opts);
-            run_codex_request(request, &host_root, &config).into_lua_table(lua)
+            run_codex_request(request, &host_root, &config, runner.as_ref().as_ref())?
+                .into_lua_table(lua)
         })?
     })?;
     lua.globals().set("spawn_codex", {
         let next_task_id = Arc::clone(&next_task_id);
         let host_root = Arc::clone(&host_root);
         let config = Arc::clone(&config);
+        let runner = Arc::clone(&runner);
         lua.create_function(move |_, opts: Table| {
             let request = codex_request_from_opts(opts);
             let task_id = next_task_id.fetch_add(1, Ordering::Relaxed);
             let host_root = Arc::clone(&host_root);
             let config = Arc::clone(&config);
-            let join = std::thread::spawn(move || run_codex_request(request, &host_root, &config));
+            let runner = Arc::clone(&runner);
+            let join = std::thread::spawn(move || {
+                run_codex_request(request, &host_root, &config, runner.as_ref().as_ref())
+                    .unwrap_or_else(CodexResult::mock_error)
+            });
             Ok(CodexTaskHandle {
                 owner_id,
                 task_id,
@@ -292,6 +322,14 @@ fn await_all(lua: &Lua, handles: Table, owner_id: u64) -> Result<Table> {
                 String::new(),
             ),
         };
+        if result.error_kind.as_deref() == Some("mock") {
+            return Err(mlua::Error::external(
+                result
+                    .error
+                    .clone()
+                    .unwrap_or_else(|| "mock command failed".to_string()),
+            ));
+        }
         results.set(index + 1, result.into_lua_table(lua)?)?;
     }
     if let Some(message) = invalid {
@@ -305,7 +343,12 @@ fn run_codex_request(
     request: CodexRequest,
     host_root: &Path,
     config: &ConfigContext,
-) -> CodexResult {
+    runner: Option<&MockCommandState>,
+) -> Result<CodexResult> {
+    if let Some(runner) = runner {
+        return run_mocked_codex_request(request, runner);
+    }
+
     if let Err(err) = ensure_pool_with_context(host_root, config) {
         let message = format!("codex permit pool failed: {err}");
         write_codex_log(
@@ -316,14 +359,14 @@ fn run_codex_request(
             &command_line_for_request(&request),
             request.stall_window_seconds,
         );
-        return CodexResult::failure(
+        return Ok(CodexResult::failure(
             "permit",
             message,
             String::new(),
             String::new(),
             -1,
             request.log_path.to_string_lossy().into_owned(),
-        );
+        ));
     }
     let _permit = match acquire_permit_with_context(host_root, config) {
         Ok(permit) => permit,
@@ -337,18 +380,46 @@ fn run_codex_request(
                 &command_line_for_request(&request),
                 request.stall_window_seconds,
             );
-            return CodexResult::failure(
+            return Ok(CodexResult::failure(
                 "permit",
                 message,
                 String::new(),
                 String::new(),
                 -1,
                 request.log_path.to_string_lossy().into_owned(),
-            );
+            ));
         }
     };
 
-    run_codex_request_with_permit(request)
+    Ok(run_codex_request_with_permit(request))
+}
+
+fn run_mocked_codex_request(
+    request: CodexRequest,
+    runner: &MockCommandState,
+) -> Result<CodexResult> {
+    let args = command_args_for_request(&request);
+    let cmd_line = format_command("codex", &args);
+    let result = runner.execute(
+        cmd_line.clone(),
+        "codex".to_string(),
+        args,
+        request.prompt.clone(),
+    )?;
+    write_codex_log(
+        &request.log_path,
+        &result.stdout,
+        &result.stderr,
+        result.exit_code,
+        &cmd_line,
+        request.stall_window_seconds,
+    );
+    Ok(CodexResult::success(
+        result.stdout,
+        result.stderr,
+        result.exit_code,
+        request.log_path.to_string_lossy().into_owned(),
+    ))
 }
 
 fn run_codex_request_with_permit(request: CodexRequest) -> CodexResult {
@@ -830,24 +901,6 @@ fn civil_from_days(days_since_epoch: i64) -> (i32, u32, u32) {
     let month = mp + if mp < 10 { 3 } else { -9 };
     let year = y + if month <= 2 { 1 } else { 0 };
     (year as i32, month as u32, day as u32)
-}
-
-fn format_command(program: &str, args: &[String]) -> String {
-    std::iter::once(program.to_string())
-        .chain(args.iter().map(|arg| shell_quote(arg)))
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
-fn shell_quote(value: &str) -> String {
-    if value
-        .bytes()
-        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.' | b'/' | b':' | b'='))
-    {
-        value.to_string()
-    } else {
-        format!("'{}'", value.replace('\'', "'\"'\"'"))
-    }
 }
 
 // crate-internal visibility keeps permit setup testable after extraction.
