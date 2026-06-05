@@ -128,6 +128,16 @@ engine 无 runtime accepted-state/回退；发布安全是外部策略。
 
 命名即本体论。`Company`、`Department`、`Person` 是结构约束，不是比喻。类型与函数名应反映引擎事实，而不是 host 业务愿望。Rust framework 中出现业务名、具体部门名或共识策略名，通常就是边界泄漏。
 
+## Git 提交/分支规范
+
+提交信息、PR 标题/正文、分支说明属于对外产物，使用中文。分支名本身、代码标识符、路径、crate 名、命令名、协议名、测试断言和引用原文保留英文；不要用中英混杂凑句。
+
+默认集成分支是 `dev`，不直接向 `dev` 提交；所有改动从 `dev` 切出分支，经 PR 合入。分支名使用 `<type>/<kebab-topic>`，其中 `type` 只能是 `feat`、`fix`、`docs`、`chore`、`refactor`、`test`。历史上的 `dev-rc-*`、`*-archive-*` 等分支不作为新增命名模板；合并后的工作分支及时删除，不保留长期僵尸分支。
+
+一个 commit 只承载一个自洽逻辑改动，不混入无关改动或格式化噪声。subject 用一行中文祈使句概括做了什么，尽量不超过 50 字，不堆叠多件事。改动多于琐碎时，在空行后的 body 写清为什么、影响和取舍；关键词、符号、错误分类要可 grep。改契约就改完整，旧形态从当前态删除，不留 deprecated shim、`.old`、`.bak`、`_legacy` 或兼容并行实现。
+
+PR 对 `dev` 开，标题使用中文，正文包含动机、改动和测试证据；测试证据写明命令与结果。CI 绿才合并。合并方式使用 squash，保持 `dev` 线性，一个 feature 在 `dev` 上对应一条 commit，subject 末尾保留 `(#PR)`。AI 生成的 PR 正文或变更说明末尾保留 `⟦AI:FKST⟧`。
+
 ## 已拒绝方向
 
 拒绝 workflow engine 化、actor 平台化、LLM provider 抽象、package manifest DSL、YAML/JSON 配置语言驱动行为图、多 package-root override graph、runtime dynamic handler registration、SQLite/KV/event-log 状态层、web dashboard、持久 agent 记忆、agent 直接通信、framework 内业务 retry/cooldown/gate/round。
