@@ -75,6 +75,17 @@ mod tests {
     use super::*;
     use mlua::Lua;
 
+    fn register_raise_and_json(lua: &Lua, buf: RaiseBuffer) {
+        crate::sdk_json::register(lua).unwrap();
+        register(
+            lua,
+            buf,
+            NameResolver::new(["pkg".to_string()]),
+            "pkg".to_string(),
+        )
+        .unwrap();
+    }
+
     #[test]
     fn raise_adds_to_buffer() {
         let lua = Lua::new();
@@ -117,6 +128,82 @@ mod tests {
         assert_eq!(entries.len(), 3);
         assert_eq!(entries[0].queue, "q1");
         assert_eq!(entries[2].queue, "q1");
+    }
+
+    #[test]
+    fn raise_preserves_json_decoded_empty_array_payload_field() {
+        let lua = Lua::new();
+        let buf = RaiseBuffer::new();
+        register_raise_and_json(&lua, buf.clone());
+
+        lua.load(r#"raise("done", {items = json.decode("[]")})"#)
+            .exec()
+            .unwrap();
+
+        let entries = buf.0.lock().unwrap();
+        assert_eq!(
+            entries[0].payload,
+            serde_json::json!({
+                "items": []
+            })
+        );
+    }
+
+    #[test]
+    fn raise_serializes_bare_empty_table_payload_field_as_object() {
+        let lua = Lua::new();
+        let buf = RaiseBuffer::new();
+        register_raise_and_json(&lua, buf.clone());
+
+        lua.load(r#"raise("done", {items = {}})"#).exec().unwrap();
+
+        let entries = buf.0.lock().unwrap();
+        assert_eq!(
+            entries[0].payload,
+            serde_json::json!({
+                "items": {}
+            })
+        );
+    }
+
+    #[test]
+    fn raise_serializes_non_empty_sequence_payload_field_as_array() {
+        let lua = Lua::new();
+        let buf = RaiseBuffer::new();
+        register_raise_and_json(&lua, buf.clone());
+
+        lua.load(r#"raise("done", {items = {"a"}})"#)
+            .exec()
+            .unwrap();
+
+        let entries = buf.0.lock().unwrap();
+        assert_eq!(
+            entries[0].payload,
+            serde_json::json!({
+                "items": ["a"]
+            })
+        );
+    }
+
+    #[test]
+    fn raise_serializes_non_empty_map_payload_field_as_object() {
+        let lua = Lua::new();
+        let buf = RaiseBuffer::new();
+        register_raise_and_json(&lua, buf.clone());
+
+        lua.load(r#"raise("done", {items = {name = "a"}})"#)
+            .exec()
+            .unwrap();
+
+        let entries = buf.0.lock().unwrap();
+        assert_eq!(
+            entries[0].payload,
+            serde_json::json!({
+                "items": {
+                    "name": "a"
+                }
+            })
+        );
     }
 
     #[test]
