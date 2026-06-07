@@ -161,6 +161,35 @@ pub fn validate(cfg: &Config, project_root: &std::path::Path) -> Result<Vec<Stri
         }
     }
 
+    for (producer_name, producer) in &cfg.department {
+        if producer.consumes.is_empty() {
+            continue;
+        }
+        let propagates_source_ref = producer.consumes.iter().any(|queue| {
+            !producer
+                .ephemeral
+                .iter()
+                .any(|ephemeral| ephemeral == queue)
+        });
+        if propagates_source_ref {
+            continue;
+        }
+
+        for produced in &producer.produces {
+            let reliable_downstream = reliable_consumers_for_queue(cfg, produced);
+            if !reliable_downstream.is_empty() {
+                return Err(FkstError::Schema(format!(
+                    "department '{}' consumes only ephemeral queues ({}) but produces queue '{}' with reliable consumer(s) ({}); a reliable raised event inherits its source_ref from a reliable consumed event, so an all-ephemeral consumer has no source_ref to propagate. Fix: remove 'ephemeral' from at least one consumed queue (make it reliable), or mark the downstream consumer(s) of '{}' ephemeral.",
+                    producer_name,
+                    quote_list(&producer.consumes),
+                    produced,
+                    quote_list(&reliable_downstream),
+                    produced
+                )));
+            }
+        }
+    }
+
     let mut warnings = Vec::new();
     let mut queue_names: Vec<&String> = queues.iter().copied().collect();
     queue_names.sort();
@@ -301,6 +330,27 @@ fn queue_consumers(cfg: &Config, qname: &str) -> Vec<String> {
     }
     consumers.sort();
     consumers
+}
+
+fn reliable_consumers_for_queue(cfg: &Config, qname: &str) -> Vec<String> {
+    let mut consumers = Vec::new();
+    for (name, dept) in &cfg.department {
+        let consumes = dept.consumes.iter().any(|queue| queue == qname);
+        let ephemeral = dept.ephemeral.iter().any(|queue| queue == qname);
+        if consumes && !ephemeral {
+            consumers.push(name.clone());
+        }
+    }
+    consumers.sort();
+    consumers
+}
+
+fn quote_list(values: &[String]) -> String {
+    values
+        .iter()
+        .map(|value| format!("'{}'", value))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 // Same-queue feedback is accepted only when the queue contract is explicitly

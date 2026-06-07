@@ -53,6 +53,29 @@ fn cfg_minimal(lua_file: &Path) -> Config {
     }
 }
 
+fn add_queue(cfg: &mut Config, name: &str) {
+    cfg.queue.insert(
+        name.into(),
+        QueueDecl {
+            capacity: 10,
+            fanout: false,
+        },
+    );
+}
+
+fn department_decl(lua_file: &Path, consumes: Vec<&str>, produces: Vec<&str>) -> DepartmentDecl {
+    DepartmentDecl {
+        lua: lua_file.into(),
+        owner_root: lua_file.parent().unwrap().into(),
+        owner_namespace: "pkg".to_string(),
+        consumes: consumes.into_iter().map(String::from).collect(),
+        produces: produces.into_iter().map(String::from).collect(),
+        ephemeral: vec![],
+        stall_window: "30m".into(),
+        retry: None,
+    }
+}
+
 #[test]
 fn direct_deserialize_requires_department_stall_window() {
     let err = serde_json::from_value::<DepartmentDecl>(serde_json::json!({
@@ -351,6 +374,109 @@ fn ephemeral_queue_must_be_consumed_by_department() {
         e.to_string().contains("marks queue 'ghost' ephemeral"),
         "{e}"
     );
+}
+
+#[test]
+fn all_ephemeral_producer_to_reliable_consumer_rejected() {
+    let tmp = tempdir().unwrap();
+    let lua = touch(tmp.path(), "d.lua");
+    let mut cfg = cfg_minimal(&lua);
+    add_queue(&mut cfg, "proposal");
+    let producer = cfg.department.get_mut("d").unwrap();
+    producer.consumes = vec!["tick".into()];
+    producer.ephemeral = vec!["tick".into()];
+    producer.produces = vec!["proposal".into()];
+    cfg.department.insert(
+        "reliable_worker".into(),
+        department_decl(&lua, vec!["proposal"], vec![]),
+    );
+
+    let err = validate(&cfg, tmp.path()).unwrap_err();
+    let message = err.to_string();
+
+    assert!(message.contains("department 'd'"), "{message}");
+    assert!(message.contains("queue 'proposal'"), "{message}");
+    assert!(message.contains("ephemeral"), "{message}");
+}
+
+#[test]
+fn reliable_input_can_raise_to_reliable_consumer() {
+    let tmp = tempdir().unwrap();
+    let lua = touch(tmp.path(), "d.lua");
+    let mut cfg = cfg_minimal(&lua);
+    add_queue(&mut cfg, "proposal");
+    cfg.department.get_mut("d").unwrap().produces = vec!["proposal".into()];
+    cfg.department.insert(
+        "reliable_worker".into(),
+        department_decl(&lua, vec!["proposal"], vec![]),
+    );
+
+    let warnings = validate(&cfg, tmp.path()).unwrap();
+
+    assert!(warnings.is_empty(), "{warnings:?}");
+}
+
+#[test]
+fn all_ephemeral_input_can_raise_to_ephemeral_consumer() {
+    let tmp = tempdir().unwrap();
+    let lua = touch(tmp.path(), "d.lua");
+    let mut cfg = cfg_minimal(&lua);
+    add_queue(&mut cfg, "proposal");
+    let producer = cfg.department.get_mut("d").unwrap();
+    producer.ephemeral = vec!["tick".into()];
+    producer.produces = vec!["proposal".into()];
+    let mut downstream = department_decl(&lua, vec!["proposal"], vec![]);
+    downstream.ephemeral = vec!["proposal".into()];
+    cfg.department.insert("ephemeral_worker".into(), downstream);
+
+    let warnings = validate(&cfg, tmp.path()).unwrap();
+
+    assert!(warnings.is_empty(), "{warnings:?}");
+}
+
+#[test]
+fn mixed_ephemeral_and_reliable_inputs_can_raise_to_reliable_consumer() {
+    let tmp = tempdir().unwrap();
+    let lua = touch(tmp.path(), "d.lua");
+    let mut cfg = cfg_minimal(&lua);
+    add_queue(&mut cfg, "seed");
+    add_queue(&mut cfg, "proposal");
+    cfg.raiser.insert(
+        "cron_seed".into(),
+        RaiserDecl::Cron {
+            interval: "10s".into(),
+            produces: "seed".into(),
+        },
+    );
+    let producer = cfg.department.get_mut("d").unwrap();
+    producer.consumes = vec!["tick".into(), "seed".into()];
+    producer.ephemeral = vec!["tick".into()];
+    producer.produces = vec!["proposal".into()];
+    cfg.department.insert(
+        "reliable_worker".into(),
+        department_decl(&lua, vec!["proposal"], vec![]),
+    );
+
+    let warnings = validate(&cfg, tmp.path()).unwrap();
+
+    assert!(warnings.is_empty(), "{warnings:?}");
+}
+
+#[test]
+fn all_ephemeral_input_can_raise_to_queue_without_consumer() {
+    let tmp = tempdir().unwrap();
+    let lua = touch(tmp.path(), "d.lua");
+    let mut cfg = cfg_minimal(&lua);
+    add_queue(&mut cfg, "proposal");
+    let producer = cfg.department.get_mut("d").unwrap();
+    producer.ephemeral = vec!["tick".into()];
+    producer.produces = vec!["proposal".into()];
+
+    let warnings = validate(&cfg, tmp.path()).unwrap();
+
+    assert_eq!(warnings.len(), 1, "{warnings:?}");
+    assert!(warnings[0].contains("proposal"), "{warnings:?}");
+    assert!(warnings[0].contains("has no consumer"), "{warnings:?}");
 }
 
 #[test]
