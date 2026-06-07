@@ -79,7 +79,7 @@ fkst-framework run <lua> --project-root <path> --package-root <owner-root> --eve
 fkst-framework supervise --project-root <path> [--package-root <path> ...] --framework-bin <path>
 fkst-framework conformance --project-root <path> [--package-root <path> ...]
 fkst-framework config --project-root <path> [--package-root <path> ...]
-fkst-framework test --project-root <path> [--package-root <path> ...]
+fkst-framework test --project-root <path> [--package-root <path> ...] [--report-json <path>]
 fkst-framework --self-test
 ```
 
@@ -92,7 +92,28 @@ fkst-framework --self-test
 <ROOT>/tests/*_test.lua
 ```
 
-runner 不全树递归，不扫描 `raisers/` 或 `fkst/`。每个测试文件在独立 Lua state 中执行，先注册 production SDK 以便测试可 `require` package 模块和调用固定 SDK，再注册 test-mode `fkst.test` 表。测试文件必须返回 table；runner 只执行排序后的 `test_*` key。单个测试失败后继续执行同文件其余测试和后续文件，最后输出 `N passed, M failed`；`M > 0` 时退出码非 0。
+runner 不全树递归，不扫描 `raisers/` 或 `fkst/`。每个测试文件在独立 Lua state 中执行，先注册 production SDK 以便测试可 `require` package 模块和调用固定 SDK，再注册 test-mode `fkst.test` 表。测试文件必须返回 table；runner 只执行排序后的 `test_*` key。单个测试失败后继续执行同文件其余测试和后续文件，最后输出 `N passed, M failed`。退出码语义是：全部通过返回 0；存在测试失败返回 1；`--report-json` 写入失败等基础设施错误返回 2。`test` 仍不启动 router 或 supervise。
+
+`--report-json <path>` 在所有测试运行结束后用临时文件加原子 rename 写入 JSON 报告，schema 为 `fkst.test.report.v1`：
+
+```json
+{
+  "schema": "fkst.test.report.v1",
+  "summary": { "passed": 1, "failed": 0 },
+  "tests": [
+    {
+      "owner_namespace": "pkg",
+      "file": "tests/example_test.lua",
+      "name": "test_example",
+      "status": "pass"
+    }
+  ]
+}
+```
+
+失败条目额外包含 `error`。加载或 eval 测试文件失败时，报告条目使用 `name = "<load>"` 且计入 failed。报告条目来自 Rust 侧枚举出的测试文件和 `test_*` key；每个条目的身份是 `owner_namespace`、`file`、`name` 三元组，不提供可被分隔符碰撞污染的拼接 `id`。Lua `print` 不能向报告注入伪造测试；stdout 的 `PASS` / `FAIL` / summary 行保留为 legacy human / compatibility surface，不是 authoritative machine channel。
+
+明确非目标：当前 test runner 不向 package author 提供 router、可靠投递或 supervise 的 Lua 原语；不承担 Lua stray-global 或 unused-local lint；不使用随机 sentinel 或专用 fd 分离测试输出；不沙箱恶意 Lua。它的范围是运行受信 package 的 Lua 测试、提供 Rust 枚举来源的机器报告，并保持 stdout 兼容面。
 
 `fkst.test` 包含 `eq(actual, expected[, msg])`、`is_true(value[, msg])`、`raises(fn[, msg])`、`is_nil(value[, msg])` 四个断言，以及 test-mode-only `run_department(path, event[, opts])`。`run_department` 用 fresh Lua state 注册 production SDK 和独立 `RaiseBuffer`，再通过正常 department runner 注入 `event`；它返回 `{ exit_code = int, raises = { { queue = string, payload = table }, ... } }`。queue 解析与 production 一致，唯一例外是 `run_department` 会记录但不投递 subject department 在 `M.spec.produces` 中声明的 qualified queue raise。每个测试文件按所属 graph root 隔离执行；相对 `path` 按该测试文件所属的 owner package root 解析，运行期 `package.path` 也只指向该 owner root。绝对 `path` 仍按绝对路径处理。`opts.cwd`、`opts.env`、`opts.path_prepend` 只作用于该次执行并随后恢复。
 

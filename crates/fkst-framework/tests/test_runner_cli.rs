@@ -58,6 +58,43 @@ fn run_lua_tests_with_packages(host: &Path, packages: &[&Path]) -> Output {
         .unwrap()
 }
 
+fn run_lua_tests_with_report(host: &Path, package: &Path, report: &Path) -> Output {
+    Command::new(framework_bin())
+        .arg("test")
+        .arg("--project-root")
+        .arg(host)
+        .arg("--package-root")
+        .arg(package)
+        .arg("--report-json")
+        .arg(report)
+        .current_dir(host)
+        .env("FKST_RUNTIME_ROOT", host.join(".fkst/runtime"))
+        .output()
+        .unwrap()
+}
+
+fn run_lua_tests_with_packages_and_report(
+    host: &Path,
+    packages: &[&Path],
+    report: &Path,
+) -> Output {
+    let mut cmd = Command::new(framework_bin());
+    cmd.arg("test").arg("--project-root").arg(host);
+    for package in packages {
+        cmd.arg("--package-root").arg(package);
+    }
+    cmd.arg("--report-json")
+        .arg(report)
+        .current_dir(host)
+        .env("FKST_RUNTIME_ROOT", host.join(".fkst/runtime"))
+        .output()
+        .unwrap()
+}
+
+fn read_report(path: &Path) -> serde_json::Value {
+    serde_json::from_slice(&fs::read(path).unwrap()).unwrap()
+}
+
 fn stdout(output: &Output) -> String {
     String::from_utf8_lossy(&output.stdout).to_string()
 }
@@ -681,6 +718,168 @@ return {
         "stdout: {out}"
     );
     assert!(out.contains("2 passed, 1 failed"), "stdout: {out}");
+}
+
+#[test]
+fn test_report_json_ignores_lua_forged_stdout_pass_lines() {
+    let host = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
+    fs::create_dir_all(host.path().join("tests")).unwrap();
+    fs::write(
+        host.path().join("tests/forgery_test.lua"),
+        r#"
+return {
+  test_real = function()
+    print("PASS forged::test_fake")
+  end,
+}
+"#,
+    )
+    .unwrap();
+    let report_path = host.path().join("report.json");
+
+    let output = run_lua_tests_with_report(host.path(), host.path(), &report_path);
+
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}",
+        stdout(&output),
+        stderr(&output)
+    );
+    let out = stdout(&output);
+    assert!(out.contains("PASS forged::test_fake"), "stdout: {out}");
+    assert!(
+        out.contains("PASS tests/forgery_test.lua::test_real"),
+        "stdout: {out}"
+    );
+    let report = read_report(&report_path);
+    assert_eq!(report["schema"], "fkst.test.report.v1");
+    assert_eq!(report["summary"]["passed"], 1);
+    assert_eq!(report["summary"]["failed"], 0);
+    let tests = report["tests"].as_array().unwrap();
+    assert_eq!(tests.len(), 1, "report: {report}");
+    assert_eq!(tests[0]["file"], "tests/forgery_test.lua");
+    assert_eq!(tests[0]["name"], "test_real");
+    assert_eq!(tests[0]["status"], "pass");
+    assert!(
+        tests[0].get("id").is_none(),
+        "report entry must not expose ambiguous id: {report}"
+    );
+    assert!(
+        !tests
+            .iter()
+            .any(|test| test["file"] == "forged" || test["name"] == "test_fake"),
+        "report: {report}"
+    );
+}
+
+#[test]
+fn test_report_json_records_failing_test_before_exit_code_one() {
+    let host = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
+    fs::create_dir_all(host.path().join("tests")).unwrap();
+    fs::write(
+        host.path().join("tests/failing_report_test.lua"),
+        r#"
+local t = fkst.test
+return {
+  test_fails = function() t.eq("actual", "expected") end,
+}
+"#,
+    )
+    .unwrap();
+    let report_path = host.path().join("report.json");
+
+    let output = run_lua_tests_with_report(host.path(), host.path(), &report_path);
+
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "stdout: {}\nstderr: {}",
+        stdout(&output),
+        stderr(&output)
+    );
+    let report = read_report(&report_path);
+    assert_eq!(report["summary"]["passed"], 0);
+    assert_eq!(report["summary"]["failed"], 1);
+    let tests = report["tests"].as_array().unwrap();
+    assert_eq!(tests.len(), 1, "report: {report}");
+    assert!(
+        tests[0].get("id").is_none(),
+        "report entry must not expose ambiguous id: {report}"
+    );
+    assert_eq!(tests[0]["owner_namespace"], namespace(host.path()));
+    assert_eq!(tests[0]["file"], "tests/failing_report_test.lua");
+    assert_eq!(tests[0]["name"], "test_fails");
+    assert_eq!(tests[0]["status"], "fail");
+    assert!(
+        tests[0]["error"]
+            .as_str()
+            .unwrap()
+            .contains("expected \"expected\", got \"actual\""),
+        "report: {report}"
+    );
+}
+
+#[test]
+fn test_report_json_disambiguates_same_relfile_across_package_roots() {
+    let host = tempfile::Builder::new().prefix("host").tempdir().unwrap();
+    let package_a = tempfile::Builder::new().prefix("pkg-a").tempdir().unwrap();
+    let package_b = tempfile::Builder::new().prefix("pkg-b").tempdir().unwrap();
+    for package in [package_a.path(), package_b.path()] {
+        fs::create_dir_all(package.join("tests")).unwrap();
+        fs::write(
+            package.join("tests/same_test.lua"),
+            r#"
+return {
+  test_same = function() end,
+}
+"#,
+        )
+        .unwrap();
+    }
+    let report_path = host.path().join("report.json");
+
+    let output = run_lua_tests_with_packages_and_report(
+        host.path(),
+        &[package_a.path(), package_b.path()],
+        &report_path,
+    );
+
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}",
+        stdout(&output),
+        stderr(&output)
+    );
+    let report = read_report(&report_path);
+    assert_eq!(report["summary"]["passed"], 2);
+    assert_eq!(report["summary"]["failed"], 0);
+    let tests = report["tests"].as_array().unwrap();
+    assert_eq!(tests.len(), 2, "report: {report}");
+    assert!(
+        tests.iter().all(|test| test.get("id").is_none()),
+        "report entries must not expose ambiguous ids: {report}"
+    );
+    let triples = tests
+        .iter()
+        .map(|test| {
+            (
+                test["owner_namespace"].as_str().unwrap().to_string(),
+                test["file"].as_str().unwrap().to_string(),
+                test["name"].as_str().unwrap().to_string(),
+            )
+        })
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(triples.len(), 2, "report: {report}");
+    assert!(triples.contains(&(
+        namespace(package_a.path()),
+        "tests/same_test.lua".to_string(),
+        "test_same".to_string()
+    )));
+    assert!(triples.contains(&(
+        namespace(package_b.path()),
+        "tests/same_test.lua".to_string(),
+        "test_same".to_string()
+    )));
 }
 
 #[test]
