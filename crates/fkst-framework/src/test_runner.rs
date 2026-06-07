@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use mlua::{Function, Lua, LuaSerdeExt, Table, Value};
+use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
@@ -7,10 +8,11 @@ use crate::external_command::{MockCommandResult, MockCommandState};
 use crate::path_resolver::PackageRoots;
 use crate::raise::RaiseBuffer;
 
-pub(crate) fn run_tests(roots: PackageRoots) -> Result<i32> {
+pub(crate) fn run_tests(roots: PackageRoots, report_json: Option<PathBuf>) -> Result<i32> {
     let files = discover_test_files(&roots)?;
     let mut passed = 0usize;
     let mut failed = 0usize;
+    let mut report = TestReport::new();
 
     for file in files {
         let relpath = display_path(&file.path, &file.owner_root);
@@ -46,10 +48,17 @@ pub(crate) fn run_tests(roots: PackageRoots) -> Result<i32> {
                         Ok(()) => {
                             println!("PASS {relpath}::{name}");
                             passed += 1;
+                            report.push_pass(&file.owner_namespace, &relpath, &name);
                         }
                         Err(err) => {
                             println!("FAIL {relpath}::{name}: {err}");
                             failed += 1;
+                            report.push_fail(
+                                &file.owner_namespace,
+                                &relpath,
+                                &name,
+                                err.to_string(),
+                            );
                         }
                     }
                 }
@@ -57,12 +66,107 @@ pub(crate) fn run_tests(roots: PackageRoots) -> Result<i32> {
             Err(err) => {
                 println!("FAIL {relpath}::<load>: {err:#}");
                 failed += 1;
+                report.push_fail(
+                    &file.owner_namespace,
+                    &relpath,
+                    "<load>",
+                    format!("{err:#}"),
+                );
             }
         }
     }
 
     println!("{passed} passed, {failed} failed");
+    report.summary = TestReportSummary { passed, failed };
+    if let Some(path) = report_json {
+        write_report_json(&path, &report)
+            .with_context(|| format!("write test report {}", path.display()))?;
+    }
     Ok(if failed == 0 { 0 } else { 1 })
+}
+
+#[derive(Debug, Serialize)]
+struct TestReport {
+    schema: &'static str,
+    summary: TestReportSummary,
+    tests: Vec<TestReportEntry>,
+}
+
+impl TestReport {
+    fn new() -> Self {
+        Self {
+            schema: "fkst.test.report.v1",
+            summary: TestReportSummary {
+                passed: 0,
+                failed: 0,
+            },
+            tests: Vec::new(),
+        }
+    }
+
+    fn push_pass(&mut self, owner_namespace: &str, file: &str, name: &str) {
+        self.tests.push(TestReportEntry {
+            owner_namespace: owner_namespace.to_string(),
+            file: file.to_string(),
+            name: name.to_string(),
+            status: TestReportStatus::Pass,
+            error: None,
+        });
+    }
+
+    fn push_fail(&mut self, owner_namespace: &str, file: &str, name: &str, error: String) {
+        self.tests.push(TestReportEntry {
+            owner_namespace: owner_namespace.to_string(),
+            file: file.to_string(),
+            name: name.to_string(),
+            status: TestReportStatus::Fail,
+            error: Some(error),
+        });
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct TestReportSummary {
+    passed: usize,
+    failed: usize,
+}
+
+#[derive(Debug, Serialize)]
+struct TestReportEntry {
+    owner_namespace: String,
+    file: String,
+    name: String,
+    status: TestReportStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "lowercase")]
+enum TestReportStatus {
+    Pass,
+    Fail,
+}
+
+fn write_report_json(path: &Path, report: &TestReport) -> Result<()> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| anyhow::anyhow!("report path has no file name"))?;
+    let tmp_path = parent.join(format!(
+        ".{}.{}.tmp",
+        file_name.to_string_lossy(),
+        std::process::id()
+    ));
+    let data = serde_json::to_vec_pretty(report)?;
+    std::fs::write(&tmp_path, data)
+        .with_context(|| format!("write temporary report {}", tmp_path.display()))?;
+    std::fs::rename(&tmp_path, path)
+        .with_context(|| format!("rename {} to {}", tmp_path.display(), path.display()))?;
+    Ok(())
 }
 
 #[derive(Clone, Debug)]
