@@ -239,7 +239,9 @@ Department 收到的标准事件是 `Event{queue,payload,ts}`，其中 `ts` 是 
 
 `consumer.rs` 为每个 Department 的每个 consumed queue 建 receiver，再汇入该 Department 的 inbox。每个事件 spawn 一个 framework child，不是在 supervisor 进程内直接调用 Lua。framework child 的 stdout/stderr 会写到 `<RT>/logs/framework-child/` 下的具名 log；dept 的 `log.*` 以结构化行写 stderr，并由这个具名 log 捕获。RAISED 解析不依赖 log 文件，而是解析 captured stdout。
 
-`raise` 不落盘。需要 durable intent 或完成态事实时，package/host 必须显式写入 git commit、host repo 文件或外部源，再由 package controller 通过 `cron` / `file_watch` 重新引入事件。
+`raise` 不落盘。它通过 `LuaSerdeExt` 的 `lua.from_value` 将 Lua payload 转为 JSON 后进入 stdout `RAISED:` 协议。bare Lua empty table 没有数组 / 对象意图标记，序列化为 JSON object `{}`；由 `json.decode("[]")` 构造的 array-tagged empty table 会保持为 JSON array `[]`。需要可能为空的数组字段时，package 必须显式构造 array-tagged table；engine 不根据字段名或 schema 推断空表形态。
+
+需要 durable intent 或完成态事实时，package/host 必须显式写入 git commit、host repo 文件或外部源，再由 package controller 通过 `cron` / `file_watch` 重新引入事件。
 
 ## 8. 瞬时队列与恢复模型
 
@@ -280,6 +282,8 @@ engine 维护 durable 在途 delivery state，但它不是实体业务真相、a
 | `file.read/write/exists` | `sdk_fs.rs` |
 | `log.info/warn/error` | `sdk_log.rs`，结构化行写 stderr，由 supervise 捕获进 framework-child log |
 | `now()` | `sdk_basic.rs`，Unix seconds |
+
+`json` surface 只包含 `json.decode`，不包含 `json.encode` 或 `json.array`。`json.decode` 产生的 JSON array table 会带有 `LuaSerdeExt` 可识别的数组标记，因此 `json.decode("[]")` 经 `raise` 仍是 `[]`；裸 `{}` 经 `raise` 是 `{}`。非空 sequence 序列化为 JSON array，非空 map 序列化为 JSON object。
 
 `M.spec.retry` 默认启用；`retry=false` 表示失败不重试；`retry={...}` 支持 `max_attempts`、`base`、`cap` 子集覆盖。全局默认由 registry 的 `retry_default_max_attempts`、`retry_default_base`、`retry_default_cap` 提供。可靠 / 非可靠投递由 `M.spec.ephemeral` 决定，不由 retry 决定。可靠路径不依赖 payload dedup key、runtime marker 或 retry scratch 文件；delivery store 使用 `delivery_id`、`lease_generation` 和 redb 事务提供 fencing、ack、retry 和 dead 表。
 
