@@ -462,7 +462,7 @@ fn spawn_codex_returns_handle_before_child_finishes() {
         &bin_dir,
         r#"#!/bin/sh
 cat >/dev/null
-ps -o pgid= -p $$ | tr -d ' ' > "$PGID_FIFO"
+printf '%s' "$$" > "$PGID_FIFO"
 read _ < "$RELEASE_FIFO"
 printf 'released'
 "#,
@@ -481,7 +481,10 @@ printf 'released'
     let spawn: mlua::Function = lua.globals().get("spawn_codex").unwrap();
     let handle: AnyUserData = spawn.call(lua_opts(&lua, "hello")).unwrap();
 
-    let child_pgid = read_fifo(&pgid_fifo).trim().parse::<i32>().unwrap();
+    let child_pid = read_fifo(&pgid_fifo).trim().parse::<i32>().unwrap();
+    let child_pgid = nix::unistd::getpgid(Some(nix::unistd::Pid::from_raw(child_pid)))
+        .unwrap()
+        .as_raw();
     let current_pgid = nix::unistd::getpgrp().as_raw();
     assert_ne!(child_pgid, current_pgid);
 

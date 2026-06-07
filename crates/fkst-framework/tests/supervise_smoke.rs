@@ -2,7 +2,7 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 mod sdk_codex {
     pub const CODEX_PERMIT_SLOTS_ENV: &str = "FKST_CODEX_PERMIT_SLOTS";
@@ -24,6 +24,15 @@ fn write_graph_defaults(root: &std::path::Path) {
     fs::write(
         root.join("fkst.env"),
         "FKST_QUEUE_CAPACITY=100\nFKST_DEPARTMENT_DEFAULT_STALL_WINDOW=30m\nFKST_CODEX_PERMIT_SLOTS=20\n",
+    )
+    .unwrap();
+}
+
+fn write_fkst_env(root: &std::path::Path) {
+    fs::create_dir_all(root).unwrap();
+    fs::write(
+        root.join("fkst.env"),
+        "FKST_QUEUE_CAPACITY=100\nFKST_DEPARTMENT_DEFAULT_STALL_WINDOW=30s\nFKST_CODEX_PERMIT_SLOTS=20\n",
     )
     .unwrap();
 }
@@ -57,6 +66,21 @@ fn namespace(root: &Path) -> String {
         .unwrap()
         .to_string_lossy()
         .into_owned()
+}
+
+fn wait_for_file_containing(path: &Path, needle: &str, timeout: Duration) -> Option<String> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Ok(body) = fs::read_to_string(path) {
+            if body.contains(needle) {
+                return Some(body);
+            }
+        }
+        if Instant::now() >= deadline {
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
 }
 
 #[test]
@@ -171,9 +195,6 @@ function pipeline(event)
   f:write("marker=" .. standard.marker() .. "\n")
   f:write("event_path=" .. tostring(event.payload.path) .. "\n")
   f:close()
-  exec_sync([[child_ppid=$(ps -o ppid= -p $$ | tr -d ' ')
-supervise_pid=$(ps -o ppid= -p "$child_ppid" | tr -d ' ')
-kill -TERM "$supervise_pid"]])
 end
 return M
 "#,
@@ -183,7 +204,7 @@ return M
     )
     .unwrap();
 
-    let status = Command::new(env!("CARGO_BIN_EXE_fkst-framework"))
+    let mut child = Command::new(env!("CARGO_BIN_EXE_fkst-framework"))
         .current_dir(&host)
         .arg("supervise")
         .arg("--project-root")
@@ -193,11 +214,28 @@ return M
         .env("FKST_PACKAGE_ROOT", &package)
         .env("FKST_RUNTIME_ROOT", host.join(".fkst/runtime"))
         .env("FKST_DURABLE_ROOT", host.join(".fkst/durable"))
-        .status()
+        .spawn()
         .unwrap();
 
-    assert!(status.success(), "status={status}");
-    let body = fs::read_to_string(&fact).unwrap();
+    let body = wait_for_file_containing(
+        &fact,
+        "marker=package-standard-marker",
+        Duration::from_secs(10),
+    )
+    .unwrap_or_else(|| {
+        let _ = child.kill();
+        panic!("timed out waiting for {}", fact.display());
+    });
+    nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(child.id() as i32),
+        nix::sys::signal::Signal::SIGTERM,
+    )
+    .unwrap();
+    let status = child.wait().unwrap();
+    assert!(
+        status.success(),
+        "supervise should exit successfully after SIGTERM"
+    );
     assert!(
         body.contains("marker=package-standard-marker\n"),
         "body={body}"
@@ -207,6 +245,98 @@ return M
         body.contains(&format!("event_path={}", input_path.display())),
         "body={body}"
     );
+}
+
+#[test]
+fn supervise_delivers_cross_package_raise_from_composed_child() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let host = root.join("host");
+    let producer_pkg = root.join("github-devloop");
+    let consumer_pkg = root.join("consensus");
+    let fact = host.join("proposal-fact.txt");
+    fs::create_dir_all(producer_pkg.join("departments/producer")).unwrap();
+    fs::create_dir_all(producer_pkg.join("raisers")).unwrap();
+    fs::create_dir_all(consumer_pkg.join("departments/proposal_sink")).unwrap();
+    write_fkst_env(&host);
+    fs::write(producer_pkg.join("input.txt"), "ready").unwrap();
+    fs::write(
+        producer_pkg.join("raisers/input.lua"),
+        format!(
+            r#"return {{ type = "file_watch", glob = {}, produces = "tick" }}"#,
+            lua_string(&producer_pkg.join("input.txt"))
+        ),
+    )
+    .unwrap();
+    fs::write(
+        producer_pkg.join("departments/producer/main.lua"),
+        r#"
+local M = {}
+M.spec = {
+  consumes = { "tick" },
+  produces = { "consensus.proposal" },
+  ephemeral = { "tick" },
+  stall_window = "5s",
+}
+function pipeline(event)
+  raise("consensus.proposal", { seen = "cross-package" })
+end
+return M
+"#,
+    )
+    .unwrap();
+    fs::write(
+        consumer_pkg.join("departments/proposal_sink/main.lua"),
+        format!(
+            r#"
+local M = {{}}
+M.spec = {{
+  consumes = {{ "proposal" }},
+  ephemeral = {{ "proposal" }},
+  stall_window = "5s",
+}}
+function pipeline(event)
+  local f = assert(io.open({}, "w"))
+  f:write(event.queue .. "\n")
+  f:write(event.payload.seen .. "\n")
+  f:close()
+end
+return M
+"#,
+            lua_string(&fact)
+        ),
+    )
+    .unwrap();
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_fkst-framework"))
+        .current_dir(&host)
+        .arg("supervise")
+        .arg("--project-root")
+        .arg(&host)
+        .arg("--package-root")
+        .arg(&producer_pkg)
+        .arg("--package-root")
+        .arg(&consumer_pkg)
+        .arg("--framework-bin")
+        .arg(env!("CARGO_BIN_EXE_fkst-framework"))
+        .env("FKST_RUNTIME_ROOT", host.join(".fkst/runtime"))
+        .env("FKST_DURABLE_ROOT", host.join(".fkst/durable"))
+        .spawn()
+        .unwrap();
+
+    let body = wait_for_file_containing(&fact, "cross-package\n", Duration::from_secs(10))
+        .unwrap_or_else(|| {
+            let _ = child.kill();
+            panic!("timed out waiting for {}", fact.display());
+        });
+    child.kill().unwrap();
+    let status = child.wait().unwrap();
+    assert!(
+        !status.success(),
+        "supervise should be killed after fact write"
+    );
+    assert!(body.contains("consensus.proposal\n"), "body={body}");
+    assert!(body.contains("cross-package\n"), "body={body}");
 }
 
 #[tokio::test]

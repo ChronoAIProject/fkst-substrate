@@ -1,6 +1,8 @@
 //! fkst-framework — Tier III one-shot Lua runner.
 //!
-//! CLI: `fkst-framework run <lua_file> --project-root <path> --package-root <path> ... [--owner-namespace <id>] --event '<json>'`
+//! CLI: `fkst-framework run <lua_file> --project-root <path> --package-root <path> ... --owner-namespace <id> --event '<json>'`
+//! Multiple `--package-root` flags give composed namespace knowledge; `--owner-namespace`
+//! selects the owner root used for Lua `require`.
 //! CLI: `fkst-framework supervise --project-root <path> --framework-bin <path>`
 //! CLI: `fkst-framework conformance --project-root <path>`
 //! CLI: `fkst-framework test --project-root <path> [--package-root <path> ...] [--report-json <path>]`
@@ -135,9 +137,9 @@ fn parse_args() -> Result<CliCommand> {
         let project_root = project_root.ok_or_else(|| anyhow::anyhow!("missing --project-root"))?;
         let roots = PackageRoots::resolve_run(project_root, package_roots)?;
         // --owner-namespace is optional: a direct `run` with a single --package-root
-        // (dogfood, package departments) defaults to that package's namespace. The
-        // supervisor passes it explicitly when a department's require roots span
-        // several package roots (host departments).
+        // (dogfood, package departments) defaults to that package's namespace. Multiple
+        // package roots form the namespace catalog; the owner namespace still selects
+        // the owner root whose require roots are installed into Lua package.path.
         let owner_namespace = match owner_namespace {
             Some(namespace) => namespace,
             None => roots

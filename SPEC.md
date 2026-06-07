@@ -14,6 +14,7 @@
 - engine operation knob 由 source-owned typed registry 声明；解析顺序是 process env、host `fkst.env`、Operational 默认。HostFact 缺失 fail closed。registry 不读取 `tunables/*.txt`，不提供 set/write/dynamic registration/YAML/DSL/manifest/plugin。
 - package identity 是 canonical package-root 的 basename。package id、department name、raiser name 与 queue 段名都必须匹配 `[A-Za-z0-9_-]+`；`.` 只作为 `pkg.queue` 跨包限定符。两个 package root 的 basename 相同 fail closed；独立 host root 存在时，package basename `host` fail closed，因为 `host` 是固定 host namespace。
 - queue 是包内命名空间。多 graph-root 组合时，裸 queue 名按 owner namespace 归一化为 `<pkg>.<queue>` 或 `host.<queue>`；跨包消费必须显式写 `pkg.queue`。折叠单包（`package-root == host-root` 且只有一个 graph root）保持 LegacyFlat 字节等价：裸名仍输出裸名，同包限定名只作为幂等别名解析回裸名。
+- composed graph 中的 child `run` 接收完整 package roots input set 作为 namespace catalog；`--owner-namespace` 选择 owner root，并由 owner root 计算 Lua `require` roots。`--package-root` 不是跨包 `require` 授权。
 - 不存在 package manifest、依赖、order、override 或跨包 require 语义；`FKST_STDLIB_ROOT`、`FKST_RUNTIME_PACKAGE_ROOT`、`FKST_GRAPH_ROOTS` 不是合法 contract。一个 supervisor 仍只组合出一张 composed graph。
 - 当前 fkst-substrate 仓库把 Tier II 身份锚点物化在根目录 `SPEC.md`；Rust `fkst-framework conformance` 是 engine host-conformance。
 - 根目录 SPEC/conformance 只是当前 fkst-substrate 物化，不是所有 host project 的路径本体论。
