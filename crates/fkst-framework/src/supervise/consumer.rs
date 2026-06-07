@@ -578,7 +578,7 @@ fn spawn_args(
             project_root.join(&decl.lua)
         },
         project_root: project_root.to_path_buf(),
-        package_roots: roots.require_roots_for_owner(&decl.owner_root),
+        graph_package_roots: roots.package_roots().to_vec(),
         event_json: serde_json::to_string(&event)?,
         stall_window,
         codex_permit_slots,
@@ -591,7 +591,7 @@ struct SpawnArgs {
     framework_bin: PathBuf,
     lua_full: PathBuf,
     project_root: PathBuf,
-    package_roots: Vec<PathBuf>,
+    graph_package_roots: Vec<PathBuf>,
     event_json: String,
     stall_window: Duration,
     codex_permit_slots: usize,
@@ -604,7 +604,7 @@ async fn spawn_and_report(dept_name: &str, args: &SpawnArgs) -> anyhow::Result<S
         &args.framework_bin,
         &args.lua_full,
         &args.project_root,
-        &args.package_roots,
+        &args.graph_package_roots,
         &args.owner_namespace,
         &args.event_json,
         args.stall_window,
@@ -668,7 +668,18 @@ mod tests {
     use base64::Engine;
     use fkst_common::config::{Config, LimitsDecl, QueueDecl};
     use std::collections::BTreeMap;
+    use std::fs;
+    use std::path::Path;
     use tempfile::TempDir;
+
+    fn package_namespace(root: &Path) -> String {
+        root.canonicalize()
+            .unwrap()
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned()
+    }
 
     fn record(id: &str) -> DeliveryRecord {
         DeliveryRecord {
@@ -730,6 +741,80 @@ mod tests {
             },
         };
         DeliveryRouter::new(&cfg, Fanout::new(), Some(store))
+    }
+
+    #[test]
+    fn spawn_args_passes_composed_package_roots_for_namespace_graph() {
+        let temp = TempDir::new().unwrap();
+        let host = temp.path().join("host");
+        let github_devloop = temp.path().join("github-devloop");
+        let consensus = temp.path().join("consensus");
+        fs::create_dir_all(&host).unwrap();
+        fs::create_dir_all(&github_devloop).unwrap();
+        fs::create_dir_all(&consensus).unwrap();
+        let roots =
+            PackageRoots::resolve(&host, vec![github_devloop.clone(), consensus.clone()]).unwrap();
+        let decl = DepartmentDecl {
+            lua: "departments/producer/main.lua".into(),
+            owner_root: github_devloop.canonicalize().unwrap(),
+            owner_namespace: "github-devloop".to_string(),
+            consumes: vec!["github-devloop.tick".to_string()],
+            produces: vec!["consensus.proposal".to_string()],
+            ephemeral: vec!["github-devloop.tick".to_string()],
+            stall_window: "30s".to_string(),
+            retry: None,
+        };
+
+        let args = spawn_args(
+            &decl,
+            &host,
+            &roots,
+            &host.join("fkst-framework"),
+            &host.join("logs"),
+            Event::new("github-devloop.tick", serde_json::json!({})),
+            Duration::from_secs(30),
+            1,
+        )
+        .unwrap();
+
+        assert_eq!(args.graph_package_roots, roots.package_roots());
+        assert_eq!(args.owner_namespace, "github-devloop");
+    }
+
+    #[test]
+    fn spawn_args_keeps_folded_single_package_root_form() {
+        let temp = TempDir::new().unwrap();
+        fs::create_dir_all(temp.path()).unwrap();
+        let roots = PackageRoots::resolve(temp.path(), vec![temp.path().to_path_buf()]).unwrap();
+        let owner_namespace = package_namespace(temp.path());
+        let decl = DepartmentDecl {
+            lua: "departments/producer/main.lua".into(),
+            owner_root: temp.path().canonicalize().unwrap(),
+            owner_namespace: owner_namespace.clone(),
+            consumes: vec!["tick".to_string()],
+            produces: vec!["done".to_string()],
+            ephemeral: vec!["tick".to_string()],
+            stall_window: "30s".to_string(),
+            retry: None,
+        };
+
+        let args = spawn_args(
+            &decl,
+            temp.path(),
+            &roots,
+            &temp.path().join("fkst-framework"),
+            &temp.path().join("logs"),
+            Event::new("tick", serde_json::json!({})),
+            Duration::from_secs(30),
+            1,
+        )
+        .unwrap();
+
+        assert_eq!(
+            args.graph_package_roots,
+            vec![temp.path().canonicalize().unwrap()]
+        );
+        assert_eq!(args.owner_namespace, owner_namespace);
     }
 
     #[test]

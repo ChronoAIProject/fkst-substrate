@@ -75,7 +75,7 @@ workspace 只包含这三个 crate。没有业务 Lua package crate，也没有 
 `fkst-framework` 当前 surface：
 
 ```text
-fkst-framework run <lua> --project-root <path> --package-root <owner-root> --event <json>
+fkst-framework run <lua> --project-root <path> --package-root <path> ... --owner-namespace <id> --event <json>
 fkst-framework supervise --project-root <path> [--package-root <path> ...] --framework-bin <path>
 fkst-framework conformance --project-root <path> [--package-root <path> ...]
 fkst-framework config --project-root <path> [--package-root <path> ...]
@@ -133,7 +133,7 @@ host root 来自显式 --project-root
 
 package identity 是 canonical package-root basename。package id、Department name、Raiser name 与 queue 段名都必须匹配 `[A-Za-z0-9_-]+`；`.` 只作为 `pkg.queue` 限定符。两个 package root 的 basename 相同 fail closed；独立 host root 存在时，package basename `host` fail closed，因为 `host` 是固定 host namespace。
 
-`run` 模式接收一个 owner namespace，并按 owner root 构造 require roots；host owner 可使用 `[host]+packages`，package owner 只使用自己的 package root。`supervise`、`test`、`conformance`、`config` 可接收多个 package root。如果某个 `<PKG> == <HOST>`，该 graph root 折叠为 `PackageAndHost`。否则扫描顺序是 package roots 后 host root。每个 graph root 使用 fresh Lua state，`package.path` 只指向当前 root；运行期 Department 和测试文件的相对路径按所属 owner package root 解析，不存在 package manifest、依赖、order、override 或跨包 require。重复 package root 在 canonicalize 后拒绝；同名 Department 或 Raiser 只要 owner namespace 不同即可共存。`package.lua` 是被移除的 surface，存在即拒绝启动。
+`run` 模式可接收多个 `--package-root`，这些 root 只提供 composed namespace catalog；`--owner-namespace` 选择 owner root，并按 owner root 构造 Lua `require` roots。host owner 可使用 `[host]+packages`，package owner 只使用自己的 package root。`--package-root` 不是跨包 `require` 授权。`supervise`、`test`、`conformance`、`config` 可接收多个 package root。如果某个 `<PKG> == <HOST>`，该 graph root 折叠为 `PackageAndHost`。否则扫描顺序是 package roots 后 host root。每个 graph root 使用 fresh Lua state，`package.path` 只指向当前 root；运行期 Department 和测试文件的相对路径按所属 owner package root 解析，不存在 package manifest、依赖、order、override 或跨包 require。重复 package root 在 canonicalize 后拒绝；同名 Department 或 Raiser 只要 owner namespace 不同即可共存。`package.lua` 是被移除的 surface，存在即拒绝启动。
 
 queue 是包内命名空间。多 graph-root 组合时，裸 queue 名按 owner namespace 归一化为 `<pkg>.<queue>` 或 `host.<queue>`；跨包消费必须显式写 `pkg.queue`。折叠单包使用 LegacyFlat：裸名输出仍是裸名，同包限定名解析回裸名，`RAISED`、`Event.queue`、delivery id 与 source reference 字节保持单包旧形态。
 
@@ -222,9 +222,9 @@ Vec<mpsc::Sender<Event>>
     ↓
 consumer inbox
     ↓
-spawn fkst-framework run <department main.lua> --project-root <HOST> --package-root <ROOT> ... --owner-namespace <id> --event <json>
+spawn fkst-framework run <department main.lua> --project-root <HOST> --package-root <PKG_A> --package-root <PKG_B> ... --owner-namespace <id> --event <json>
     ↓
-single Lua state + pipeline(event)
+single Lua state + owner-scoped package.path + pipeline(event)
     ↓
 SDK calls: file/json/git/lock/worktree/exec/codex/log/now/raise
     ↓

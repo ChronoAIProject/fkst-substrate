@@ -1,3 +1,4 @@
+use base64::Engine;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -103,6 +104,18 @@ fn stderr(output: &Output) -> String {
     String::from_utf8_lossy(&output.stderr).to_string()
 }
 
+fn raised_entries(output: &Output) -> serde_json::Value {
+    let out = stdout(output);
+    let line = out
+        .lines()
+        .find_map(|line| line.strip_prefix("RAISED: "))
+        .unwrap_or_else(|| panic!("missing RAISED line in stdout: {out}"));
+    let decoded = base64::engine::general_purpose::URL_SAFE
+        .decode(line)
+        .unwrap();
+    serde_json::from_slice(&decoded).unwrap()
+}
+
 fn run_command(host: &Path, lua: &Path) -> Command {
     let mut cmd = Command::new(framework_bin());
     cmd.arg("run")
@@ -116,6 +129,104 @@ fn run_command(host: &Path, lua: &Path) -> Command {
         .env_remove("FKST_PACKAGE_ROOT")
         .env_remove("FKST_PACKAGE_ROOTS");
     cmd
+}
+
+#[test]
+fn production_run_with_composed_package_roots_raises_declared_cross_package_queue() {
+    let temp = tempfile::tempdir().unwrap();
+    let host = temp.path().join("host");
+    let owner = temp.path().join("github-devloop");
+    let sibling = temp.path().join("consensus");
+    fs::create_dir_all(owner.join("departments/probe")).unwrap();
+    fs::create_dir_all(&sibling).unwrap();
+    fs::create_dir_all(&host).unwrap();
+    let probe = owner.join("departments/probe/main.lua");
+    fs::write(
+        &probe,
+        r#"
+local M = {}
+M.spec = {
+  consumes = { "tick" },
+  produces = { "consensus.proposal" },
+}
+function pipeline(event)
+  raise("consensus.proposal", { source = event.payload.value })
+end
+return M
+"#,
+    )
+    .unwrap();
+
+    let output = run_command(&host, &probe)
+        .arg("--package-root")
+        .arg(&owner)
+        .arg("--package-root")
+        .arg(&sibling)
+        .arg("--owner-namespace")
+        .arg("github-devloop")
+        .output()
+        .unwrap();
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stdout: {}\nstderr: {}",
+        stdout(&output),
+        stderr(&output)
+    );
+    let raises = raised_entries(&output);
+    assert_eq!(raises[0]["queue"], "consensus.proposal");
+    assert_eq!(raises[0]["payload"]["source"], "ok");
+}
+
+#[test]
+fn production_run_composed_namespace_roots_do_not_authorize_sibling_require() {
+    let temp = tempfile::tempdir().unwrap();
+    let host = temp.path().join("host");
+    let owner = temp.path().join("github-devloop");
+    let sibling = temp.path().join("consensus");
+    fs::create_dir_all(owner.join("departments/probe")).unwrap();
+    fs::create_dir_all(&sibling).unwrap();
+    fs::create_dir_all(&host).unwrap();
+    fs::write(
+        sibling.join("sibling_only.lua"),
+        r#"return { value = "leaked" }"#,
+    )
+    .unwrap();
+    let probe = owner.join("departments/probe/main.lua");
+    fs::write(
+        &probe,
+        r#"
+function pipeline(event)
+  local ok, err = pcall(require, "sibling_only")
+  assert(not ok, "sibling module leaked into owner package.path")
+  assert(string.find(err, "module 'sibling_only' not found", 1, true), err)
+  raise("checked", { isolated = true })
+end
+"#,
+    )
+    .unwrap();
+
+    let output = run_command(&host, &probe)
+        .arg("--package-root")
+        .arg(&owner)
+        .arg("--package-root")
+        .arg(&sibling)
+        .arg("--owner-namespace")
+        .arg("github-devloop")
+        .output()
+        .unwrap();
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stdout: {}\nstderr: {}",
+        stdout(&output),
+        stderr(&output)
+    );
+    let raises = raised_entries(&output);
+    assert_eq!(raises[0]["queue"], "github-devloop.checked");
+    assert_eq!(raises[0]["payload"]["isolated"], true);
 }
 
 fn namespace(root: &Path) -> String {
