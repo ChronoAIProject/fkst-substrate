@@ -16,7 +16,7 @@ function pipeline(event)
   local request = file.read(path)
   local result = spawn_codex_sync({
     prompt = prompt.build(request),
-    stall_window = 300,
+    timeout = 3600,
   })
   log.info(string.format(
     "codex exit_code=%s log=%s",

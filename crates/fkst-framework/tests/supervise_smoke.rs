@@ -357,7 +357,6 @@ async fn spawn_framework_passes_codex_permit_slots_env() {
         &[sandbox.root().to_path_buf()],
         "pkg",
         "{}",
-        Duration::from_secs(5),
         7,
         "permit",
         &logs,
@@ -384,7 +383,6 @@ async fn framework_child_log_records_final_metadata_for_exit_modes() {
         &[sandbox.root().to_path_buf()],
         "pkg",
         "{}",
-        Duration::from_secs(5),
         20,
         "success",
         &logs,
@@ -399,9 +397,9 @@ async fn framework_child_log_records_final_metadata_for_exit_modes() {
     assert!(success_log.contains("OWNER_NAMESPACE=pkg"));
     assert!(success_log.contains("DEPT=success"));
     assert!(success_log.contains("EXIT=0\n"));
-    assert!(success_log.contains("STALLED=false\n"));
     assert!(success_log.contains("ELAPSED_MS="));
-    assert!(success_log.contains("LAST_OUTPUT_AGE_MS="));
+    assert!(!success_log.contains("STALLED="));
+    assert!(!success_log.contains("LAST_OUTPUT_AGE_MS="));
 
     let nonzero = fake_framework(sandbox.root(), r#"printf 'bad\n' >&2; exit 9"#);
     let nonzero_result = spawn_framework(
@@ -411,7 +409,6 @@ async fn framework_child_log_records_final_metadata_for_exit_modes() {
         &[sandbox.root().to_path_buf()],
         "pkg",
         "{}",
-        Duration::from_secs(5),
         20,
         "nonzero-meta",
         &logs,
@@ -424,35 +421,35 @@ async fn framework_child_log_records_final_metadata_for_exit_modes() {
     assert!(nonzero_log.contains("LUA="));
     assert!(nonzero_log.contains("DEPT=nonzero-meta"));
     assert!(nonzero_log.contains("EXIT=9\n"));
-    assert!(nonzero_log.contains("STALLED=false\n"));
     assert!(nonzero_log.contains("ELAPSED_MS="));
-    assert!(nonzero_log.contains("LAST_OUTPUT_AGE_MS="));
+    assert!(!nonzero_log.contains("STALLED="));
+    assert!(!nonzero_log.contains("LAST_OUTPUT_AGE_MS="));
 
-    let stall = fake_framework(sandbox.root(), r#"while :; do :; done"#);
-    let stall_result = spawn_framework(
-        &stall,
+    let silent = fake_framework(sandbox.root(), r#"sleep 1; exit 0"#);
+    let silent_result = spawn_framework(
+        &silent,
         &lua_dummy,
         sandbox.root(),
         &[sandbox.root().to_path_buf()],
         "pkg",
         "{}",
-        Duration::from_millis(120),
         20,
-        "stall-meta",
+        "silent-meta",
         &logs,
     )
     .await
     .unwrap();
-    let stall_log = read_log(&stall_result);
-    assert!(stall_log.contains("CMD="));
-    assert!(stall_log.contains("PID="));
-    assert!(stall_log.contains("LUA="));
-    assert!(stall_log.contains("DEPT=stall-meta"));
-    assert!(stall_log.contains("STALL_KILL_PID="));
-    assert!(stall_log.contains("EXIT=124\n"));
-    assert!(stall_log.contains("STALLED=true\n"));
-    assert!(stall_log.contains("ELAPSED_MS="));
-    assert!(stall_log.contains("LAST_OUTPUT_AGE_MS="));
+    let silent_log = read_log(&silent_result);
+    assert_eq!(silent_result.exit_code, 0);
+    assert!(silent_log.contains("CMD="));
+    assert!(silent_log.contains("PID="));
+    assert!(silent_log.contains("LUA="));
+    assert!(silent_log.contains("DEPT=silent-meta"));
+    assert!(silent_log.contains("EXIT=0\n"));
+    assert!(silent_log.contains("ELAPSED_MS="));
+    assert!(!silent_log.contains("STALL_KILL_PID="));
+    assert!(!silent_log.contains("STALLED="));
+    assert!(!silent_log.contains("LAST_OUTPUT_AGE_MS="));
 }
 
 #[tokio::test]
@@ -474,7 +471,6 @@ async fn framework_child_log_failure_preserves_spawn_result() {
         &[sandbox.root().to_path_buf()],
         "pkg",
         "{}",
-        Duration::from_secs(5),
         20,
         "blocked",
         &blocked_log_path,
@@ -485,6 +481,5 @@ async fn framework_child_log_failure_preserves_spawn_result() {
     assert_eq!(result.exit_code, 6);
     assert_eq!(result.stdout, "stdout-stays\n");
     assert_eq!(result.stderr, "stderr-stays\n");
-    assert!(!result.stalled);
     assert!(result.log_path.is_none());
 }

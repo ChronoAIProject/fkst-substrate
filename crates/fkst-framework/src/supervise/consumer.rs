@@ -329,8 +329,8 @@ async fn run_durable_record(
             }
         }
         Ok(result) => Some(format!(
-            "exit={} stalled={} stderr={}",
-            result.exit_code, result.stalled, result.stderr
+            "exit={} stderr={}",
+            result.exit_code, result.stderr
         )),
         Err(err) => {
             error!(
@@ -607,7 +607,6 @@ async fn spawn_and_report(dept_name: &str, args: &SpawnArgs) -> anyhow::Result<S
         &args.graph_package_roots,
         &args.owner_namespace,
         &args.event_json,
-        args.stall_window,
         args.codex_permit_slots,
         dept_name,
         &args.log_dir,
@@ -615,10 +614,9 @@ async fn spawn_and_report(dept_name: &str, args: &SpawnArgs) -> anyhow::Result<S
     .await?;
 
     if result.exit_code != 0 {
-        warn!(dept = %dept_name, exit = result.exit_code, stalled = result.stalled,
+        warn!(dept = %dept_name, exit = result.exit_code,
               stall_window_ms = args.stall_window.as_millis(),
               elapsed_ms = result.elapsed_ms,
-              last_output_age_ms = result.last_output_age_ms,
               log_path = ?result.log_path,
               stderr = %result.stderr,
               "framework failed");
@@ -626,7 +624,6 @@ async fn spawn_and_report(dept_name: &str, args: &SpawnArgs) -> anyhow::Result<S
         info!(dept = %dept_name,
               stall_window_ms = args.stall_window.as_millis(),
               elapsed_ms = result.elapsed_ms,
-              last_output_age_ms = result.last_output_age_ms,
               log_path = ?result.log_path,
               "framework ok");
     }

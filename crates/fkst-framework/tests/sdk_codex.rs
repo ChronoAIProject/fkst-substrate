@@ -15,7 +15,6 @@ use nix::fcntl::{flock, FlockArg};
 use sdk_codex::{
     acquire_permit, ensure_pool, CodexResult, CodexTaskHandle, CODEX_PERMIT_SLOTS_ENV,
 };
-use std::io::Write;
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -78,28 +77,17 @@ fn recv_result<T>(rx: &std::sync::mpsc::Receiver<T>, label: &str) -> T {
         .unwrap_or_else(|err| panic!("timed out waiting for {label}: {err}"))
 }
 
-fn assert_no_result_during_activity_window<T>(rx: &std::sync::mpsc::Receiver<T>, label: &str) {
-    match rx.recv_timeout(Duration::from_millis(450)) {
-        Ok(_) => panic!("{label} completed before activity could extend the stall window"),
-        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
-        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-            panic!("{label} sender disconnected before activity could extend the stall window")
-        }
-    }
-}
-
 #[cfg(unix)]
-fn active_codex_script(stream_redirect: &'static str) -> String {
+fn continuous_output_codex_script(stream_redirect: &'static str) -> String {
     format!(
         r#"#!/bin/sh
 cat >/dev/null
-while IFS= read -r line; do
-  if [ "$line" = "done" ]; then
-    break
-  fi
-  printf '%s\n' "$line" {stream_redirect}
-  printf 'ack:%s\n' "$line" > "$ACK_FIFO"
-done < "$TICK_FIFO"
+i=0
+while :; do
+  i=$((i + 1))
+  printf 'tick:%s\n' "$i" {stream_redirect}
+  sleep 0.05
+done
 "#
     )
 }
@@ -108,6 +96,8 @@ struct ActivityResult {
     exit_code: i64,
     stdout: String,
     stderr: String,
+    error_kind: String,
+    error: String,
 }
 
 enum TestStream {
@@ -116,24 +106,18 @@ enum TestStream {
 }
 
 #[cfg(unix)]
-fn run_stall_window_activity_test(output_stream: TestStream) -> ActivityResult {
+fn run_timeout_activity_test(output_stream: TestStream) -> ActivityResult {
     let tmp = tempfile::tempdir().unwrap();
     let bin_dir = tmp.path().join("bin");
-    let tick_fifo = tmp.path().join("tick.fifo");
-    let ack_fifo = tmp.path().join("ack.fifo");
-    make_fifo(&tick_fifo);
-    make_fifo(&ack_fifo);
     let stream_redirect = match output_stream {
         TestStream::Stdout => "",
         TestStream::Stderr => ">&2",
     };
-    install_codex_script(&bin_dir, &active_codex_script(stream_redirect));
+    install_codex_script(&bin_dir, &continuous_output_codex_script(stream_redirect));
 
     let mut sandbox = ProcessSandbox::new();
     sandbox.enter_cwd(tmp.path()).runtime_root(".fkst/runtime");
     sandbox.prepend_path(&bin_dir);
-    sandbox.set_env("TICK_FIFO", tick_fifo.to_string_lossy().into_owned());
-    sandbox.set_env("ACK_FIFO", ack_fifo.to_string_lossy().into_owned());
     sandbox.runtime_log_dir(tmp.path().join("runtime"));
     let (_lock, _guard) = sandbox.enter();
 
@@ -143,35 +127,18 @@ fn run_stall_window_activity_test(output_stream: TestStream) -> ActivityResult {
         register(&lua).unwrap();
         let spawn: mlua::Function = lua.globals().get("spawn_codex_sync").unwrap();
         let opts = lua_opts(&lua, "active");
-        opts.set("stall_window", 1).unwrap();
+        opts.set("timeout", 1).unwrap();
         let result: Table = spawn.call(opts).unwrap();
         result_tx
             .send(ActivityResult {
                 exit_code: result.get::<i64>("exit_code").unwrap(),
                 stdout: result.get::<String>("stdout").unwrap(),
                 stderr: result.get::<String>("stderr").unwrap(),
+                error_kind: result.get::<String>("error_kind").unwrap(),
+                error: result.get::<String>("error").unwrap(),
             })
             .unwrap();
     });
-
-    let mut ticks = std::fs::OpenOptions::new()
-        .write(true)
-        .open(&tick_fifo)
-        .unwrap();
-    ticks.write_all(b"one\n").unwrap();
-    ticks.flush().unwrap();
-    assert_eq!(read_fifo(&ack_fifo), "ack:one\n");
-    assert_no_result_during_activity_window(&result_rx, "codex activity result");
-    ticks.write_all(b"two\n").unwrap();
-    ticks.flush().unwrap();
-    assert_eq!(read_fifo(&ack_fifo), "ack:two\n");
-    assert_no_result_during_activity_window(&result_rx, "codex activity result");
-    ticks.write_all(b"three\n").unwrap();
-    ticks.flush().unwrap();
-    assert_eq!(read_fifo(&ack_fifo), "ack:three\n");
-    assert_no_result_during_activity_window(&result_rx, "codex activity result");
-    ticks.write_all(b"done\n").unwrap();
-    ticks.flush().unwrap();
 
     let result = recv_result(&result_rx, "codex activity result");
     spawn_thread.join().unwrap();
@@ -334,7 +301,7 @@ printf 'ok'
     opts.set("prompt", prompt.as_str()).unwrap();
     opts.set("context", "ctx.json").unwrap();
     opts.set("worktree", "wt").unwrap();
-    opts.set("stall_window", 42).unwrap();
+    opts.set("timeout", 42).unwrap();
 
     let result: mlua::Table = spawn.call(opts).unwrap();
     assert_eq!(result.get::<i64>("exit_code").unwrap(), 0);
@@ -353,7 +320,7 @@ printf 'ok'
     assert!(log_body.contains(
         "CMD=codex exec --dangerously-bypass-approvals-and-sandbox --context ctx.json -C wt -\n"
     ));
-    assert!(log_body.contains("STALL_WINDOW=42\n"));
+    assert!(log_body.contains("TIMEOUT_SECONDS=42\n"));
 
     let argv = fs::read_to_string(capture_dir.join("argv")).unwrap();
     let args: Vec<&str> = argv.lines().collect();
@@ -704,25 +671,93 @@ printf 'done'
 
 #[cfg(unix)]
 #[test]
-fn spawn_codex_sync_stdout_activity_extends_stall_window() {
-    let result = run_stall_window_activity_test(TestStream::Stdout);
-    assert_eq!(result.exit_code, 0);
-    assert!(result.stdout.contains("one"));
-    assert!(result.stdout.contains("two"));
+fn spawn_codex_sync_stdout_activity_does_not_extend_timeout() {
+    let result = run_timeout_activity_test(TestStream::Stdout);
+    assert_eq!(result.exit_code, 124);
+    assert_eq!(result.error_kind, "timeout");
+    assert!(result.error.contains("timed out"));
+    assert!(result.stdout.contains("tick:"));
 }
 
 #[cfg(unix)]
 #[test]
-fn spawn_codex_sync_stderr_activity_extends_stall_window() {
-    let result = run_stall_window_activity_test(TestStream::Stderr);
-    assert_eq!(result.exit_code, 0);
-    assert!(result.stderr.contains("one"));
-    assert!(result.stderr.contains("two"));
+fn spawn_codex_sync_stderr_activity_does_not_extend_timeout() {
+    let result = run_timeout_activity_test(TestStream::Stderr);
+    assert_eq!(result.exit_code, 124);
+    assert_eq!(result.error_kind, "timeout");
+    assert!(result.error.contains("timed out"));
+    assert!(result.stderr.contains("tick:"));
 }
 
 #[cfg(unix)]
 #[test]
-fn spawn_codex_sync_silent_child_returns_stall_failure() {
+fn spawn_codex_sync_stdin_write_is_bounded_by_overall_timeout() {
+    let tmp = tempfile::tempdir().unwrap();
+    let bin_dir = tmp.path().join("bin");
+    install_codex_script(
+        &bin_dir,
+        r#"#!/bin/sh
+while :; do :; done
+"#,
+    );
+
+    let mut sandbox = ProcessSandbox::new();
+    sandbox.enter_cwd(tmp.path()).runtime_root(".fkst/runtime");
+    sandbox.prepend_path(&bin_dir);
+    sandbox.runtime_log_dir(tmp.path().join("runtime"));
+    let (_lock, _guard) = sandbox.enter();
+
+    let lua = Lua::new();
+    register(&lua).unwrap();
+    let spawn: mlua::Function = lua.globals().get("spawn_codex_sync").unwrap();
+    let opts = lua_opts(&lua, &"prompt ".repeat(1024 * 1024));
+    opts.set("timeout", 1).unwrap();
+
+    let result: Table = spawn.call(opts).unwrap();
+    assert_eq!(result.get::<i64>("exit_code").unwrap(), 124);
+    assert_eq!(result.get::<String>("error_kind").unwrap(), "timeout");
+    assert!(result.get::<String>("error").unwrap().contains("timed out"));
+}
+
+#[cfg(unix)]
+#[test]
+fn spawn_codex_sync_silent_child_exits_before_timeout_successfully() {
+    let tmp = tempfile::tempdir().unwrap();
+    let bin_dir = tmp.path().join("bin");
+    install_codex_script(
+        &bin_dir,
+        r#"#!/bin/sh
+cat >/dev/null
+sleep 1
+exit 0
+"#,
+    );
+
+    let mut sandbox = ProcessSandbox::new();
+    sandbox.enter_cwd(tmp.path()).runtime_root(".fkst/runtime");
+    sandbox.prepend_path(&bin_dir);
+    sandbox.runtime_log_dir(tmp.path().join("runtime"));
+    let (_lock, _guard) = sandbox.enter();
+
+    let lua = Lua::new();
+    register(&lua).unwrap();
+    let spawn: mlua::Function = lua.globals().get("spawn_codex_sync").unwrap();
+    let opts = lua_opts(&lua, "silent");
+    opts.set("timeout", 2).unwrap();
+
+    let result: Table = spawn.call(opts).unwrap();
+    assert_eq!(result.get::<i64>("exit_code").unwrap(), 0);
+    assert!(result.get::<String>("stderr").unwrap().is_empty());
+    assert!(result.get::<String>("error_kind").is_err());
+    let log_path = PathBuf::from(result.get::<String>("log_path").unwrap());
+    let log_body = std::fs::read_to_string(log_path).unwrap();
+    assert!(log_body.contains("EXIT=0\n"));
+    assert!(log_body.contains("TIMEOUT_SECONDS=2\n"));
+}
+
+#[cfg(unix)]
+#[test]
+fn spawn_codex_sync_silent_child_returns_timeout_failure() {
     let tmp = tempfile::tempdir().unwrap();
     let bin_dir = tmp.path().join("bin");
     install_codex_script(
@@ -742,36 +777,39 @@ while :; do :; done
     let lua = Lua::new();
     register(&lua).unwrap();
     let spawn: mlua::Function = lua.globals().get("spawn_codex_sync").unwrap();
-    let opts = lua_opts(&lua, "stalled");
-    opts.set("stall_window", 1).unwrap();
+    let opts = lua_opts(&lua, "timed out");
+    opts.set("timeout", 1).unwrap();
 
     let result: Table = spawn.call(opts).unwrap();
     assert_eq!(result.get::<i64>("exit_code").unwrap(), 124);
-    assert_eq!(result.get::<String>("error_kind").unwrap(), "stall");
-    assert!(result.get::<String>("stderr").unwrap().contains("stalled"));
+    assert_eq!(result.get::<String>("error_kind").unwrap(), "timeout");
+    assert!(result
+        .get::<String>("stderr")
+        .unwrap()
+        .contains("timed out"));
     let log_path = PathBuf::from(result.get::<String>("log_path").unwrap());
     let log_body = std::fs::read_to_string(log_path).unwrap();
-    assert!(log_body.contains("STALL_WINDOW=1\n"));
+    assert!(log_body.contains("TIMEOUT_SECONDS=1\n"));
 }
 
 #[cfg(unix)]
 #[test]
-fn spawn_codex_sync_kills_stalled_child_process_group() {
+fn spawn_codex_sync_kills_timed_out_child_process_group() {
     use nix::sys::signal::kill;
     use nix::unistd::Pid;
 
     let tmp = tempfile::tempdir().unwrap();
     let bin_dir = tmp.path().join("bin");
     let pid_fifo = tmp.path().join("pid.fifo");
-    let stall_fifo = tmp.path().join("stall.fifo");
+    let timeout_fifo = tmp.path().join("timeout.fifo");
     make_fifo(&pid_fifo);
-    make_fifo(&stall_fifo);
+    make_fifo(&timeout_fifo);
     install_codex_script(
         &bin_dir,
         r#"#!/bin/sh
 cat >/dev/null
 printf '%s' "$$" > "$PID_FIFO"
-read _ < "$STALL_FIFO"
+read _ < "$TIMEOUT_FIFO"
 "#,
     );
 
@@ -779,7 +817,7 @@ read _ < "$STALL_FIFO"
     sandbox.enter_cwd(tmp.path()).runtime_root(".fkst/runtime");
     sandbox.prepend_path(&bin_dir);
     sandbox.set_env("PID_FIFO", pid_fifo.to_string_lossy().into_owned());
-    sandbox.set_env("STALL_FIFO", stall_fifo.to_string_lossy().into_owned());
+    sandbox.set_env("TIMEOUT_FIFO", timeout_fifo.to_string_lossy().into_owned());
     sandbox.runtime_log_dir(tmp.path().join("runtime"));
     let (_lock, _guard) = sandbox.enter();
 
@@ -791,13 +829,14 @@ read _ < "$STALL_FIFO"
     let lua = Lua::new();
     register(&lua).unwrap();
     let spawn: mlua::Function = lua.globals().get("spawn_codex_sync").unwrap();
-    let opts = lua_opts(&lua, "stalled");
-    opts.set("stall_window", 1).unwrap();
+    let opts = lua_opts(&lua, "timed out");
+    opts.set("timeout", 1).unwrap();
 
     let result: Table = spawn.call(opts).unwrap();
     let child_pid = pid_reader.join().unwrap();
     assert_eq!(result.get::<i64>("exit_code").unwrap(), 124);
-    assert_eq!(result.get::<String>("error_kind").unwrap(), "stall");
+    assert_eq!(result.get::<String>("error_kind").unwrap(), "timeout");
+    assert!(result.get::<String>("error").unwrap().contains("timed out"));
     assert!(result
         .get::<String>("error")
         .unwrap()

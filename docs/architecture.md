@@ -159,7 +159,7 @@ queue 是包内命名空间。多 graph-root 组合时，裸 queue 名按 owner 
 }
 ```
 
-`M.spec` 只接受 `consumes`、`produces`、`fanout`、`stall_window`；未知字段 fail-closed。
+`M.spec` 只接受 `consumes`、`produces`、`fanout`、`stall_window`；未知字段 fail-closed。`stall_window` 是可靠投递 lease window，不是 framework child 的无输出 kill deadline。
 
 每个 Raiser lua 文件 return 一个 source declaration，当前只支持：
 
@@ -179,7 +179,7 @@ queue 是包内命名空间。多 graph-root 组合时，裸 queue 名按 owner 
 | name | env key | kind | type | default / required |
 |---|---|---|---|---|
 | `queue_capacity` | `FKST_QUEUE_CAPACITY` | Operational | `usize` | default `16` |
-| `department_default_stall_window` | `FKST_DEPARTMENT_DEFAULT_STALL_WINDOW` | Operational | duration string | default `30s` |
+| `department_default_stall_window` | `FKST_DEPARTMENT_DEFAULT_STALL_WINDOW` | Operational | duration string | default `30s`, Department delivery lease |
 | `codex_permit_slots` | `FKST_CODEX_PERMIT_SLOTS` | Operational | `usize` | default `20` |
 | `retry_default_max_attempts` | `FKST_RETRY_DEFAULT_MAX_ATTEMPTS` | Operational | `usize` | default `5` |
 | `retry_default_base` | `FKST_RETRY_DEFAULT_BASE` | Operational | duration string | default `60s` |
@@ -287,11 +287,11 @@ engine 维护 durable 在途 delivery state，但它不是实体业务真相、a
 
 `M.spec.retry` 默认启用；`retry=false` 表示失败不重试；`retry={...}` 支持 `max_attempts`、`base`、`cap` 子集覆盖。全局默认由 registry 的 `retry_default_max_attempts`、`retry_default_base`、`retry_default_cap` 提供。可靠 / 非可靠投递由 `M.spec.ephemeral` 决定，不由 retry 决定。可靠路径不依赖 payload dedup key、runtime marker 或 retry scratch 文件；delivery store 使用 `delivery_id`、`lease_generation` 和 redb 事务提供 fencing、ack、retry 和 dead 表。
 
-`spawn_codex` 的 handle 只能由同一个 Lua pipeline 的 `await_all` 消费。单 handle 等待用 `await_all({handle})`。没有 sleep timer、first-result fanout、provider abstraction 或动态 SDK extension。
+`spawn_codex_sync` 与 `spawn_codex` 使用整体 wall-clock `timeout`，默认 3600 秒；stdout/stderr 输出只被捕获，不延长 timeout。`spawn_codex` 的 handle 只能由同一个 Lua pipeline 的 `await_all` 消费。单 handle 等待用 `await_all({handle})`。没有 sleep timer、first-result fanout、provider abstraction 或动态 SDK extension。
 
 ## 10. 事件与队列机制
 
-`Config` 包含 `queue`、`raiser`、`department`、`limits`。Queue 有 `capacity` 与 `fanout`。Raiser 只有 `Cron` 与 `FileWatch`。Department 有 `lua`、`owner_root`、`owner_namespace`、`consumes`、`produces`、`ephemeral`、`stall_window`、可选 `retry`。多 graph-root 下，Config 的 queue、raiser、department key 都是 canonical name；折叠单包仍是裸名。
+`Config` 包含 `queue`、`raiser`、`department`、`limits`。Queue 有 `capacity` 与 `fanout`。Raiser 只有 `Cron` 与 `FileWatch`。Department 有 `lua`、`owner_root`、`owner_namespace`、`consumes`、`produces`、`ephemeral`、`stall_window`、可选 `retry`。`stall_window` 用作可靠投递 lease 与续租窗口，不流入 framework child kill deadline。多 graph-root 下，Config 的 queue、raiser、department key 都是 canonical name；折叠单包仍是裸名。
 
 validation 规则：
 
@@ -300,7 +300,7 @@ validation 规则：
 - 每个 Raiser produces 必须引用已声明 queue
 - 每个 Department consumes/produces 必须引用已声明 queue
 - Department lua 文件必须存在
-- stall_window 必须以 `s`、`m` 或 `h` 结尾
+- stall_window 必须以 `s`、`m` 或 `h` 结尾，语义是 Department delivery lease
 - queue 不能孤立
 - 非 fanout queue 不能有多个 consumer
 - Department consume 和 produce 同一 queue 时，该 queue 必须 fanout
@@ -311,9 +311,9 @@ validation 规则：
 
 supervisor 使用 current-thread tokio runtime，spawn `fkst-framework supervise` 并把 stdout/stderr 继承出去。收到 interrupt/terminate 时 supervisor 返回对应 exit code，不 signal event runtime。它最后 best-effort reap children。
 
-supervise 运行在 current-thread tokio runtime 内，但每个 Department event 都会 spawn 一个 framework child process。framework child 是新的 process group leader。stall window 内无 stdout/stderr 输出时，supervise 对 `-pgid` 发送 `SIGKILL`，使 framework child 及其 codex 子孙一起退出。
+supervise 运行在 current-thread tokio runtime 内，但每个 Department event 都会 spawn 一个 framework child process。framework child 是新的 process group leader，并运行到自然退出。Department `M.spec.stall_window` 是可靠投递 lease 与续租窗口，不是 codex kill deadline。
 
-Codex SDK 也把 `codex exec` 放入 process group。stall 时 kill process group。permit 池使用 fcntl lock file，不是内存 semaphore。permit 数来自 registry 的 `codex_permit_slots`：env 或 host `fkst.env` 可覆盖，未设置时默认 `20`。
+Codex SDK 也把 `codex exec` 放入 process group。`spawn_codex_sync` 与 `spawn_codex` 使用整体 wall-clock `timeout`，默认 3600 秒；只有总运行时间超过 timeout 时才 kill process group，stdout/stderr 输出只被捕获，不延长 timeout。permit 池使用 fcntl lock file，不是内存 semaphore。permit 数来自 registry 的 `codex_permit_slots`：env 或 host `fkst.env` 可覆盖，未设置时默认 `20`。
 
 `with_lock(name, fn)` 是跨 pipeline 互斥 primitive。它把校验后的锁名解析到 `<RT>/locks/<name>` 并打开，获取 exclusive flock，执行 Lua function，释放 file handle。进程死时 lock 自动释放。
 
