@@ -15,11 +15,29 @@ use mlua::Lua;
 use sdk_git::{parse_worktree_paths, register};
 use std::path::Path;
 use std::process::Command;
+use std::sync::OnceLock;
 use support::process_sandbox::ProcessSandbox;
 use tempfile::tempdir;
 
+fn git_bin() -> &'static Path {
+    static GIT_BIN: OnceLock<std::path::PathBuf> = OnceLock::new();
+    GIT_BIN
+        .get_or_init(|| {
+            [
+                "/usr/bin/git",
+                "/opt/homebrew/bin/git",
+                "/usr/local/bin/git",
+            ]
+            .into_iter()
+            .map(std::path::PathBuf::from)
+            .find(|path| path.is_file())
+            .expect("test host must provide git at a standard absolute path")
+        })
+        .as_path()
+}
+
 fn git(repo: &Path, args: &[&str]) {
-    let out = Command::new("git")
+    let out = Command::new(git_bin())
         .args(args)
         .current_dir(repo)
         .output()
@@ -33,7 +51,7 @@ fn git(repo: &Path, args: &[&str]) {
 }
 
 fn git_stdout(repo: &Path, args: &[&str]) -> String {
-    let out = Command::new("git")
+    let out = Command::new(git_bin())
         .args(args)
         .current_dir(repo)
         .output()
@@ -60,12 +78,15 @@ fn in_sandbox<T>(
 
 fn repo_with_commit(message: &str) -> tempfile::TempDir {
     let tmp = tempdir().unwrap();
-    git(tmp.path(), &["init", "-q"]);
-    git(tmp.path(), &["config", "user.email", "test@example.com"]);
-    git(tmp.path(), &["config", "user.name", "Test User"]);
-    std::fs::write(tmp.path().join("file.txt"), "content\n").unwrap();
-    git(tmp.path(), &["add", "file.txt"]);
-    git(tmp.path(), &["commit", "-q", "-m", message]);
+    let sandbox = ProcessSandbox::new();
+    sandbox.run(|| {
+        git(tmp.path(), &["init", "-q"]);
+        git(tmp.path(), &["config", "user.email", "test@example.com"]);
+        git(tmp.path(), &["config", "user.name", "Test User"]);
+        std::fs::write(tmp.path().join("file.txt"), "content\n").unwrap();
+        git(tmp.path(), &["add", "file.txt"]);
+        git(tmp.path(), &["commit", "-q", "-m", message]);
+    });
     tmp
 }
 

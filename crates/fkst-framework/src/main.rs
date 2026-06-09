@@ -11,7 +11,7 @@
 //!   0 = pipeline ok
 //!   1 = lua error / pipeline error
 //!   2 = SDK / IO / arg parsing error
-//!   124 = no-output stall killed by SIGKILL -pgid
+//!   124 = codex subprocess timed out and was killed by SIGKILL -pgid
 
 use anyhow::{Context, Result};
 use host_conformance::HostConformanceOptions;

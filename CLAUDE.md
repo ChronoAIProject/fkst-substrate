@@ -102,9 +102,9 @@ Producer 对 queue 调用 `try_send`。某个慢消费者 `Full` 或 `Closed` �
 
 supervisor spawn framework 时使用独立 process group，但收到 `SIGINT` 或 `SIGTERM` 时只退出自己，不向 event runtime 发送信号。restart 不杀 in-flight framework/codex；在飞工作可以自然完成并留下事实，后续事件若丢失应由 package/host scanner 从事实源恢复。
 
-Department execution 由 supervise spawn `fkst-framework run <lua> --project-root <HOST> --package-root <ROOT> ... --owner-namespace <id> --event <json>`。每个 framework child 有独立 process group、具名 log、stdout/stderr 捕获和 no-output stall window；child log 写入 `OWNER_NAMESPACE=...`。stall window 是无输出卡死检测，不是总时长上限；有持续输出就等自然退出。stall 时发送 `SIGKILL` 到整个 process group，退出码映射为 `124`。
+Department execution 由 supervise spawn `fkst-framework run <lua> --project-root <HOST> --package-root <ROOT> ... --owner-namespace <id> --event <json>`。每个 framework child 有独立 process group、具名 log 和 stdout/stderr 捕获；framework child 不因无输出被 kill，运行到自然退出。`M.spec.stall_window` 是 consumer 可靠投递 lease 与续租窗口，不是子进程 kill deadline。
 
-Codex 调用固定为 `codex exec --dangerously-bypass-approvals-and-sandbox [-C worktree] [--context context] -`。prompt 写入 stdin；stdin EOF 是调用边界。stdout、stderr、exit_code、cmd、done time、stall window 必须写入 codex log。`spawn_codex` 返回的 handle 只能由同一 pipeline 的 `await_all` 消费，不能跨 pipeline 复用。
+Codex 调用固定为 `codex exec --dangerously-bypass-approvals-and-sandbox [-C worktree] [--context context] -`。prompt 写入 stdin；stdin EOF 是调用边界。`spawn_codex_sync({ prompt = ..., timeout = 3600 })` 与 `spawn_codex` 使用整体 wall-clock timeout，stdout/stderr 输出只被捕获，不延长 timeout；stdout、stderr、exit_code、cmd、done time、timeout 必须写入 codex log。`spawn_codex` 返回的 handle 只能由同一 pipeline 的 `await_all` 消费，不能跨 pipeline 复用。
 
 `fkst-framework test` 注册 test-mode-only `fkst.test.mock_command(pattern, result)` 与 `fkst.test.command_calls()`，和 `run_department` 并列。test mode 劫持 `exec_sync`、codex SDK 与 git SDK 的外部命令调用，按渲染命令行前缀或子串匹配 mock，按注册顺序一次性消费；未 mock 的外部命令 fail closed，不启动真实进程。production `run`、`supervise`、`--self-test` 与 conformance 不注册 mock state。`setup_worktree` 在 test mode 通过同一 git mock runner fail closed，但不模拟 worktree 副作用。
 

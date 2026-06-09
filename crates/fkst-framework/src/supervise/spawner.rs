@@ -1,11 +1,8 @@
-//! Framework spawn with new process group + SIGKILL -pgid on stall.
+//! Framework spawn with new process group, output capture, and child log.
 //!
 //! Spawn `fkst-framework run <lua_path> --project-root <path> --package-root <path> ... --owner-namespace <id> --event <json>` with setsid.
-//! On no-output stall, send SIGKILL to -pgid so codex subprocess children are collected too.
 
 use anyhow::{Context, Result};
-use nix::sys::signal::{kill, Signal};
-use nix::unistd::Pid;
 use std::ffi::OsStr;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -16,37 +13,33 @@ use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::{Child, Command};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
-use tracing::{info, warn};
+use tracing::info;
 
 static NEXT_FRAMEWORK_CHILD_LOG_ID: AtomicU64 = AtomicU64::new(1);
 
-// results expose no-output stalls and the age of the last observed output.
 pub struct SpawnResult {
     pub exit_code: i32,
     pub stdout: String,
     pub stderr: String,
-    pub stalled: bool,
     pub elapsed_ms: u128,
-    pub last_output_age_ms: u128,
     pub log_path: Option<PathBuf>,
 }
 
-// each stream is tagged as live activity while the child is still running.
+// each stream is tagged so captured output preserves stdout/stderr boundaries.
 #[derive(Clone, Copy)]
 enum FrameworkStream {
     Stdout,
     Stderr,
 }
 
-// output chunks and process exit share one activity channel.
+// output chunks and process exit share one wait channel.
 enum FrameworkEvent {
     Output(FrameworkStream, Vec<u8>),
     Exited(std::result::Result<std::process::ExitStatus, String>),
 }
 
-// stdout/stderr activity keeps the process alive until natural exit.
-// supervise only forwards configured slot width to each framework
-// child; SDK fcntl permit locks remain the only codex concurrency authority.
+// Framework children run until natural exit; Department stall_window is a
+// delivery lease owned by consumer.rs, not a subprocess kill deadline.
 pub async fn spawn_framework(
     binary: &Path,
     lua_path: &Path,
@@ -54,7 +47,6 @@ pub async fn spawn_framework(
     package_roots: &[PathBuf],
     owner_namespace: &str,
     event_json: &str,
-    stall_window: Duration,
     codex_permit_slots: usize,
     child_label: &str,
     log_dir: &Path,
@@ -78,7 +70,6 @@ pub async fn spawn_framework(
     ));
     log.write_line(&format!("OWNER_NAMESPACE={owner_namespace}"));
     log.write_line(&format!("DEPT={child_label}"));
-    log.write_line(&format!("STALL_WINDOW_MS={}", stall_window.as_millis()));
 
     let mut cmd = Command::new(binary);
     cmd.arg("run")
@@ -116,9 +107,9 @@ pub async fn spawn_framework(
         .id()
         .ok_or_else(|| anyhow::anyhow!("no pid after spawn"))?;
     log.write_line(&format!("PID={pid}"));
-    info!(pid = pid, lua = %lua_path.display(), stall_window_ms = stall_window.as_millis(), "framework spawned");
+    info!(pid = pid, lua = %lua_path.display(), "framework spawned");
 
-    wait_with_stall_window(child, pid, stall_window, start, log).await
+    wait_for_framework_child(child, start, log).await
 }
 
 fn package_root_flags(package_roots: &[PathBuf]) -> String {
@@ -137,11 +128,8 @@ fn package_root_list(package_roots: &[PathBuf]) -> String {
         .join(";")
 }
 
-// stdout/stderr output resets a no-output stall window.
-async fn wait_with_stall_window(
+async fn wait_for_framework_child(
     mut child: Child,
-    pid: u32,
-    stall_window: Duration,
     start: Instant,
     mut log: FrameworkChildLog,
 ) -> Result<SpawnResult> {
@@ -167,41 +155,15 @@ async fn wait_with_stall_window(
     });
 
     let mut output = FrameworkOutput::default();
-    let mut last_output = Instant::now();
-    let mut stalled = false;
     let status = loop {
-        let event = if stalled {
-            rx.recv().await
-        } else {
-            let remaining = stall_window.saturating_sub(last_output.elapsed());
-            if remaining.is_zero() {
-                None
-            } else {
-                tokio::time::timeout(remaining, rx.recv())
-                    .await
-                    .unwrap_or(None)
-            }
-        };
-
-        match event {
+        match rx.recv().await {
             Some(FrameworkEvent::Output(stream, bytes)) => {
                 if !bytes.is_empty() {
-                    last_output = Instant::now();
                     log.write_chunk(stream, &bytes);
                     output.push(stream, bytes);
                 }
             }
             Some(FrameworkEvent::Exited(result)) => break result,
-            None if !stalled => {
-                stalled = true;
-                log.write_line(&format!("STALL_KILL_PID={pid}"));
-                warn!(
-                    pid = pid,
-                    stall_window_ms = stall_window.as_millis(),
-                    "framework stalled, SIGKILL -pgid"
-                );
-                let _ = kill(Pid::from_raw(-(pid as i32)), Signal::SIGKILL);
-            }
             None => break Err("framework wait channel closed before process exit".to_string()),
         }
     };
@@ -212,10 +174,10 @@ async fn wait_with_stall_window(
     let _ = waiter.await;
     drain_framework_events(&mut rx, &mut output, &mut log);
 
-    spawn_result_from_status(status, stalled, output, start, last_output, log)
+    spawn_result_from_status(status, output, start, log)
 }
 
-// buffers accumulate incrementally as liveness events arrive.
+// buffers accumulate incrementally as output events arrive.
 #[derive(Default)]
 struct FrameworkOutput {
     stdout: Vec<u8>,
@@ -245,41 +207,30 @@ fn drain_framework_events(
     }
 }
 
-// stall kill maps to exit 124 while natural exits keep their child status.
+// natural exits keep their child status.
 fn spawn_result_from_status(
     status: std::result::Result<std::process::ExitStatus, String>,
-    stalled: bool,
     output: FrameworkOutput,
     start: Instant,
-    last_output: Instant,
     mut log: FrameworkChildLog,
 ) -> Result<SpawnResult> {
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-    let exit_code = if stalled {
-        124
-    } else {
-        status.map_err(anyhow::Error::msg)?.code().unwrap_or(-1)
-    };
+    let exit_code = status.map_err(anyhow::Error::msg)?.code().unwrap_or(-1);
     let elapsed_ms = start.elapsed().as_millis();
-    let last_output_age_ms = last_output.elapsed().as_millis();
     log.write_line(&format!("EXIT={exit_code}"));
-    log.write_line(&format!("STALLED={stalled}"));
     log.write_line(&format!("ELAPSED_MS={elapsed_ms}"));
-    log.write_line(&format!("LAST_OUTPUT_AGE_MS={last_output_age_ms}"));
     let log_path = log.path().map(Path::to_path_buf);
     Ok(SpawnResult {
         exit_code,
         stdout,
         stderr,
-        stalled,
         elapsed_ms,
-        last_output_age_ms,
         log_path,
     })
 }
 
-// readers forward each chunk immediately so output refreshes liveness.
+// readers forward each chunk immediately for output capture.
 fn spawn_stream_reader<R>(
     mut reader: R,
     stream: FrameworkStream,
@@ -308,7 +259,7 @@ where
 }
 
 // each framework child owns a best-effort durable log that records command
-// metadata, streamed stdout/stderr chunks, stall kills, and final exit metadata
+// metadata, streamed stdout/stderr chunks, and final exit metadata
 // without changing RAISED parsing or spawn success semantics.
 struct FrameworkChildLog {
     path: Option<PathBuf>,

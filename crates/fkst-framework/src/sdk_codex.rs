@@ -27,7 +27,7 @@ use crate::runtime_context;
 
 pub(crate) const CODEX_PERMIT_SLOTS_ENV: &str = "FKST_CODEX_PERMIT_SLOTS";
 pub const RUNTIME_LOG_DIR_ENV: &str = "FKST_RUNTIME_LOG_DIR";
-const DEFAULT_STALL_WINDOW_SECONDS: i64 = 900;
+const DEFAULT_CODEX_TIMEOUT_SECONDS: i64 = 3600;
 static NEXT_PIPELINE_OWNER_ID: AtomicU64 = AtomicU64::new(1);
 
 // both sync and async SDK calls share one immutable request description.
@@ -35,7 +35,7 @@ struct CodexRequest {
     prompt: String,
     context: Option<String>,
     worktree: Option<String>,
-    stall_window_seconds: i64,
+    timeout_seconds: i64,
     log_path: PathBuf,
 }
 
@@ -71,20 +71,20 @@ impl Drop for CodexTaskHandle {
     }
 }
 
-// each stream is tagged as live activity while the child is still running.
+// each stream is tagged so captured output preserves stdout/stderr boundaries.
 #[derive(Clone, Copy)]
 enum CodexStream {
     Stdout,
     Stderr,
 }
 
-// output chunks and process exit share one liveness channel.
+// output chunks and process exit share one wait channel.
 enum CodexEvent {
     Output(CodexStream, Vec<u8>),
     Exited(std::result::Result<ExitStatus, String>),
 }
 
-// wait outcomes distinguish natural exit from no-output stall failure.
+// wait outcomes distinguish natural exit from timeout and wait failures.
 enum CodexWaitOutcome {
     Exited {
         stdout: String,
@@ -235,21 +235,21 @@ pub(crate) fn register_with_runner(
     Ok(())
 }
 
-// the same input names a no-output stall window with a bounded default.
+// the same input names an overall wall-clock timeout with a bounded default.
 fn codex_request_from_opts(opts: Table) -> CodexRequest {
     let prompt: String = opts.get("prompt").unwrap_or_default();
     let context: Option<String> = opts.get("context").ok();
     let worktree: Option<String> = opts.get("worktree").ok();
-    let stall_window: Option<i64> = opts.get("stall_window").ok();
-    let stall_window_seconds = stall_window
+    let timeout: Option<i64> = opts.get("timeout").ok();
+    let timeout_seconds = timeout
         .filter(|seconds| *seconds > 0)
-        .unwrap_or(DEFAULT_STALL_WINDOW_SECONDS);
+        .unwrap_or(DEFAULT_CODEX_TIMEOUT_SECONDS);
     let log_path = codex_log_path(worktree.as_deref());
     CodexRequest {
         prompt,
         context,
         worktree,
-        stall_window_seconds,
+        timeout_seconds,
         log_path,
     }
 }
@@ -357,7 +357,7 @@ fn run_codex_request(
             &message,
             -1,
             &command_line_for_request(&request),
-            request.stall_window_seconds,
+            request.timeout_seconds,
         );
         return Ok(CodexResult::failure(
             "permit",
@@ -378,7 +378,7 @@ fn run_codex_request(
                 &message,
                 -1,
                 &command_line_for_request(&request),
-                request.stall_window_seconds,
+                request.timeout_seconds,
             );
             return Ok(CodexResult::failure(
                 "permit",
@@ -412,7 +412,7 @@ fn run_mocked_codex_request(
         &result.stderr,
         result.exit_code,
         &cmd_line,
-        request.stall_window_seconds,
+        request.timeout_seconds,
     );
     Ok(CodexResult::success(
         result.stdout,
@@ -422,25 +422,26 @@ fn run_mocked_codex_request(
     ))
 }
 
-fn run_codex_request_with_permit(request: CodexRequest) -> CodexResult {
+fn run_codex_request_with_permit(mut request: CodexRequest) -> CodexResult {
     let (mut cmd, cmd_line) = command_for_request(&request);
     eprintln!(
-        "SPAWN: log={} cd={} stall_window={}",
+        "SPAWN: log={} cd={} timeout={}",
         request.log_path.display(),
         request.worktree.as_deref().unwrap_or("."),
-        request.stall_window_seconds
+        request.timeout_seconds
     );
 
     let child = match spawn_codex_child(&request, &mut cmd, &cmd_line) {
         Ok(child) => child,
         Err(result) => return *result,
     };
-    let child = match write_prompt_to_child(child, &request, &cmd_line) {
-        Ok(child) => child,
+    let prompt = std::mem::take(&mut request.prompt);
+    let (child, stdin_writer) = match spawn_stdin_writer(child, prompt, &request, &cmd_line) {
+        Ok(parts) => parts,
         Err(result) => return *result,
     };
 
-    wait_for_codex_child(child, &request, &cmd_line)
+    wait_for_codex_child(child, stdin_writer, &request, &cmd_line)
 }
 
 // only the rare error path is boxed while preserving the success path shape.
@@ -463,11 +464,12 @@ fn spawn_codex_child(
 }
 
 // stdin setup failures keep the same value and are boxed only at the boundary.
-fn write_prompt_to_child(
+fn spawn_stdin_writer(
     mut child: Child,
+    prompt: String,
     request: &CodexRequest,
     cmd_line: &str,
-) -> std::result::Result<Child, Box<CodexResult>> {
+) -> std::result::Result<(Child, JoinHandle<std::io::Result<()>>), Box<CodexResult>> {
     let Some(mut stdin) = child.stdin.take() else {
         return Err(Box::new(logged_failure(
             request,
@@ -479,65 +481,49 @@ fn write_prompt_to_child(
             -1,
         )));
     };
-    if let Err(err) = stdin.write_all(request.prompt.as_bytes()) {
-        let message = format!("codex stdin write failed: {err}");
+    let writer = std::thread::spawn(move || {
+        let result = stdin.write_all(prompt.as_bytes());
         drop(stdin);
-        return Err(Box::new(wait_after_stdin_error(
-            child, request, cmd_line, message,
-        )));
-    }
-    Ok(child)
+        result
+    });
+    Ok((child, writer))
 }
 
-fn wait_after_stdin_error(
+fn join_stdin_writer(writer: JoinHandle<std::io::Result<()>>) -> std::result::Result<(), String> {
+    writer
+        .join()
+        .map_err(|_| "codex stdin writer thread panicked".to_string())?
+        .map_err(|err| format!("codex stdin write failed: {err}"))
+}
+
+fn wait_for_codex_child(
     child: Child,
+    stdin_writer: JoinHandle<std::io::Result<()>>,
     request: &CodexRequest,
     cmd_line: &str,
-    message: String,
 ) -> CodexResult {
-    match wait_codex_with_stall_window(child, request.stall_window_seconds) {
-        CodexWaitOutcome::Exited {
-            stdout,
-            stderr,
-            exit_code,
-        } => logged_failure(
-            request, cmd_line, "stdin", message, stdout, stderr, exit_code,
-        ),
-        CodexWaitOutcome::Failed {
-            message: wait_error,
-            stdout: _,
-            stderr: _,
-            exit_code: _,
-            ..
-        } => {
-            let message = format!("{message}; {wait_error}");
-            logged_failure(
-                request,
-                cmd_line,
-                "stdin",
-                message,
-                String::new(),
-                String::new(),
-                -1,
-            )
-        }
-    }
-}
-
-fn wait_for_codex_child(child: Child, request: &CodexRequest, cmd_line: &str) -> CodexResult {
-    match wait_codex_with_stall_window(child, request.stall_window_seconds) {
+    let wait_outcome = wait_codex_with_timeout(child, request.timeout_seconds);
+    let stdin_result = join_stdin_writer(stdin_writer);
+    match wait_outcome {
         CodexWaitOutcome::Exited {
             stdout,
             stderr,
             exit_code,
         } => {
+            if exit_code == 0 {
+                if let Err(message) = stdin_result {
+                    return logged_failure(
+                        request, cmd_line, "stdin", message, stdout, stderr, exit_code,
+                    );
+                }
+            }
             write_codex_log(
                 &request.log_path,
                 &stdout,
                 &stderr,
                 exit_code,
                 cmd_line,
-                request.stall_window_seconds,
+                request.timeout_seconds,
             );
             CodexResult::success(
                 stdout,
@@ -556,8 +542,9 @@ fn wait_for_codex_child(child: Child, request: &CodexRequest, cmd_line: &str) ->
     }
 }
 
-// stdout/stderr output resets a no-output stall window.
-fn wait_codex_with_stall_window(mut child: Child, stall_seconds: i64) -> CodexWaitOutcome {
+// stdout/stderr output is captured but does not extend the wall-clock timeout.
+fn wait_codex_with_timeout(mut child: Child, timeout_seconds: i64) -> CodexWaitOutcome {
+    let start = Instant::now();
     let child_pid = child.id();
     let (tx, rx) = mpsc::channel();
     let mut readers = Vec::new();
@@ -570,16 +557,15 @@ fn wait_codex_with_stall_window(mut child: Child, stall_seconds: i64) -> CodexWa
     let waiter = spawn_waiter(child, tx.clone());
     drop(tx);
 
-    let stall_window = stall_window(stall_seconds);
-    let mut last_output = Instant::now();
-    let mut killed_for_stall: Option<String> = None;
+    let timeout = overall_timeout(timeout_seconds);
+    let mut killed_for_timeout: Option<String> = None;
     let mut stdout = Vec::new();
     let mut stderr = Vec::new();
     let exit = loop {
-        let event = if killed_for_stall.is_some() {
+        let event = if killed_for_timeout.is_some() {
             rx.recv().map_err(|_| RecvTimeoutError::Disconnected)
-        } else if let Some(window) = stall_window {
-            let remaining = window.saturating_sub(last_output.elapsed());
+        } else if let Some(timeout) = timeout {
+            let remaining = timeout.saturating_sub(start.elapsed());
             if remaining.is_zero() {
                 Err(RecvTimeoutError::Timeout)
             } else {
@@ -592,7 +578,6 @@ fn wait_codex_with_stall_window(mut child: Child, stall_seconds: i64) -> CodexWa
         match event {
             Ok(CodexEvent::Output(stream, bytes)) => {
                 if !bytes.is_empty() {
-                    last_output = Instant::now();
                     match stream {
                         CodexStream::Stdout => stdout.extend(bytes),
                         CodexStream::Stderr => stderr.extend(bytes),
@@ -602,12 +587,12 @@ fn wait_codex_with_stall_window(mut child: Child, stall_seconds: i64) -> CodexWa
             Ok(CodexEvent::Exited(result)) => break result,
             Err(RecvTimeoutError::Timeout) => {
                 let message = format!(
-                    "codex stalled for {stall_seconds}s without stdout/stderr output; sent SIGKILL to process group"
+                    "codex timed out after {timeout_seconds}s wall clock; sent SIGKILL to process group"
                 );
                 if let Err(err) = kill_process_group(child_pid) {
-                    killed_for_stall = Some(format!("{message}; kill failed: {err}"));
+                    killed_for_timeout = Some(format!("{message}; kill failed: {err}"));
                 } else {
-                    killed_for_stall = Some(message);
+                    killed_for_timeout = Some(message);
                 }
             }
             Err(RecvTimeoutError::Disconnected) => {
@@ -622,27 +607,27 @@ fn wait_codex_with_stall_window(mut child: Child, stall_seconds: i64) -> CodexWa
     let _ = waiter.join();
     drain_codex_events(&rx, &mut stdout, &mut stderr);
 
-    codex_outcome_from_wait(exit, killed_for_stall, stdout, stderr)
+    codex_outcome_from_wait(exit, killed_for_timeout, stdout, stderr)
 }
 
-// no-output stall failures get stable kind, exit 124, and captured output.
+// overall timeout failures get stable kind, exit 124, and captured output.
 fn codex_outcome_from_wait(
     exit: std::result::Result<ExitStatus, String>,
-    killed_for_stall: Option<String>,
+    killed_for_timeout: Option<String>,
     stdout: Vec<u8>,
     stderr: Vec<u8>,
 ) -> CodexWaitOutcome {
     let stdout = String::from_utf8_lossy(&stdout).to_string();
     let stderr = String::from_utf8_lossy(&stderr).to_string();
-    let exit_code = if killed_for_stall.is_some() {
+    let exit_code = if killed_for_timeout.is_some() {
         124
     } else {
         exit.as_ref().ok().and_then(ExitStatus::code).unwrap_or(-1)
     };
 
-    if let Some(message) = killed_for_stall {
+    if let Some(message) = killed_for_timeout {
         return CodexWaitOutcome::Failed {
-            kind: "stall",
+            kind: "timeout",
             message,
             stdout,
             stderr,
@@ -666,7 +651,7 @@ fn codex_outcome_from_wait(
     }
 }
 
-// readers forward chunks immediately so output refreshes liveness.
+// readers forward chunks immediately for output capture.
 fn spawn_stream_reader<R: Read + Send + 'static>(
     mut reader: R,
     stream: CodexStream,
@@ -691,7 +676,7 @@ fn spawn_stream_reader<R: Read + Send + 'static>(
     })
 }
 
-// child exit is another liveness event delivered beside output.
+// child exit is delivered beside output.
 fn spawn_waiter(mut child: Child, tx: Sender<CodexEvent>) -> JoinHandle<()> {
     std::thread::spawn(move || {
         let result = child.wait().map_err(|err| err.to_string());
@@ -710,9 +695,9 @@ fn drain_codex_events(rx: &Receiver<CodexEvent>, stdout: &mut Vec<u8>, stderr: &
     }
 }
 
-// positive values become no-output windows; invalid values mean unbounded wait.
-fn stall_window(stall_seconds: i64) -> Option<Duration> {
-    u64::try_from(stall_seconds)
+// positive values become overall timeout caps; invalid values mean unbounded wait.
+fn overall_timeout(timeout_seconds: i64) -> Option<Duration> {
+    u64::try_from(timeout_seconds)
         .ok()
         .filter(|seconds| *seconds > 0)
         .map(Duration::from_secs)
@@ -751,7 +736,7 @@ fn logged_failure(
         &logged_stderr,
         exit_code,
         cmd_line,
-        request.stall_window_seconds,
+        request.timeout_seconds,
     );
     CodexResult::failure(
         kind,
@@ -839,7 +824,7 @@ fn write_codex_log(
     stderr: &str,
     exit_code: i32,
     cmd_line: &str,
-    stall_window_seconds: i64,
+    timeout_seconds: i64,
 ) {
     if let Some(parent) = path.parent() {
         if let Err(err) = std::fs::create_dir_all(parent) {
@@ -852,7 +837,7 @@ fn write_codex_log(
     }
 
     let content = format!(
-        "{stdout}{stdout_sep}{stderr}{stderr_sep}EXIT={exit_code}\nDONE_AT={done_at}\nCMD={cmd_line}\nSTALL_WINDOW={stall_window_seconds}\n",
+        "{stdout}{stdout_sep}{stderr}{stderr_sep}EXIT={exit_code}\nDONE_AT={done_at}\nCMD={cmd_line}\nTIMEOUT_SECONDS={timeout_seconds}\n",
         stdout_sep = if stdout.ends_with('\n') || stdout.is_empty() {
             ""
         } else {

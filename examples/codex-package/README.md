@@ -3,7 +3,7 @@
 `examples/codex-package` 是一个 package-root fixture，用来展示现有 Lua SDK 里的 `spawn_codex_sync`：
 
 - `raisers/requests.lua` 通过 `file_watch` 观察 `requests/*.md`，产生 payload 为 `{ "path": "<abs path>" }` 的 `codex_request`。
-- `departments/codex_demo/main.lua` 消费 `codex_request`，读取 `payload.path` 指向的请求文件内容，调用 `spawn_codex_sync({ prompt, stall_window })`，再 `raise("codex_result", payload)`。
+- `departments/codex_demo/main.lua` 消费 `codex_request`，读取 `payload.path` 指向的请求文件内容，调用 `spawn_codex_sync({ prompt, timeout })`，再 `raise("codex_result", payload)`。
 - `departments/codex_demo/prompt.lua` 只包含纯字符串逻辑，不调用 SDK。
 - `departments/codex_demo/codex_demo_test.lua` 返回 `test_*` 函数表，用 `fkst-framework test` 覆盖纯逻辑。
 
@@ -28,9 +28,11 @@ local prompt = require("departments.codex_demo.prompt")
 ```lua
 local result = spawn_codex_sync({
   prompt = "Summarize: input",
-  stall_window = 300,
+  timeout = 3600,
 })
 ```
+
+`timeout` 是 codex 子进程整体 wall-clock 上限；stdout/stderr 输出只会被捕获，不会延长上限。
 
 返回表包含：
 
