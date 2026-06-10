@@ -26,6 +26,7 @@ pub fn register_framework_sdk(
     let config = ConfigContext::from_host_root(host_root).map_err(mlua::Error::external)?;
     crate::sdk_log::register(lua)?;
     crate::sdk_basic::register(lua)?;
+    crate::sdk_strings::register(lua)?;
     crate::sdk_fs::register(lua)?;
     crate::sdk_json::register(lua)?;
     crate::sdk_git::register(lua, host_root, config.clone())?;
@@ -47,6 +48,7 @@ pub(crate) fn register_framework_sdk_with_runner(
     let config = ConfigContext::from_host_root(host_root).map_err(mlua::Error::external)?;
     crate::sdk_log::register(lua)?;
     crate::sdk_basic::register_with_runner(lua, runner.clone())?;
+    crate::sdk_strings::register(lua)?;
     crate::sdk_fs::register(lua)?;
     crate::sdk_json::register(lua)?;
     crate::sdk_git::register_with_runner(lua, host_root, config.clone(), runner.clone())?;
