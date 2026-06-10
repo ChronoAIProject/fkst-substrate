@@ -106,14 +106,13 @@ pub async fn spawn_consumer(
             tokio::select! {
                 maybe_ev = ephemeral_rx.recv(), if ephemeral_open => {
                     let Some(ev) = maybe_ev else {
-                        match ephemeral_disconnect_action(!reliable_queues.is_empty()) {
-                            EphemeralDisconnectAction::StopConsumer => {
+                        match on_ephemeral_disconnect(reliable_queues.is_empty(), &mut ephemeral_open) {
+                            ShouldExit::Yes => {
                                 warn!(dept = %name, "consumer ephemeral inbox disconnected");
                                 return;
                             }
-                            EphemeralDisconnectAction::DisableArm => {
+                            ShouldExit::No => {
                                 warn!(dept = %name, "consumer ephemeral inbox disconnected; disabling ephemeral arm");
-                                ephemeral_open = false;
                                 continue;
                             }
                         }
@@ -136,7 +135,7 @@ pub async fn spawn_consumer(
                 maybe_wake = recv_reliable_wake(&mut reliable_wake_rx), if reliable_wake_rx.is_some() => {
                     if maybe_wake.is_none() {
                         warn!(dept = %name, "consumer reliable wake inbox disconnected");
-                        reliable_wake_rx = None;
+                        on_wake_disconnect(&mut reliable_wake_rx);
                     }
                     dispatch_due(
                         &name,
@@ -191,17 +190,22 @@ async fn recv_reliable_wake(rx: &mut Option<mpsc::Receiver<()>>) -> Option<()> {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum EphemeralDisconnectAction {
-    StopConsumer,
-    DisableArm,
+enum ShouldExit {
+    Yes,
+    No,
 }
 
-fn ephemeral_disconnect_action(has_reliable_queues: bool) -> EphemeralDisconnectAction {
-    if has_reliable_queues {
-        EphemeralDisconnectAction::DisableArm
+fn on_ephemeral_disconnect(reliable_queues_empty: bool, ephemeral_open: &mut bool) -> ShouldExit {
+    if reliable_queues_empty {
+        ShouldExit::Yes
     } else {
-        EphemeralDisconnectAction::StopConsumer
+        *ephemeral_open = false;
+        ShouldExit::No
     }
+}
+
+fn on_wake_disconnect(reliable_wake_rx: &mut Option<mpsc::Receiver<()>>) {
+    *reliable_wake_rx = None;
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -729,25 +733,31 @@ mod tests {
     }
 
     #[test]
-    fn ephemeral_disconnect_disables_arm_for_reliable_consumer() {
-        assert_eq!(
-            ephemeral_disconnect_action(true),
-            EphemeralDisconnectAction::DisableArm
-        );
-        assert_eq!(
-            ephemeral_disconnect_action(false),
-            EphemeralDisconnectAction::StopConsumer
-        );
+    fn ephemeral_disconnect_disables_arm_when_reliable_queues_remain() {
+        let mut ephemeral_open = true;
+
+        let should_exit = on_ephemeral_disconnect(false, &mut ephemeral_open);
+
+        assert_eq!(should_exit, ShouldExit::No);
+        assert!(!ephemeral_open);
     }
 
-    #[tokio::test]
-    async fn reliable_wake_disconnect_clears_receiver() {
-        let (tx, rx) = mpsc::channel::<()>(1);
-        let mut reliable_wake_rx = Some(rx);
-        drop(tx);
+    #[test]
+    fn ephemeral_disconnect_exits_when_reliable_queues_are_empty() {
+        let mut ephemeral_open = true;
 
-        assert!(recv_reliable_wake(&mut reliable_wake_rx).await.is_none());
-        reliable_wake_rx = None;
+        let should_exit = on_ephemeral_disconnect(true, &mut ephemeral_open);
+
+        assert_eq!(should_exit, ShouldExit::Yes);
+        assert!(ephemeral_open);
+    }
+
+    #[test]
+    fn wake_disconnect_clears_receiver() {
+        let (_tx, rx) = mpsc::channel::<()>(1);
+        let mut reliable_wake_rx = Some(rx);
+
+        on_wake_disconnect(&mut reliable_wake_rx);
 
         assert!(reliable_wake_rx.is_none());
     }
