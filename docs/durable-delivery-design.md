@@ -62,7 +62,7 @@ DeliveryEnvelope {
 | 问题 | 新架构 |
 |---|---|
 | 净化碰撞静默吞 | structured `delivery_id`；dedup 仅可选 coalesce 提示，冲突记录不静默丢 |
-| marker 无界 | 删 success marker；ack 即删 delivery；dead 表有界/可配保留 |
+| marker 无界 | 删 success marker；ack 即删 delivery；dead 表只保留 compact tombstone（id/queue/dept/source/time/attempt/error excerpt），不保留 payload |
 | `<RT>` 清/重启风暴 | delivery 在 `FKST_DURABLE_ROOT`，清 `<RT>` 不影响；重启续 lease 过期/ready |
 | 无 jitter herd | retry `not_before` 加 bounded jitter；dispatcher 每轮限批取 due |
 | 健康长任务双跑 | 运行 handle 权威 + lease fencing；只跨重启重投 |

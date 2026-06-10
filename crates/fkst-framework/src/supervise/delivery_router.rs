@@ -172,16 +172,17 @@ pub(crate) fn derive_delivery_id(
     derived: Option<&DerivedDelivery>,
 ) -> String {
     let key = if let Some(derived) = derived {
+        let parent_hash = stable_hex_hash(&derived.parent_delivery_id);
         runtime_key([
             "delivery",
-            "v1",
+            "v2",
             "raised",
             "queue",
             queue,
             "dept",
             dept,
-            "parent",
-            &derived.parent_delivery_id,
+            "parent_hash",
+            &parent_hash,
             "ordinal",
             &derived.ordinal.to_string(),
         ])
@@ -201,6 +202,15 @@ pub(crate) fn derive_delivery_id(
     };
     validate_runtime_key(&key).expect("delivery id should be a runtime-safe key");
     key
+}
+
+fn stable_hex_hash(value: &str) -> String {
+    let mut hash = 0xcbf29ce484222325_u64;
+    for byte in value.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("{hash:016x}")
 }
 
 fn runtime_key<'a>(parts: impl IntoIterator<Item = &'a str>) -> String {
@@ -517,8 +527,34 @@ mod tests {
 
         assert_eq!(
             id,
-            "delivery/v1/raised/queue/next/dept/next__worker/parent/delivery_x2Fv1_x2Fsource_x2Fcron_x2Fqueue_x2Fjobs_x2Fdept_x2Fworker_x2Fref_x2Ftick/ordinal/2"
+            "delivery/v2/raised/queue/next/dept/next__worker/parent__hash/e6995b559fab6b68/ordinal/2"
         );
+    }
+
+    #[test]
+    fn raised_delivery_id_chain_stays_bounded() {
+        let source = SourceRef {
+            kind: SourceKind::Cron,
+            reference: "tick".to_string(),
+        };
+        let mut parent = derive_delivery_id("jobs", "worker", &source, None);
+
+        for hop in 0..20 {
+            let derived = DerivedDelivery {
+                parent_delivery_id: parent.clone(),
+                ordinal: hop,
+            };
+            let id = derive_delivery_id("next", "next_worker", &source, Some(&derived));
+
+            assert!(
+                id.len() < 512,
+                "hop {hop} delivery id exceeded bound: {} bytes",
+                id.len()
+            );
+            assert!(id.contains("/parent__hash/"));
+            assert!(!id.contains("/parent/"));
+            parent = id;
+        }
     }
 
     #[tokio::test]
