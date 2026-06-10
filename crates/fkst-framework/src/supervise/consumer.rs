@@ -68,6 +68,7 @@ pub async fn spawn_consumer(
             .expect("validation already accepted retry");
 
         let (ephemeral_tx, mut ephemeral_rx) = mpsc::channel::<Event>(queue_capacity);
+        let mut ephemeral_open = !receivers.is_empty();
         for mut rx in receivers {
             let tx = ephemeral_tx.clone();
             let dept_name = name.clone();
@@ -103,13 +104,19 @@ pub async fn spawn_consumer(
         tick.tick().await;
         loop {
             tokio::select! {
-                maybe_ev = ephemeral_rx.recv() => {
+                maybe_ev = ephemeral_rx.recv(), if ephemeral_open => {
                     let Some(ev) = maybe_ev else {
-                        if reliable_queues.is_empty() {
-                            warn!(dept = %name, "consumer ephemeral inbox disconnected");
-                            return;
+                        match ephemeral_disconnect_action(!reliable_queues.is_empty()) {
+                            EphemeralDisconnectAction::StopConsumer => {
+                                warn!(dept = %name, "consumer ephemeral inbox disconnected");
+                                return;
+                            }
+                            EphemeralDisconnectAction::DisableArm => {
+                                warn!(dept = %name, "consumer ephemeral inbox disconnected; disabling ephemeral arm");
+                                ephemeral_open = false;
+                                continue;
+                            }
                         }
-                        continue;
                     };
                     if ephemeral_queues.iter().any(|queue| queue == &ev.queue) {
                         spawn_ephemeral(
@@ -129,6 +136,7 @@ pub async fn spawn_consumer(
                 maybe_wake = recv_reliable_wake(&mut reliable_wake_rx), if reliable_wake_rx.is_some() => {
                     if maybe_wake.is_none() {
                         warn!(dept = %name, "consumer reliable wake inbox disconnected");
+                        reliable_wake_rx = None;
                     }
                     dispatch_due(
                         &name,
@@ -179,6 +187,20 @@ async fn recv_reliable_wake(rx: &mut Option<mpsc::Receiver<()>>) -> Option<()> {
     match rx {
         Some(rx) => rx.recv().await,
         None => None,
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum EphemeralDisconnectAction {
+    StopConsumer,
+    DisableArm,
+}
+
+fn ephemeral_disconnect_action(has_reliable_queues: bool) -> EphemeralDisconnectAction {
+    if has_reliable_queues {
+        EphemeralDisconnectAction::DisableArm
+    } else {
+        EphemeralDisconnectAction::StopConsumer
     }
 }
 
@@ -704,6 +726,30 @@ mod tests {
             base: Duration::from_millis(1),
             cap: Duration::from_millis(1),
         }
+    }
+
+    #[test]
+    fn ephemeral_disconnect_disables_arm_for_reliable_consumer() {
+        assert_eq!(
+            ephemeral_disconnect_action(true),
+            EphemeralDisconnectAction::DisableArm
+        );
+        assert_eq!(
+            ephemeral_disconnect_action(false),
+            EphemeralDisconnectAction::StopConsumer
+        );
+    }
+
+    #[tokio::test]
+    async fn reliable_wake_disconnect_clears_receiver() {
+        let (tx, rx) = mpsc::channel::<()>(1);
+        let mut reliable_wake_rx = Some(rx);
+        drop(tx);
+
+        assert!(recv_reliable_wake(&mut reliable_wake_rx).await.is_none());
+        reliable_wake_rx = None;
+
+        assert!(reliable_wake_rx.is_none());
     }
 
     fn router_with_dead_letter(store: Arc<DeliveryStore>) -> DeliveryRouter {
