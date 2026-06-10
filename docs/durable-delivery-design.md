@@ -83,7 +83,7 @@ DeliveryEnvelope {
 
 ## 实现落点
 
-1. redb API 使用 `delivery_by_id`、`ready_by_due`、`leased_by_until`、`dead_by_id` 和 `meta` 表，所有状态迁移在写事务内完成。
+1. redb API 使用 `delivery_by_id`、`ready_by_dept_due`、`leased_by_dept_until`、`dead_by_id` 和 `meta` 表，所有状态迁移在写事务内完成。
 2. `DeliveryRecord` 持有 `delivery_id`、`queue`、`dept`、小 payload、`source_ref`、`cron_payload`、观测时间、attempt、lease generation、lease_until、not_before 和 last error excerpt。
 3. `DurableLayout` 只从 `FKST_DURABLE_ROOT` 解析 `<DURABLE>/delivery.redb`；有可靠订阅时缺失 fail-closed，纯 ephemeral host 不创建 durable store。
 4. 可靠默认启用，`M.spec.ephemeral = {"queue"}` 对本 Department 的指定 consumed queue opt-out。
