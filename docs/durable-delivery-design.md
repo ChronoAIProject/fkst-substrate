@@ -62,7 +62,7 @@ DeliveryEnvelope {
 | 问题 | 新架构 |
 |---|---|
 | 净化碰撞静默吞 | structured `delivery_id`；dedup 仅可选 coalesce 提示，冲突记录不静默丢 |
-| marker 无界 | 删 success marker；ack 即删 delivery；dead 表有界/可配保留 |
+| marker 无界 | 删 success marker；ack 即删 delivery；dead 表只保留 compact tombstone（id/queue/dept/source/time/attempt/error excerpt），不保留 payload |
 | `<RT>` 清/重启风暴 | delivery 在 `FKST_DURABLE_ROOT`，清 `<RT>` 不影响；重启续 lease 过期/ready |
 | 无 jitter herd | retry `not_before` 加 bounded jitter；dispatcher 每轮限批取 due |
 | 健康长任务双跑 | 运行 handle 权威 + lease fencing；只跨重启重投 |
@@ -83,7 +83,7 @@ DeliveryEnvelope {
 
 ## 实现落点
 
-1. redb API 使用 `delivery_by_id`、`ready_by_due`、`leased_by_until`、`dead_by_id` 和 `meta` 表，所有状态迁移在写事务内完成。
+1. redb API 使用 `delivery_by_id`、`ready_by_dept_due`、`leased_by_dept_until`、`dead_by_id` 和 `meta` 表，所有状态迁移在写事务内完成。
 2. `DeliveryRecord` 持有 `delivery_id`、`queue`、`dept`、小 payload、`source_ref`、`cron_payload`、观测时间、attempt、lease generation、lease_until、not_before 和 last error excerpt。
 3. `DurableLayout` 只从 `FKST_DURABLE_ROOT` 解析 `<DURABLE>/delivery.redb`；有可靠订阅时缺失 fail-closed，纯 ephemeral host 不创建 durable store。
 4. 可靠默认启用，`M.spec.ephemeral = {"queue"}` 对本 Department 的指定 consumed queue opt-out。

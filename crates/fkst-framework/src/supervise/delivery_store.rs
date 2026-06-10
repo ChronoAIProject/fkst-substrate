@@ -1,24 +1,31 @@
 //! Durable delivery redb state machine.
 #![allow(dead_code)]
 
+#[cfg(test)]
+use super::delivery_index::count_index_entries;
+use super::delivery_index::{
+    collect_due_keys, make_index_key, LEASED_BY_DEPT_UNTIL, READY_BY_DEPT_DUE,
+};
+#[cfg(test)]
+use super::delivery_retry::ERROR_EXCERPT_LIMIT;
+use super::delivery_retry::{backoff_delay, bounded_jitter, error_excerpt};
+use super::delivery_transition::{lease_key, read_delivery_table, rebuild_due_indexes};
 use super::delivery_types::{DeadRecord, DeliveryRecord, RetryPolicy};
+use super::delivery_watch::StoreOpWatch;
 use anyhow::{bail, Result};
 use redb::{Database, ReadableTable, TableDefinition};
-use std::collections::hash_map::DefaultHasher;
 use std::collections::BTreeSet;
-use std::hash::{Hash, Hasher};
 use std::path::Path;
 use std::time::Duration;
 
-const SCHEMA_VERSION: &str = "1";
-const ERROR_EXCERPT_LIMIT: usize = 512;
-const JITTER_DIVISOR: u128 = 4;
+const SCHEMA_VERSION: &str = "2";
 
 const DELIVERY_BY_ID: TableDefinition<&str, &[u8]> = TableDefinition::new("delivery_by_id");
-const READY_BY_DUE: TableDefinition<(u64, &str), ()> = TableDefinition::new("ready_by_due");
-const LEASED_BY_UNTIL: TableDefinition<(u64, &str), ()> = TableDefinition::new("leased_by_until");
 const DEAD_BY_ID: TableDefinition<&str, &[u8]> = TableDefinition::new("dead_by_id");
 const META: TableDefinition<&str, &str> = TableDefinition::new("meta");
+const OLD_READY_BY_DUE: TableDefinition<(u64, &str), ()> = TableDefinition::new("ready_by_due");
+const OLD_LEASED_BY_UNTIL: TableDefinition<(u64, &str), ()> =
+    TableDefinition::new("leased_by_until");
 
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum RetryOutcome {
@@ -41,9 +48,21 @@ impl DeliveryStore {
         let write = db.begin_write()?;
         {
             write.open_table(DELIVERY_BY_ID)?;
-            write.open_table(READY_BY_DUE)?;
-            write.open_table(LEASED_BY_UNTIL)?;
+            write.open_table(READY_BY_DEPT_DUE)?;
+            write.open_table(LEASED_BY_DEPT_UNTIL)?;
+            let meta = write.open_table(META)?;
+            let current_version = meta
+                .get("schema_version")?
+                .map(|value| value.value().to_string());
+            drop(meta);
+            if current_version.as_deref() == Some("1") {
+                write.delete_table(DEAD_BY_ID)?;
+            }
             write.open_table(DEAD_BY_ID)?;
+            if current_version.as_deref() != Some(SCHEMA_VERSION) {
+                delete_old_global_indexes(&write)?;
+                rebuild_due_indexes(&write, DELIVERY_BY_ID)?;
+            }
             let mut meta = write.open_table(META)?;
             meta.insert("schema_version", SCHEMA_VERSION)?;
         }
@@ -52,6 +71,7 @@ impl DeliveryStore {
     }
 
     pub(crate) fn enqueue(&self, record: &DeliveryRecord) -> Result<()> {
+        let _op = StoreOpWatch::new("enqueue", &record.dept);
         let write = self.db.begin_write()?;
         {
             let mut delivery = write.open_table(DELIVERY_BY_ID)?;
@@ -65,8 +85,11 @@ impl DeliveryStore {
             }
             let bytes = serde_json::to_vec(record)?;
             delivery.insert(record.delivery_id.as_str(), bytes.as_slice())?;
-            let mut ready = write.open_table(READY_BY_DUE)?;
-            ready.insert((record.not_before_ms, record.delivery_id.as_str()), &())?;
+            let mut ready = write.open_table(READY_BY_DEPT_DUE)?;
+            ready.insert(
+                make_index_key(&record.dept, record.not_before_ms, &record.delivery_id).as_str(),
+                &(),
+            )?;
         }
         write.commit()?;
         Ok(())
@@ -78,18 +101,25 @@ impl DeliveryStore {
         lease_generation: u64,
         lease_until_ms: u64,
     ) -> Result<bool> {
+        let mut op = StoreOpWatch::new("renew", "<unknown>");
         let write = self.db.begin_write()?;
         let applied = {
             let mut delivery = write.open_table(DELIVERY_BY_ID)?;
             if let Some(mut current) = read_delivery_table(&delivery, delivery_id)? {
+                op.set_dept(&current.dept);
                 if let Some(old_lease_until) = current.lease_until_ms {
                     if current.lease_generation == lease_generation {
-                        let mut lease_index = write.open_table(LEASED_BY_UNTIL)?;
-                        lease_index.remove((old_lease_until, delivery_id))?;
+                        let mut lease_index = write.open_table(LEASED_BY_DEPT_UNTIL)?;
+                        lease_index.remove(
+                            make_index_key(&current.dept, old_lease_until, delivery_id).as_str(),
+                        )?;
                         current.lease_until_ms = Some(lease_until_ms);
                         let bytes = serde_json::to_vec(&current)?;
                         delivery.insert(delivery_id, bytes.as_slice())?;
-                        lease_index.insert((lease_until_ms, delivery_id), &())?;
+                        lease_index.insert(
+                            make_index_key(&current.dept, lease_until_ms, delivery_id).as_str(),
+                            &(),
+                        )?;
                         true
                     } else {
                         false
@@ -143,6 +173,7 @@ impl DeliveryStore {
         dept: Option<&str>,
         excluded: &BTreeSet<String>,
     ) -> Result<Vec<DeliveryRecord>> {
+        let _op = StoreOpWatch::new("lease", dept.unwrap_or("<any>"));
         if batch_limit == 0 {
             return Ok(Vec::new());
         }
@@ -151,13 +182,22 @@ impl DeliveryStore {
         let mut leased = Vec::new();
         {
             let expired_quota = expired_lease_quota(batch_limit);
-            let expired_keys =
-                collect_due_keys(&write.open_table(LEASED_BY_UNTIL)?, now_ms, usize::MAX)?;
-            let ready_keys =
-                collect_due_keys(&write.open_table(READY_BY_DUE)?, now_ms, usize::MAX)?;
+            let scan_budget = scan_budget(batch_limit, excluded.len());
+            let expired_keys = collect_due_keys(
+                &write.open_table(LEASED_BY_DEPT_UNTIL)?,
+                dept,
+                now_ms,
+                scan_budget,
+            )?;
+            let ready_keys = collect_due_keys(
+                &write.open_table(READY_BY_DEPT_DUE)?,
+                dept,
+                now_ms,
+                scan_budget,
+            )?;
             let mut delivery = write.open_table(DELIVERY_BY_ID)?;
-            let mut ready = write.open_table(READY_BY_DUE)?;
-            let mut lease_index = write.open_table(LEASED_BY_UNTIL)?;
+            let mut ready = write.open_table(READY_BY_DEPT_DUE)?;
+            let mut lease_index = write.open_table(LEASED_BY_DEPT_UNTIL)?;
 
             for key in expired_keys {
                 if leased.len() >= expired_quota {
@@ -201,14 +241,18 @@ impl DeliveryStore {
     }
 
     pub(crate) fn ack(&self, delivery_id: &str, lease_generation: u64) -> Result<bool> {
+        let mut op = StoreOpWatch::new("ack", "<unknown>");
         let write = self.db.begin_write()?;
         let applied = {
             let mut delivery = write.open_table(DELIVERY_BY_ID)?;
             if let Some(current) = read_delivery_table(&delivery, delivery_id)? {
+                op.set_dept(&current.dept);
                 if current.lease_generation == lease_generation {
                     if let Some(lease_until) = current.lease_until_ms {
-                        let mut lease_index = write.open_table(LEASED_BY_UNTIL)?;
-                        lease_index.remove((lease_until, delivery_id))?;
+                        let mut lease_index = write.open_table(LEASED_BY_DEPT_UNTIL)?;
+                        lease_index.remove(
+                            make_index_key(&current.dept, lease_until, delivery_id).as_str(),
+                        )?;
                     } else {
                         return Ok(false);
                     }
@@ -233,18 +277,21 @@ impl DeliveryStore {
         policy: &RetryPolicy,
         now_ms: u64,
     ) -> Result<RetryOutcome> {
+        let mut op = StoreOpWatch::new("retry", "<unknown>");
         let write = self.db.begin_write()?;
         let outcome = {
             let mut delivery = write.open_table(DELIVERY_BY_ID)?;
             if let Some(mut current) = read_delivery_table(&delivery, delivery_id)? {
+                op.set_dept(&current.dept);
                 let Some(lease_until) = current.lease_until_ms else {
                     return Ok(RetryOutcome::Stale);
                 };
                 if current.lease_generation != lease_generation {
                     RetryOutcome::Stale
                 } else {
-                    let mut lease_index = write.open_table(LEASED_BY_UNTIL)?;
-                    lease_index.remove((lease_until, delivery_id))?;
+                    let mut lease_index = write.open_table(LEASED_BY_DEPT_UNTIL)?;
+                    lease_index
+                        .remove(make_index_key(&current.dept, lease_until, delivery_id).as_str())?;
 
                     let attempt = current.attempt.saturating_add(1);
                     current.attempt = attempt;
@@ -253,9 +300,15 @@ impl DeliveryStore {
 
                     if attempt >= policy.max_attempts {
                         let dead = DeadRecord {
-                            record: current.clone(),
+                            delivery_id: current.delivery_id.clone(),
+                            queue: current.queue.clone(),
+                            dept: current.dept.clone(),
+                            source: current.source.clone(),
+                            observed_at_ms: current.observed_at_ms,
+                            not_before_ms: current.not_before_ms,
                             dead_at_ms: now_ms,
                             attempts: attempt,
+                            error_excerpt: current.last_error_excerpt.clone(),
                         };
                         let bytes = serde_json::to_vec(&dead)?;
                         let mut dead_table = write.open_table(DEAD_BY_ID)?;
@@ -270,8 +323,12 @@ impl DeliveryStore {
                             .saturating_add(duration_millis(jitter));
                         let bytes = serde_json::to_vec(&current)?;
                         delivery.insert(delivery_id, bytes.as_slice())?;
-                        let mut ready = write.open_table(READY_BY_DUE)?;
-                        ready.insert((current.not_before_ms, delivery_id), &())?;
+                        let mut ready = write.open_table(READY_BY_DEPT_DUE)?;
+                        ready.insert(
+                            make_index_key(&current.dept, current.not_before_ms, delivery_id)
+                                .as_str(),
+                            &(),
+                        )?;
                         RetryOutcome::Scheduled
                     }
                 }
@@ -290,27 +347,36 @@ impl DeliveryStore {
         read_delivery_read_only(&delivery, delivery_id)
     }
 
-    #[cfg(test)]
     pub(crate) fn get_dead(&self, delivery_id: &str) -> Result<Option<DeadRecord>> {
         let read = self.db.begin_read()?;
         let dead = read.open_table(DEAD_BY_ID)?;
         let Some(bytes) = dead.get(delivery_id)? else {
             return Ok(None);
         };
-        Ok(Some(serde_json::from_slice(bytes.value())?))
+        match serde_json::from_slice(bytes.value()) {
+            Ok(dead) => Ok(Some(dead)),
+            Err(err) => {
+                tracing::warn!(
+                    delivery_id = %delivery_id,
+                    error = %err,
+                    "skipping undecodable dead delivery record"
+                );
+                Ok(None)
+            }
+        }
     }
 
     #[cfg(test)]
     fn ready_index_len(&self) -> Result<usize> {
         let read = self.db.begin_read()?;
-        let ready = read.open_table(READY_BY_DUE)?;
+        let ready = read.open_table(READY_BY_DEPT_DUE)?;
         count_index_entries(&ready)
     }
 
     #[cfg(test)]
     fn leased_index_len(&self) -> Result<usize> {
         let read = self.db.begin_read()?;
-        let leased = read.open_table(LEASED_BY_UNTIL)?;
+        let leased = read.open_table(LEASED_BY_DEPT_UNTIL)?;
         count_index_entries(&leased)
     }
 }
@@ -332,86 +398,14 @@ fn expired_lease_quota(batch_limit: usize) -> usize {
     }
 }
 
-fn collect_due_keys(
-    table: &redb::Table<'_, (u64, &str), ()>,
-    now_ms: u64,
-    limit: usize,
-) -> Result<Vec<(u64, String)>> {
-    if limit == 0 {
-        return Ok(Vec::new());
-    }
-    let mut keys = Vec::new();
-    for entry in table.range::<(u64, &str)>((0, "")..=(now_ms, "\u{10ffff}"))? {
-        let (key, _) = entry?;
-        let (due, delivery_id) = key.value();
-        keys.push((due, delivery_id.to_string()));
-        if keys.len() >= limit {
-            break;
-        }
-    }
-    Ok(keys)
+fn scan_budget(batch_limit: usize, excluded_len: usize) -> usize {
+    batch_limit.saturating_mul(8).saturating_add(excluded_len)
 }
 
-fn lease_key(
-    key: (u64, String),
-    now_ms: u64,
-    lease_until: u64,
-    dept: Option<&str>,
-    excluded: &BTreeSet<String>,
-    delivery: &mut redb::Table<'_, &str, &[u8]>,
-    ready: &mut redb::Table<'_, (u64, &str), ()>,
-    lease_index: &mut redb::Table<'_, (u64, &str), ()>,
-    from_expired_lease: bool,
-) -> Result<Option<DeliveryRecord>> {
-    let (indexed_at, delivery_id) = key;
-    if excluded.contains(&delivery_id) {
-        return Ok(None);
-    }
-    let Some(mut record) = read_delivery_table(delivery, &delivery_id)? else {
-        if from_expired_lease {
-            lease_index.remove((indexed_at, delivery_id.as_str()))?;
-        } else {
-            ready.remove((indexed_at, delivery_id.as_str()))?;
-        }
-        return Ok(None);
-    };
-    if dept.is_some_and(|wanted| record.dept != wanted) {
-        return Ok(None);
-    }
-    if from_expired_lease {
-        lease_index.remove((indexed_at, delivery_id.as_str()))?;
-        if record.lease_until_ms != Some(indexed_at) {
-            return Ok(None);
-        }
-    } else {
-        ready.remove((indexed_at, delivery_id.as_str()))?;
-        if record.lease_until_ms.is_some() {
-            return Ok(None);
-        }
-    }
-    if record.not_before_ms > now_ms && !from_expired_lease {
-        ready.insert((record.not_before_ms, delivery_id.as_str()), &())?;
-        return Ok(None);
-    }
-    if let Some(old_lease_until) = record.lease_until_ms {
-        lease_index.remove((old_lease_until, delivery_id.as_str()))?;
-    }
-    record.lease_generation = record.lease_generation.saturating_add(1);
-    record.lease_until_ms = Some(lease_until);
-    let bytes = serde_json::to_vec(&record)?;
-    delivery.insert(delivery_id.as_str(), bytes.as_slice())?;
-    lease_index.insert((lease_until, delivery_id.as_str()), &())?;
-    Ok(Some(record))
-}
-
-fn read_delivery_table(
-    table: &redb::Table<'_, &str, &[u8]>,
-    delivery_id: &str,
-) -> Result<Option<DeliveryRecord>> {
-    let Some(bytes) = table.get(delivery_id)? else {
-        return Ok(None);
-    };
-    Ok(Some(serde_json::from_slice(bytes.value())?))
+fn delete_old_global_indexes(write: &redb::WriteTransaction) -> Result<()> {
+    write.delete_table(OLD_READY_BY_DUE)?;
+    write.delete_table(OLD_LEASED_BY_UNTIL)?;
+    Ok(())
 }
 
 fn read_delivery_read_only(
@@ -424,51 +418,8 @@ fn read_delivery_read_only(
     Ok(Some(serde_json::from_slice(bytes.value())?))
 }
 
-pub(crate) fn backoff_delay(base: Duration, cap: Duration, attempt: u64) -> Duration {
-    let exponent = attempt.saturating_sub(1).min(63);
-    let multiplier = 1_u128 << exponent;
-    let millis = base.as_millis().saturating_mul(multiplier);
-    let capped = millis.min(cap.as_millis());
-    Duration::from_millis(capped.min(u64::MAX as u128) as u64)
-}
-
-pub(crate) fn bounded_jitter(delivery_id: &str, attempt: u64, base: Duration) -> Duration {
-    let max = (base.as_millis() / JITTER_DIVISOR).min(u64::MAX as u128) as u64;
-    if max == 0 {
-        return Duration::ZERO;
-    }
-    let mut hasher = DefaultHasher::new();
-    delivery_id.hash(&mut hasher);
-    attempt.hash(&mut hasher);
-    Duration::from_millis(hasher.finish() % (max + 1))
-}
-
-pub(crate) fn error_excerpt(error: &str) -> String {
-    let mut excerpt = error.replace('\r', "\\r").replace('\n', "\\n");
-    if excerpt.len() > ERROR_EXCERPT_LIMIT {
-        let boundary = excerpt
-            .char_indices()
-            .map(|(idx, _)| idx)
-            .take_while(|idx| *idx <= ERROR_EXCERPT_LIMIT)
-            .last()
-            .unwrap_or(0);
-        excerpt.truncate(boundary);
-    }
-    excerpt
-}
-
 fn duration_millis(duration: Duration) -> u64 {
     duration.as_millis().min(u64::MAX as u128) as u64
-}
-
-#[cfg(test)]
-fn count_index_entries(table: &redb::ReadOnlyTable<(u64, &str), ()>) -> Result<usize> {
-    let mut count = 0;
-    for entry in table.iter()? {
-        let _ = entry?;
-        count += 1;
-    }
-    Ok(count)
 }
 
 #[cfg(test)]
@@ -760,17 +711,36 @@ mod tests {
     fn retry_at_max_moves_to_dead() {
         let temp = TempDir::new().unwrap();
         let store = store(&temp);
-        store.enqueue(&record("one", 100)).unwrap();
+        let mut original = record("one", 100);
+        original.payload = serde_json::json!({"blob": "x".repeat(10_000)});
+        store.enqueue(&original).unwrap();
         store.lease(100, 10, Duration::from_millis(50)).unwrap();
 
-        let outcome = store.retry("one", 1, "final", &policy(1), 120).unwrap();
+        let outcome = store
+            .retry(
+                "one",
+                1,
+                &format!("final {}", "x".repeat(800)),
+                &policy(1),
+                120,
+            )
+            .unwrap();
 
         assert_eq!(outcome, RetryOutcome::Dead);
         assert!(store.get("one").unwrap().is_none());
         let dead = store.get_dead("one").unwrap().unwrap();
-        assert_eq!(dead.record.delivery_id, "one");
+        assert_eq!(dead.delivery_id, "one");
+        assert_eq!(dead.queue, "input");
+        assert_eq!(dead.dept, "worker");
+        assert_eq!(dead.source, None);
+        assert_eq!(dead.observed_at_ms, 10);
+        assert_eq!(dead.not_before_ms, 100);
         assert_eq!(dead.dead_at_ms, 120);
         assert_eq!(dead.attempts, 1);
+        assert!(dead.error_excerpt.as_ref().unwrap().len() <= ERROR_EXCERPT_LIMIT);
+        let dead_json = serde_json::to_value(&dead).unwrap();
+        assert!(dead_json.get("payload").is_none());
+        assert!(dead_json.get("record").is_none());
     }
 
     #[test]
@@ -872,6 +842,33 @@ mod tests {
     }
 
     #[test]
+    fn scan_budget_is_derived_from_batch_limit_and_exclusions() {
+        assert_eq!(scan_budget(1, 0), 8);
+        assert_eq!(scan_budget(2, 3), 19);
+    }
+
+    #[test]
+    fn lease_for_dept_is_not_starved_by_other_dept_backlog() {
+        let temp = TempDir::new().unwrap();
+        let store = store(&temp);
+        for index in 0..10_000 {
+            let mut other = record(&format!("other-{index:05}"), 100);
+            other.dept = "other".to_string();
+            store.enqueue(&other).unwrap();
+        }
+        store.enqueue(&record("worker-record", 100)).unwrap();
+
+        let leased = store
+            .lease_for_dept("worker", 100, 1, Duration::from_millis(50))
+            .unwrap();
+
+        assert_eq!(leased.len(), 1);
+        assert_eq!(leased[0].delivery_id, "worker-record");
+        assert_eq!(store.ready_index_len().unwrap(), 10_000);
+        assert_eq!(store.leased_index_len().unwrap(), 1);
+    }
+
+    #[test]
     fn expired_lease_is_not_starved_by_ready_backlog() {
         let temp = TempDir::new().unwrap();
         let store = store(&temp);
@@ -903,6 +900,64 @@ mod tests {
 
         assert_eq!(leased.len(), 1);
         assert_eq!(leased[0].delivery_id, "one");
+    }
+
+    #[test]
+    fn schema_v1_open_clears_dead_rows_and_rebuilds_dept_indexes() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("delivery.redb");
+        {
+            let db = Database::create(&path).unwrap();
+            let write = db.begin_write().unwrap();
+            {
+                let mut delivery = write.open_table(DELIVERY_BY_ID).unwrap();
+                let pending = record("pending", 100);
+                delivery
+                    .insert(
+                        pending.delivery_id.as_str(),
+                        serde_json::to_vec(&pending).unwrap().as_slice(),
+                    )
+                    .unwrap();
+                let mut old_ready = write.open_table(OLD_READY_BY_DUE).unwrap();
+                old_ready.insert((100, "pending"), &()).unwrap();
+                let mut dead = write.open_table(DEAD_BY_ID).unwrap();
+                dead.insert(
+                    "legacy-dead",
+                    br#"{"delivery_id":"legacy-dead","queue":"input","dept":"worker","source":null,"dead_at_ms":1,"attempts":1,"error_excerpt":null}"#
+                        .as_slice(),
+                )
+                .unwrap();
+                let mut meta = write.open_table(META).unwrap();
+                meta.insert("schema_version", "1").unwrap();
+            }
+            write.commit().unwrap();
+        }
+
+        let store = DeliveryStore::open(&path).unwrap();
+
+        assert!(store.get_dead("legacy-dead").unwrap().is_none());
+        assert_eq!(store.ready_index_len().unwrap(), 1);
+        let leased = store
+            .lease_for_dept("worker", 100, 1, Duration::from_millis(50))
+            .unwrap();
+        assert_eq!(leased.len(), 1);
+        assert_eq!(leased[0].delivery_id, "pending");
+    }
+
+    #[test]
+    fn get_dead_skips_undecodable_rows() {
+        let temp = TempDir::new().unwrap();
+        let store = store(&temp);
+        {
+            let write = store.db.begin_write().unwrap();
+            {
+                let mut dead = write.open_table(DEAD_BY_ID).unwrap();
+                dead.insert("bad", b"{not-json".as_slice()).unwrap();
+            }
+            write.commit().unwrap();
+        }
+
+        assert!(store.get_dead("bad").unwrap().is_none());
     }
 
     #[test]

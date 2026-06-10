@@ -1,11 +1,19 @@
 // path-based integration tests own behavior coverage while runtime modules keep runtime code.
 
+#[path = "../src/supervise/delivery_index.rs"]
+mod delivery_index;
+#[path = "../src/supervise/delivery_retry.rs"]
+mod delivery_retry;
 #[path = "../src/supervise/delivery_router.rs"]
 mod delivery_router;
 #[path = "../src/supervise/delivery_store.rs"]
 mod delivery_store;
+#[path = "../src/supervise/delivery_transition.rs"]
+mod delivery_transition;
 #[path = "../src/supervise/delivery_types.rs"]
 mod delivery_types;
+#[path = "../src/supervise/delivery_watch.rs"]
+mod delivery_watch;
 #[path = "../src/supervise/event_fanout.rs"]
 mod event_fanout;
 #[allow(dead_code)]
