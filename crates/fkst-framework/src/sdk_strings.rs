@@ -27,7 +27,10 @@ fn truncate_utf8(value: mlua::String, max_bytes: i64) -> Result<String> {
         return Ok(value.to_string());
     }
 
-    let end = value.floor_char_boundary(max_bytes);
+    let mut end = max_bytes.min(value.len());
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
     Ok(value[..end].to_string())
 }
 
@@ -72,6 +75,15 @@ mod tests {
         register(&lua).unwrap();
 
         assert_eq!(eval_truncate(&lua, "标", 2).unwrap(), "");
+    }
+
+    #[test]
+    fn two_byte_char_boundary_keeps_only_complete_char() {
+        let lua = Lua::new();
+        register(&lua).unwrap();
+
+        assert_eq!(eval_truncate(&lua, "éx", 1).unwrap(), "");
+        assert_eq!(eval_truncate(&lua, "éx", 2).unwrap(), "é");
     }
 
     #[test]
