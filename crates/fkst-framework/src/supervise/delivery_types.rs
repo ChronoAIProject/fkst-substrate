@@ -41,6 +41,8 @@ pub(crate) struct DeadRecord {
     pub queue: String,
     pub dept: String,
     pub source: Option<SourceRef>,
+    pub observed_at_ms: u64,
+    pub not_before_ms: u64,
     pub dead_at_ms: u64,
     pub attempts: u64,
     pub error_excerpt: Option<String>,

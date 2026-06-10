@@ -9,9 +9,13 @@ use tracing::{error, info, warn};
 use crate::path_resolver::PackageRoots;
 
 mod consumer;
+mod delivery_index;
+mod delivery_retry;
 mod delivery_router;
 pub(crate) mod delivery_store;
+mod delivery_transition;
 pub(crate) mod delivery_types;
+mod delivery_watch;
 pub mod event_fanout;
 mod graph_scan;
 mod raised;
