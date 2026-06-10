@@ -65,6 +65,24 @@ now()
 
 用户提纲里的 SDK 列表漏掉了当前已存在的 `list_orphan_worktrees(prefix)`。提纲中的其它 production primitive 均存在。没有发现额外 production SDK primitive。
 
+### 2.1 Lua standard library surface
+
+Every engine-constructed Lua context is created with mlua `Lua::new()`, which loads the full Lua 5.4 safe standard library. Packages can rely on it everywhere — including `utf8` (`utf8.offset`, `utf8.len`, `utf8.codes`, `utf8.codepoint`, `utf8.char`), `string`, `table`, `math`, `coroutine`, `os.time`/`os.date`, and `select`/`pairs`/`ipairs`/`pcall` base functions. A capability already covered by the stdlib is a documentation fact, not a feature request.
+
+中文补充：stdlib（含 `utf8`）在所有引擎 Lua 上下文都已加载；stdlib 已覆盖的能力不构成新原语需求。
+
+### 2.2 Layered capability doctrine（能力分层固定）
+
+How a Lua-side capability need is satisfied, decided strictly in order:
+
+1. **Lua stdlib first.** If the Lua 5.4 standard library covers it (see §2.1), use it directly; the only deliverable is documentation. Hand-rolling what the stdlib provides (e.g. byte arithmetic instead of `utf8.offset`) is a defect.
+2. **Engine Lua prelude** for pure utilities beyond the stdlib: a small engine-vendored pure-Lua layer, loaded uniformly into EVERY context the engine constructs (production, test, conformance, graph-scan/spec-eval). Capabilities are written in Lua; presence is guaranteed by the engine; additions are curated wholesale (Redis/OpenResty battery model), never per incident.
+3. **Rust primitives ONLY for**: host authority and side effects (raise / spawn / locks / cache / worktrees), performance, or fail-closed boundary enforcement (e.g. `json.decode` validation). A proposal for a new Rust primitive must state why layers 1–2 cannot carry it.
+
+Prior art: Redis frozen battery set (cjson/cmsgpack/bit/struct/sha1hex), OpenResty curated batteries, Neovim vendored `vim.json`/`vim.lpeg`. The common split is host-authority effectful primitives from the host, pure data utilities from a curated, documented battery layer.
+
+中文补充：顺序固定为「stdlib 优先 → 引擎纯 Lua prelude（全上下文统一加载，整批精选引入）→ Rust 原语只留 host 权威/性能/fail-closed 边界」。新增 Rust 原语的提案必须说明为何前两层无法承载。
+
 `fkst-framework test` 额外注册 test-mode-only `fkst.test`：
 
 ```text
