@@ -168,10 +168,7 @@ exec \"$real_program\" \"$@\"\n",
         program = shell_single_quote(name),
         framework_bin = shell_single_quote(&framework_bin.to_string_lossy()),
         rate_pool_root = shell_single_quote(
-            &shim_dir
-                .parent()
-                .unwrap_or_else(|| registry.root())
-                .to_string_lossy(),
+            &registry.root().to_string_lossy(),
         ),
         rate_pool_exports = rate_pool_exports,
     )
