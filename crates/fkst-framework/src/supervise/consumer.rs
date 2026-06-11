@@ -1,8 +1,10 @@
 //! Per-department consumer task.
 
 use super::delivery_router::{now_unix_millis, DeliveryRouter, DerivedDelivery, PublishEnvelope};
-use super::delivery_store::{DeliveryStore, RetryOutcome};
-use super::delivery_types::{DeliveryRecord, RetryPolicy, SourceKind, SourceRef};
+use super::delivery_store::{DeliveryStore, RetryFailure, RetryOutcome};
+use super::delivery_types::{
+    DeadRecord, DeliveryRecord, RedrivePolicy, RetryPolicy, SourceKind, SourceRef,
+};
 use super::event_fanout::Fanout;
 use super::raised::parse_raised;
 use super::source_runner::parse_duration;
@@ -20,6 +22,8 @@ use tracing::{error, info, warn};
 
 const DISPATCH_INTERVAL: Duration = Duration::from_secs(1);
 const DISPATCH_BATCH: usize = 16;
+const REDRIVE_COOLDOWN: Duration = Duration::from_secs(600);
+const REDRIVE_MAX: u64 = 3;
 
 #[allow(clippy::too_many_arguments)]
 pub async fn spawn_consumer(
@@ -155,6 +159,7 @@ pub async fn spawn_consumer(
                 }
                 _ = tick.tick(), if !reliable_queues.is_empty() => {
                     renew_running(&name, store.as_deref(), stall_window, &running);
+                    maintain_dead_letters(&name, store.as_deref(), &router);
                     dispatch_due(
                         &name,
                         &decl,
@@ -314,7 +319,7 @@ fn dispatch_due(
                     router,
                     retry_policy,
                     &record,
-                    format!("build spawn args: {err}"),
+                    DeliveryFailure::permanent(format!("build spawn args: {err}")),
                 );
                 continue;
             }
@@ -351,13 +356,12 @@ async fn run_durable_record(
         Ok(result) if result.exit_code == 0 => {
             match publish_raised(router, &result.stdout, &record) {
                 Ok(()) => None,
-                Err(err) => Some(format!("raised publish error: {err}")),
+                Err(err) => Some(DeliveryFailure::permanent(format!(
+                    "raised publish error: {err}"
+                ))),
             }
         }
-        Ok(result) => Some(format!(
-            "exit={} stderr={}",
-            result.exit_code, result.stderr
-        )),
+        Ok(result) => Some(DeliveryFailure::from_spawn_result(&result)),
         Err(err) => {
             error!(
                 dept = %dept_name,
@@ -365,7 +369,7 @@ async fn run_durable_record(
                 error = %err,
                 "framework spawn error"
             );
-            Some(format!("spawn error: {err}"))
+            Some(DeliveryFailure::permanent(format!("spawn error: {err}")))
         }
     };
 
@@ -464,7 +468,7 @@ fn retry_record(
     router: &DeliveryRouter,
     retry_policy: Option<&RetryPolicy>,
     record: &DeliveryRecord,
-    error: String,
+    failure: DeliveryFailure,
 ) {
     let Some(policy) = retry_policy else {
         if let Err(err) = store.ack(&record.delivery_id, record.lease_generation) {
@@ -480,11 +484,26 @@ fn retry_record(
     match store.retry(
         &record.delivery_id,
         record.lease_generation,
-        &error,
+        &RetryFailure {
+            message: failure.message,
+            replayable: failure.replayable,
+        },
         policy,
         now_unix_millis(),
     ) {
-        Ok(RetryOutcome::Dead) => publish_dead_letter(router, record, &error),
+        Ok(RetryOutcome::DeadPendingRedrive) => {}
+        Ok(RetryOutcome::PermanentDead) => match store.get_dead(&record.delivery_id) {
+            Ok(Some(dead)) => publish_permanent_dead_letter(router, &dead),
+            Ok(None) => warn!(
+                delivery_id = %record.delivery_id,
+                "permanent dead delivery missing tombstone"
+            ),
+            Err(err) => error!(
+                delivery_id = %record.delivery_id,
+                error = %err,
+                "permanent dead delivery lookup failed"
+            ),
+        },
         Ok(RetryOutcome::Scheduled | RetryOutcome::Stale | RetryOutcome::Missing) => {}
         Err(err) => {
             error!(
@@ -497,48 +516,79 @@ fn retry_record(
     }
 }
 
-fn publish_dead_letter(router: &DeliveryRouter, record: &DeliveryRecord, error: &str) {
-    let Some((namespace, _)) = record.dept.split_once('.') else {
-        if record.queue == "dead_letter" {
+fn maintain_dead_letters(dept_name: &str, store: Option<&DeliveryStore>, router: &DeliveryRouter) {
+    let Some(store) = store else {
+        error!(dept = %dept_name, "reliable consumer missing delivery store");
+        return;
+    };
+    let policy = RedrivePolicy {
+        max_redrives: REDRIVE_MAX,
+        cooldown: REDRIVE_COOLDOWN,
+    };
+    match store.redrive_due(&policy, now_unix_millis(), DISPATCH_BATCH) {
+        Ok(result) => {
+            for record in result.redriven {
+                info!(
+                    dept = %record.dept,
+                    queue = %record.queue,
+                    delivery_id = %record.delivery_id,
+                    redrive_count = record.redrive_count,
+                    "delivery redriven"
+                );
+                router.notify_reliable_public(&record.dept);
+            }
+            for dead in result.permanent {
+                publish_permanent_dead_letter(router, &dead);
+            }
+        }
+        Err(err) => {
+            error!(
+                dept = %dept_name,
+                error = %err,
+                "dead delivery redrive failed"
+            );
+        }
+    }
+}
+
+fn publish_permanent_dead_letter(router: &DeliveryRouter, dead: &DeadRecord) {
+    let Some((namespace, _)) = dead.dept.split_once('.') else {
+        if dead.queue == "dead_letter" {
             return;
         }
-        publish_dead_letter_to(router, record, "dead_letter", error);
+        publish_dead_letter_to(router, dead, "dead_letter");
         return;
     };
     let dead_letter = format!("{namespace}.dead_letter");
-    if record.queue == dead_letter {
+    if dead.queue == dead_letter {
         return;
     }
-    publish_dead_letter_to(router, record, &dead_letter, error);
+    publish_dead_letter_to(router, dead, &dead_letter);
 }
 
-fn publish_dead_letter_to(
-    router: &DeliveryRouter,
-    record: &DeliveryRecord,
-    queue: &str,
-    error: &str,
-) {
+fn publish_dead_letter_to(router: &DeliveryRouter, dead: &DeadRecord, queue: &str) {
     let event = Event::new(
         queue,
         serde_json::json!({
-            "delivery_id": record.delivery_id,
-            "queue": record.queue,
-            "dept": record.dept,
-            "attempt": record.attempt.saturating_add(1),
-            "error": error,
+            "delivery_id": dead.delivery_id,
+            "queue": dead.queue,
+            "dept": dead.dept,
+            "attempt": dead.attempts,
+            "redrive_count": dead.redrive_count,
+            "error": dead.error_excerpt,
         }),
     );
     if let Err(err) = router.publish(PublishEnvelope {
         event,
         source: Some(SourceRef {
             kind: SourceKind::External,
-            reference: format!("dead/{}", record.delivery_id),
+            reference: format!("dead/{}", dead.delivery_id),
         }),
         cron_payload: None,
         derived: None,
     }) {
         warn!(
-            delivery_id = %record.delivery_id,
+            delivery_id = %dead.delivery_id,
             error = %err,
             "dead_letter publish failed"
         );
@@ -673,7 +723,29 @@ struct RunningDelivery {
 
 struct CompletedDelivery {
     record: DeliveryRecord,
-    failure: Option<String>,
+    failure: Option<DeliveryFailure>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct DeliveryFailure {
+    message: String,
+    replayable: bool,
+}
+
+impl DeliveryFailure {
+    fn permanent(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            replayable: false,
+        }
+    }
+
+    fn from_spawn_result(result: &SpawnResult) -> Self {
+        Self {
+            message: format!("exit={} stderr={}", result.exit_code, result.stderr),
+            replayable: result.exit_code == 124,
+        }
+    }
 }
 
 fn policy_from_decl(decl: &RetryDecl) -> anyhow::Result<RetryPolicy> {
@@ -717,6 +789,7 @@ mod tests {
             cron_payload: None,
             observed_at_ms: now_unix_millis(),
             attempt: 0,
+            redrive_count: 0,
             lease_generation: 0,
             lease_until_ms: None,
             not_before_ms: 0,
@@ -903,7 +976,10 @@ mod tests {
                 .retry(
                     &first.delivery_id,
                     first.lease_generation,
-                    "failure",
+                    &RetryFailure {
+                        message: "failure".to_string(),
+                        replayable: false,
+                    },
                     &policy(3),
                     now_unix_millis()
                 )
@@ -959,11 +1035,38 @@ mod tests {
             &router,
             Some(&policy(1)),
             &leased,
-            "failure".to_string(),
+            DeliveryFailure::permanent("failure"),
         );
 
         assert!(store.get("one").unwrap().is_none());
         assert!(store.get_dead("one").unwrap().is_some());
+    }
+
+    #[test]
+    fn durable_timeout_failure_is_stored_as_replayable_dead_record() {
+        let temp = TempDir::new().unwrap();
+        let store = Arc::new(DeliveryStore::open(temp.path().join("delivery.redb")).unwrap());
+        store.enqueue(&record("one")).unwrap();
+        let leased = store
+            .lease_for_dept("worker", now_unix_millis(), 8, Duration::from_millis(50))
+            .unwrap()
+            .remove(0);
+        let router = router_with_dead_letter(store.clone());
+        let failure = DeliveryFailure::from_spawn_result(&SpawnResult {
+            exit_code: 124,
+            stdout: String::new(),
+            stderr: "codex timed out".to_string(),
+            elapsed_ms: 1_000,
+            log_path: None,
+        });
+
+        retry_record(&store, &router, Some(&policy(1)), &leased, failure);
+
+        assert!(store.get("one").unwrap().is_none());
+        let dead = store.get_dead("one").unwrap().unwrap();
+        assert!(dead.replayable);
+        assert!(!dead.permanent);
+        assert!(dead.record.is_some());
     }
 
     #[test]
