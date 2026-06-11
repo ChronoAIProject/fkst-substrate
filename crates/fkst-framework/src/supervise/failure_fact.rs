@@ -1,7 +1,7 @@
 //! Structured engine failure facts emitted by supervise.
 
 use super::delivery_retry::error_excerpt;
-use super::delivery_types::{DeliveryRecord, SourceRef};
+use super::delivery_types::{DeadRecord, DeliveryRecord, SourceRef};
 use fkst_common::Event;
 use serde_json::{json, Value as JsonValue};
 
@@ -77,6 +77,25 @@ pub(crate) fn dead_letter_payload(record: &DeliveryRecord, error: &str) -> JsonV
         "error_class": error_class.as_str(),
         "fingerprint": fingerprint(error_class, error),
         "source_ref": source_ref_json(record.source.as_ref()),
+    })
+}
+
+pub(crate) fn dead_record_payload(dead: &DeadRecord) -> JsonValue {
+    let error = dead.error_excerpt.as_deref().unwrap_or("unknown delivery failure");
+    let error_class = classify_delivery_error(error);
+    json!({
+        "delivery_id": dead.delivery_id,
+        "dedup_id": dead.delivery_id,
+        "queue": dead.queue,
+        "dept": dead.dept,
+        "origin_queue": dead.queue,
+        "origin_dept": dead.dept,
+        "attempt": dead.attempts,
+        "redrive_count": dead.redrive_count,
+        "error": error_excerpt(error),
+        "error_class": error_class.as_str(),
+        "fingerprint": fingerprint(error_class, error),
+        "source_ref": source_ref_json(dead.source.as_ref()),
     })
 }
 
@@ -216,6 +235,7 @@ mod tests {
             cron_payload: None,
             observed_at_ms: 10,
             attempt: 2,
+            redrive_count: 0,
             lease_generation: 1,
             lease_until_ms: Some(20),
             not_before_ms: 0,

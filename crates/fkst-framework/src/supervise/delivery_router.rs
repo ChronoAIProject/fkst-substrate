@@ -109,6 +109,7 @@ impl DeliveryRouter {
                     cron_payload: envelope.cron_payload.clone(),
                     observed_at_ms: envelope.event.ts,
                     attempt: 0,
+                    redrive_count: 0,
                     lease_generation: 0,
                     lease_until_ms: None,
                     not_before_ms: now_unix_millis(),
@@ -151,6 +152,10 @@ impl DeliveryRouter {
         FailureFactPublisher {
             router: self.clone(),
         }
+    }
+
+    pub(crate) fn notify_reliable_public(&self, dept: &str) {
+        self.notify_reliable(dept);
     }
 
     fn notify_reliable(&self, dept: &str) {

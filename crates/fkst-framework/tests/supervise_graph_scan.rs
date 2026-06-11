@@ -8,6 +8,8 @@ mod graph_scan;
 mod path_resolver;
 #[path = "../src/rate_pool.rs"]
 mod rate_pool;
+#[path = "../src/sdk_strings.rs"]
+mod sdk_strings;
 
 use fkst_common::config::RaiserDecl;
 use fkst_common::validation::validate;
@@ -262,6 +264,34 @@ return M
 }
 
 #[test]
+fn graph_scan_spec_eval_exposes_truncate_utf8() {
+    let dir = write_repo(
+        &[(
+            "hello",
+            r#"
+local M = {}
+local consumed = truncate_utf8("tick-long", 4)
+M.spec = { consumes = {consumed}, produces = {"done"}, stall_window = "30s" }
+function pipeline(_) end
+return M
+"#,
+        )],
+        &[(
+            "cron_a",
+            r#"return { type = "cron", interval = "10s", produces = truncate_utf8("tick-long", 4) }"#,
+        )],
+    );
+
+    let cfg = load(dir.path()).unwrap();
+
+    assert_eq!(cfg.department.get("hello").unwrap().consumes, vec!["tick"]);
+    match cfg.raiser.get("cron_a").unwrap() {
+        RaiserDecl::Cron { produces, .. } => assert_eq!(produces, "tick"),
+        _ => panic!("expected Cron"),
+    }
+}
+
+#[test]
 fn graph_scan_rejects_department_producing_engine_failure_fact_queue() {
     let dir = write_repo(
         &[(
@@ -282,6 +312,33 @@ return M
         err.to_string().contains("resolve `forger.spec.produces`"),
         "got: {err:#}"
     );
+}
+
+#[test]
+fn graph_scan_spec_eval_does_not_expose_runtime_primitives() {
+    let dir = write_repo(
+        &[(
+            "hello",
+            r#"
+local M = {}
+assert(exec_sync == nil, "exec_sync graph-scan global must not be injected")
+local _ = exec_sync("echo no")
+M.spec = { consumes = {"tick"}, stall_window = "30s" }
+function pipeline(_) end
+return M
+"#,
+        )],
+        &[(
+            "cron_a",
+            r#"return { type = "cron", interval = "10s", produces = "tick" }"#,
+        )],
+    );
+
+    let err = load(dir.path()).unwrap_err();
+    let msg = format!("{err:#}");
+
+    assert!(msg.contains("exec_sync"), "got: {msg}");
+    assert!(msg.contains("eval department `hello`"), "got: {msg}");
 }
 
 #[test]
