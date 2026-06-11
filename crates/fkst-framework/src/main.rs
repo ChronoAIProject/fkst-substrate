@@ -6,6 +6,7 @@
 //! CLI: `fkst-framework supervise --project-root <path> --framework-bin <path>`
 //! CLI: `fkst-framework conformance --project-root <path>`
 //! CLI: `fkst-framework test --project-root <path> [--package-root <path> ...] [--report-json <path>]`
+//! CLI: `fkst-framework init-package-repo [--ref <substrate-ref>] [--force]`
 //! CLI: `fkst-framework --self-test`
 //! Exit codes:
 //!   0 = pipeline ok
@@ -22,6 +23,7 @@ use std::path::PathBuf;
 mod config_registry;
 mod external_command;
 mod host_conformance;
+mod init_package_repo;
 mod mlua_init;
 mod path_resolver;
 mod raise;
@@ -65,6 +67,7 @@ enum CliCommand {
         pool: String,
     },
     Test(TestCli),
+    InitPackageRepo(init_package_repo::InitPackageRepoOptions),
     SelfTest,
 }
 
@@ -73,7 +76,7 @@ fn parse_args() -> Result<CliCommand> {
     let mut args_iter = args.into_iter();
     let sub = args_iter.next().ok_or_else(|| {
         anyhow::anyhow!(
-            "usage: fkst-framework run <lua> --project-root <path> --package-root <path> [--package-root <path> ...] [--owner-namespace <id>] --event <json> | fkst-framework supervise --project-root <path> --framework-bin <path> [--package-root <path> ...] | fkst-framework conformance --project-root <path> [--package-root <path> ...] | fkst-framework config --project-root <path> [--package-root <path> ...] | fkst-framework rate-acquire <pool> | fkst-framework test --project-root <path> [--package-root <path> ...] [--report-json <path>] | fkst-framework --self-test"
+            "usage: fkst-framework run <lua> --project-root <path> --package-root <path> [--package-root <path> ...] [--owner-namespace <id>] --event <json> | fkst-framework supervise --project-root <path> --framework-bin <path> [--package-root <path> ...] | fkst-framework conformance --project-root <path> [--package-root <path> ...] | fkst-framework config --project-root <path> [--package-root <path> ...] | fkst-framework rate-acquire <pool> | fkst-framework test --project-root <path> [--package-root <path> ...] [--report-json <path>] | fkst-framework init-package-repo [--ref <substrate-ref>] [--force] | fkst-framework --self-test"
         )
     })?;
     if sub == "--self-test" {
@@ -121,6 +124,12 @@ fn parse_args() -> Result<CliCommand> {
     if sub == "test" {
         let rest = args_iter.collect::<Vec<_>>();
         return Ok(CliCommand::Test(parse_test_args(&rest)?));
+    }
+    if sub == "init-package-repo" {
+        let rest = args_iter.collect::<Vec<_>>();
+        return Ok(CliCommand::InitPackageRepo(parse_init_package_repo_args(
+            &rest,
+        )?));
     }
     if sub == "run" {
         let lua_path: PathBuf = args_iter
@@ -282,6 +291,43 @@ fn parse_test_args(args: &[String]) -> Result<TestCli> {
     })
 }
 
+fn parse_init_package_repo_args(
+    args: &[String],
+) -> Result<init_package_repo::InitPackageRepoOptions> {
+    let mut substrate_ref: Option<String> = None;
+    let mut force = false;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--ref" => {
+                if substrate_ref.is_some() {
+                    anyhow::bail!("duplicate --ref");
+                }
+                i += 1;
+                substrate_ref = Some(next_value(args, i, "--ref")?);
+            }
+            "--force" => force = true,
+            other => anyhow::bail!("unknown init-package-repo argument: {}", other),
+        }
+        i += 1;
+    }
+
+    let substrate_ref = match substrate_ref {
+        Some(value) => value,
+        None => {
+            let pin = env!("FKST_FRAMEWORK_SOURCE_PIN").to_string();
+            if pin == "unknown" {
+                anyhow::bail!("missing --ref: build-time FKST_FRAMEWORK_SOURCE_PIN is unavailable");
+            }
+            pin
+        }
+    };
+    Ok(init_package_repo::InitPackageRepoOptions {
+        substrate_ref,
+        force,
+    })
+}
+
 fn next_iter_value(args: &mut impl Iterator<Item = String>, flag: &str) -> Result<String> {
     args.next()
         .filter(|value| !value.is_empty())
@@ -397,6 +443,7 @@ fn run() -> Result<i32> {
         CliCommand::Config(options) => run_config_command(options),
         CliCommand::RateAcquire { pool } => run_rate_acquire(&pool),
         CliCommand::Test(options) => test_runner::run_tests(options.roots, options.report_json),
+        CliCommand::InitPackageRepo(options) => init_package_repo::run(options),
         CliCommand::SelfTest => match self_test::run() {
             Ok(()) => Ok(0),
             Err(err) => {

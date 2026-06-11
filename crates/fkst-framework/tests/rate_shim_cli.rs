@@ -6,13 +6,63 @@ mod rate_pool;
 mod rate_shim;
 
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 use rate_pool::{RatePoolConfig, RatePoolRegistry};
 
-fn framework_bin() -> &'static str {
-    env!("CARGO_BIN_EXE_fkst-framework")
+struct EnvGuard {
+    values: Vec<(&'static str, Option<std::ffi::OsString>)>,
+}
+
+struct CwdGuard {
+    original: PathBuf,
+}
+
+impl CwdGuard {
+    fn enter(path: &Path) -> Self {
+        let original = std::env::current_dir().unwrap();
+        std::env::set_current_dir(path).unwrap();
+        Self { original }
+    }
+}
+
+impl Drop for CwdGuard {
+    fn drop(&mut self) {
+        let _ = std::env::set_current_dir(&self.original);
+    }
+}
+
+impl EnvGuard {
+    fn remove(keys: &[&'static str]) -> Self {
+        let values = keys
+            .iter()
+            .map(|key| {
+                let value = std::env::var_os(key);
+                std::env::remove_var(key);
+                (*key, value)
+            })
+            .collect();
+        Self { values }
+    }
+}
+
+impl Drop for EnvGuard {
+    fn drop(&mut self) {
+        for (key, value) in self.values.drain(..).rev() {
+            if let Some(value) = value {
+                std::env::set_var(key, value);
+            } else {
+                std::env::remove_var(key);
+            }
+        }
+    }
+}
+
+fn framework_bin() -> PathBuf {
+    let exe = std::env::current_exe().unwrap();
+    let deps_dir = exe.parent().unwrap();
+    deps_dir.parent().unwrap().join("fkst-framework")
 }
 
 fn stdout(output: &Output) -> String {
@@ -154,12 +204,9 @@ fn generated_shim_consumes_same_bucket_as_cli_acquire() {
     seed_ledger(&root, "gh", 2);
 
     let generator_path = std::env::join_paths([real_dir.as_path()]).unwrap();
-    let shim_dir = rate_shim::ensure_rate_shims_with_path(
-        &registry,
-        Path::new(framework_bin()),
-        &generator_path,
-    )
-    .unwrap();
+    let shim_dir =
+        rate_shim::ensure_rate_shims_with_path(&registry, &framework_bin(), &generator_path)
+            .unwrap();
 
     let direct = Command::new(framework_bin())
         .arg("rate-acquire")
@@ -201,19 +248,16 @@ fn generated_shim_bakes_resolved_config_from_fkst_env_style_registry() {
     .unwrap();
     executable(&real_dir.join("gh"), "#!/bin/sh\nprintf shim-real\n");
 
-    let original_cwd = std::env::current_dir().unwrap();
-    std::env::set_current_dir(&host).unwrap();
+    let _env_guard = EnvGuard::remove(&["FKST_RATE_POOL_ROOT", "FKST_RATE_POOL_GH"]);
+    let _cwd_guard = CwdGuard::enter(&host);
     let config = config_registry::ConfigContext::from_host_root(&host).unwrap();
     let registry = RatePoolRegistry::from_config(&config).unwrap();
-    std::env::set_current_dir(original_cwd).unwrap();
+    drop(_cwd_guard);
     seed_ledger(registry.root(), "gh", 2);
     let generator_path = std::env::join_paths([real_dir.as_path()]).unwrap();
-    let shim_dir = rate_shim::ensure_rate_shims_with_path(
-        &registry,
-        Path::new(framework_bin()),
-        &generator_path,
-    )
-    .unwrap();
+    let shim_dir =
+        rate_shim::ensure_rate_shims_with_path(&registry, &framework_bin(), &generator_path)
+            .unwrap();
     let path = std::env::join_paths([shim_dir.as_path(), real_dir.as_path()]).unwrap();
 
     let shim = Command::new(shim_dir.join("gh"))
@@ -258,12 +302,9 @@ fn generated_shim_skips_symlinked_shim_path_before_real_program() {
     );
     seed_ledger(&root, "gh", 2);
     let generator_path = std::env::join_paths([real_dir.as_path()]).unwrap();
-    let shim_dir = rate_shim::ensure_rate_shims_with_path(
-        &registry,
-        Path::new(framework_bin()),
-        &generator_path,
-    )
-    .unwrap();
+    let shim_dir =
+        rate_shim::ensure_rate_shims_with_path(&registry, &framework_bin(), &generator_path)
+            .unwrap();
     let shim_link = tmp.path().join("shims-link");
     std::os::unix::fs::symlink(&shim_dir, &shim_link).unwrap();
     let path = std::env::join_paths([shim_link.as_path(), shim_dir.as_path(), real_dir.as_path()])

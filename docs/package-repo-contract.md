@@ -173,6 +173,7 @@ fkst-framework test --project-root <path> [--package-root <path> ...] [--report-
 fkst-framework run <lua> --project-root <path> --package-root <path> [--package-root <path> ...] [--owner-namespace <id>] --event <json>
 fkst-framework supervise --project-root <path> --framework-bin <path> [--package-root <path> ...]
 fkst-framework config --project-root <path> [--package-root <path> ...]
+fkst-framework init-package-repo [--ref <substrate-ref>] [--force]
 ```
 
 `--self-test` 运行引擎自检。`conformance` 支持 flat single-root 与 composed multi-root，通过 `--project-root` 和可重复 `--package-root` 形成 host + package graph。`test` 发现 `<ROOT>/departments/*/*_test.lua` 与 `<ROOT>/tests/*_test.lua`；`--report-json <path>` 写 schema 为 `fkst.test.report.v1` 的机器报告，条目身份是 `owner_namespace`、`file`、`name`。stdout 的 `PASS` / `FAIL` / summary 行只是 human / compatibility surface，不是 authoritative inventory。
@@ -180,6 +181,8 @@ fkst-framework config --project-root <path> [--package-root <path> ...]
 `run` 执行一个 Lua entrypoint。无 `--owner-namespace` 时，只在单一 package root 可唯一确定 owner namespace 的情况下默认；多个 `--package-root` 时必须传 `--owner-namespace <id>`。当前 `run` 明确拒绝 `FKST_PACKAGE_ROOTS` env；应通过可重复 `--package-root` 传 composed namespace catalog。
 
 `supervise` 扫描 package roots 与 host root，构造一张 composed graph，spawn consumer/source runtime，并用 `--framework-bin` 指定 child `fkst-framework run` binary。`config` 是只读自省命令，不是 package 行为入口，但它属于当前 CLI surface。
+
+`init-package-repo` is a deterministic scaffold generator for package or host repositories. It runs inside the target git repository, writes engine-owned templates for `scripts/run.sh`, `scripts/check_repo.py`, `.github/workflows/ci.yml`, `env.example`, `.fkst-substrate-ref`, `.gitignore` entries and a minimal `README.md` pointer, and prints a converge report. Identical files are a no-op; differing owned template files are refused unless `--force` is passed; `.gitignore` only receives missing scaffold entries. The command does not touch `packages/`, git history or remotes. When `--ref` is omitted, `.fkst-substrate-ref` uses the running binary's build-time source revision.
 
 ## 8. Conformance
 

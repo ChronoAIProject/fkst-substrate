@@ -71,10 +71,13 @@ impl Sleeper for ThreadSleeper {
 impl RatePoolRegistry {
     pub(crate) fn from_config(config: &ConfigContext) -> Result<Self> {
         let pools = parse_pool_definitions(config.rate_pool_env())?;
-        let root = canonicalize_configured_root(
-            expand_home(&config.resolved_string(ConfigKey::RatePoolRoot)?)?,
-            pools.is_empty(),
-        )?;
+        let root = expand_home(&config.resolved_string(ConfigKey::RatePoolRoot)?)?;
+        let root = if root.is_absolute() {
+            root
+        } else {
+            config.host_root().join(root)
+        };
+        let root = canonicalize_configured_root(root, pools.is_empty())?;
         Ok(Self { root, pools })
     }
 

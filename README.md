@@ -36,6 +36,14 @@ target/debug/fkst-framework config \
   --package-root "$PWD/examples/minimal-package"
 ```
 
+## Package repo scaffold
+
+`fkst-framework init-package-repo [--ref <substrate-ref>] [--force]` materializes the package-repo bootstrap scaffold in the current git repository. It writes the engine-owned templates for `scripts/run.sh`, `scripts/check_repo.py`, `.github/workflows/ci.yml`, `env.example`, `.fkst-substrate-ref`, `.gitignore` entries and a minimal `README.md` pointer.
+
+The command is idempotent: identical files are reported as `UNCHANGED`; missing files are created; local edits to owned template files are refused by default and require `--force` to overwrite. `.gitignore` is append-only for the scaffold entries. The command does not touch `packages/`, git history or remotes.
+
+With no `--ref`, the scaffold pins the running engine binary's build-time source revision. Operators can pass `--ref <substrate-ref>` when they need an explicit release tag or commit.
+
 ## 独立运行
 
 本仓库内置一个 package-root fixture：`examples/minimal-package`。它声明一个 cron source `tick`、一个 producer department 和一个 consumer department。cron source 产生 `tick` queue 事件；producer 消费 `tick` 后 `raise("example_event", payload)`；consumer 消费 `example_event`，只读并打印完整标准事件。
