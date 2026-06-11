@@ -1515,6 +1515,77 @@ end
 }
 
 #[test]
+fn production_exec_sync_returns_typed_boundary_error_class() {
+    let host = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
+    fs::create_dir_all(host.path().join("departments/probe")).unwrap();
+    let probe = host.path().join("departments/probe/main.lua");
+    fs::write(
+        &probe,
+        r#"
+function pipeline(event)
+  local result = exec_sync(event.payload.cmd)
+  raise("seen", { exit_code = result.exit_code, error_class = result.error_class })
+end
+"#,
+    )
+    .unwrap();
+
+    let auth = Command::new(framework_bin())
+        .arg("run")
+        .arg(&probe)
+        .arg("--project-root")
+        .arg(host.path())
+        .arg("--package-root")
+        .arg(host.path())
+        .arg("--owner-namespace")
+        .arg(namespace(host.path()))
+        .arg("--event")
+        .arg(r#"{"payload":{"cmd":"printf 'HTTP 401 bad credentials' >&2; exit 1"}}"#)
+        .current_dir(host.path())
+        .env("FKST_RUNTIME_ROOT", host.path().join(".fkst/runtime"))
+        .output()
+        .unwrap();
+
+    assert_eq!(
+        auth.status.code(),
+        Some(0),
+        "stdout: {}\nstderr: {}",
+        stdout(&auth),
+        stderr(&auth)
+    );
+    let raises = raised_entries(&auth);
+    assert_eq!(raises[0]["payload"]["exit_code"], 1);
+    assert_eq!(raises[0]["payload"]["error_class"], "auth-degraded");
+
+    let throttle = Command::new(framework_bin())
+        .arg("run")
+        .arg(&probe)
+        .arg("--project-root")
+        .arg(host.path())
+        .arg("--package-root")
+        .arg(host.path())
+        .arg("--owner-namespace")
+        .arg(namespace(host.path()))
+        .arg("--event")
+        .arg(r#"{"payload":{"cmd":"printf 'secondary rate limit' >&2; exit 1"}}"#)
+        .current_dir(host.path())
+        .env("FKST_RUNTIME_ROOT", host.path().join(".fkst/runtime"))
+        .output()
+        .unwrap();
+
+    assert_eq!(
+        throttle.status.code(),
+        Some(0),
+        "stdout: {}\nstderr: {}",
+        stdout(&throttle),
+        stderr(&throttle)
+    );
+    let raises = raised_entries(&throttle);
+    assert_eq!(raises[0]["payload"]["exit_code"], 1);
+    assert_eq!(raises[0]["payload"]["error_class"], "provider-throttle");
+}
+
+#[test]
 fn run_accepts_host_owner_with_multiple_package_root_flags_as_require_roots() {
     let host = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
     let package_a = tempfile::Builder::new().prefix("repo").tempdir().unwrap();

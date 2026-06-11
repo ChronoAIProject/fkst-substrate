@@ -17,6 +17,7 @@ mod delivery_transition;
 pub(crate) mod delivery_types;
 mod delivery_watch;
 pub mod event_fanout;
+pub(crate) mod failure_fact;
 pub(crate) mod graph_scan;
 mod raised;
 pub(crate) mod source_runner;
@@ -26,6 +27,7 @@ use consumer::spawn_consumer;
 use delivery_router::DeliveryRouter;
 use delivery_store::DeliveryStore;
 use event_fanout::Fanout;
+use failure_fact::schema_validation_failure_fact;
 use source_runner::{spawn_cron, spawn_file_watch};
 
 pub(crate) fn load_host_graph_for_conformance(roots: &PackageRoots) -> Result<Config> {
@@ -46,8 +48,10 @@ pub async fn supervise(roots: PackageRoots, framework_bin: PathBuf) -> Result<()
     })?;
 
     let schema_warnings = validate(&cfg, &project_root).map_err(|e| {
-        error!(error = %e, "schema validation failed, refusing to start");
-        anyhow::Error::msg(e.to_string())
+        let message = e.to_string();
+        error!(error = %message, "schema validation failed, refusing to start");
+        publish_startup_validation_failure(&cfg, &message);
+        anyhow::Error::msg(message)
     })?;
     for warning in schema_warnings {
         warn!(warning = %warning, "schema validation warning");
@@ -64,6 +68,7 @@ pub async fn supervise(roots: PackageRoots, framework_bin: PathBuf) -> Result<()
     let fanout = Fanout::new();
     let delivery_store = delivery_store_for_config(&cfg)?;
     let router = DeliveryRouter::new(&cfg, fanout.clone(), delivery_store.clone());
+    delivery_watch::set_failure_fact_publisher(router.failure_fact_publisher());
     let codex_permit_slots = cfg.limits.global_codex_processes;
     let mut handles = vec![];
 
@@ -149,6 +154,23 @@ fn delivery_store_for_config(cfg: &Config) -> Result<Option<Arc<DeliveryStore>>>
     Ok(Some(Arc::new(DeliveryStore::open(
         durable.delivery_db_path(),
     )?)))
+}
+
+fn publish_startup_validation_failure(cfg: &Config, error: &str) {
+    let fact = schema_validation_failure_fact(error);
+    let fanout = Fanout::new();
+    let store = match delivery_store_for_config(cfg) {
+        Ok(store) => store,
+        Err(err) => {
+            warn!(error = %err, "startup failure fact store unavailable");
+            None
+        }
+    };
+    let router = DeliveryRouter::new(cfg, fanout, store);
+    if let Err(err) = router.publish_failure_fact(fact.clone()) {
+        warn!(error = %err, "startup failure fact publish failed");
+    }
+    error!(queue = %fact.queue, payload = %fact.payload, "engine failure fact");
 }
 
 #[cfg(test)]

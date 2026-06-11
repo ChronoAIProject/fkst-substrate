@@ -1,5 +1,7 @@
 // path-based integration tests own behavior coverage while runtime modules keep runtime code.
 
+#[path = "../src/boundary_resource.rs"]
+mod boundary_resource;
 #[path = "../src/config_registry.rs"]
 mod config_registry;
 #[path = "../src/external_command.rs"]
@@ -404,6 +406,10 @@ fn spawn_codex_sync_returns_visible_spawn_error() {
     let result: mlua::Table = spawn.call(opts).unwrap();
     assert_eq!(result.get::<i64>("exit_code").unwrap(), -1);
     assert_eq!(result.get::<String>("error_kind").unwrap(), "spawn");
+    assert_eq!(
+        result.get::<String>("error_class").unwrap(),
+        "provider-unavailable"
+    );
     assert!(result
         .get::<String>("error")
         .unwrap()
@@ -417,6 +423,39 @@ fn spawn_codex_sync_returns_visible_spawn_error() {
     assert!(log_body.contains("codex spawn failed"));
     assert!(log_body.contains("EXIT=-1\n"));
     assert!(log_body.contains("CMD=codex exec --dangerously-bypass-approvals-and-sandbox -\n"));
+}
+
+#[cfg(unix)]
+#[test]
+fn spawn_codex_sync_classifies_provider_output() {
+    let tmp = tempfile::tempdir().unwrap();
+    let bin_dir = tmp.path().join("bin");
+    install_codex_script(
+        &bin_dir,
+        r#"#!/bin/sh
+cat >/dev/null
+printf 'HTTP 401 bad credentials' >&2
+exit 1
+"#,
+    );
+
+    let mut sandbox = ProcessSandbox::new();
+    sandbox.enter_cwd(tmp.path()).runtime_root(".fkst/runtime");
+    sandbox.prepend_path(&bin_dir);
+    sandbox.runtime_log_dir(tmp.path().join("runtime"));
+    let (_lock, _guard) = sandbox.enter();
+
+    let lua = Lua::new();
+    register(&lua).unwrap();
+    let spawn: mlua::Function = lua.globals().get("spawn_codex_sync").unwrap();
+    let result: mlua::Table = spawn.call(lua_opts(&lua, "hello")).unwrap();
+
+    assert_eq!(result.get::<i64>("exit_code").unwrap(), 1);
+    assert!(result.get::<String>("error_kind").is_err());
+    assert_eq!(
+        result.get::<String>("error_class").unwrap(),
+        "auth-degraded"
+    );
 }
 
 #[cfg(unix)]
@@ -871,7 +910,7 @@ read _ < "$TIMEOUT_FIFO"
     register(&lua).unwrap();
     let spawn: mlua::Function = lua.globals().get("spawn_codex_sync").unwrap();
     let opts = lua_opts(&lua, "timed out");
-    opts.set("timeout", 1).unwrap();
+    opts.set("timeout", 2).unwrap();
 
     let result: Table = spawn.call(opts).unwrap();
     let child_pid = pid_reader.join().unwrap();

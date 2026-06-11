@@ -47,6 +47,7 @@ pub(crate) struct CodexResult {
     exit_code: i32,
     log_path: String,
     error_kind: Option<String>,
+    error_class: Option<String>,
     error: Option<String>,
 }
 
@@ -108,12 +109,16 @@ impl CodexResult {
         exit_code: i32,
         log_path: String,
     ) -> Self {
+        let error_class =
+            crate::boundary_resource::classify_process_output(exit_code, &stdout, &stderr)
+                .map(|class| class.label().to_string());
         Self {
             stdout,
             stderr,
             exit_code,
             log_path,
             error_kind: None,
+            error_class,
             error: None,
         }
     }
@@ -137,6 +142,11 @@ impl CodexResult {
             exit_code,
             log_path,
             error_kind: Some(kind.to_string()),
+            error_class: Some(
+                crate::boundary_resource::class_for_adapter_failure(kind, &message)
+                    .label()
+                    .to_string(),
+            ),
             error: Some(message),
         }
     }
@@ -149,6 +159,11 @@ impl CodexResult {
             exit_code: -1,
             log_path: String::new(),
             error_kind: Some("mock".to_string()),
+            error_class: Some(
+                crate::boundary_resource::BoundaryErrorClass::ProviderUnavailable
+                    .label()
+                    .to_string(),
+            ),
             error: Some(message),
         }
     }
@@ -157,6 +172,9 @@ impl CodexResult {
         let t = result_table(lua, self.stdout, self.stderr, self.exit_code, self.log_path)?;
         if let Some(kind) = self.error_kind {
             t.set("error_kind", kind)?;
+        }
+        if let Some(class) = self.error_class {
+            t.set("error_class", class)?;
         }
         if let Some(message) = self.error {
             t.set("error", message)?;

@@ -25,6 +25,7 @@ struct ExecResult {
     stderr: String,
     exit_code: i32,
     timed_out: Option<bool>,
+    error_class: Option<String>,
 }
 
 // Lua SDK registration and self-test match the fixed CLAUDE.md surface exactly; human notification, if needed, is represented through existing git/fs/log facts rather than a new SDK function.
@@ -62,6 +63,9 @@ pub(crate) fn register_with_runner(
             t.set("exit_code", out.exit_code)?;
             if let Some(timed_out) = out.timed_out {
                 t.set("timed_out", timed_out)?;
+            }
+            if let Some(error_class) = out.error_class {
+                t.set("error_class", error_class)?;
             }
             Ok(t)
         })?,
@@ -155,6 +159,7 @@ fn run_exec_sync(
             stderr: result.stderr,
             exit_code: result.exit_code,
             timed_out: None,
+            error_class: None,
         });
     }
 
@@ -168,11 +173,18 @@ fn run_exec_sync(
             let out = build_command(&opts)
                 .output()
                 .map_err(mlua::Error::external)?;
+            let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+            let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+            let exit_code = out.status.code().unwrap_or(-1);
             Ok(ExecResult {
-                stdout: String::from_utf8_lossy(&out.stdout).to_string(),
-                stderr: String::from_utf8_lossy(&out.stderr).to_string(),
-                exit_code: out.status.code().unwrap_or(-1),
+                stdout: stdout.clone(),
+                stderr: stderr.clone(),
+                exit_code,
                 timed_out: None,
+                error_class: crate::boundary_resource::classify_process_output(
+                    exit_code, &stdout, &stderr,
+                )
+                .map(|class| class.label().to_string()),
             })
         }
     }
@@ -203,11 +215,18 @@ fn run_exec_sync_with_timeout(opts: &ExecOptions, timeout: Duration) -> Result<E
         if let Some(status) = child.try_wait().map_err(mlua::Error::external)? {
             let stdout = join_pipe_reader(stdout_reader)?;
             let stderr = join_pipe_reader(stderr_reader)?;
+            let stdout = String::from_utf8_lossy(&stdout).to_string();
+            let stderr = String::from_utf8_lossy(&stderr).to_string();
+            let exit_code = status.code().unwrap_or(-1);
             return Ok(ExecResult {
-                stdout: String::from_utf8_lossy(&stdout).to_string(),
-                stderr: String::from_utf8_lossy(&stderr).to_string(),
-                exit_code: status.code().unwrap_or(-1),
+                stdout: stdout.clone(),
+                stderr: stderr.clone(),
+                exit_code,
                 timed_out: Some(false),
+                error_class: crate::boundary_resource::classify_process_output(
+                    exit_code, &stdout, &stderr,
+                )
+                .map(|class| class.label().to_string()),
             });
         }
 
@@ -216,11 +235,18 @@ fn run_exec_sync_with_timeout(opts: &ExecOptions, timeout: Duration) -> Result<E
             let _ = child.wait();
             let stdout = join_pipe_reader(stdout_reader)?;
             let stderr = join_pipe_reader(stderr_reader)?;
+            let stdout = String::from_utf8_lossy(&stdout).to_string();
+            let stderr = String::from_utf8_lossy(&stderr).to_string();
             return Ok(ExecResult {
-                stdout: String::from_utf8_lossy(&stdout).to_string(),
-                stderr: String::from_utf8_lossy(&stderr).to_string(),
+                stdout,
+                stderr,
                 exit_code: 124,
                 timed_out: Some(true),
+                error_class: Some(
+                    crate::boundary_resource::BoundaryErrorClass::ProviderUnavailable
+                        .label()
+                        .to_string(),
+                ),
             });
         }
 

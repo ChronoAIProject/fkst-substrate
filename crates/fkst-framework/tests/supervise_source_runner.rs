@@ -16,6 +16,8 @@ mod delivery_types;
 mod delivery_watch;
 #[path = "../src/supervise/event_fanout.rs"]
 mod event_fanout;
+#[path = "../src/supervise/failure_fact.rs"]
+mod failure_fact;
 #[allow(dead_code)]
 #[path = "../src/supervise/source_runner.rs"]
 mod source_runner;

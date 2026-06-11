@@ -6,6 +6,7 @@ use super::delivery_types::{
     DeadRecord, DeliveryRecord, RedrivePolicy, RetryPolicy, SourceKind, SourceRef,
 };
 use super::event_fanout::Fanout;
+use super::failure_fact::{dead_record_payload, delivery_failure_fact, FAILURE_FACT_QUEUE};
 use super::raised::parse_raised;
 use super::source_runner::parse_duration;
 use super::spawner::{spawn_framework, SpawnResult};
@@ -481,6 +482,7 @@ fn retry_record(
         }
         return;
     };
+    let failure_message = failure.message.clone();
     match store.retry(
         &record.delivery_id,
         record.lease_generation,
@@ -493,7 +495,10 @@ fn retry_record(
     ) {
         Ok(RetryOutcome::DeadPendingRedrive) => {}
         Ok(RetryOutcome::PermanentDead) => match store.get_dead(&record.delivery_id) {
-            Ok(Some(dead)) => publish_permanent_dead_letter(router, &dead),
+            Ok(Some(dead)) => {
+                publish_failure_fact(router, delivery_failure_fact(record, &failure_message));
+                publish_permanent_dead_letter(router, &dead);
+            }
             Ok(None) => warn!(
                 delivery_id = %record.delivery_id,
                 "permanent dead delivery missing tombstone"
@@ -567,17 +572,7 @@ fn publish_permanent_dead_letter(router: &DeliveryRouter, dead: &DeadRecord) {
 }
 
 fn publish_dead_letter_to(router: &DeliveryRouter, dead: &DeadRecord, queue: &str) {
-    let event = Event::new(
-        queue,
-        serde_json::json!({
-            "delivery_id": dead.delivery_id,
-            "queue": dead.queue,
-            "dept": dead.dept,
-            "attempt": dead.attempts,
-            "redrive_count": dead.redrive_count,
-            "error": dead.error_excerpt,
-        }),
-    );
+    let event = Event::new(queue, dead_record_payload(dead));
     if let Err(err) = router.publish(PublishEnvelope {
         event,
         source: Some(SourceRef {
@@ -595,12 +590,19 @@ fn publish_dead_letter_to(router: &DeliveryRouter, dead: &DeadRecord, queue: &st
     }
 }
 
+fn publish_failure_fact(router: &DeliveryRouter, event: Event) {
+    if let Err(err) = router.publish_failure_fact(event) {
+        warn!(error = %err, "failure fact publish failed");
+    }
+}
+
 fn publish_raised(
     router: &DeliveryRouter,
     stdout: &str,
     parent: &DeliveryRecord,
 ) -> anyhow::Result<()> {
     for (ordinal, mut raised_ev) in parse_raised(stdout).into_iter().enumerate() {
+        reject_reserved_raised_queue(&raised_ev)?;
         raised_ev.ts = parent.observed_at_ms;
         router.publish(PublishEnvelope {
             event: raised_ev,
@@ -617,12 +619,23 @@ fn publish_raised(
 
 fn publish_ephemeral_raised(router: &DeliveryRouter, stdout: &str) -> anyhow::Result<()> {
     for raised_ev in parse_raised(stdout) {
+        reject_reserved_raised_queue(&raised_ev)?;
         router.publish(PublishEnvelope {
             event: raised_ev,
             source: None,
             cron_payload: None,
             derived: None,
         })?;
+    }
+    Ok(())
+}
+
+fn reject_reserved_raised_queue(event: &Event) -> anyhow::Result<()> {
+    if event.queue == FAILURE_FACT_QUEUE {
+        anyhow::bail!(
+            "reserved engine queue `{}` cannot be raised by department output",
+            event.queue
+        );
     }
     Ok(())
 }
@@ -836,6 +849,13 @@ mod tests {
     }
 
     fn router_with_dead_letter(store: Arc<DeliveryStore>) -> DeliveryRouter {
+        router_with_dead_letter_and_fanout(store, Fanout::new())
+    }
+
+    fn router_with_dead_letter_and_fanout(
+        store: Arc<DeliveryStore>,
+        fanout: Fanout,
+    ) -> DeliveryRouter {
         let mut queue = BTreeMap::new();
         queue.insert(
             "dead_letter".to_string(),
@@ -867,7 +887,42 @@ mod tests {
                 global_codex_processes: 1,
             },
         };
-        DeliveryRouter::new(&cfg, Fanout::new(), Some(store))
+        DeliveryRouter::new(&cfg, fanout, Some(store))
+    }
+
+    fn router_with_failure_fact_and_fanout(fanout: Fanout) -> DeliveryRouter {
+        let mut queue = BTreeMap::new();
+        queue.insert(
+            "fkst.failure_fact".to_string(),
+            QueueDecl {
+                capacity: 8,
+                fanout: false,
+            },
+        );
+        let mut department = BTreeMap::new();
+        department.insert(
+            "triage".to_string(),
+            DepartmentDecl {
+                lua: "departments/triage/main.lua".into(),
+                owner_root: std::path::PathBuf::from("."),
+                owner_namespace: "pkg".to_string(),
+                consumes: vec!["fkst.failure_fact".to_string()],
+                produces: Vec::new(),
+                ephemeral: vec!["fkst.failure_fact".to_string()],
+                stall_window: "30s".to_string(),
+                graph_json: false,
+                retry: None,
+            },
+        );
+        let cfg = Config {
+            queue,
+            raiser: BTreeMap::new(),
+            department,
+            limits: LimitsDecl {
+                global_codex_processes: 1,
+            },
+        };
+        DeliveryRouter::new(&cfg, fanout, None)
     }
 
     #[test]
@@ -1040,6 +1095,82 @@ mod tests {
 
         assert!(store.get("one").unwrap().is_none());
         assert!(store.get_dead("one").unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn dead_letter_payload_exports_error_fact_fields() {
+        let temp = TempDir::new().unwrap();
+        let store = Arc::new(DeliveryStore::open(temp.path().join("delivery.redb")).unwrap());
+        store.enqueue(&record("one")).unwrap();
+        let leased = store
+            .lease_for_dept("worker", now_unix_millis(), 8, Duration::from_millis(50))
+            .unwrap()
+            .remove(0);
+        let fanout = Fanout::new();
+        let mut rx = fanout.subscribe("dead_letter", 8).await;
+        let router = router_with_dead_letter_and_fanout(store.clone(), fanout);
+
+        retry_record(
+            &store,
+            &router,
+            Some(&policy(1)),
+            &leased,
+            DeliveryFailure::permanent("exit=7 stderr=bad"),
+        );
+
+        let event = rx.recv().await.unwrap();
+        assert_eq!(event.queue, "dead_letter");
+        assert_eq!(event.payload["delivery_id"], "one");
+        assert_eq!(event.payload["dedup_id"], "one");
+        assert_eq!(event.payload["origin_queue"], "jobs");
+        assert_eq!(event.payload["origin_dept"], "worker");
+        assert_eq!(event.payload["attempt"], 1);
+        assert_eq!(event.payload["error_class"], "framework_child_nonzero");
+        assert_eq!(event.payload["source_ref"]["kind"], "cron");
+        assert!(event.payload["fingerprint"]
+            .as_str()
+            .unwrap()
+            .starts_with("framework_child_nonzero:"));
+    }
+
+    #[tokio::test]
+    async fn failure_fact_publish_is_optional_and_subscribable() {
+        let fanout = Fanout::new();
+        let mut rx = fanout.subscribe("fkst.failure_fact", 8).await;
+        let router = router_with_failure_fact_and_fanout(fanout);
+        let fact = delivery_failure_fact(&record("one"), "spawn error: missing binary");
+
+        router.publish_failure_fact(fact).unwrap();
+
+        let event = rx.recv().await.unwrap();
+        assert_eq!(event.queue, "fkst.failure_fact");
+        assert_eq!(event.payload["schema"], "fkst.failure_fact.v1");
+        assert_eq!(event.payload["error_class"], "framework_child_spawn");
+        assert_eq!(event.payload["origin_queue"], "jobs");
+        assert_eq!(event.payload["origin_dept"], "worker");
+    }
+
+    #[test]
+    fn raised_output_cannot_publish_engine_failure_fact_queue() {
+        let router = router_with_failure_fact_and_fanout(Fanout::new());
+        let parent = record("parent");
+        let stdout = format!(
+            "RAISED: {}\n",
+            base64::engine::general_purpose::URL_SAFE.encode(
+                serde_json::to_vec(&serde_json::json!([
+                    {"queue": "fkst.failure_fact", "payload": {"n": 1}}
+                ]))
+                .unwrap()
+            )
+        );
+
+        let err = publish_raised(&router, &stdout, &parent).unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("reserved engine queue `fkst.failure_fact`"),
+            "{err}"
+        );
     }
 
     #[test]
