@@ -54,13 +54,14 @@
 ## Conformance
 
 - 当前 fkst-substrate 的 engine host-conformance 入口是 Rust CLI `fkst-framework conformance --project-root <path> [--package-root <path> ...]`。
-- 当前 conformance check 是 `runtime-layout`、`project-layout`、`graph-scan`、`department-non-empty`、`schema-validation`。
+- 当前 conformance check 是 `runtime-layout`、`project-layout`、`locale-catalogs`、`graph-scan`、`department-non-empty`、`schema-validation`。
 - conformance 读取仓库文件与 Lua graph 来执行上述 check。
 - conformance 不得调度工作、重试 pipeline、调用 GitHub、写隐藏状态、维护队列或承担 workflow engine 职责。
 
 ## SDK surface
 
-- 固定 Lua SDK surface 锚点是 `fixed-lua-sdk-surface`；允许 surface 是 `pipeline`、`source`、`raise`、`spawn_codex_sync`、`spawn_codex`、`exec_sync`、`await_all`、`with_lock`、`once`、`cache_set`、`cache_get`、`graph_json`、`git_log_count`、`git_log_grep`、`count_worktrees`、`list_orphan_worktrees`、`setup_worktree`、`file`、`json.decode`、`log.info`、`log.warn`、`log.error`、`now`。
+- 固定 Lua SDK surface 锚点是 `fixed-lua-sdk-surface`；允许 surface 是 `pipeline`、`source`、`raise`、`spawn_codex_sync`、`spawn_codex`、`exec_sync`、`await_all`、`with_lock`、`once`、`cache_set`、`cache_get`、`graph_json`、`t`、`git_log_count`、`git_log_grep`、`count_worktrees`、`list_orphan_worktrees`、`setup_worktree`、`file`、`json.decode`、`log.info`、`log.warn`、`log.error`、`now`。
+- `t(key[, vars])` is the fixed key-catalog localization primitive. It reads owner-root `locales/<locale>.lua` and `locales/en.lua`, resolves `<locale>` from `FKST_OUTPUT_LANG`, falls back to `en` for missing locale or key with a structured warning, and interpolates `{name}` placeholders from scalar vars. Catalog files are flat Lua tables with stable string keys and literal UTF-8 string values. `en` is the reference locale; conformance requires every non-`en` catalog to cover all `en` keys, rejects decode-helper-hidden literals in `locales/`, and rejects machine protocol tokens in catalog keys or values. Locale catalogs are the sanctioned exception to the source-files-English rule for prose literals; machine tokens remain code and must not be catalog content.
 - `graph_json() -> string` 是显式授权的只读 introspection surface；只有当前 Department 的 `M.spec.graph_json = true` 时可调用。它按当前 fixed package roots input set 与 host root 重新扫描并验证 composed graph，返回稳定 JSON 字符串，schema 为 `fkst.graph.v1`。输出只包含 topology fact：raiser / queue / department nodes、raiser→queue / queue→department / department→queue edges，以及 department 的 `consumes`、`produces`、`ephemeral`、`stall_window` 和 materialized `retry` metadata；node `id` 与 edge endpoint 使用 `kind:canonical_name` 形态以区分同名 raiser / queue / department；不输出 `lua` path、`owner_root`、queue capacity 或 runtime state。排序必须确定性。
 - `with_lock(name, fn)`、`once(key, fn)`、`cache_set(key, value)` 与 `cache_get(key)` 共用 runtime key 合约：key / name 必须是非空相对 filesystem path，`/` 表示目录；每个 segment 非空、匹配 `[A-Za-z0-9._-]+`，且不是 `.` 或 `..`；禁止 leading / trailing `/`、`//`、反斜杠、NUL 与绝对路径。校验后的 key 可直接 join 到 `<RT>/{locks,marks,cache}/<key>`，形成可人工浏览的目录树，不再做 byte hex 编码。
 - `once(key, fn)` 在 `<RT>/locks/once/<key>` 上持有 exclusive flock 后检查 `<RT>/marks/<key>`；`locks/once/` 是 once 内部锁的保留子目录，不属于 `with_lock` 用户锁命名空间。marker 已存在时返回 `false` 且不调用 `fn`，不存在时调用 `fn`，成功后写入 marker 并返回 `true`，失败时传播错误且不写 marker。

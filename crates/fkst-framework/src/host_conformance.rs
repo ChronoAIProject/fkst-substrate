@@ -34,6 +34,7 @@ impl HostConformanceSuite {
 
         checks.push(self.check_runtime_layout());
         checks.push(self.check_project_layout());
+        checks.push(self.check_locale_catalogs());
 
         let graph_result = supervise::load_host_graph_for_conformance(&self.options.roots);
         let graph_available = match &graph_result {
@@ -136,6 +137,30 @@ impl HostConformanceSuite {
             ),
             Err(err) => HostCheck::fail("project-layout", format!("{err:#}")),
         }
+    }
+
+    fn check_locale_catalogs(&self) -> HostCheck {
+        let mut checked = 0usize;
+        for graph_root in self.options.roots.graph_roots() {
+            if let Err(err) = crate::sdk_i18n::validate_graph_root_catalogs(&graph_root.root)
+                .with_context(|| {
+                    format!(
+                        "validate locale catalogs for namespace `{}` at {}",
+                        graph_root.namespace,
+                        graph_root.root.display()
+                    )
+                })
+            {
+                return HostCheck::fail("locale-catalogs", format!("{err:#}"));
+            }
+            if graph_root.root.join("locales").exists() {
+                checked += 1;
+            }
+        }
+        HostCheck::pass(
+            "locale-catalogs",
+            format!("validated locale catalogs for {checked} graph roots"),
+        )
     }
 
     fn check_department_non_empty(&self, cfg: &fkst_common::config::Config) -> HostCheck {

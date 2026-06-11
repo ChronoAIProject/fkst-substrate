@@ -15,13 +15,16 @@
 │   └── <dept>/
 │       ├── main.lua
 │       └── *_test.lua
+├── locales/
+│   ├── en.lua
+│   └── <locale>.lua
 ├── raisers/
 │   └── <raiser>.lua
 └── tests/
     └── *_test.lua
 ```
 
-`core.lua` 是 package 自己可 `require` 的共享库约定；引擎只通过 package root 设置 `package.path`，不会特殊识别 `core.lua`。`departments/<dept>/main.lua` 是 Department entrypoint，必须返回含 `M.spec` 的 table，并定义全局 `pipeline(event)`。`raisers/<raiser>.lua` 返回 source declaration。`tests/*_test.lua` 与 `departments/<dept>/*_test.lua` 由 `fkst-framework test` 发现；runner 不递归扫描其它目录。
+`core.lua` 是 package 自己可 `require` 的共享库约定；引擎只通过 package root 设置 `package.path`，不会特殊识别 `core.lua`。`departments/<dept>/main.lua` 是 Department entrypoint，必须返回含 `M.spec` 的 table，并定义全局 `pipeline(event)`。`raisers/<raiser>.lua` 返回 source declaration。`locales/*.lua` 是 package-owned key catalog content for `t(key[, vars])`; `en.lua` is the reference catalog. `tests/*_test.lua` 与 `departments/<dept>/*_test.lua` 由 `fkst-framework test` 发现；runner 不递归扫描其它目录。
 
 flat package 指 `package-root == host-root` 且只有一个 graph root；它保持 LegacyFlat：裸 queue 名、`Event.queue`、`RAISED`、delivery id 和 `source_ref` 字节仍是裸名。composed packages 指多个 package root 与 host root 组合成一张 composed graph；此时 package root basename 是 namespace，裸 queue 名按 owner namespace 归一化为 `<pkg>.<queue>` 或 `host.<queue>`，跨包消费必须显式写 `pkg.queue`。详见 `SPEC.md` 的“身份边界 / SDK surface”和 `docs/architecture.md` §4。
 
@@ -44,6 +47,8 @@ once(key, fn)
 cache_get(key)
 cache_set(key, value)
 truncate_utf8(s, max_bytes)
+graph_json()
+t(key[, vars])
 git_log_count(grep, since)
 git_log_grep(grep, since)
 count_worktrees()
@@ -60,6 +65,10 @@ now()
 ```
 
 `pipeline(event)` 与 `source` 是 package-side 约定，不是普通 SDK global。Rust 注册的 runtime primitive 来自 `mlua_init.rs` 调用的 `sdk_*` 模块与 `raise.rs`。`json` 只有 `json.decode`，没有 `json.encode`、`json.array` 或 schema 推断；需要空数组时用 `json.decode("[]")` 形成 array-tagged table。Pure data utilities are not automatically Rust primitives; §2.2 defines the decision order.
+
+`t(key[, vars])` implements key-based localization using the current owner root only. It reads `locales/<locale>.lua`, where `<locale>` comes from `FKST_OUTPUT_LANG`, and falls back to `locales/en.lua` when the requested locale or key is missing. `vars` is an optional table of scalar values interpolated into `{name}` placeholders. Catalogs are plain flat Lua tables with stable string keys and literal UTF-8 string values; they are package content, not engine policy.
+
+`locales/*.lua` is the sanctioned home for non-English prose literals. Source files outside `locales/` still follow the English-source rule. Machine protocol tokens, marker names, verdict sentinels and AI provenance sentinels are code, not prose; they must not appear in catalog keys or values. Conformance checks catalog completeness against `en`, rejects decode-helper-hidden literals in `locales/`, and rejects machine tokens in catalogs.
 
 `truncate_utf8(s, max_bytes)` returns the longest prefix of `s` that is at most `max_bytes` bytes and ends on a UTF-8 character boundary, matching Rust `str::floor_char_boundary` semantics. It never emits a partial sequence; `max_bytes >= #s` returns `s` unchanged; `max_bytes` smaller than the first character returns the empty string; negative `max_bytes` is an argument error; invalid UTF-8 input is an argument error. This is the blessed replacement for package-side byte truncation.
 
@@ -204,12 +213,15 @@ fkst-framework init-package-repo [--ref <substrate-ref>] [--force]
 ```text
 runtime-layout
 project-layout
+locale-catalogs
 graph-scan
 department-non-empty
 schema-validation
 ```
 
 `graph-scan` 会执行 package root / host root 扫描、`package.lua` removed surface 拒绝、`M.spec` unknown fields 拒绝、`retry` 解析、namespace 解析、queue 归一化和 owner-scoped `package.path`。每个 graph root 用 fresh Lua state，package owner 只看自己的 root；host owner 可看 host + packages；`--package-root` 不是跨包 `require` 授权。
+
+`locale-catalogs` validates each graph root's `locales/` directory when present. It requires `en.lua` as the reference if any locale catalog exists, requires every non-`en` catalog to cover all `en` keys, and rejects decode-helper-hidden literals or machine protocol tokens in catalogs.
 
 `schema-validation` 会检查 queue capacity、raiser / department queue 引用、Department lua 文件存在、`ephemeral` 必须属于 `consumes`、`stall_window` 后缀、`retry` 数值与 duration、孤立 queue、多消费者 fanout、同 Department consume+produce 同 queue 必须 fanout，以及“只消费 ephemeral queue 的 Department 不能 produce 到 reliable downstream”这一 reliable `source_ref` 传播规则。
 
@@ -244,6 +256,8 @@ schema-validation
 | reliable retry / lease / fencing / DLQ | engine delivery store / consumer |
 | `once` / `cache` / `with_lock` runtime key 是相对可读 path | engine `validate_runtime_key` |
 | `json` decode-only | engine SDK registration / self-test |
+| `t(key[, vars])` owner-root locale catalog lookup and `en` fallback | engine SDK registration / self-test / Rust tests |
+| `locales/*.lua` completeness, no decode-helper-hidden literals, no machine tokens | engine conformance `locale-catalogs` |
 | `fkst.test.*` 不泄漏到 production | engine test-mode registration + Rust tests |
 | machine test inventory 只能来自 `--report-json` 的 `fkst.test.report.v1` | engine test runner |
 | stdout `PASS` lines 不作为 authoritative inventory | doctrine + test runner contract |

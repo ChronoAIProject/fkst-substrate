@@ -149,6 +149,7 @@ M.spec = {
   consumes = { "tick" },
   produces = { "consensus.proposal" },
 }
+
 function pipeline(event)
   raise("consensus.proposal", { source = event.payload.value })
 end
@@ -177,6 +178,53 @@ return M
     let raises = raised_entries(&output);
     assert_eq!(raises[0]["queue"], "consensus.proposal");
     assert_eq!(raises[0]["payload"]["source"], "ok");
+}
+
+#[test]
+fn production_run_resolves_owner_locale_catalog() {
+    let temp = tempfile::tempdir().unwrap();
+    let host = temp.path().join("host");
+    let owner = temp.path().join("github-devloop");
+    fs::create_dir_all(owner.join("departments/probe")).unwrap();
+    fs::create_dir_all(owner.join("locales")).unwrap();
+    fs::create_dir_all(&host).unwrap();
+    fs::write(
+        owner.join("locales/en.lua"),
+        r#"return { ["result.summary"] = "Hello {name}" }"#,
+    )
+    .unwrap();
+    fs::write(
+        owner.join("locales/zh-CN.lua"),
+        r#"return { ["result.summary"] = "你好 {name}" }"#,
+    )
+    .unwrap();
+    let probe = owner.join("departments/probe/main.lua");
+    fs::write(
+        &probe,
+        r#"
+function pipeline(event)
+  raise("checked", { message = t("result.summary", { name = event.payload.value }) })
+end
+"#,
+    )
+    .unwrap();
+
+    let output = run_command(&host, &probe)
+        .arg("--package-root")
+        .arg(&owner)
+        .env("FKST_OUTPUT_LANG", "zh-CN")
+        .output()
+        .unwrap();
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stdout: {}\nstderr: {}",
+        stdout(&output),
+        stderr(&output)
+    );
+    let raises = raised_entries(&output);
+    assert_eq!(raises[0]["payload"]["message"], "你好 ok");
 }
 
 #[test]

@@ -135,7 +135,8 @@ pub fn load_roots(roots: &PackageRoots) -> Result<Config> {
 
     for graph_root in &graph_roots {
         let lua = Lua::new();
-        register_spec_eval_pure_primitives(&lua).context("register graph-scan pure primitives")?;
+        register_spec_eval_pure_primitives(&lua, &graph_root.root)
+            .context("register graph-scan pure primitives")?;
         let require_roots = roots.require_roots_for_owner(&graph_root.root);
         scan_departments(
             &lua,
@@ -172,8 +173,10 @@ fn reject_removed_surfaces(graph_root: &GraphRoot) -> Result<()> {
     Ok(())
 }
 
-fn register_spec_eval_pure_primitives(lua: &Lua) -> mlua::Result<()> {
-    crate::sdk_strings::register_truncate_utf8(lua)
+fn register_spec_eval_pure_primitives(lua: &Lua, owner_root: &Path) -> mlua::Result<()> {
+    crate::sdk_strings::register_truncate_utf8(lua)?;
+    crate::sdk_i18n::register(lua, owner_root)?;
+    Ok(())
 }
 
 fn scan_departments(
