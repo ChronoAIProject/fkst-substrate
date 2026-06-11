@@ -3,6 +3,7 @@
 use super::delivery_store::DeliveryStore;
 use super::delivery_types::{DeliveryRecord, SourceKind, SourceRef};
 use super::event_fanout::Fanout;
+use super::failure_fact::{FAILURE_FACT_QUEUE, FAILURE_FACT_SCHEMA};
 use anyhow::{anyhow, bail, Context, Result};
 use fkst_common::config::Config;
 use fkst_common::validate_runtime_key;
@@ -128,6 +129,31 @@ impl DeliveryRouter {
         Ok(())
     }
 
+    pub(crate) fn publish_failure_fact(&self, event: Event) -> Result<()> {
+        if event.queue != FAILURE_FACT_QUEUE {
+            bail!("failure fact queue must be `{}`", FAILURE_FACT_QUEUE);
+        }
+        let Some(subscribers) = self.subscriptions.get(FAILURE_FACT_QUEUE) else {
+            return Ok(());
+        };
+        if subscribers.is_empty() {
+            return Ok(());
+        }
+        let source = failure_fact_source(&event);
+        self.publish(PublishEnvelope {
+            event,
+            source: Some(source),
+            cron_payload: None,
+            derived: None,
+        })
+    }
+
+    pub(crate) fn failure_fact_publisher(&self) -> FailureFactPublisher {
+        FailureFactPublisher {
+            router: self.clone(),
+        }
+    }
+
     pub(crate) fn notify_reliable_public(&self, dept: &str) {
         self.notify_reliable(dept);
     }
@@ -147,6 +173,29 @@ impl DeliveryRouter {
         if let Err(err) = wake.try_send(()) {
             warn!(dept = %dept, error = %err, "reliable wake notify failed");
         }
+    }
+}
+
+fn failure_fact_source(event: &Event) -> SourceRef {
+    let fingerprint = event
+        .payload
+        .get("fingerprint")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("unknown");
+    SourceRef {
+        kind: SourceKind::External,
+        reference: format!("{FAILURE_FACT_SCHEMA}/{fingerprint}/{}", event.ts),
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct FailureFactPublisher {
+    router: DeliveryRouter,
+}
+
+impl FailureFactPublisher {
+    pub(crate) fn publish(&self, event: Event) -> Result<()> {
+        self.router.publish_failure_fact(event)
     }
 }
 

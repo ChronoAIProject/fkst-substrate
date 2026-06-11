@@ -240,6 +240,30 @@ return M
 }
 
 #[test]
+fn graph_scan_accepts_engine_failure_fact_queue() {
+    let dir = write_repo(
+        &[(
+            "triage",
+            r#"
+local M = {}
+M.spec = { consumes = {"fkst.failure_fact"}, ephemeral = {"fkst.failure_fact"}, stall_window = "30s", retry = false }
+function pipeline(_) end
+return M
+"#,
+        )],
+        &[],
+    );
+
+    let cfg = load(dir.path()).unwrap();
+
+    assert!(cfg.queue.contains_key("fkst.failure_fact"));
+    assert_eq!(
+        cfg.department.get("triage").unwrap().consumes,
+        vec!["fkst.failure_fact"]
+    );
+}
+
+#[test]
 fn graph_scan_spec_eval_exposes_truncate_utf8() {
     let dir = write_repo(
         &[(
@@ -265,6 +289,29 @@ return M
         RaiserDecl::Cron { produces, .. } => assert_eq!(produces, "tick"),
         _ => panic!("expected Cron"),
     }
+}
+
+#[test]
+fn graph_scan_rejects_department_producing_engine_failure_fact_queue() {
+    let dir = write_repo(
+        &[(
+            "forger",
+            r#"
+local M = {}
+M.spec = { produces = {"fkst.failure_fact"}, stall_window = "30s" }
+function pipeline(_) end
+return M
+"#,
+        )],
+        &[],
+    );
+
+    let err = load(dir.path()).unwrap_err();
+
+    assert!(
+        err.to_string().contains("resolve `forger.spec.produces`"),
+        "got: {err:#}"
+    );
 }
 
 #[test]

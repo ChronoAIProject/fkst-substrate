@@ -20,11 +20,15 @@ target/debug/fkst-framework test \
 
 引擎操作配置由 `crates/fkst-framework/src/config_registry.rs` 中的静态 typed registry 声明。读取优先级固定为 process env → host `fkst.env` → operational 默认；HostFact 缺失 fail-closed。registry 只读，没有 set/apply/watch、YAML/DSL/manifest/plugin 或 per-key `tunables/*.txt` 兼容层。
 
-5 个 knob:
+9 个 knob:
 
 - Operational: `FKST_QUEUE_CAPACITY` 默认 `16`
 - Operational: `FKST_DEPARTMENT_DEFAULT_STALL_WINDOW` 默认 `30s`，作为 Department delivery lease window
 - Operational: `FKST_CODEX_PERMIT_SLOTS` 默认 `20`
+- Operational: `FKST_RATE_POOL_ROOT` 默认 `~/.fkst/rate-pools`
+- Operational: `FKST_RETRY_DEFAULT_MAX_ATTEMPTS` 默认 `5`
+- Operational: `FKST_RETRY_DEFAULT_BASE` 默认 `60s`
+- Operational: `FKST_RETRY_DEFAULT_CAP` 默认 `30m`
 - HostFact: `FKST_CANDIDATE_PREFIX` 必填
 - HostFact: `FKST_CANDIDATE_FROM_SEP` 必填
 
@@ -43,6 +47,18 @@ target/debug/fkst-framework config \
 The command is idempotent: identical files are reported as `UNCHANGED`; missing files are created; local edits to owned template files are refused by default and require `--force` to overwrite. `.gitignore` is append-only for the scaffold entries. The command does not touch `packages/`, git history or remotes.
 
 With no `--ref`, the scaffold pins the running engine binary's build-time source revision. Operators can pass `--ref <substrate-ref>` when they need an explicit release tag or commit.
+
+## 边界资源
+
+边界资源遵循 capability security 的 no ambient authority 模型：engine 能触达的外部资源必须先进入静态 registry，并通过 adapter grant、meter、budget/backpressure 与 typed error contract 访问。当前 registry 由 `crates/fkst-framework/src/boundary_resource.rs` 定义，覆盖 `codex.process`、`shell.process`、`git.process`、`runtime.filesystem` 与 `wall-clock`。
+
+只读自省:
+
+```sh
+target/debug/fkst-framework boundary-resources
+```
+
+`exec_sync`、`spawn_codex_sync` 与 `spawn_codex` 在可分类的边界失败结果中返回 `error_class`，取值为 `quota-exhausted`、`auth-degraded`、`provider-unavailable` 或 `provider-throttle`。该字段是 adapter 层事实；调用方不得通过 stderr 字符串猜测配额、身份或 provider 状态。
 
 ## 独立运行
 
