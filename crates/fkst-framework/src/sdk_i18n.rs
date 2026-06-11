@@ -152,6 +152,20 @@ fn requested_locale() -> String {
         .ok()
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
+        .filter(|value| {
+            if validate_locale_name(value).is_ok() {
+                true
+            } else {
+                crate::sdk_log::emit(
+                    "warn",
+                    &format!(
+                        "i18n fallback=invalid_locale requested={} fallback={}",
+                        value, REFERENCE_LOCALE
+                    ),
+                );
+                false
+            }
+        })
         .unwrap_or_else(|| REFERENCE_LOCALE.to_string())
 }
 
@@ -417,6 +431,20 @@ mod tests {
         write_catalog(dir.path(), "en", r#"return { answer = "Answer" }"#);
         write_catalog(dir.path(), "zh", r#"return { other = "其它" }"#);
         let _env = EnvGuard::set_output_lang("zh");
+        let lua = Lua::new();
+        register(&lua, dir.path()).unwrap();
+
+        let value: String = lua.load(r#"return t("answer")"#).eval().unwrap();
+
+        assert_eq!(value, "Answer");
+    }
+
+    #[test]
+    fn t_rejects_output_lang_path_traversal_and_falls_back_to_en() {
+        let dir = TempDir::new().unwrap();
+        write_catalog(dir.path(), "en", r#"return { answer = "Answer" }"#);
+        std::fs::write(dir.path().join("core.lua"), r#"return { answer = "Pwned" }"#).unwrap();
+        let _env = EnvGuard::set_output_lang("../core");
         let lua = Lua::new();
         register(&lua, dir.path()).unwrap();
 
