@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use crate::config_registry::{ConfigContext, ConfigKey};
+use crate::config_registry::{ConfigContext, ConfigKey, ConfigKind};
 
 const ENV_PREFIX: &str = "FKST_RATE_POOL_";
 const ROOT_ENV: &str = "FKST_RATE_POOL_ROOT";
@@ -70,14 +70,59 @@ impl Sleeper for ThreadSleeper {
 
 impl RatePoolRegistry {
     pub(crate) fn from_config(config: &ConfigContext) -> Result<Self> {
-        let root = expand_home(&config.resolved_string(ConfigKey::RatePoolRoot)?)?;
         let pools = parse_pool_definitions(config.rate_pool_env())?;
+        let root = canonicalize_configured_root(
+            expand_home(&config.resolved_string(ConfigKey::RatePoolRoot)?)?,
+            pools.is_empty(),
+        )?;
+        Ok(Self { root, pools })
+    }
+
+    pub(crate) fn from_env() -> Result<Self> {
+        let root = match std::env::var(ROOT_ENV) {
+            Ok(value) if !value.trim().is_empty() => expand_home(value.trim())?,
+            Ok(_) | Err(std::env::VarError::NotPresent) => {
+                let ConfigKind::Operational { default } =
+                    crate::config_registry::entry(ConfigKey::RatePoolRoot).kind
+                else {
+                    bail!("{ROOT_ENV} has no operational default");
+                };
+                expand_home(default)?
+            }
+            Err(std::env::VarError::NotUnicode(_)) => bail!("{ROOT_ENV} must be valid UTF-8"),
+        };
+        let mut values = BTreeMap::new();
+        for (key, value) in std::env::vars_os() {
+            let Some(key) = key.to_str() else {
+                continue;
+            };
+            if key.starts_with(ENV_PREFIX) && key != ROOT_ENV {
+                let Some(value) = value.to_str() else {
+                    bail!("{key} must be valid UTF-8");
+                };
+                values.insert(key.to_string(), value.to_string());
+            }
+        }
+        let pools = parse_pool_definitions(values)?;
+        let root = canonicalize_configured_root(root, pools.is_empty())?;
         Ok(Self { root, pools })
     }
 
     #[cfg(test)]
     pub(crate) fn for_test(root: PathBuf, pools: BTreeMap<String, RatePoolConfig>) -> Self {
         Self { root, pools }
+    }
+
+    pub(crate) fn root(&self) -> &Path {
+        &self.root
+    }
+
+    pub(crate) fn pools(&self) -> &BTreeMap<String, RatePoolConfig> {
+        &self.pools
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.pools.is_empty()
     }
 
     pub(crate) fn acquire_for_program(&self, program: &str) -> Result<bool> {
@@ -94,11 +139,18 @@ impl RatePoolRegistry {
         self.acquire_for_program(&program)
     }
 
-    fn acquire_for_name(&self, name: &str) -> Result<bool> {
-        let Some(config) = self.pools.get(name) else {
+    pub(crate) fn acquire_for_name(&self, name: &str) -> Result<bool> {
+        let normalized = name.to_ascii_lowercase();
+        let Some(config) = self.pools.get(&normalized) else {
             return Ok(false);
         };
-        acquire_token(&self.root, name, config, &SystemClock, &ThreadSleeper)?;
+        acquire_token(
+            &self.root,
+            &normalized,
+            config,
+            &SystemClock,
+            &ThreadSleeper,
+        )?;
         Ok(true)
     }
 }
@@ -168,6 +220,16 @@ fn expand_home(raw: &str) -> Result<PathBuf> {
     } else {
         Ok(PathBuf::from(raw))
     }
+}
+
+fn canonicalize_configured_root(root: PathBuf, empty: bool) -> Result<PathBuf> {
+    if empty {
+        return Ok(root);
+    }
+    std::fs::create_dir_all(&root)
+        .with_context(|| format!("create rate pool root {}", root.display()))?;
+    root.canonicalize()
+        .with_context(|| format!("canonicalize rate pool root {}", root.display()))
 }
 
 fn pool_name_for_program(program: &str) -> Option<String> {
