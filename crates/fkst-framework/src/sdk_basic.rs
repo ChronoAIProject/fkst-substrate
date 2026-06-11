@@ -356,6 +356,11 @@ mod tests {
             std::fs::set_permissions(&gh, perms).unwrap();
         }
         let rate_pools = registry(dir.path(), "gh");
+        std::fs::write(
+            dir.path().join("gh.bucket"),
+            "updated_nanos=0\ntokens=1\nremainder_nanos=0\n",
+        )
+        .unwrap();
         let out = run_exec_sync(
             ExecOptions {
                 cmd: "gh --version".to_string(),
@@ -370,6 +375,43 @@ mod tests {
 
         assert_eq!(out.stdout, "gh-ok");
         assert!(dir.path().join("gh.bucket").is_file());
+    }
+
+    #[test]
+    fn exec_sync_matches_program_basename_case_insensitively() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        let gh = bin.join("GH");
+        std::fs::write(&gh, "#!/bin/sh\nprintf gh-ok\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&gh).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&gh, perms).unwrap();
+        }
+        std::fs::write(
+            dir.path().join("gh.bucket"),
+            "updated_nanos=0\ntokens=1\nremainder_nanos=0\n",
+        )
+        .unwrap();
+        let rate_pools = registry(dir.path(), "gh");
+        let out = run_exec_sync(
+            ExecOptions {
+                cmd: format!("{} --version", gh.display()),
+                cwd: None,
+                env: Vec::new(),
+                timeout: None,
+            },
+            None,
+            &rate_pools,
+        )
+        .unwrap();
+
+        assert_eq!(out.stdout, "gh-ok");
+        let ledger = std::fs::read_to_string(dir.path().join("gh.bucket")).unwrap();
+        assert!(ledger.contains("tokens=0\n"), "{ledger}");
     }
 
     #[test]

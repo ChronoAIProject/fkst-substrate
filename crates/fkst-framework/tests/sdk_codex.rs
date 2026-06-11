@@ -346,6 +346,42 @@ printf 'ok'
 
 #[cfg(unix)]
 #[test]
+fn spawn_codex_sync_bypasses_named_rate_pool() {
+    let tmp = tempfile::tempdir().unwrap();
+    let bin_dir = tmp.path().join("bin");
+    let pool_root = tmp.path().join("rate-pools");
+    install_codex_script(
+        &bin_dir,
+        r#"#!/bin/sh
+cat >/dev/null
+printf 'codex-ok'
+"#,
+    );
+
+    let mut sandbox = ProcessSandbox::new();
+    sandbox.enter_cwd(tmp.path()).runtime_root(".fkst/runtime");
+    sandbox.prepend_path(&bin_dir);
+    sandbox.runtime_log_dir(tmp.path().join("runtime"));
+    sandbox.set_env("FKST_RATE_POOL_ROOT", pool_root.as_os_str().to_owned());
+    sandbox.set_env("FKST_RATE_POOL_CODEX", "1,1");
+    let (_lock, _guard) = sandbox.enter();
+
+    let lua = Lua::new();
+    register(&lua).unwrap();
+    let spawn: mlua::Function = lua.globals().get("spawn_codex_sync").unwrap();
+    let result: Table = spawn.call(lua_opts(&lua, "bypass")).unwrap();
+
+    assert_eq!(result.get::<i64>("exit_code").unwrap(), 0);
+    assert_eq!(result.get::<String>("stdout").unwrap(), "codex-ok");
+    assert!(!pool_root.join("codex.bucket").exists());
+    assert!(tmp
+        .path()
+        .join(".fkst/runtime/codex-permits/permit-0")
+        .exists());
+}
+
+#[cfg(unix)]
+#[test]
 fn spawn_codex_sync_returns_visible_spawn_error() {
     let tmp = tempfile::tempdir().unwrap();
     let bin_dir = tmp.path().join("empty-bin");

@@ -158,7 +158,7 @@ package source tree 在运行期承载代码、fixture 和 asset，不承载“�
 
 ### 6.1 Host command rate pools
 
-Named rate pools are host posture env facts for external command pressure, not package API. A host may set `FKST_RATE_POOL_<NAME>=<burst>,<refill_per_minute>` such as `FKST_RATE_POOL_GH=50,50`; when a real external command's program basename matches `<NAME>` case-insensitively, the engine acquires one token before spawning it. `exec_sync("gh ...")`, git SDK calls, and Codex subprocess calls go through this adapter; `fkst.test.mock_command` bypasses the pool and does not consume tokens.
+Named rate pools are host posture env facts for external command pressure, not package API. A host may set `FKST_RATE_POOL_<NAME>=<burst>,<refill_per_minute>` such as `FKST_RATE_POOL_GH=50,50`; when a real external command's program basename matches `<NAME>` case-insensitively, the engine acquires one token before spawning it. `exec_sync("gh ...")` and git SDK calls go through this adapter; Codex subprocesses keep only the existing `codex-permits` fcntl pool. `fkst.test.mock_command` bypasses rate pools and does not consume tokens.
 
 Pool ledgers live under `FKST_RATE_POOL_ROOT`, default `~/.fkst/rate-pools`. This root is deliberately outside `FKST_RUNTIME_ROOT` so independent `supervise` instances on the same host share one command posture. Invalid pool definitions fail closed at startup/config parsing. Packages must not depend on ledger file contents as business facts.
 

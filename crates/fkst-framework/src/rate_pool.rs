@@ -8,7 +8,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use nix::fcntl::{flock, FlockArg};
 use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{Read, Write};
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::thread;
@@ -37,7 +37,7 @@ pub(crate) struct RatePoolRegistry {
 #[derive(Clone, Copy, Debug)]
 struct BucketState {
     tokens: u64,
-    remainder_nanos: u128,
+    remainder_numerator: u128,
     updated_nanos: u128,
 }
 
@@ -233,29 +233,42 @@ fn acquire_token(
     sleeper: &impl Sleeper,
 ) -> Result<()> {
     std::fs::create_dir_all(root).with_context(|| format!("create {}", root.display()))?;
-    let path = root.join(format!("{name}.bucket"));
     let mut wait = INITIAL_WAIT;
     loop {
-        let mut file = open_ledger(&path)?;
-        flock(file.as_raw_fd(), FlockArg::LockExclusive)
-            .with_context(|| format!("lock {}", path.display()))?;
-        let now = clock.now_nanos();
-        let mut state = read_state(&mut file, now, config)?;
-        state = refill(state, config, now);
-        if state.tokens > 0 {
-            state.tokens -= 1;
-            write_state(&mut file, state)?;
+        if try_acquire_token(root, name, config, clock)? {
             return Ok(());
         }
-        write_state(&mut file, state)?;
-        drop(file);
-
         sleeper.sleep(wait);
         wait = (wait * 2).min(MAX_WAIT);
     }
 }
 
-fn open_ledger(path: &Path) -> Result<File> {
+fn try_acquire_token(
+    root: &Path,
+    name: &str,
+    config: &RatePoolConfig,
+    clock: &impl Clock,
+) -> Result<bool> {
+    std::fs::create_dir_all(root).with_context(|| format!("create {}", root.display()))?;
+    let ledger_path = root.join(format!("{name}.bucket"));
+    let lock_path = root.join(format!("{name}.lock"));
+    let lock = open_lock(&lock_path)?;
+    flock(lock.as_raw_fd(), FlockArg::LockExclusive)
+        .with_context(|| format!("lock {}", lock_path.display()))?;
+    let now = clock.now_nanos();
+    let mut state = read_state(&ledger_path, now, config);
+    state = refill(state, config, now);
+    let admitted = if state.tokens > 0 {
+        state.tokens -= 1;
+        true
+    } else {
+        false
+    };
+    write_state(&ledger_path, state)?;
+    Ok(admitted)
+}
+
+fn open_lock(path: &Path) -> Result<File> {
     OpenOptions::new()
         .create(true)
         .truncate(false)
@@ -265,26 +278,37 @@ fn open_ledger(path: &Path) -> Result<File> {
         .with_context(|| format!("open {}", path.display()))
 }
 
-fn read_state(file: &mut File, now_nanos: u128, config: &RatePoolConfig) -> Result<BucketState> {
-    file.seek(SeekFrom::Start(0))?;
+fn empty_state(now_nanos: u128) -> BucketState {
+    BucketState {
+        tokens: 0,
+        remainder_numerator: 0,
+        updated_nanos: now_nanos,
+    }
+}
+
+fn read_state(path: &Path, now_nanos: u128, config: &RatePoolConfig) -> BucketState {
+    let Ok(mut file) = File::open(path) else {
+        return empty_state(now_nanos);
+    };
     let mut content = String::new();
-    file.read_to_string(&mut content)?;
+    if file.read_to_string(&mut content).is_err() {
+        return empty_state(now_nanos);
+    }
     if content.trim().is_empty() {
-        return Ok(BucketState {
-            tokens: config.burst,
-            remainder_nanos: 0,
-            updated_nanos: now_nanos,
-        });
+        return empty_state(now_nanos);
     }
     let mut lines = content.lines();
-    let updated_nanos = parse_state_field(lines.next(), "updated_nanos")?;
-    let tokens = parse_state_field(lines.next(), "tokens")?;
-    let remainder_nanos = parse_state_field(lines.next(), "remainder_nanos")?;
-    Ok(BucketState {
-        tokens,
-        remainder_nanos,
-        updated_nanos,
-    })
+    let parsed = (|| -> Result<BucketState> {
+        let updated_nanos = parse_state_field(lines.next(), "updated_nanos")?;
+        let tokens: u64 = parse_state_field(lines.next(), "tokens")?;
+        let remainder_numerator: u128 = parse_state_field(lines.next(), "remainder_nanos")?;
+        Ok(BucketState {
+            tokens: tokens.min(config.burst),
+            remainder_numerator,
+            updated_nanos,
+        })
+    })();
+    parsed.unwrap_or_else(|_| empty_state(now_nanos))
 }
 
 fn parse_state_field<T>(line: Option<&str>, label: &str) -> Result<T>
@@ -304,39 +328,109 @@ where
         .with_context(|| format!("parse rate pool ledger {label}"))
 }
 
-fn write_state(file: &mut File, state: BucketState) -> Result<()> {
-    file.seek(SeekFrom::Start(0))?;
-    file.set_len(0)?;
-    write!(
-        file,
-        "updated_nanos={}\ntokens={}\nremainder_nanos={}\n",
-        state.updated_nanos, state.tokens, state.remainder_nanos
-    )?;
-    file.sync_all()?;
+fn write_state(path: &Path, state: BucketState) -> Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow!("rate pool ledger '{}' has no parent", path.display()))?;
+    std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+    let temp_path = parent.join(format!(
+        ".{}.tmp-{}-{}",
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("bucket"),
+        std::process::id(),
+        ulid::Ulid::new()
+    ));
+    {
+        let mut file = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&temp_path)
+            .with_context(|| format!("create {}", temp_path.display()))?;
+        write!(
+            file,
+            "updated_nanos={}\ntokens={}\nremainder_nanos={}\n",
+            state.updated_nanos, state.tokens, state.remainder_numerator
+        )?;
+        file.sync_all()
+            .with_context(|| format!("sync {}", temp_path.display()))?;
+    }
+    std::fs::rename(&temp_path, path)
+        .with_context(|| format!("rename {} to {}", temp_path.display(), path.display()))?;
+    let dir = File::open(parent).with_context(|| format!("open {}", parent.display()))?;
+    dir.sync_all()
+        .with_context(|| format!("sync {}", parent.display()))?;
     Ok(())
 }
 
+#[cfg(test)]
+fn seed_state(path: &Path, state: BucketState) -> Result<()> {
+    write_state(path, state)
+}
+
+#[cfg(test)]
+fn ledger_body(path: &Path) -> Result<String> {
+    let mut body = String::new();
+    File::open(path)
+        .with_context(|| format!("open {}", path.display()))?
+        .read_to_string(&mut body)
+        .with_context(|| format!("read {}", path.display()))?;
+    Ok(body)
+}
+
+#[cfg(test)]
+fn parse_tokens(body: &str) -> u64 {
+    body.lines()
+        .find_map(|line| line.strip_prefix("tokens="))
+        .expect("ledger must contain tokens")
+        .parse::<u64>()
+        .expect("tokens must parse")
+}
+
+#[cfg(test)]
+fn parse_remainder(body: &str) -> u128 {
+    body.lines()
+        .find_map(|line| line.strip_prefix("remainder_nanos="))
+        .expect("ledger must contain remainder")
+        .parse::<u128>()
+        .expect("remainder must parse")
+}
+
+#[cfg(test)]
+fn parse_updated(body: &str) -> u128 {
+    body.lines()
+        .find_map(|line| line.strip_prefix("updated_nanos="))
+        .expect("ledger must contain updated_nanos")
+        .parse::<u128>()
+        .expect("updated_nanos must parse")
+}
+
 fn refill(mut state: BucketState, config: &RatePoolConfig, now_nanos: u128) -> BucketState {
-    if now_nanos <= state.updated_nanos {
+    if now_nanos < state.updated_nanos {
+        state.updated_nanos = now_nanos;
+        return state;
+    }
+    if now_nanos == state.updated_nanos {
         return state;
     }
     if state.tokens >= config.burst {
         state.tokens = config.burst;
-        state.remainder_nanos = 0;
+        state.remainder_numerator = 0;
         state.updated_nanos = now_nanos;
         return state;
     }
 
     let elapsed = now_nanos - state.updated_nanos;
-    let available_nanos = elapsed.saturating_add(state.remainder_nanos);
-    let produced_numerator = available_nanos.saturating_mul(config.refill_per_minute as u128);
+    let produced_numerator = elapsed
+        .saturating_mul(config.refill_per_minute as u128)
+        .saturating_add(state.remainder_numerator);
     let produced = produced_numerator / NANOS_PER_MINUTE;
-    state.remainder_nanos = available_nanos % NANOS_PER_MINUTE;
+    state.remainder_numerator = produced_numerator % NANOS_PER_MINUTE;
     if produced > 0 {
         let produced = produced.min(u64::MAX as u128) as u64;
         state.tokens = state.tokens.saturating_add(produced).min(config.burst);
         if state.tokens >= config.burst {
-            state.remainder_nanos = 0;
+            state.remainder_numerator = 0;
         }
     }
     state.updated_nanos = now_nanos;
@@ -346,6 +440,7 @@ fn refill(mut state: BucketState, config: &RatePoolConfig, now_nanos: u128) -> B
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::process::Command;
     use std::sync::{
         atomic::{AtomicUsize, Ordering},
         Arc, Barrier, Mutex,
@@ -393,8 +488,35 @@ mod tests {
         }
     }
 
+    fn state(tokens: u64, remainder_numerator: u128, updated_nanos: u128) -> BucketState {
+        BucketState {
+            tokens,
+            remainder_numerator,
+            updated_nanos,
+        }
+    }
+
+    fn run_process_child_if_requested() {
+        if std::env::var_os("FKST_RATE_POOL_CHILD_ACQUIRE").is_none() {
+            return;
+        }
+        let root = PathBuf::from(std::env::var_os("FKST_RATE_POOL_CHILD_ROOT").unwrap());
+        let admitted = try_acquire_token(
+            &root,
+            "gh",
+            &RatePoolConfig {
+                burst: 2,
+                refill_per_minute: 60,
+            },
+            &ManualClock::new(0),
+        )
+        .unwrap();
+        std::process::exit(if admitted { 0 } else { 3 });
+    }
+
     #[test]
     fn parse_pool_definitions_fails_closed_on_invalid_format() {
+        run_process_child_if_requested();
         let err = parse_pool_definitions(BTreeMap::from([(
             "FKST_RATE_POOL_GH".to_string(),
             "50".to_string(),
@@ -404,30 +526,46 @@ mod tests {
     }
 
     #[test]
-    fn refill_math_respects_boundaries_and_burst_cap() {
+    fn refill_math_tracks_numerator_remainder_exactly() {
+        run_process_child_if_requested();
+        let config = RatePoolConfig {
+            burst: 3,
+            refill_per_minute: 120,
+        };
+        let state = refill(state(0, 0, 0), &config, 500_000_000);
+        assert_eq!(state.tokens, 1);
+        assert_eq!(state.remainder_numerator, 0);
+        assert_eq!(state.updated_nanos, 500_000_000);
+
+        let state = refill(state, &config, 1_000_000_000);
+        assert_eq!(state.tokens, 2);
+        assert_eq!(state.remainder_numerator, 0);
+        assert_eq!(state.updated_nanos, 1_000_000_000);
+    }
+
+    #[test]
+    fn refill_math_does_not_mint_bonus_token_after_exact_boundary() {
+        run_process_child_if_requested();
         let config = RatePoolConfig {
             burst: 3,
             refill_per_minute: 6,
         };
-        let state = BucketState {
-            tokens: 0,
-            remainder_nanos: 0,
-            updated_nanos: 0,
-        };
-        let state = refill(state, &config, 9_999_999_999);
+        let state = refill(state(0, 0, 0), &config, 9_999_999_999);
         assert_eq!(state.tokens, 0);
-        assert!(state.remainder_nanos > 0);
+        assert_eq!(state.remainder_numerator, 59_999_999_994);
 
         let state = refill(state, &config, 10_000_000_000);
         assert_eq!(state.tokens, 1);
+        assert_eq!(state.remainder_numerator, 0);
 
-        let state = refill(state, &config, 70_000_000_000);
-        assert_eq!(state.tokens, 3);
-        assert_eq!(state.remainder_nanos, 0);
+        let state = refill(BucketState { tokens: 0, ..state }, &config, 10_000_000_001);
+        assert_eq!(state.tokens, 0);
+        assert_eq!(state.remainder_numerator, 6);
     }
 
     #[test]
     fn acquire_blocks_until_refill_without_wall_clock_sleep() {
+        run_process_child_if_requested();
         let tmp = tempfile::tempdir().unwrap();
         let config = RatePoolConfig {
             burst: 1,
@@ -435,6 +573,7 @@ mod tests {
         };
         let clock = Arc::new(ManualClock::new(0));
         let sleeper = AdvancingSleeper::new(clock.clone(), Duration::from_secs(1));
+        seed_state(&tmp.path().join("gh.bucket"), state(1, 0, 0)).unwrap();
 
         acquire_token(tmp.path(), "gh", &config, clock.as_ref(), &sleeper).unwrap();
         assert_eq!(sleeper.sleeps.load(Ordering::SeqCst), 0);
@@ -444,50 +583,115 @@ mod tests {
     }
 
     #[test]
-    fn concurrent_acquire_serializes_through_locked_ledger() {
+    fn unreadable_or_corrupt_ledger_is_empty_not_burst() {
+        run_process_child_if_requested();
         let tmp = tempfile::tempdir().unwrap();
         let config = RatePoolConfig {
             burst: 2,
-            refill_per_minute: 120,
+            refill_per_minute: 60,
         };
-        let clock = Arc::new(ManualClock::new(0));
-        let sleeper = Arc::new(AdvancingSleeper::new(clock.clone(), Duration::from_secs(1)));
-        let barrier = Arc::new(Barrier::new(4));
+        let clock = ManualClock::new(0);
+        std::fs::write(tmp.path().join("gh.bucket"), "not a ledger\n").unwrap();
 
-        let handles = (0..4)
+        assert!(!try_acquire_token(tmp.path(), "gh", &config, &clock).unwrap());
+        let body = ledger_body(&tmp.path().join("gh.bucket")).unwrap();
+        assert_eq!(parse_tokens(&body), 0);
+        assert_eq!(parse_remainder(&body), 0);
+        assert_eq!(parse_updated(&body), 0);
+    }
+
+    #[test]
+    fn backwards_clock_clamps_updated_without_stalling_future_refill() {
+        run_process_child_if_requested();
+        let config = RatePoolConfig {
+            burst: 2,
+            refill_per_minute: 60,
+        };
+        let state = refill(state(0, 0, 2_000_000_000), &config, 500_000_000);
+        assert_eq!(state.tokens, 0);
+        assert_eq!(state.remainder_numerator, 0);
+        assert_eq!(state.updated_nanos, 500_000_000);
+
+        let state = refill(state, &config, 1_500_000_000);
+        assert_eq!(state.tokens, 1);
+        assert_eq!(state.remainder_numerator, 0);
+    }
+
+    #[test]
+    fn concurrent_try_acquire_admits_exact_seeded_token_count() {
+        run_process_child_if_requested();
+        let tmp = tempfile::tempdir().unwrap();
+        let config = RatePoolConfig {
+            burst: 2,
+            refill_per_minute: 60,
+        };
+        seed_state(&tmp.path().join("gh.bucket"), state(2, 0, 0)).unwrap();
+        let clock = Arc::new(ManualClock::new(0));
+        let barrier = Arc::new(Barrier::new(9));
+        let admitted = Arc::new(AtomicUsize::new(0));
+
+        let handles = (0..8)
             .map(|_| {
                 let root = tmp.path().to_path_buf();
                 let config = config.clone();
                 let clock = clock.clone();
-                let sleeper = sleeper.clone();
                 let barrier = barrier.clone();
+                let admitted = admitted.clone();
                 thread::spawn(move || {
                     barrier.wait();
-                    acquire_token(&root, "gh", &config, clock.as_ref(), sleeper.as_ref()).unwrap();
+                    if try_acquire_token(&root, "gh", &config, clock.as_ref()).unwrap() {
+                        admitted.fetch_add(1, Ordering::SeqCst);
+                    }
                 })
             })
             .collect::<Vec<_>>();
 
+        barrier.wait();
         for handle in handles {
             handle.join().unwrap();
         }
 
-        let mut ledger = String::new();
-        File::open(tmp.path().join("gh.bucket"))
-            .unwrap()
-            .read_to_string(&mut ledger)
-            .unwrap();
-        let tokens = ledger
-            .lines()
-            .find_map(|line| line.strip_prefix("tokens="))
-            .unwrap()
-            .parse::<u64>()
-            .unwrap();
-        assert!(tokens <= config.burst, "{ledger}");
+        assert_eq!(admitted.load(Ordering::SeqCst), 2);
+        let body = ledger_body(&tmp.path().join("gh.bucket")).unwrap();
+        assert_eq!(parse_tokens(&body), 0);
+    }
+
+    #[test]
+    fn separate_processes_share_locked_bucket_admission_count() {
+        run_process_child_if_requested();
+        let tmp = tempfile::tempdir().unwrap();
+        seed_state(&tmp.path().join("gh.bucket"), state(2, 0, 0)).unwrap();
+        let exe = std::env::current_exe().unwrap();
+        let current_test = std::thread::current().name().unwrap().to_string();
+        let statuses = (0..4)
+            .map(|_| {
+                Command::new(&exe)
+                    .arg(&current_test)
+                    .arg("--exact")
+                    .arg("--nocapture")
+                    .env("FKST_RATE_POOL_CHILD_ACQUIRE", "1")
+                    .env("FKST_RATE_POOL_CHILD_ROOT", tmp.path())
+                    .status()
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let admitted = statuses
+            .iter()
+            .filter(|status| status.code() == Some(0))
+            .count();
+        let denied = statuses
+            .iter()
+            .filter(|status| status.code() == Some(3))
+            .count();
+        assert_eq!(admitted, 2, "{statuses:?}");
+        assert_eq!(denied, 2, "{statuses:?}");
+        let body = ledger_body(&tmp.path().join("gh.bucket")).unwrap();
+        assert_eq!(parse_tokens(&body), 0);
     }
 
     #[test]
     fn command_matching_uses_program_basename_and_shell_first_word() {
+        run_process_child_if_requested();
         let registry = RatePoolRegistry {
             root: PathBuf::from("/tmp/unused"),
             pools: BTreeMap::from([(
@@ -499,7 +703,12 @@ mod tests {
             )]),
         };
         assert_eq!(pool_name_for_program("/usr/bin/gh").unwrap(), "gh");
+        assert_eq!(pool_name_for_program("/usr/local/bin/GH").unwrap(), "gh");
         assert_eq!(first_shell_word("  gh issue list").unwrap(), "gh");
+        assert_eq!(
+            first_shell_word("  /usr/bin/GH issue list").unwrap(),
+            "/usr/bin/GH"
+        );
         assert_eq!(first_shell_word("'gh' issue list").unwrap(), "gh");
         assert!(registry.pools.contains_key("gh"));
     }
