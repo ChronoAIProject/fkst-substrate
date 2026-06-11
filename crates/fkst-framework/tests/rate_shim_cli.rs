@@ -4,12 +4,14 @@ mod config_registry;
 mod rate_pool;
 #[path = "../src/rate_shim.rs"]
 mod rate_shim;
+mod support;
 
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::process::{Command, Output};
 
 use rate_pool::{RatePoolConfig, RatePoolRegistry};
+use support::process_sandbox::ProcessSandbox;
 
 fn framework_bin() -> &'static str {
     env!("CARGO_BIN_EXE_fkst-framework")
@@ -201,11 +203,14 @@ fn generated_shim_bakes_resolved_config_from_fkst_env_style_registry() {
     .unwrap();
     executable(&real_dir.join("gh"), "#!/bin/sh\nprintf shim-real\n");
 
-    let original_cwd = std::env::current_dir().unwrap();
-    std::env::set_current_dir(&host).unwrap();
-    let config = config_registry::ConfigContext::from_host_root(&host).unwrap();
-    let registry = RatePoolRegistry::from_config(&config).unwrap();
-    std::env::set_current_dir(original_cwd).unwrap();
+    let registry = ProcessSandbox::new()
+        .enter_cwd(&host)
+        .unset_env("FKST_RATE_POOL_ROOT")
+        .unset_env("FKST_RATE_POOL_GH")
+        .run(|| {
+            let config = config_registry::ConfigContext::from_host_root(&host).unwrap();
+            RatePoolRegistry::from_config(&config).unwrap()
+        });
     seed_ledger(registry.root(), "gh", 2);
     let generator_path = std::env::join_paths([real_dir.as_path()]).unwrap();
     let shim_dir = rate_shim::ensure_rate_shims_with_path(
