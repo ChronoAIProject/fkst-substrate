@@ -30,10 +30,14 @@ use support::process_sandbox::ProcessSandbox;
 const DEFAULT_CODEX_PERMIT_SLOTS: usize = 20;
 
 fn register(lua: &Lua) -> mlua::Result<()> {
+    register_with_dept(lua, None)
+}
+
+fn register_with_dept(lua: &Lua, dept: Option<String>) -> mlua::Result<()> {
     let host_root = std::env::current_dir().map_err(mlua::Error::external)?;
     let config = config_registry::ConfigContext::from_host_root(&host_root)
         .map_err(mlua::Error::external)?;
-    sdk_codex::register(lua, &host_root, config)
+    sdk_codex::register(lua, &host_root, config, dept)
 }
 
 #[cfg(unix)]
@@ -157,6 +161,14 @@ fn lua_opts(lua: &Lua, prompt: &str) -> Table {
     opts
 }
 
+fn table_len(table: &Table, key: &str) -> usize {
+    table
+        .get::<Table>(key)
+        .unwrap()
+        .sequence_values::<Table>()
+        .count()
+}
+
 #[test]
 fn fixed_surface_does_not_register_await_any_await_or_sleep() {
     let lua = Lua::new();
@@ -166,6 +178,7 @@ fn fixed_surface_does_not_register_await_any_await_or_sleep() {
         r#"
         assert(type(spawn_codex) == "function")
         assert(type(await_all) == "function")
+        assert(type(codex_status) == "function")
         assert(await_any == nil)
         assert(await == nil)
         assert(sleep == nil)
@@ -173,6 +186,124 @@ fn fixed_surface_does_not_register_await_any_await_or_sleep() {
     )
     .exec()
     .unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn codex_status_reports_running_and_recent_without_output_or_paths() {
+    let tmp = tempfile::tempdir().unwrap();
+    let bin_dir = tmp.path().join("bin");
+    let started_fifo = tmp.path().join("started.fifo");
+    let release_fifo = tmp.path().join("release.fifo");
+    make_fifo(&started_fifo);
+    make_fifo(&release_fifo);
+    install_codex_script(
+        &bin_dir,
+        r#"#!/bin/sh
+cat >/dev/null
+printf 'started' > "$STARTED_FIFO"
+read _ < "$RELEASE_FIFO"
+printf 'sensitive output must stay out of codex_status'
+"#,
+    );
+
+    let mut sandbox = ProcessSandbox::new();
+    sandbox.enter_cwd(tmp.path()).runtime_root(".fkst/runtime");
+    sandbox.prepend_path(&bin_dir);
+    sandbox.set_env("STARTED_FIFO", started_fifo.to_string_lossy().into_owned());
+    sandbox.set_env("RELEASE_FIFO", release_fifo.to_string_lossy().into_owned());
+    sandbox.runtime_log_dir(tmp.path().join("runtime"));
+    let (_lock, _guard) = sandbox.enter();
+
+    let lua = Lua::new();
+    register_with_dept(&lua, Some("pkg.reviewer".to_string())).unwrap();
+    let spawn: mlua::Function = lua.globals().get("spawn_codex").unwrap();
+    let opts = lua_opts(&lua, "status");
+    opts.set("label", "review").unwrap();
+    opts.set("proposal_id", "proposal-43").unwrap();
+    let handle: AnyUserData = spawn.call(opts).unwrap();
+    assert_eq!(read_fifo(&started_fifo), "started");
+
+    let status_fn: mlua::Function = lua.globals().get("codex_status").unwrap();
+    let status: Table = status_fn.call(()).unwrap();
+    let running: Table = status.get("running").unwrap();
+    assert_eq!(running.raw_len(), 1);
+    let active: Table = running.get(1).unwrap();
+    assert_eq!(active.get::<String>("status").unwrap(), "running");
+    assert_eq!(active.get::<String>("label").unwrap(), "review");
+    assert_eq!(active.get::<String>("proposal_id").unwrap(), "proposal-43");
+    assert_eq!(active.get::<String>("dept").unwrap(), "pkg.reviewer");
+    assert!(active.get::<u64>("elapsed_ms").is_ok());
+    assert!(active.get::<i64>("exit_code").is_err());
+    assert!(active.get::<String>("output_excerpt").is_err());
+    assert!(active.get::<String>("log_path").is_err());
+    assert_eq!(table_len(&status, "recent"), 0);
+
+    write_fifo(&release_fifo, "go\n");
+    let await_all: mlua::Function = lua.globals().get("await_all").unwrap();
+    let handles = lua.create_sequence_from(vec![handle]).unwrap();
+    let results: Table = await_all.call(handles).unwrap();
+    let result: Table = results.get(1).unwrap();
+    assert_eq!(result.get::<i64>("exit_code").unwrap(), 0);
+
+    let status: Table = status_fn.call(()).unwrap();
+    assert_eq!(table_len(&status, "running"), 0);
+    let recent: Table = status.get("recent").unwrap();
+    assert_eq!(recent.raw_len(), 1);
+    let completed: Table = recent.get(1).unwrap();
+    assert_eq!(completed.get::<String>("status").unwrap(), "completed");
+    assert_eq!(completed.get::<i64>("exit_code").unwrap(), 0);
+    assert!(completed.get::<String>("ended_at").unwrap().ends_with('Z'));
+    assert!(completed.get::<u64>("ended_at_ms").is_ok());
+    assert!(
+        completed.get::<u64>("elapsed_ms").unwrap() >= active.get::<u64>("elapsed_ms").unwrap()
+    );
+    assert!(completed.get::<String>("output_excerpt").is_err());
+    assert!(completed.get::<String>("log_path").is_err());
+}
+
+#[cfg(unix)]
+#[test]
+fn codex_status_recent_is_bounded_to_last_fifty_completions() {
+    let tmp = tempfile::tempdir().unwrap();
+    let bin_dir = tmp.path().join("bin");
+    install_codex_script(
+        &bin_dir,
+        r#"#!/bin/sh
+cat >/dev/null
+printf 'ok'
+"#,
+    );
+
+    let mut sandbox = ProcessSandbox::new();
+    sandbox.enter_cwd(tmp.path()).runtime_root(".fkst/runtime");
+    sandbox.prepend_path(&bin_dir);
+    sandbox.runtime_log_dir(tmp.path().join("runtime"));
+    let (_lock, _guard) = sandbox.enter();
+
+    let lua = Lua::new();
+    register(&lua).unwrap();
+    let spawn: mlua::Function = lua.globals().get("spawn_codex_sync").unwrap();
+    for index in 0..55 {
+        let opts = lua_opts(&lua, "done");
+        opts.set("label", format!("job-{index:02}")).unwrap();
+        let result: Table = spawn.call(opts).unwrap();
+        assert_eq!(result.get::<i64>("exit_code").unwrap(), 0);
+    }
+
+    let status_fn: mlua::Function = lua.globals().get("codex_status").unwrap();
+    let status: Table = status_fn.call(()).unwrap();
+    assert_eq!(table_len(&status, "running"), 0);
+    let recent: Table = status.get("recent").unwrap();
+    assert_eq!(recent.raw_len(), 50);
+    let labels = recent
+        .sequence_values::<Table>()
+        .map(|item| item.unwrap().get::<String>("label").unwrap())
+        .collect::<Vec<_>>();
+    assert!(!labels.iter().any(|label| label == "job-00"));
+    assert!(labels.iter().any(|label| label == "job-54"));
+    assert!(tmp.path().join("runtime/codex").exists());
+    assert!(!tmp.path().join(".fkst/runtime/codex-status").exists());
 }
 
 #[test]
@@ -232,6 +363,7 @@ fn acquire_two_permits_concurrently() {
     ensure_pool().unwrap();
     let p1 = acquire_permit().unwrap();
     let p2 = acquire_permit().unwrap();
+    assert_ne!(p1.slot(), p2.slot());
 
     drop(p1);
     drop(p2);
@@ -346,6 +478,171 @@ printf 'ok'
         fs::read_to_string(capture_dir.join("stdin")).unwrap(),
         prompt
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn spawn_codex_sync_records_minimal_completed_status() {
+    let tmp = tempfile::tempdir().unwrap();
+    let bin_dir = tmp.path().join("bin");
+    install_codex_script(
+        &bin_dir,
+        r#"#!/bin/sh
+cat >/dev/null
+printf 'sensitive output body'
+"#,
+    );
+
+    let mut sandbox = ProcessSandbox::new();
+    sandbox.enter_cwd(tmp.path()).runtime_root(".fkst/runtime");
+    sandbox.prepend_path(&bin_dir);
+    sandbox.runtime_log_dir(tmp.path().join("runtime"));
+    let (_lock, _guard) = sandbox.enter();
+
+    let lua = Lua::new();
+    register_with_dept(&lua, Some("pkg.writer".to_string())).unwrap();
+    let spawn: mlua::Function = lua.globals().get("spawn_codex_sync").unwrap();
+    let opts = lua_opts(&lua, "status");
+    opts.set("label", "draft").unwrap();
+    opts.set("proposal_id", "proposal-43").unwrap();
+
+    let result: Table = spawn.call(opts).unwrap();
+    assert_eq!(result.get::<i64>("exit_code").unwrap(), 0);
+
+    let status_fn: mlua::Function = lua.globals().get("codex_status").unwrap();
+    let status: Table = status_fn.call(()).unwrap();
+    let running: Table = status.get("running").unwrap();
+    let recent: Table = status.get("recent").unwrap();
+    assert_eq!(running.raw_len(), 0);
+    assert_eq!(recent.raw_len(), 1);
+
+    let item: Table = recent.get(1).unwrap();
+    assert_eq!(item.get::<String>("label").unwrap(), "draft");
+    assert_eq!(item.get::<String>("dept").unwrap(), "pkg.writer");
+    assert_eq!(item.get::<String>("proposal_id").unwrap(), "proposal-43");
+    assert_eq!(item.get::<String>("status").unwrap(), "completed");
+    assert_eq!(item.get::<i64>("exit_code").unwrap(), 0);
+    assert!(item.get::<String>("run_id").unwrap().starts_with("codex-"));
+    assert!(item.get::<u64>("started_at_ms").unwrap() > 0);
+    assert!(item.get::<u64>("ended_at_ms").unwrap() >= item.get::<u64>("started_at_ms").unwrap());
+    assert!(item.get::<u64>("elapsed_ms").unwrap() <= 60_000);
+    assert!(item.get::<String>("started_at").unwrap().ends_with('Z'));
+    assert!(item.get::<String>("ended_at").unwrap().ends_with('Z'));
+    assert!(item.get::<String>("log_path").is_err());
+    assert!(item.get::<String>("output_excerpt").is_err());
+
+    let log_body = std::fs::read_to_string(result.get::<String>("log_path").unwrap()).unwrap();
+    assert!(log_body.contains("CODEX_STATUS:"));
+    assert!(!tmp.path().join(".fkst/runtime/codex-status").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn spawn_codex_running_status_is_queryable_before_exit() {
+    let tmp = tempfile::tempdir().unwrap();
+    let bin_dir = tmp.path().join("bin");
+    let started_fifo = tmp.path().join("started.fifo");
+    let release_fifo = tmp.path().join("release.fifo");
+    make_fifo(&started_fifo);
+    make_fifo(&release_fifo);
+    install_codex_script(
+        &bin_dir,
+        r#"#!/bin/sh
+cat >/dev/null
+printf 'started' > "$STARTED_FIFO"
+read _ < "$RELEASE_FIFO"
+printf 'done'
+"#,
+    );
+
+    let mut sandbox = ProcessSandbox::new();
+    sandbox.enter_cwd(tmp.path()).runtime_root(".fkst/runtime");
+    sandbox.prepend_path(&bin_dir);
+    sandbox.set_env("STARTED_FIFO", started_fifo.to_string_lossy().into_owned());
+    sandbox.set_env("RELEASE_FIFO", release_fifo.to_string_lossy().into_owned());
+    sandbox.runtime_log_dir(tmp.path().join("runtime"));
+    let (_lock, _guard) = sandbox.enter();
+
+    let lua = Lua::new();
+    register_with_dept(&lua, Some("pkg.runner".to_string())).unwrap();
+    let spawn: mlua::Function = lua.globals().get("spawn_codex").unwrap();
+    let opts = lua_opts(&lua, "running");
+    opts.set("label", "live").unwrap();
+    let handle: AnyUserData = spawn.call(opts).unwrap();
+    assert_eq!(read_fifo(&started_fifo), "started");
+
+    let status_fn: mlua::Function = lua.globals().get("codex_status").unwrap();
+    let status: Table = status_fn.call(()).unwrap();
+    let running: Table = status.get("running").unwrap();
+    let recent: Table = status.get("recent").unwrap();
+    assert_eq!(running.raw_len(), 1);
+    assert_eq!(recent.raw_len(), 0);
+    let item: Table = running.get(1).unwrap();
+    assert_eq!(item.get::<String>("label").unwrap(), "live");
+    assert_eq!(item.get::<String>("dept").unwrap(), "pkg.runner");
+    assert_eq!(item.get::<String>("status").unwrap(), "running");
+    assert!(item.get::<i64>("exit_code").is_err());
+    assert!(item.get::<usize>("permit_slot").unwrap() < DEFAULT_CODEX_PERMIT_SLOTS);
+    assert!(item.get::<u64>("elapsed_ms").unwrap() <= 60_000);
+    assert!(item.get::<String>("log_path").is_err());
+
+    write_fifo(&release_fifo, "go\n");
+    let await_all: mlua::Function = lua.globals().get("await_all").unwrap();
+    let handles = lua.create_sequence_from(vec![handle]).unwrap();
+    let results: Table = await_all.call(handles).unwrap();
+    let result: Table = results.get(1).unwrap();
+    assert_eq!(result.get::<String>("stdout").unwrap(), "done");
+
+    let status: Table = status_fn.call(()).unwrap();
+    let running: Table = status.get("running").unwrap();
+    let recent: Table = status.get("recent").unwrap();
+    assert_eq!(running.raw_len(), 0);
+    assert_eq!(recent.raw_len(), 1);
+    let completed: Table = recent.get(1).unwrap();
+    assert_eq!(completed.get::<String>("status").unwrap(), "completed");
+    assert_eq!(completed.get::<i64>("exit_code").unwrap(), 0);
+}
+
+#[cfg(unix)]
+#[test]
+fn codex_status_retains_last_fifty_completed_runs() {
+    let tmp = tempfile::tempdir().unwrap();
+    let bin_dir = tmp.path().join("bin");
+    install_codex_script(
+        &bin_dir,
+        r#"#!/bin/sh
+cat >/dev/null
+printf 'ok'
+"#,
+    );
+
+    let mut sandbox = ProcessSandbox::new();
+    sandbox.enter_cwd(tmp.path()).runtime_root(".fkst/runtime");
+    sandbox.prepend_path(&bin_dir);
+    sandbox.runtime_log_dir(tmp.path().join("runtime"));
+    let (_lock, _guard) = sandbox.enter();
+
+    let lua = Lua::new();
+    register(&lua).unwrap();
+    let spawn: mlua::Function = lua.globals().get("spawn_codex_sync").unwrap();
+    for index in 0..55 {
+        let opts = lua_opts(&lua, "retention");
+        opts.set("label", format!("run-{index:02}")).unwrap();
+        let result: Table = spawn.call(opts).unwrap();
+        assert_eq!(result.get::<i64>("exit_code").unwrap(), 0);
+    }
+
+    let status_fn: mlua::Function = lua.globals().get("codex_status").unwrap();
+    let status: Table = status_fn.call(()).unwrap();
+    let recent: Table = status.get("recent").unwrap();
+    assert_eq!(recent.raw_len(), 50);
+    let newest: Table = recent.get(1).unwrap();
+    assert_eq!(newest.get::<String>("label").unwrap(), "run-54");
+    let oldest: Table = recent.get(50).unwrap();
+    assert_eq!(oldest.get::<String>("label").unwrap(), "run-05");
+
+    assert!(tmp.path().join("runtime/codex").exists());
+    assert!(!tmp.path().join(".fkst/runtime/codex-status").exists());
 }
 
 #[cfg(unix)]

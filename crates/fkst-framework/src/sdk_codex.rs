@@ -7,6 +7,7 @@
 use fkst_common::RuntimeKind;
 use mlua::{AnyUserData, Lua, Result, Table, UserData};
 use nix::fcntl::{flock, FlockArg};
+use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::ffi::OsStr;
 use std::io::{Read, Write};
@@ -28,15 +29,39 @@ use crate::runtime_context;
 pub(crate) const CODEX_PERMIT_SLOTS_ENV: &str = "FKST_CODEX_PERMIT_SLOTS";
 pub const RUNTIME_LOG_DIR_ENV: &str = "FKST_RUNTIME_LOG_DIR";
 const DEFAULT_CODEX_TIMEOUT_SECONDS: i64 = 3600;
+const CODEX_STATUS_RECENT_LIMIT: usize = 50;
+const CODEX_STATUS_LOG_PREFIX: &str = "CODEX_STATUS:";
 static NEXT_PIPELINE_OWNER_ID: AtomicU64 = AtomicU64::new(1);
+static NEXT_CODEX_RUN_ID: AtomicU64 = AtomicU64::new(1);
 
 // both sync and async SDK calls share one immutable request description.
 struct CodexRequest {
+    run_id: String,
     prompt: String,
     context: Option<String>,
     worktree: Option<String>,
     timeout_seconds: i64,
     log_path: PathBuf,
+    label: Option<String>,
+    proposal_id: Option<String>,
+    dept: Option<String>,
+    started_at_ms: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct CodexStatusRecord {
+    run_id: String,
+    label: Option<String>,
+    dept: Option<String>,
+    proposal_id: Option<String>,
+    started_at: String,
+    started_at_ms: u64,
+    ended_at: Option<String>,
+    ended_at_ms: Option<u64>,
+    elapsed_ms: Option<u64>,
+    status: String,
+    exit_code: Option<i32>,
+    permit_slot: Option<usize>,
 }
 
 // worker threads return the same result shape before Lua table conversion.
@@ -57,6 +82,18 @@ pub(crate) struct CodexTaskHandle {
     pub(crate) owner_id: u64,
     pub(crate) task_id: u64,
     pub(crate) join: Arc<Mutex<Option<JoinHandle<CodexResult>>>>,
+}
+
+pub(crate) struct CodexPermit {
+    slot: usize,
+    _file: std::fs::File,
+}
+
+impl CodexPermit {
+    #[cfg(test)]
+    pub(crate) fn slot(&self) -> usize {
+        self.slot
+    }
 }
 
 impl UserData for CodexTaskHandle {}
@@ -198,28 +235,36 @@ fn result_table(
     Ok(t)
 }
 
-pub fn register(lua: &Lua, host_root: &Path, config: ConfigContext) -> Result<()> {
-    register_with_runner(lua, host_root, config, None)
+pub fn register(
+    lua: &Lua,
+    host_root: &Path,
+    config: ConfigContext,
+    dept: Option<String>,
+) -> Result<()> {
+    register_with_runner(lua, host_root, config, dept, None)
 }
 
 pub(crate) fn register_with_runner(
     lua: &Lua,
     host_root: &Path,
     config: ConfigContext,
+    dept: Option<String>,
     runner: Option<MockCommandState>,
 ) -> Result<()> {
     let owner_id = NEXT_PIPELINE_OWNER_ID.fetch_add(1, Ordering::Relaxed);
     let next_task_id = Arc::new(AtomicU64::new(1));
     let host_root = Arc::new(host_root.to_path_buf());
     let config = Arc::new(config);
+    let dept = Arc::new(dept);
     let runner = Arc::new(runner);
 
     lua.globals().set("spawn_codex_sync", {
         let host_root = Arc::clone(&host_root);
         let config = Arc::clone(&config);
+        let dept = Arc::clone(&dept);
         let runner = Arc::clone(&runner);
         lua.create_function(move |lua, opts: Table| {
-            let request = codex_request_from_opts(opts);
+            let request = codex_request_from_opts(opts, dept.as_deref().map(str::to_string));
             run_codex_request(request, &host_root, &config, runner.as_ref().as_ref())?
                 .into_lua_table(lua)
         })?
@@ -228,9 +273,10 @@ pub(crate) fn register_with_runner(
         let next_task_id = Arc::clone(&next_task_id);
         let host_root = Arc::clone(&host_root);
         let config = Arc::clone(&config);
+        let dept = Arc::clone(&dept);
         let runner = Arc::clone(&runner);
         lua.create_function(move |_, opts: Table| {
-            let request = codex_request_from_opts(opts);
+            let request = codex_request_from_opts(opts, dept.as_deref().map(str::to_string));
             let task_id = next_task_id.fetch_add(1, Ordering::Relaxed);
             let host_root = Arc::clone(&host_root);
             let config = Arc::clone(&config);
@@ -250,25 +296,38 @@ pub(crate) fn register_with_runner(
         "await_all",
         lua.create_function(move |lua, handles: Table| await_all(lua, handles, owner_id))?,
     )?;
+    lua.globals().set("codex_status", {
+        let host_root = Arc::clone(&host_root);
+        lua.create_function(move |lua, ()| codex_status(lua, &host_root))?
+    })?;
     Ok(())
 }
 
 // the same input names an overall wall-clock timeout with a bounded default.
-fn codex_request_from_opts(opts: Table) -> CodexRequest {
+fn codex_request_from_opts(opts: Table, runtime_dept: Option<String>) -> CodexRequest {
     let prompt: String = opts.get("prompt").unwrap_or_default();
     let context: Option<String> = opts.get("context").ok();
     let worktree: Option<String> = opts.get("worktree").ok();
+    let label: Option<String> = opts.get("label").ok();
+    let proposal_id: Option<String> = opts.get("proposal_id").ok();
+    let dept: Option<String> = opts.get("dept").ok().or(runtime_dept);
     let timeout: Option<i64> = opts.get("timeout").ok();
     let timeout_seconds = timeout
         .filter(|seconds| *seconds > 0)
         .unwrap_or(DEFAULT_CODEX_TIMEOUT_SECONDS);
     let log_path = codex_log_path(worktree.as_deref());
+    let started_at_ms = unix_duration().as_millis() as u64;
     CodexRequest {
+        run_id: codex_run_id(),
         prompt,
         context,
         worktree,
         timeout_seconds,
         log_path,
+        label,
+        proposal_id,
+        dept,
+        started_at_ms,
     }
 }
 
@@ -367,6 +426,8 @@ fn run_codex_request(
         return run_mocked_codex_request(request, runner);
     }
 
+    let mut status = CodexStatusRecord::from_request(&request, None);
+    write_codex_status(&request.log_path, &status);
     if let Err(err) = ensure_pool_with_context(host_root, config) {
         let message = format!("codex permit pool failed: {err}");
         write_codex_log(
@@ -377,6 +438,8 @@ fn run_codex_request(
             &command_line_for_request(&request),
             request.timeout_seconds,
         );
+        status.finish(-1);
+        write_codex_status(&request.log_path, &status);
         return Ok(CodexResult::failure(
             "permit",
             message,
@@ -387,7 +450,11 @@ fn run_codex_request(
         ));
     }
     let _permit = match acquire_permit_with_context(host_root, config) {
-        Ok(permit) => permit,
+        Ok(permit) => {
+            status.permit_slot = Some(permit.slot);
+            write_codex_status(&request.log_path, &status);
+            permit
+        }
         Err(err) => {
             let message = format!("codex permit acquire failed: {err}");
             write_codex_log(
@@ -398,6 +465,8 @@ fn run_codex_request(
                 &command_line_for_request(&request),
                 request.timeout_seconds,
             );
+            status.finish(-1);
+            write_codex_status(&request.log_path, &status);
             return Ok(CodexResult::failure(
                 "permit",
                 message,
@@ -409,13 +478,18 @@ fn run_codex_request(
         }
     };
 
-    Ok(run_codex_request_with_permit(request, config))
+    let result = run_codex_request_with_permit(request, config);
+    status.finish(result.exit_code);
+    write_codex_status(Path::new(&result.log_path), &status);
+    Ok(result)
 }
 
 fn run_mocked_codex_request(
     request: CodexRequest,
     runner: &MockCommandState,
 ) -> Result<CodexResult> {
+    let mut status = CodexStatusRecord::from_request(&request, None);
+    write_codex_status(&request.log_path, &status);
     let args = command_args_for_request(&request);
     let cmd_line = format_command("codex", &args);
     let result = runner.execute(
@@ -432,12 +506,180 @@ fn run_mocked_codex_request(
         &cmd_line,
         request.timeout_seconds,
     );
+    status.finish(result.exit_code);
+    write_codex_status(&request.log_path, &status);
     Ok(CodexResult::success(
         result.stdout,
         result.stderr,
         result.exit_code,
         request.log_path.to_string_lossy().into_owned(),
     ))
+}
+
+impl CodexStatusRecord {
+    fn from_request(request: &CodexRequest, permit_slot: Option<usize>) -> Self {
+        Self {
+            run_id: request.run_id.clone(),
+            label: request.label.clone(),
+            dept: request.dept.clone(),
+            proposal_id: request.proposal_id.clone(),
+            started_at: unix_millis_to_iso8601(request.started_at_ms),
+            started_at_ms: request.started_at_ms,
+            ended_at: None,
+            ended_at_ms: None,
+            elapsed_ms: None,
+            status: "running".to_string(),
+            exit_code: None,
+            permit_slot,
+        }
+    }
+
+    fn finish(&mut self, exit_code: i32) {
+        let ended_at_ms = unix_duration().as_millis() as u64;
+        self.ended_at = Some(unix_millis_to_iso8601(ended_at_ms));
+        self.ended_at_ms = Some(ended_at_ms);
+        self.elapsed_ms = Some(ended_at_ms.saturating_sub(self.started_at_ms));
+        self.status = "completed".to_string();
+        self.exit_code = Some(exit_code);
+    }
+}
+
+fn codex_status(lua: &Lua, host_root: &Path) -> Result<Table> {
+    let mut records = read_codex_status_records(host_root).map_err(mlua::Error::external)?;
+    let now_ms = unix_duration().as_millis() as u64;
+    records.sort_by(|left, right| {
+        right
+            .started_at_ms
+            .cmp(&left.started_at_ms)
+            .then_with(|| right.run_id.cmp(&left.run_id))
+    });
+
+    let result = lua.create_table()?;
+    let running = lua.create_table()?;
+    let recent = lua.create_table()?;
+    let mut running_index = 1;
+    let mut recent_index = 1;
+    for record in records {
+        let item = codex_status_record_table(lua, &record, now_ms)?;
+        if record.status == "running" {
+            running.set(running_index, item)?;
+            running_index += 1;
+        } else if recent_index <= CODEX_STATUS_RECENT_LIMIT {
+            recent.set(recent_index, item)?;
+            recent_index += 1;
+        }
+    }
+    result.set("running", running)?;
+    result.set("recent", recent)?;
+    Ok(result)
+}
+
+fn codex_status_record_table(lua: &Lua, record: &CodexStatusRecord, now_ms: u64) -> Result<Table> {
+    let table = lua.create_table()?;
+    table.set("run_id", record.run_id.clone())?;
+    set_optional_string(&table, "label", &record.label)?;
+    set_optional_string(&table, "dept", &record.dept)?;
+    set_optional_string(&table, "proposal_id", &record.proposal_id)?;
+    table.set("started_at", record.started_at.clone())?;
+    table.set("started_at_ms", record.started_at_ms)?;
+    set_optional_string(&table, "ended_at", &record.ended_at)?;
+    if let Some(ended_at_ms) = record.ended_at_ms {
+        table.set("ended_at_ms", ended_at_ms)?;
+    }
+    let elapsed_ms = record
+        .elapsed_ms
+        .unwrap_or_else(|| now_ms.saturating_sub(record.started_at_ms));
+    table.set("elapsed_ms", elapsed_ms)?;
+    table.set("status", record.status.clone())?;
+    if let Some(exit_code) = record.exit_code {
+        table.set("exit_code", exit_code)?;
+    }
+    if let Some(permit_slot) = record.permit_slot {
+        table.set("permit_slot", permit_slot)?;
+    }
+    Ok(table)
+}
+
+fn set_optional_string(table: &Table, key: &str, value: &Option<String>) -> Result<()> {
+    if let Some(value) = value {
+        table.set(key, value.as_str())?;
+    }
+    Ok(())
+}
+
+fn write_codex_status(log_path: &Path, record: &CodexStatusRecord) {
+    if let Err(err) = append_codex_status_log(log_path, record) {
+        eprintln!(
+            "WARN: codex status write failed run_id={} error={err}",
+            record.run_id
+        );
+    }
+}
+
+fn append_codex_status_log(log_path: &Path, record: &CodexStatusRecord) -> anyhow::Result<()> {
+    if let Some(parent) = log_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log_path)?;
+    writeln!(
+        file,
+        "{CODEX_STATUS_LOG_PREFIX}{}",
+        serde_json::to_string(record)?
+    )?;
+    Ok(())
+}
+
+fn read_codex_status_records(host_root: &Path) -> anyhow::Result<Vec<CodexStatusRecord>> {
+    let _ = host_root;
+    let log_dir = runtime_log_dir().join("codex");
+    let entries = match std::fs::read_dir(&log_dir) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(err) => return Err(err.into()),
+    };
+    let mut records = Vec::new();
+    for entry in entries {
+        let entry = entry?;
+        let path = entry.path();
+        if path.extension().and_then(OsStr::to_str) != Some("log") {
+            continue;
+        }
+        let body = std::fs::read_to_string(&path)?;
+        for line in body.lines() {
+            let Some(json) = line.strip_prefix(CODEX_STATUS_LOG_PREFIX) else {
+                continue;
+            };
+            match serde_json::from_str::<CodexStatusRecord>(json) {
+                Ok(record) => records.push(record),
+                Err(err) => eprintln!(
+                    "WARN: codex status log line skipped path={} error={err}",
+                    path.display()
+                ),
+            }
+        }
+    }
+    Ok(latest_codex_status_records(records))
+}
+
+fn latest_codex_status_records(records: Vec<CodexStatusRecord>) -> Vec<CodexStatusRecord> {
+    let mut latest = std::collections::HashMap::<String, CodexStatusRecord>::new();
+    for record in records {
+        let key = record.run_id.clone();
+        match latest.get(&key) {
+            Some(existing) if status_record_time(existing) > status_record_time(&record) => {}
+            _ => {
+                latest.insert(key, record);
+            }
+        }
+    }
+    latest.into_values().collect()
+}
+
+fn status_record_time(record: &CodexStatusRecord) -> u64 {
+    record.ended_at_ms.unwrap_or(record.started_at_ms)
 }
 
 fn run_codex_request_with_permit(mut request: CodexRequest, config: &ConfigContext) -> CodexResult {
@@ -890,6 +1132,11 @@ fn codex_log_path(worktree: Option<&str>) -> PathBuf {
         .join(format!("{basename}-{timestamp}.log"))
 }
 
+fn codex_run_id() -> String {
+    let sequence = NEXT_CODEX_RUN_ID.fetch_add(1, Ordering::Relaxed);
+    format!("codex-{}-{sequence}", filename_timestamp())
+}
+
 fn filename_timestamp() -> String {
     let duration = unix_duration();
     format!("{}-{:09}", duration.as_secs(), duration.subsec_nanos())
@@ -951,6 +1198,10 @@ fn unix_seconds_to_iso8601(seconds: u64) -> String {
     format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z")
 }
 
+fn unix_millis_to_iso8601(millis: u64) -> String {
+    unix_seconds_to_iso8601(millis / 1000)
+}
+
 fn civil_from_days(days_since_epoch: i64) -> (i32, u32, u32) {
     let z = days_since_epoch + 719_468;
     let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
@@ -1001,7 +1252,7 @@ pub(crate) fn self_test_permit_pool(host_root: &Path) -> mlua::Result<()> {
 /// Returns a held file (lock active) or blocks until one is available.
 // crate-internal visibility keeps permit locking behavior testable after extraction.
 #[cfg(test)]
-pub(crate) fn acquire_permit() -> mlua::Result<std::fs::File> {
+pub(crate) fn acquire_permit() -> mlua::Result<CodexPermit> {
     let host_root = std::env::current_dir().map_err(mlua::Error::external)?;
     let config = ConfigContext::from_host_root(&host_root).map_err(mlua::Error::external)?;
     acquire_permit_with_context(&host_root, &config)
@@ -1010,7 +1261,7 @@ pub(crate) fn acquire_permit() -> mlua::Result<std::fs::File> {
 fn acquire_permit_with_context(
     host_root: &Path,
     config: &ConfigContext,
-) -> mlua::Result<std::fs::File> {
+) -> mlua::Result<CodexPermit> {
     let pool_dir = permit_pool_dir(host_root)?;
     let slot_count = permit_slot_count(config)?;
     for i in 0..slot_count {
@@ -1021,7 +1272,7 @@ fn acquire_permit_with_context(
             .open(&p)
             .map_err(mlua::Error::external)?;
         if flock(f.as_raw_fd(), FlockArg::LockExclusiveNonblock).is_ok() {
-            return Ok(f);
+            return Ok(CodexPermit { slot: i, _file: f });
         }
     }
 
@@ -1032,7 +1283,7 @@ fn acquire_permit_with_context(
         .open(&p)
         .map_err(mlua::Error::external)?;
     flock(f.as_raw_fd(), FlockArg::LockExclusive).map_err(mlua::Error::external)?;
-    Ok(f)
+    Ok(CodexPermit { slot: 0, _file: f })
 }
 
 fn permit_slot_count(config: &ConfigContext) -> mlua::Result<usize> {

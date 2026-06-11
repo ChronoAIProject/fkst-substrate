@@ -24,6 +24,7 @@ pub(crate) fn run_tests(roots: PackageRoots, report_json: Option<PathBuf>) -> Re
             &lua,
             RaiseBuffer::new(),
             roots.host_root(),
+            None,
             roots.name_resolver(),
             file.owner_namespace.clone(),
             Some(mock_commands.clone()),
@@ -445,6 +446,7 @@ fn run_department(
         &dept_lua,
         raise_buf.clone(),
         roots.host_root(),
+        department_name_for_lua(&lua_path, owner_root, owner_namespace),
         roots
             .name_resolver()
             .with_recorded_only_queues(qualified_produces),
@@ -539,6 +541,29 @@ fn is_department_entrypoint(owner_root: &Path, lua_path: &Path) -> bool {
                 && *main == std::ffi::OsStr::new("main.lua")
         }
         _ => false,
+    }
+}
+
+fn department_name_for_lua(
+    lua_path: &Path,
+    owner_root: &Path,
+    owner_namespace: &str,
+) -> Option<String> {
+    let rel = lua_path.strip_prefix(owner_root).ok()?;
+    let mut components = rel.components();
+    let first = components.next()?.as_os_str();
+    let name = components.next()?.as_os_str().to_str()?;
+    let last = components.next()?.as_os_str();
+    if components.next().is_some()
+        || first != std::ffi::OsStr::new("departments")
+        || last != std::ffi::OsStr::new("main.lua")
+    {
+        return None;
+    }
+    if owner_namespace == crate::path_resolver::HOST_NAMESPACE {
+        Some(name.to_string())
+    } else {
+        Some(format!("{owner_namespace}.{name}"))
     }
 }
 

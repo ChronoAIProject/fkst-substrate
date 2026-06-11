@@ -18,7 +18,7 @@ use anyhow::{Context, Result};
 use host_conformance::HostConformanceOptions;
 use path_resolver::PackageRoots;
 use serde_json::Value as JsonValue;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 mod boundary_resource;
 mod config_registry;
@@ -369,8 +369,9 @@ fn run_pipeline(
         &lua,
         raise_buf.clone(),
         roots.host_root(),
+        department_name_for_lua(&lua_path, owner_root, &owner_namespace),
         roots.name_resolver(),
-        owner_namespace,
+        owner_namespace.clone(),
         Some(roots.clone()),
         graph_json_authorized,
     )?;
@@ -390,6 +391,29 @@ fn run_pipeline(
 
     raise_buf.emit_stdout();
     Ok(exit_code)
+}
+
+fn department_name_for_lua(
+    lua_path: &Path,
+    owner_root: &Path,
+    owner_namespace: &str,
+) -> Option<String> {
+    let rel = lua_path.strip_prefix(owner_root).ok()?;
+    let mut components = rel.components();
+    let first = components.next()?.as_os_str();
+    let name = components.next()?.as_os_str().to_str()?;
+    let last = components.next()?.as_os_str();
+    if components.next().is_some()
+        || first != std::ffi::OsStr::new("departments")
+        || last != std::ffi::OsStr::new("main.lua")
+    {
+        return None;
+    }
+    if owner_namespace == crate::path_resolver::HOST_NAMESPACE {
+        Some(name.to_string())
+    } else {
+        Some(format!("{owner_namespace}.{name}"))
+    }
 }
 
 fn run_config_command(options: ConfigCli) -> Result<i32> {

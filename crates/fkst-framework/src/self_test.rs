@@ -135,6 +135,7 @@ fn check_sdk_registration(host_root: &std::path::Path) -> Result<()> {
         &lua,
         RaiseBuffer::new(),
         host_root,
+        Some("pkg.self_test".to_string()),
         NameResolver::new(["pkg".to_string()]),
         "pkg".to_string(),
         None,
@@ -177,6 +178,7 @@ fn check_sdk_registration(host_root: &std::path::Path) -> Result<()> {
         expect_type("list_orphan_worktrees", list_orphan_worktrees, "function")
         expect_type("spawn_codex", spawn_codex, "function")
         expect_type("spawn_codex_sync", spawn_codex_sync, "function")
+        expect_type("codex_status", codex_status, "function")
         expect_type("await_all", await_all, "function")
         expect_type("raise", raise, "function")
         expect_nil("await_any", await_any)
