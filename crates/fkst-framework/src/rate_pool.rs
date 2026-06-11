@@ -562,6 +562,11 @@ mod tests {
         if std::env::var_os("FKST_RATE_POOL_CHILD_ACQUIRE").is_none() {
             return;
         }
+        if std::thread::current().name()
+            != Some("rate_pool::tests::separate_processes_share_locked_bucket_admission_count")
+        {
+            return;
+        }
         let root = PathBuf::from(std::env::var_os("FKST_RATE_POOL_CHILD_ROOT").unwrap());
         let admitted = try_acquire_token(
             &root,

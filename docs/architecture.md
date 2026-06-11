@@ -79,6 +79,7 @@ fkst-framework run <lua> --project-root <path> --package-root <path> ... --owner
 fkst-framework supervise --project-root <path> [--package-root <path> ...] --framework-bin <path>
 fkst-framework conformance --project-root <path> [--package-root <path> ...]
 fkst-framework config --project-root <path> [--package-root <path> ...]
+fkst-framework boundary-resources
 fkst-framework test --project-root <path> [--package-root <path> ...] [--report-json <path>]
 fkst-framework --self-test
 ```
@@ -181,6 +182,7 @@ queue 是包内命名空间。多 graph-root 组合时，裸 queue 名按 owner 
 | `queue_capacity` | `FKST_QUEUE_CAPACITY` | Operational | `usize` | default `16` |
 | `department_default_stall_window` | `FKST_DEPARTMENT_DEFAULT_STALL_WINDOW` | Operational | duration string | default `30s`, Department delivery lease |
 | `codex_permit_slots` | `FKST_CODEX_PERMIT_SLOTS` | Operational | `usize` | default `20` |
+| `rate_pool_root` | `FKST_RATE_POOL_ROOT` | Operational | string | default `~/.fkst/rate-pools` |
 | `retry_default_max_attempts` | `FKST_RETRY_DEFAULT_MAX_ATTEMPTS` | Operational | `usize` | default `5` |
 | `retry_default_base` | `FKST_RETRY_DEFAULT_BASE` | Operational | duration string | default `60s` |
 | `retry_default_cap` | `FKST_RETRY_DEFAULT_CAP` | Operational | duration string | default `30m` |
@@ -188,6 +190,10 @@ queue 是包内命名空间。多 graph-root 组合时，裸 queue 名按 owner 
 | `candidate_from_sep` | `FKST_CANDIDATE_FROM_SEP` | HostFact | string | required |
 
 `fkst-framework config --project-root <path> [--package-root <path>]` 是只读自省命令，逐项打印 env key、kind、type、default/required、resolved value/source 与 doc。HostFact 缺失时显示缺失，不会写配置或访问网络。
+
+### 5.1 Boundary Resource Registry
+
+边界资源遵循 capability security 的 no ambient authority 约束：engine 触达的外部资源必须在静态 registry 中枚举，并经 adapter grant、meter、budget/backpressure 与 typed error contract 访问。`fkst-framework boundary-resources` 是只读自省命令，当前条目为 `codex.process`、`shell.process`、`git.process`、`runtime.filesystem` 与 `wall-clock`。`exec_sync`、`spawn_codex_sync` 与 `spawn_codex` 对可分类边界失败返回 `error_class`，值域为 `quota-exhausted`、`auth-degraded`、`provider-unavailable`、`provider-throttle`。
 
 ## 6. Runtime I/O 与落点
 
@@ -287,7 +293,7 @@ engine 维护 durable 在途 delivery state，但它不是实体业务真相、a
 
 `M.spec.retry` 默认启用；`retry=false` 表示失败不重试；`retry={...}` 支持 `max_attempts`、`base`、`cap` 子集覆盖。全局默认由 registry 的 `retry_default_max_attempts`、`retry_default_base`、`retry_default_cap` 提供。可靠 / 非可靠投递由 `M.spec.ephemeral` 决定，不由 retry 决定。可靠路径不依赖 payload dedup key、runtime marker 或 retry scratch 文件；delivery store 使用 `delivery_id`、`lease_generation` 和 redb 事务提供 fencing、ack、retry 和 dead 表。
 
-`spawn_codex_sync` 与 `spawn_codex` 使用整体 wall-clock `timeout`，默认 3600 秒；stdout/stderr 输出只被捕获，不延长 timeout。`spawn_codex` 的 handle 只能由同一个 Lua pipeline 的 `await_all` 消费。单 handle 等待用 `await_all({handle})`。没有 sleep timer、first-result fanout、provider abstraction 或动态 SDK extension。
+`spawn_codex_sync` 与 `spawn_codex` 使用整体 wall-clock `timeout`，默认 3600 秒；stdout/stderr 输出只被捕获，不延长 timeout。`spawn_codex` 的 handle 只能由同一个 Lua pipeline 的 `await_all` 消费。单 handle 等待用 `await_all({handle})`。失败结果保留既有 `error_kind`，同时在可分类时提供 `error_class`；provider 非零退出可直接返回 `error_class` 而不制造 adapter `error_kind`。没有 sleep timer、first-result fanout、provider abstraction 或动态 SDK extension。
 
 ## 10. 事件与队列机制
 

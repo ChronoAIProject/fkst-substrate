@@ -99,6 +99,32 @@ fn config_rejects_invalid_rate_pool_definition() {
 }
 
 #[test]
+fn boundary_resources_lists_mediated_resource_registry() {
+    let cwd = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
+
+    let output = Command::new(framework_bin())
+        .arg("boundary-resources")
+        .current_dir(cwd.path())
+        .output()
+        .unwrap();
+
+    assert_exit(&output, 0);
+    let out = stdout(&output);
+    assert_eq!(out.lines().count(), 5, "{out}");
+    assert!(out.contains("id=codex.process"), "{out}");
+    assert!(
+        out.contains("adapters=spawn_codex_sync,spawn_codex"),
+        "{out}"
+    );
+    assert!(out.contains("budget=FKST_CODEX_PERMIT_SLOTS"), "{out}");
+    assert!(out.contains("id=shell.process"), "{out}");
+    assert!(
+        out.contains("errors=quota-exhausted,auth-degraded"),
+        "{out}"
+    );
+}
+
+#[test]
 fn config_env_overrides_host_fkst_env() {
     let host = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
     let cwd = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
