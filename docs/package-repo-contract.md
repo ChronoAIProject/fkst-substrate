@@ -59,7 +59,7 @@ log.error(msg)
 now()
 ```
 
-`pipeline(event)` 与 `source` 是 package-side 约定，不是普通 SDK global。Rust 注册的 runtime primitive 来自 `mlua_init.rs` 调用的 `sdk_*` 模块与 `raise.rs`。`json` 只有 `json.decode`，没有 `json.encode`、`json.array` 或 schema 推断；需要空数组时用 `json.decode("[]")` 形成 array-tagged table。
+`pipeline(event)` 与 `source` 是 package-side 约定，不是普通 SDK global。Rust 注册的 runtime primitive 来自 `mlua_init.rs` 调用的 `sdk_*` 模块与 `raise.rs`。`json` 只有 `json.decode`，没有 `json.encode`、`json.array` 或 schema 推断；需要空数组时用 `json.decode("[]")` 形成 array-tagged table。Pure data utilities are not automatically Rust primitives; §2.2 defines the decision order.
 
 `truncate_utf8(s, max_bytes)` returns the longest prefix of `s` that is at most `max_bytes` bytes and ends on a UTF-8 character boundary, matching Rust `str::floor_char_boundary` semantics. It never emits a partial sequence; `max_bytes >= #s` returns `s` unchanged; `max_bytes` smaller than the first character returns the empty string; negative `max_bytes` is an argument error; invalid UTF-8 input is an argument error. This is the blessed replacement for package-side byte truncation.
 
@@ -67,7 +67,20 @@ now()
 
 ### 2.1 Lua standard library surface
 
-Every engine-constructed Lua context is created with mlua `Lua::new()`, which loads the full Lua 5.4 safe standard library. Packages can rely on it everywhere — including `utf8` (`utf8.offset`, `utf8.len`, `utf8.codes`, `utf8.codepoint`, `utf8.char`), `string`, `table`, `math`, `coroutine`, `os.time`/`os.date`, and `select`/`pairs`/`ipairs`/`pcall` base functions. A capability already covered by the stdlib is a documentation fact, not a feature request.
+Every engine-constructed Lua context is created with mlua `Lua::new()`, which loads Lua 5.4 safe standard libraries. Packages can rely on this surface everywhere:
+
+```text
+base functions: assert, error, ipairs, next, pairs, pcall, print, rawequal, rawget, rawlen, rawset, select, tonumber, tostring, type, xpcall
+coroutine
+string
+table
+math
+utf8: utf8.char, utf8.charpattern, utf8.codepoint, utf8.codes, utf8.len, utf8.offset
+os: os.clock, os.date, os.difftime, os.time
+package
+```
+
+`io`, `debug`, `ffi`, shell access, networking, and host filesystem authority are not stdlib capability commitments for package logic; use the documented framework SDK for host-authorized effects. A capability already covered by the stdlib is a documentation fact, not a feature request.
 
 中文补充：stdlib（含 `utf8`）在所有引擎 Lua 上下文都已加载；stdlib 已覆盖的能力不构成新原语需求。
 
@@ -76,8 +89,8 @@ Every engine-constructed Lua context is created with mlua `Lua::new()`, which lo
 How a Lua-side capability need is satisfied, decided strictly in order:
 
 1. **Lua stdlib first.** If the Lua 5.4 standard library covers it (see §2.1), use it directly; the only deliverable is documentation. Hand-rolling what the stdlib provides (e.g. byte arithmetic instead of `utf8.offset`) is a defect.
-2. **Engine Lua prelude** for pure utilities beyond the stdlib: a small engine-vendored pure-Lua layer, loaded uniformly into EVERY context the engine constructs (production, test, conformance, graph-scan/spec-eval). Capabilities are written in Lua; presence is guaranteed by the engine; additions are curated wholesale (Redis/OpenResty battery model), never per incident.
-3. **Rust primitives ONLY for**: host authority and side effects (raise / spawn / locks / cache / worktrees), performance, or fail-closed boundary enforcement (e.g. `json.decode` validation). A proposal for a new Rust primitive must state why layers 1–2 cannot carry it.
+2. **Engine Lua prelude** for pure utilities beyond the stdlib: a small engine-vendored pure-Lua layer, loaded uniformly into EVERY context the engine constructs (production, test, conformance, graph-scan/spec-eval). Capabilities are written in Lua; presence is guaranteed by the engine; additions are curated wholesale (Redis/OpenResty battery model), never per incident. The prelude must not grant host authority, ambient filesystem access, subprocess access, network access, or durable fact storage.
+3. **Rust primitives ONLY for**: host authority and side effects (raise / spawn / locks / cache / worktrees), performance, or fail-closed boundary enforcement (e.g. `json.decode` validation). A proposal for a new Rust primitive must state why layers 1–2 cannot carry it and what conformance or self-test evidence pins the boundary.
 
 Prior art: Redis frozen battery set (cjson/cmsgpack/bit/struct/sha1hex), OpenResty curated batteries, Neovim vendored `vim.json`/`vim.lpeg`. The common split is host-authority effectful primitives from the host, pure data utilities from a curated, documented battery layer.
 

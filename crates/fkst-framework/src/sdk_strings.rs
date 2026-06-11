@@ -3,6 +3,11 @@
 use mlua::{Lua, Result};
 
 pub fn register(lua: &Lua) -> Result<()> {
+    register_truncate_utf8(lua)?;
+    Ok(())
+}
+
+pub(crate) fn register_truncate_utf8(lua: &Lua) -> Result<()> {
     lua.globals().set(
         "truncate_utf8",
         lua.create_function(|_, (value, max_bytes): (mlua::String, i64)| {

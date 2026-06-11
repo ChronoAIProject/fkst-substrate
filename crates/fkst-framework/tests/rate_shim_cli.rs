@@ -4,60 +4,14 @@ mod config_registry;
 mod rate_pool;
 #[path = "../src/rate_shim.rs"]
 mod rate_shim;
+mod support;
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 use rate_pool::{RatePoolConfig, RatePoolRegistry};
-
-struct EnvGuard {
-    values: Vec<(&'static str, Option<std::ffi::OsString>)>,
-}
-
-struct CwdGuard {
-    original: PathBuf,
-}
-
-impl CwdGuard {
-    fn enter(path: &Path) -> Self {
-        let original = std::env::current_dir().unwrap();
-        std::env::set_current_dir(path).unwrap();
-        Self { original }
-    }
-}
-
-impl Drop for CwdGuard {
-    fn drop(&mut self) {
-        let _ = std::env::set_current_dir(&self.original);
-    }
-}
-
-impl EnvGuard {
-    fn remove(keys: &[&'static str]) -> Self {
-        let values = keys
-            .iter()
-            .map(|key| {
-                let value = std::env::var_os(key);
-                std::env::remove_var(key);
-                (*key, value)
-            })
-            .collect();
-        Self { values }
-    }
-}
-
-impl Drop for EnvGuard {
-    fn drop(&mut self) {
-        for (key, value) in self.values.drain(..).rev() {
-            if let Some(value) = value {
-                std::env::set_var(key, value);
-            } else {
-                std::env::remove_var(key);
-            }
-        }
-    }
-}
+use support::process_sandbox::ProcessSandbox;
 
 fn framework_bin() -> PathBuf {
     let exe = std::env::current_exe().unwrap();
@@ -114,6 +68,35 @@ fn seed_ledger(root: &Path, name: &str, tokens: u64) {
         format!("updated_nanos={updated_nanos}\ntokens={tokens}\nremainder_nanos=0\n"),
     )
     .unwrap();
+}
+
+struct EnvGuard {
+    vars: Vec<(&'static str, Option<std::ffi::OsString>)>,
+}
+
+impl EnvGuard {
+    fn remove(keys: &[&'static str]) -> Self {
+        let vars = keys
+            .iter()
+            .map(|key| {
+                let previous = std::env::var_os(key);
+                std::env::remove_var(key);
+                (*key, previous)
+            })
+            .collect();
+        Self { vars }
+    }
+}
+
+impl Drop for EnvGuard {
+    fn drop(&mut self) {
+        for (key, previous) in self.vars.drain(..) {
+            match previous {
+                Some(value) => std::env::set_var(key, value),
+                None => std::env::remove_var(key),
+            }
+        }
+    }
 }
 
 #[test]
@@ -234,6 +217,7 @@ fn generated_shim_consumes_same_bucket_as_cli_acquire() {
 #[cfg(unix)]
 #[test]
 fn generated_shim_bakes_resolved_config_from_fkst_env_style_registry() {
+    let _env = EnvGuard::remove(&["FKST_RATE_POOL_ROOT", "FKST_RATE_POOL_GH"]);
     let tmp = tempfile::tempdir().unwrap();
     let host = tmp.path().join("host");
     let run_cwd = tmp.path().join("run-cwd");
@@ -248,11 +232,14 @@ fn generated_shim_bakes_resolved_config_from_fkst_env_style_registry() {
     .unwrap();
     executable(&real_dir.join("gh"), "#!/bin/sh\nprintf shim-real\n");
 
-    let _env_guard = EnvGuard::remove(&["FKST_RATE_POOL_ROOT", "FKST_RATE_POOL_GH"]);
-    let _cwd_guard = CwdGuard::enter(&host);
-    let config = config_registry::ConfigContext::from_host_root(&host).unwrap();
-    let registry = RatePoolRegistry::from_config(&config).unwrap();
-    drop(_cwd_guard);
+    let registry = ProcessSandbox::new()
+        .enter_cwd(&host)
+        .unset_env("FKST_RATE_POOL_ROOT")
+        .unset_env("FKST_RATE_POOL_GH")
+        .run(|| {
+            let config = config_registry::ConfigContext::from_host_root(&host).unwrap();
+            RatePoolRegistry::from_config(&config).unwrap()
+        });
     seed_ledger(registry.root(), "gh", 2);
     let generator_path = std::env::join_paths([real_dir.as_path()]).unwrap();
     let shim_dir =
