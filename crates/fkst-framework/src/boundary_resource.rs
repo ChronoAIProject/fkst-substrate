@@ -111,21 +111,6 @@ fn classify_text(text: &str) -> Option<BoundaryErrorClass> {
     if contains_any(
         &lower,
         &[
-            "401",
-            "403",
-            "bad credentials",
-            "requires authentication",
-            "authentication failed",
-            "auth failed",
-            "unauthorized",
-            "keyring",
-        ],
-    ) {
-        return Some(BoundaryErrorClass::AuthDegraded);
-    }
-    if contains_any(
-        &lower,
-        &[
             "secondary rate limit",
             "abuse detection",
             "too many requests",
@@ -146,6 +131,20 @@ fn classify_text(text: &str) -> Option<BoundaryErrorClass> {
         ],
     ) {
         return Some(BoundaryErrorClass::QuotaExhausted);
+    }
+    if contains_any(
+        &lower,
+        &[
+            "401",
+            "bad credentials",
+            "requires authentication",
+            "authentication failed",
+            "auth failed",
+            "unauthorized",
+            "keyring",
+        ],
+    ) {
+        return Some(BoundaryErrorClass::AuthDegraded);
     }
     if contains_any(
         &lower,
@@ -197,7 +196,15 @@ mod tests {
             Some(BoundaryErrorClass::ProviderThrottle)
         );
         assert_eq!(
+            classify_process_output(1, "", "HTTP 403 secondary rate limit"),
+            Some(BoundaryErrorClass::ProviderThrottle)
+        );
+        assert_eq!(
             classify_process_output(1, "", "API rate limit exceeded"),
+            Some(BoundaryErrorClass::QuotaExhausted)
+        );
+        assert_eq!(
+            classify_process_output(1, "", "HTTP 403 API rate limit exceeded"),
             Some(BoundaryErrorClass::QuotaExhausted)
         );
     }
