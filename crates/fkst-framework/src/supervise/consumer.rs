@@ -1,7 +1,7 @@
 //! Per-department consumer task.
 
 use super::delivery_router::{now_unix_millis, DeliveryRouter, DerivedDelivery, PublishEnvelope};
-use super::delivery_store::{DeliveryStore, RetryOutcome};
+use super::delivery_store::{DeliveryStore, RetryFailure, RetryOutcome};
 use super::delivery_types::{
     DeadRecord, DeliveryRecord, RedrivePolicy, RetryPolicy, SourceKind, SourceRef,
 };
@@ -485,7 +485,10 @@ fn retry_record(
     match store.retry(
         &record.delivery_id,
         record.lease_generation,
-        &error,
+        &RetryFailure {
+            message: error,
+            replayable: false,
+        },
         policy,
         now_unix_millis(),
     ) {
@@ -949,7 +952,10 @@ mod tests {
                 .retry(
                     &first.delivery_id,
                     first.lease_generation,
-                    "failure",
+                    &RetryFailure {
+                        message: "failure".to_string(),
+                        replayable: false,
+                    },
                     &policy(3),
                     now_unix_millis()
                 )

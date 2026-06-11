@@ -36,6 +36,12 @@ pub(crate) enum RetryOutcome {
     Missing,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct RetryFailure {
+    pub message: String,
+    pub replayable: bool,
+}
+
 #[derive(Debug, PartialEq)]
 pub(crate) struct RedriveResult {
     pub redriven: Vec<DeliveryRecord>,
@@ -281,7 +287,7 @@ impl DeliveryStore {
         &self,
         delivery_id: &str,
         lease_generation: u64,
-        error: &str,
+        failure: &RetryFailure,
         policy: &RetryPolicy,
         now_ms: u64,
     ) -> Result<RetryOutcome> {
@@ -303,11 +309,10 @@ impl DeliveryStore {
 
                     let attempt = current.attempt.saturating_add(1);
                     current.attempt = attempt;
-                    current.last_error_excerpt = Some(error_excerpt(error));
+                    current.last_error_excerpt = Some(error_excerpt(&failure.message));
                     current.lease_until_ms = None;
 
                     if attempt >= policy.max_attempts {
-                        let replayable = is_transient_failure(error);
                         let dead = DeadRecord {
                             delivery_id: current.delivery_id.clone(),
                             queue: current.queue.clone(),
@@ -318,16 +323,16 @@ impl DeliveryStore {
                             dead_at_ms: now_ms,
                             attempts: attempt,
                             redrive_count: current.redrive_count,
-                            replayable,
-                            permanent: !replayable,
+                            replayable: failure.replayable,
+                            permanent: !failure.replayable,
                             error_excerpt: current.last_error_excerpt.clone(),
-                            record: replayable.then_some(current.clone()),
+                            record: failure.replayable.then_some(current.clone()),
                         };
                         let bytes = serde_json::to_vec(&dead)?;
                         let mut dead_table = write.open_table(DEAD_BY_ID)?;
                         dead_table.insert(delivery_id, bytes.as_slice())?;
                         delivery.remove(delivery_id)?;
-                        if replayable {
+                        if failure.replayable {
                             RetryOutcome::DeadPendingRedrive
                         } else {
                             RetryOutcome::PermanentDead
@@ -590,37 +595,6 @@ fn duration_millis(duration: Duration) -> u64 {
     duration.as_millis().min(u64::MAX as u128) as u64
 }
 
-fn is_transient_failure(error: &str) -> bool {
-    let lower = error.to_ascii_lowercase();
-    [
-        "timeout",
-        "timed out",
-        "temporarily unavailable",
-        "temporary failure",
-        "connection reset",
-        "connection refused",
-        "connection closed",
-        "network is unreachable",
-        "could not resolve host",
-        "dns",
-        "http 429",
-        "status 429",
-        "rate limit",
-        "http 500",
-        "http 502",
-        "http 503",
-        "http 504",
-        "status 500",
-        "status 502",
-        "status 503",
-        "status 504",
-        "service unavailable",
-        "gateway timeout",
-    ]
-    .iter()
-    .any(|needle| lower.contains(needle))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -653,6 +627,13 @@ mod tests {
             max_attempts,
             base: Duration::from_millis(100),
             cap: Duration::from_millis(1_000),
+        }
+    }
+
+    fn failure(message: &str, replayable: bool) -> RetryFailure {
+        RetryFailure {
+            message: message.to_string(),
+            replayable,
         }
     }
 
@@ -847,7 +828,13 @@ mod tests {
             + duration_millis(bounded_jitter("one", 1, policy(3).base));
 
         let outcome = store
-            .retry("one", 1, "temporary\nfailure", &policy(3), 120)
+            .retry(
+                "one",
+                1,
+                &failure("temporary\nfailure", false),
+                &policy(3),
+                120,
+            )
             .unwrap();
         let current = store.get("one").unwrap().unwrap();
 
@@ -875,7 +862,9 @@ mod tests {
         store.enqueue(&record("one", 100)).unwrap();
         store.lease(100, 10, Duration::from_millis(50)).unwrap();
 
-        let outcome = store.retry("one", 0, "temporary", &policy(3), 120).unwrap();
+        let outcome = store
+            .retry("one", 0, &failure("temporary", false), &policy(3), 120)
+            .unwrap();
         let current = store.get("one").unwrap().unwrap();
 
         assert_eq!(outcome, RetryOutcome::Stale);
@@ -889,7 +878,9 @@ mod tests {
         let store = store(&temp);
         store.enqueue(&record("one", 100)).unwrap();
 
-        let outcome = store.retry("one", 0, "temporary", &policy(3), 120).unwrap();
+        let outcome = store
+            .retry("one", 0, &failure("temporary", false), &policy(3), 120)
+            .unwrap();
         let current = store.get("one").unwrap().unwrap();
 
         assert_eq!(outcome, RetryOutcome::Stale);
@@ -920,7 +911,7 @@ mod tests {
             .retry(
                 "one",
                 1,
-                &format!("timeout final {}", "x".repeat(800)),
+                &failure(&format!("final {}", "x".repeat(800)), true),
                 &policy(1),
                 120,
             )
@@ -969,7 +960,9 @@ mod tests {
         let store = store(&temp);
         store.enqueue(&record("one", 100)).unwrap();
         store.lease(100, 10, Duration::from_millis(50)).unwrap();
-        let outcome = store.retry("one", 1, "temporary", &policy(3), 120).unwrap();
+        let outcome = store
+            .retry("one", 1, &failure("temporary", false), &policy(3), 120)
+            .unwrap();
         let next_due = store.get("one").unwrap().unwrap().not_before_ms;
 
         assert_eq!(outcome, RetryOutcome::Scheduled);
@@ -995,7 +988,9 @@ mod tests {
         store.enqueue(&record("one", 100)).unwrap();
         store.lease(100, 10, Duration::from_millis(50)).unwrap();
 
-        let outcome = store.retry("one", 1, "final", &policy(1), 120).unwrap();
+        let outcome = store
+            .retry("one", 1, &failure("final", false), &policy(1), 120)
+            .unwrap();
 
         assert_eq!(outcome, RetryOutcome::PermanentDead);
         assert_eq!(store.ready_index_len().unwrap(), 0);
@@ -1014,7 +1009,13 @@ mod tests {
         store.lease(100, 10, Duration::from_millis(50)).unwrap();
         assert_eq!(
             store
-                .retry("one", 1, "timeout from upstream", &policy(1), 120)
+                .retry(
+                    "one",
+                    1,
+                    &failure("classified upstream timeout", true),
+                    &policy(1),
+                    120,
+                )
                 .unwrap(),
             RetryOutcome::DeadPendingRedrive
         );
@@ -1055,7 +1056,13 @@ mod tests {
             store.lease(100, 10, Duration::from_millis(50)).unwrap();
             assert_eq!(
                 store
-                    .retry("one", 1, "timeout from upstream", &policy(1), 120)
+                    .retry(
+                        "one",
+                        1,
+                        &failure("classified upstream timeout", true),
+                        &policy(1),
+                        120,
+                    )
                     .unwrap(),
                 RetryOutcome::DeadPendingRedrive
             );
@@ -1083,7 +1090,7 @@ mod tests {
                 .retry(
                     &leased.delivery_id,
                     leased.lease_generation,
-                    "timeout from upstream",
+                    &failure("classified upstream timeout", true),
                     &policy(1),
                     130,
                 )
@@ -1119,7 +1126,13 @@ mod tests {
         store.lease(100, 10, Duration::from_millis(50)).unwrap();
 
         let outcome = store
-            .retry("one", 1, "validation failed", &policy(1), 120)
+            .retry(
+                "one",
+                1,
+                &failure("timeout-shaped validation failed", false),
+                &policy(1),
+                120,
+            )
             .unwrap();
 
         assert_eq!(outcome, RetryOutcome::PermanentDead);
