@@ -30,6 +30,7 @@ pub(crate) const CODEX_PERMIT_SLOTS_ENV: &str = "FKST_CODEX_PERMIT_SLOTS";
 pub const RUNTIME_LOG_DIR_ENV: &str = "FKST_RUNTIME_LOG_DIR";
 const DEFAULT_CODEX_TIMEOUT_SECONDS: i64 = 3600;
 const CODEX_STATUS_RECENT_LIMIT: usize = 50;
+const CODEX_STATUS_LOG_PREFIX: &str = "CODEX_STATUS:";
 static NEXT_PIPELINE_OWNER_ID: AtomicU64 = AtomicU64::new(1);
 static NEXT_CODEX_RUN_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -422,11 +423,11 @@ fn run_codex_request(
     runner: Option<&MockCommandState>,
 ) -> Result<CodexResult> {
     if let Some(runner) = runner {
-        return run_mocked_codex_request(request, host_root, runner);
+        return run_mocked_codex_request(request, runner);
     }
 
     let mut status = CodexStatusRecord::from_request(&request, None);
-    write_codex_status(host_root, &status);
+    write_codex_status(&request.log_path, &status);
     if let Err(err) = ensure_pool_with_context(host_root, config) {
         let message = format!("codex permit pool failed: {err}");
         write_codex_log(
@@ -438,8 +439,7 @@ fn run_codex_request(
             request.timeout_seconds,
         );
         status.finish(-1);
-        write_codex_status(host_root, &status);
-        trim_codex_status(host_root);
+        write_codex_status(&request.log_path, &status);
         return Ok(CodexResult::failure(
             "permit",
             message,
@@ -452,7 +452,7 @@ fn run_codex_request(
     let _permit = match acquire_permit_with_context(host_root, config) {
         Ok(permit) => {
             status.permit_slot = Some(permit.slot);
-            write_codex_status(host_root, &status);
+            write_codex_status(&request.log_path, &status);
             permit
         }
         Err(err) => {
@@ -466,8 +466,7 @@ fn run_codex_request(
                 request.timeout_seconds,
             );
             status.finish(-1);
-            write_codex_status(host_root, &status);
-            trim_codex_status(host_root);
+            write_codex_status(&request.log_path, &status);
             return Ok(CodexResult::failure(
                 "permit",
                 message,
@@ -481,18 +480,16 @@ fn run_codex_request(
 
     let result = run_codex_request_with_permit(request, config);
     status.finish(result.exit_code);
-    write_codex_status(host_root, &status);
-    trim_codex_status(host_root);
+    write_codex_status(Path::new(&result.log_path), &status);
     Ok(result)
 }
 
 fn run_mocked_codex_request(
     request: CodexRequest,
-    host_root: &Path,
     runner: &MockCommandState,
 ) -> Result<CodexResult> {
     let mut status = CodexStatusRecord::from_request(&request, None);
-    write_codex_status(host_root, &status);
+    write_codex_status(&request.log_path, &status);
     let args = command_args_for_request(&request);
     let cmd_line = format_command("codex", &args);
     let result = runner.execute(
@@ -510,8 +507,7 @@ fn run_mocked_codex_request(
         request.timeout_seconds,
     );
     status.finish(result.exit_code);
-    write_codex_status(host_root, &status);
-    trim_codex_status(host_root);
+    write_codex_status(&request.log_path, &status);
     Ok(CodexResult::success(
         result.stdout,
         result.stderr,
@@ -611,8 +607,8 @@ fn set_optional_string(table: &Table, key: &str, value: &Option<String>) -> Resu
     Ok(())
 }
 
-fn write_codex_status(host_root: &Path, record: &CodexStatusRecord) {
-    if let Err(err) = write_codex_status_result(host_root, record) {
+fn write_codex_status(log_path: &Path, record: &CodexStatusRecord) {
+    if let Err(err) = append_codex_status_log(log_path, record) {
         eprintln!(
             "WARN: codex status write failed run_id={} error={err}",
             record.run_id
@@ -620,20 +616,26 @@ fn write_codex_status(host_root: &Path, record: &CodexStatusRecord) {
     }
 }
 
-fn write_codex_status_result(host_root: &Path, record: &CodexStatusRecord) -> anyhow::Result<()> {
-    let status_dir = codex_status_dir(host_root)?;
-    std::fs::create_dir_all(&status_dir)?;
-    let target = status_dir.join(format!("{}.json", record.run_id));
-    let temp = status_dir.join(format!(".{}.{}.tmp", record.run_id, std::process::id()));
-    let body = serde_json::to_vec(record)?;
-    std::fs::write(&temp, body)?;
-    std::fs::rename(temp, target)?;
+fn append_codex_status_log(log_path: &Path, record: &CodexStatusRecord) -> anyhow::Result<()> {
+    if let Some(parent) = log_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log_path)?;
+    writeln!(
+        file,
+        "{CODEX_STATUS_LOG_PREFIX}{}",
+        serde_json::to_string(record)?
+    )?;
     Ok(())
 }
 
 fn read_codex_status_records(host_root: &Path) -> anyhow::Result<Vec<CodexStatusRecord>> {
-    let status_dir = codex_status_dir(host_root)?;
-    let entries = match std::fs::read_dir(&status_dir) {
+    let _ = host_root;
+    let log_dir = runtime_log_dir().join("codex");
+    let entries = match std::fs::read_dir(&log_dir) {
         Ok(entries) => entries,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(err) => return Err(err.into()),
@@ -642,56 +644,42 @@ fn read_codex_status_records(host_root: &Path) -> anyhow::Result<Vec<CodexStatus
     for entry in entries {
         let entry = entry?;
         let path = entry.path();
-        if path.extension().and_then(OsStr::to_str) != Some("json") {
+        if path.extension().and_then(OsStr::to_str) != Some("log") {
             continue;
         }
-        match std::fs::read_to_string(&path)
-            .ok()
-            .and_then(|body| serde_json::from_str::<CodexStatusRecord>(&body).ok())
-        {
-            Some(record) => records.push(record),
-            None => eprintln!("WARN: codex status read skipped path={}", path.display()),
+        let body = std::fs::read_to_string(&path)?;
+        for line in body.lines() {
+            let Some(json) = line.strip_prefix(CODEX_STATUS_LOG_PREFIX) else {
+                continue;
+            };
+            match serde_json::from_str::<CodexStatusRecord>(json) {
+                Ok(record) => records.push(record),
+                Err(err) => eprintln!(
+                    "WARN: codex status log line skipped path={} error={err}",
+                    path.display()
+                ),
+            }
         }
     }
-    Ok(records)
+    Ok(latest_codex_status_records(records))
 }
 
-fn trim_codex_status(host_root: &Path) {
-    if let Err(err) = trim_codex_status_result(host_root) {
-        eprintln!("WARN: codex status trim failed error={err}");
-    }
-}
-
-fn trim_codex_status_result(host_root: &Path) -> anyhow::Result<()> {
-    let mut completed = read_codex_status_records(host_root)?
-        .into_iter()
-        .filter(|record| record.status != "running")
-        .collect::<Vec<_>>();
-    if completed.len() <= CODEX_STATUS_RECENT_LIMIT {
-        return Ok(());
-    }
-    completed.sort_by(|left, right| {
-        right
-            .ended_at_ms
-            .unwrap_or(right.started_at_ms)
-            .cmp(&left.ended_at_ms.unwrap_or(left.started_at_ms))
-            .then_with(|| right.run_id.cmp(&left.run_id))
-    });
-    let status_dir = codex_status_dir(host_root)?;
-    for record in completed.into_iter().skip(CODEX_STATUS_RECENT_LIMIT) {
-        let path = status_dir.join(format!("{}.json", record.run_id));
-        match std::fs::remove_file(&path) {
-            Ok(()) => {}
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-            Err(err) => return Err(err.into()),
+fn latest_codex_status_records(records: Vec<CodexStatusRecord>) -> Vec<CodexStatusRecord> {
+    let mut latest = std::collections::HashMap::<String, CodexStatusRecord>::new();
+    for record in records {
+        let key = record.run_id.clone();
+        match latest.get(&key) {
+            Some(existing) if status_record_time(existing) > status_record_time(&record) => {}
+            _ => {
+                latest.insert(key, record);
+            }
         }
     }
-    Ok(())
+    latest.into_values().collect()
 }
 
-fn codex_status_dir(host_root: &Path) -> anyhow::Result<PathBuf> {
-    runtime_context::layout_from_host_root(host_root)
-        .map(|layout| layout.runtime_dir(RuntimeKind::CodexStatus))
+fn status_record_time(record: &CodexStatusRecord) -> u64 {
+    record.ended_at_ms.unwrap_or(record.started_at_ms)
 }
 
 fn run_codex_request_with_permit(mut request: CodexRequest, config: &ConfigContext) -> CodexResult {

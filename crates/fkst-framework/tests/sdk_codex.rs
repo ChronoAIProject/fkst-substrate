@@ -302,19 +302,8 @@ printf 'ok'
         .collect::<Vec<_>>();
     assert!(!labels.iter().any(|label| label == "job-00"));
     assert!(labels.iter().any(|label| label == "job-54"));
-    assert_eq!(
-        std::fs::read_dir(tmp.path().join(".fkst/runtime/codex-status"))
-            .unwrap()
-            .filter(|entry| entry
-                .as_ref()
-                .unwrap()
-                .path()
-                .extension()
-                .and_then(std::ffi::OsStr::to_str)
-                == Some("json"))
-            .count(),
-        50
-    );
+    assert!(tmp.path().join("runtime/codex").exists());
+    assert!(!tmp.path().join(".fkst/runtime/codex-status").exists());
 }
 
 #[test]
@@ -542,9 +531,9 @@ printf 'sensitive output body'
     assert!(item.get::<String>("log_path").is_err());
     assert!(item.get::<String>("output_excerpt").is_err());
 
-    let status_dir = tmp.path().join(".fkst/runtime/codex-status");
-    let files = std::fs::read_dir(status_dir).unwrap().count();
-    assert_eq!(files, 1);
+    let log_body = std::fs::read_to_string(result.get::<String>("log_path").unwrap()).unwrap();
+    assert!(log_body.contains("CODEX_STATUS:"));
+    assert!(!tmp.path().join(".fkst/runtime/codex-status").exists());
 }
 
 #[cfg(unix)]
@@ -652,9 +641,8 @@ printf 'ok'
     let oldest: Table = recent.get(50).unwrap();
     assert_eq!(oldest.get::<String>("label").unwrap(), "run-05");
 
-    let status_dir = tmp.path().join(".fkst/runtime/codex-status");
-    let files = std::fs::read_dir(status_dir).unwrap().count();
-    assert_eq!(files, 50);
+    assert!(tmp.path().join("runtime/codex").exists());
+    assert!(!tmp.path().join(".fkst/runtime/codex-status").exists());
 }
 
 #[cfg(unix)]

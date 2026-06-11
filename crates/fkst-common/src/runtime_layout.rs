@@ -10,7 +10,6 @@ pub const RUNTIME_ROOT_ENV: &str = "FKST_RUNTIME_ROOT";
 pub enum RuntimeKind {
     Worktrees,
     CodexPermits,
-    CodexStatus,
     Locks,
     Logs,
     Marks,
@@ -28,7 +27,6 @@ impl RuntimeKind {
         match self {
             Self::Worktrees => "worktrees",
             Self::CodexPermits => "codex-permits",
-            Self::CodexStatus => "codex-status",
             Self::Locks => "locks",
             Self::Logs => "logs",
             Self::Marks => "marks",
@@ -149,10 +147,6 @@ mod tests {
         assert_eq!(
             layout.runtime_dir(RuntimeKind::Cache),
             PathBuf::from("/tmp/fkst-runtime/repo-a/cache")
-        );
-        assert_eq!(
-            layout.runtime_dir(RuntimeKind::CodexStatus),
-            PathBuf::from("/tmp/fkst-runtime/repo-a/codex-status")
         );
     }
 
