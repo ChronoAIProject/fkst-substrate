@@ -4,7 +4,7 @@ use super::delivery_router::{now_unix_millis, DeliveryRouter, DerivedDelivery, P
 use super::delivery_store::{DeliveryStore, RetryOutcome};
 use super::delivery_types::{DeliveryRecord, RetryPolicy, SourceKind, SourceRef};
 use super::event_fanout::Fanout;
-use super::failure_fact::{dead_letter_payload, delivery_failure_fact};
+use super::failure_fact::{dead_letter_payload, delivery_failure_fact, FAILURE_FACT_QUEUE};
 use super::raised::parse_raised;
 use super::source_runner::parse_duration;
 use super::spawner::{spawn_framework, SpawnResult};
@@ -552,6 +552,7 @@ fn publish_raised(
     parent: &DeliveryRecord,
 ) -> anyhow::Result<()> {
     for (ordinal, mut raised_ev) in parse_raised(stdout).into_iter().enumerate() {
+        reject_reserved_raised_queue(&raised_ev)?;
         raised_ev.ts = parent.observed_at_ms;
         router.publish(PublishEnvelope {
             event: raised_ev,
@@ -568,12 +569,23 @@ fn publish_raised(
 
 fn publish_ephemeral_raised(router: &DeliveryRouter, stdout: &str) -> anyhow::Result<()> {
     for raised_ev in parse_raised(stdout) {
+        reject_reserved_raised_queue(&raised_ev)?;
         router.publish(PublishEnvelope {
             event: raised_ev,
             source: None,
             cron_payload: None,
             derived: None,
         })?;
+    }
+    Ok(())
+}
+
+fn reject_reserved_raised_queue(event: &Event) -> anyhow::Result<()> {
+    if event.queue == FAILURE_FACT_QUEUE {
+        anyhow::bail!(
+            "reserved engine queue `{}` cannot be raised by department output",
+            event.queue
+        );
     }
     Ok(())
 }
@@ -1056,6 +1068,29 @@ mod tests {
         assert_eq!(event.payload["error_class"], "framework_child_spawn");
         assert_eq!(event.payload["origin_queue"], "jobs");
         assert_eq!(event.payload["origin_dept"], "worker");
+    }
+
+    #[test]
+    fn raised_output_cannot_publish_engine_failure_fact_queue() {
+        let router = router_with_failure_fact_and_fanout(Fanout::new());
+        let parent = record("parent");
+        let stdout = format!(
+            "RAISED: {}\n",
+            base64::engine::general_purpose::URL_SAFE.encode(
+                serde_json::to_vec(&serde_json::json!([
+                    {"queue": "fkst.failure_fact", "payload": {"n": 1}}
+                ]))
+                .unwrap()
+            )
+        );
+
+        let err = publish_raised(&router, &stdout, &parent).unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("reserved engine queue `fkst.failure_fact`"),
+            "{err}"
+        );
     }
 
     #[test]

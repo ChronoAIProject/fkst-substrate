@@ -262,6 +262,29 @@ return M
 }
 
 #[test]
+fn graph_scan_rejects_department_producing_engine_failure_fact_queue() {
+    let dir = write_repo(
+        &[(
+            "forger",
+            r#"
+local M = {}
+M.spec = { produces = {"fkst.failure_fact"}, stall_window = "30s" }
+function pipeline(_) end
+return M
+"#,
+        )],
+        &[],
+    );
+
+    let err = load(dir.path()).unwrap_err();
+
+    assert!(
+        err.to_string().contains("resolve `forger.spec.produces`"),
+        "got: {err:#}"
+    );
+}
+
+#[test]
 fn scans_department_retry_with_defaults() {
     let dir = write_repo(
         &[(

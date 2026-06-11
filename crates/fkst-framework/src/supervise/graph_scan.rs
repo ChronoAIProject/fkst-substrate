@@ -124,9 +124,8 @@ pub fn load_roots(roots: &PackageRoots) -> Result<Config> {
     }
 
     let defaults = HostGraphDefaults::load(roots)?;
-    let resolver = roots
-        .name_resolver()
-        .add_recorded_only_queue(FAILURE_FACT_QUEUE);
+    let resolver = roots.name_resolver();
+    let subscribe_resolver = resolver.clone().add_recorded_only_queue(FAILURE_FACT_QUEUE);
     let mut departments: BTreeMap<String, DepartmentDecl> = BTreeMap::new();
     let mut raisers: BTreeMap<String, RaiserDecl> = BTreeMap::new();
     let mut department_fanout: HashMap<String, Vec<String>> = HashMap::new();
@@ -139,6 +138,7 @@ pub fn load_roots(roots: &PackageRoots) -> Result<Config> {
             graph_root,
             &require_roots,
             &resolver,
+            &subscribe_resolver,
             &defaults,
             &mut departments,
             &mut department_fanout,
@@ -173,6 +173,7 @@ fn scan_departments(
     graph_root: &GraphRoot,
     require_roots: &[PathBuf],
     resolver: &NameResolver,
+    subscribe_resolver: &NameResolver,
     defaults: &HostGraphDefaults,
     departments: &mut BTreeMap<String, DepartmentDecl>,
     department_fanout: &mut HashMap<String, Vec<String>>,
@@ -205,13 +206,13 @@ fn scan_departments(
         let spec: DeptSpec = lua
             .from_value(LuaValue::Table(spec_tbl))
             .with_context(|| format!("parse `{}.spec`", name))?;
-        let consumes = resolve_queues(resolver, &graph_root.namespace, spec.consumes)
+        let consumes = resolve_queues(subscribe_resolver, &graph_root.namespace, spec.consumes)
             .with_context(|| format!("resolve `{}.spec.consumes`", name))?;
         let produces = resolve_queues(resolver, &graph_root.namespace, spec.produces)
             .with_context(|| format!("resolve `{}.spec.produces`", name))?;
         let fanout = resolve_queues(resolver, &graph_root.namespace, spec.fanout)
             .with_context(|| format!("resolve `{}.spec.fanout`", name))?;
-        let ephemeral = resolve_queues(resolver, &graph_root.namespace, spec.ephemeral)
+        let ephemeral = resolve_queues(subscribe_resolver, &graph_root.namespace, spec.ephemeral)
             .with_context(|| format!("resolve `{}.spec.ephemeral`", name))?;
         let retry = materialize_retry(&retry, defaults, &consumes)
             .with_context(|| format!("materialize `{}.spec.retry`", name))?;

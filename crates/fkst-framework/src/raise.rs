@@ -237,30 +237,25 @@ mod tests {
     }
 
     #[test]
-    fn namespaced_raise_allows_engine_failure_fact_queue_only_when_recorded() {
+    fn namespaced_raise_rejects_engine_failure_fact_queue_without_recorded_permission() {
         let lua = Lua::new();
         let buf = RaiseBuffer::new();
         register(
             &lua,
             buf.clone(),
-            NameResolver::new(["pkg".to_string(), "host".to_string()])
-                .add_recorded_only_queue("fkst.failure_fact"),
+            NameResolver::new(["pkg".to_string(), "host".to_string()]),
             "pkg".to_string(),
         )
         .unwrap();
 
-        lua.load(r#"raise("fkst.failure_fact", {n=1})"#)
-            .exec()
-            .unwrap();
         let err = lua
-            .load(r#"raise("fkst.other", {n=1})"#)
+            .load(r#"raise("fkst.failure_fact", {n=1})"#)
             .exec()
             .unwrap_err();
 
         assert!(err.to_string().contains("unknown namespace"), "got: {err}");
         let entries = buf.0.lock().unwrap();
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].queue, "fkst.failure_fact");
+        assert!(entries.is_empty());
     }
 
     #[test]
