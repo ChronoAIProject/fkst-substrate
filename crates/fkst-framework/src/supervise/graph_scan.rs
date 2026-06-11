@@ -6,7 +6,8 @@
 //! Each department exposes `M.spec = { consumes, produces, fanout, stall_window }`
 //! at module top level. Queues are auto-derived from the union of department
 //! and raiser consumes+produces, with fanout coming only from Department
-//! `M.spec.fanout`. Host graph defaults are read before graph materialization.
+//! `M.spec.fanout`. `M.spec.graph_json` authorizes composed graph introspection.
+//! Host graph defaults are read before graph materialization.
 
 use anyhow::{anyhow, bail, Context, Result};
 use fkst_common::config::{Config, DepartmentDecl, LimitsDecl, QueueDecl, RaiserDecl, RetryDecl};
@@ -33,6 +34,8 @@ struct DeptSpec {
     fanout: Vec<String>,
     #[serde(default)]
     ephemeral: Vec<String>,
+    #[serde(default)]
+    graph_json: bool,
     #[serde(default)]
     stall_window: String,
 }
@@ -241,6 +244,7 @@ fn scan_departments(
                 } else {
                     spec.stall_window
                 },
+                graph_json: spec.graph_json,
                 retry,
             },
             &config_path,

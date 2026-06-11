@@ -380,16 +380,18 @@ fn parse_worktree_paths_reads_porcelain_worktree_lines() {
 
 #[test]
 fn setup_worktree_creates_under_runtime_worktrees() {
-    let lua = Lua::new();
     let repo = repo_with_commit("worktree base");
     write_candidate_config(repo.path(), "host-rc", "__base__");
-    register_for_host(&lua, repo.path());
     let path: String = in_sandbox(
         repo.path(),
         |sandbox| {
             sandbox.runtime_root(".fkst/runtime");
+            sandbox.unset_env("FKST_CANDIDATE_PREFIX");
+            sandbox.unset_env("FKST_CANDIDATE_FROM_SEP");
         },
         || {
+            let lua = Lua::new();
+            register_for_host(&lua, repo.path());
             lua.load(r#"return setup_worktree("c3-test")"#)
                 .eval()
                 .unwrap()
@@ -425,10 +427,8 @@ fn setup_worktree_creates_under_runtime_worktrees() {
 
 #[test]
 fn setup_worktree_uses_short_sha_parent_when_detached() {
-    let lua = Lua::new();
     let repo = repo_with_commit("worktree detached base");
     write_candidate_config(repo.path(), "host-rc", "__base__");
-    register_for_host(&lua, repo.path());
     let parent_sha = git_stdout(repo.path(), &["rev-parse", "--short=12", "HEAD"]);
     git(repo.path(), &["checkout", "--detach", "HEAD"]);
 
@@ -436,8 +436,12 @@ fn setup_worktree_uses_short_sha_parent_when_detached() {
         repo.path(),
         |sandbox| {
             sandbox.runtime_root(".fkst/runtime");
+            sandbox.unset_env("FKST_CANDIDATE_PREFIX");
+            sandbox.unset_env("FKST_CANDIDATE_FROM_SEP");
         },
         || {
+            let lua = Lua::new();
+            register_for_host(&lua, repo.path());
             lua.load(r#"return setup_worktree("detached-test")"#)
                 .eval()
                 .unwrap()
@@ -499,14 +503,12 @@ fn setup_worktree_prefers_env_over_fkst_env() {
 
 #[test]
 fn setup_worktree_uses_fkst_env_without_env() {
-    let lua = Lua::new();
     let repo = repo_with_commit("worktree tunable base");
     std::fs::write(
         repo.path().join("fkst.env"),
         "FKST_CANDIDATE_PREFIX=file-rc\nFKST_CANDIDATE_FROM_SEP=__file__\n",
     )
     .unwrap();
-    register_for_host(&lua, repo.path());
 
     let path: String = in_sandbox(
         repo.path(),
@@ -516,6 +518,8 @@ fn setup_worktree_uses_fkst_env_without_env() {
             sandbox.unset_env("FKST_CANDIDATE_FROM_SEP");
         },
         || {
+            let lua = Lua::new();
+            register_for_host(&lua, repo.path());
             lua.load(r#"return setup_worktree("tunable-test")"#)
                 .eval()
                 .unwrap()

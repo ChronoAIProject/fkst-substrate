@@ -496,6 +496,7 @@ mod tests {
                 produces: Vec::new(),
                 ephemeral: vec![queue_name.to_string()],
                 stall_window: "30s".to_string(),
+                graph_json: false,
                 retry: None,
             },
         );

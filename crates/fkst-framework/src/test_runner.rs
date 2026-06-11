@@ -27,6 +27,8 @@ pub(crate) fn run_tests(roots: PackageRoots, report_json: Option<PathBuf>) -> Re
             roots.name_resolver(),
             file.owner_namespace.clone(),
             Some(mock_commands.clone()),
+            Some(roots.clone()),
+            false,
         )
         .with_context(|| format!("register SDK for {}", relpath))?;
         register_test_sdk(
@@ -429,6 +431,8 @@ fn run_department(
     let event_json: serde_json::Value = lua.from_value(event)?;
     let _guard = DeptRunEnvGuard::apply(opts)?;
     let require_roots = roots.require_roots_for_owner(owner_root);
+    let graph_json_authorized =
+        crate::sdk_graph::department_authorized(roots, owner_root, &lua_path).unwrap_or(false);
     let qualified_produces = declared_qualified_produces(
         owner_root,
         &lua_path,
@@ -446,6 +450,8 @@ fn run_department(
             .with_recorded_only_queues(qualified_produces),
         owner_namespace.to_string(),
         Some(mock_commands),
+        Some(roots.clone()),
+        graph_json_authorized,
     )?;
 
     let exit_code = match crate::mlua_init::run_dept_with_require_roots(

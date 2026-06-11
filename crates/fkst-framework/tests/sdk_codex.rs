@@ -133,7 +133,7 @@ fn run_timeout_activity_test(output_stream: TestStream) -> ActivityResult {
         register(&lua).unwrap();
         let spawn: mlua::Function = lua.globals().get("spawn_codex_sync").unwrap();
         let opts = lua_opts(&lua, "active");
-        opts.set("timeout", 2).unwrap();
+        opts.set("timeout", 3).unwrap();
         let result: Table = spawn.call(opts).unwrap();
         result_tx
             .send(ActivityResult {

@@ -875,6 +875,7 @@ mod tests {
                 produces: Vec::new(),
                 ephemeral: vec!["dead_letter".to_string()],
                 stall_window: "30s".to_string(),
+                graph_json: false,
                 retry: None,
             },
         );
@@ -909,6 +910,7 @@ mod tests {
                 produces: Vec::new(),
                 ephemeral: vec!["fkst.failure_fact".to_string()],
                 stall_window: "30s".to_string(),
+                graph_json: false,
                 retry: None,
             },
         );
@@ -942,6 +944,7 @@ mod tests {
             produces: vec!["consensus.proposal".to_string()],
             ephemeral: vec!["github-devloop.tick".to_string()],
             stall_window: "30s".to_string(),
+            graph_json: false,
             retry: None,
         };
 
@@ -975,6 +978,7 @@ mod tests {
             produces: vec!["done".to_string()],
             ephemeral: vec!["tick".to_string()],
             stall_window: "30s".to_string(),
+            graph_json: false,
             retry: None,
         };
 
@@ -1217,6 +1221,7 @@ mod tests {
                 produces: Vec::new(),
                 ephemeral: Vec::new(),
                 stall_window: "30s".to_string(),
+                graph_json: false,
                 retry: None,
             },
         );
@@ -1269,6 +1274,7 @@ mod tests {
                 produces: Vec::new(),
                 ephemeral: Vec::new(),
                 stall_window: "30s".to_string(),
+                graph_json: false,
                 retry: None,
             },
         );
