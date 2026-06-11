@@ -97,6 +97,7 @@ impl HostConformanceSuite {
             .and_then(|layout| {
                 layout.runtime_dir(RuntimeKind::Worktrees);
                 layout.runtime_dir(RuntimeKind::CodexPermits);
+                layout.runtime_dir(RuntimeKind::CodexStatus);
                 layout.runtime_dir(RuntimeKind::Locks);
                 layout.runtime_dir(RuntimeKind::Logs);
                 layout.runtime_dir(RuntimeKind::Marks);

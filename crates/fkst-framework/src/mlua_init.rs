@@ -20,6 +20,7 @@ pub fn register_framework_sdk(
     lua: &Lua,
     raise_buf: RaiseBuffer,
     host_root: &Path,
+    dept: Option<String>,
     resolver: NameResolver,
     owner_namespace: String,
     graph_roots: Option<PackageRoots>,
@@ -36,7 +37,7 @@ pub fn register_framework_sdk(
     crate::sdk_git::register(lua, host_root, config.clone())?;
     crate::sdk_mark::register(lua, host_root)?;
     crate::sdk_cache::register(lua, host_root)?;
-    crate::sdk_codex::register(lua, host_root, config)?;
+    crate::sdk_codex::register(lua, host_root, config, dept)?;
     crate::raise::register(lua, raise_buf, resolver, owner_namespace)?;
     Ok(())
 }
@@ -45,6 +46,7 @@ pub(crate) fn register_framework_sdk_with_runner(
     lua: &Lua,
     raise_buf: RaiseBuffer,
     host_root: &Path,
+    dept: Option<String>,
     resolver: NameResolver,
     owner_namespace: String,
     runner: Option<MockCommandState>,
@@ -62,7 +64,7 @@ pub(crate) fn register_framework_sdk_with_runner(
     crate::sdk_git::register_with_runner(lua, host_root, config.clone(), runner.clone())?;
     crate::sdk_mark::register(lua, host_root)?;
     crate::sdk_cache::register(lua, host_root)?;
-    crate::sdk_codex::register_with_runner(lua, host_root, config, runner)?;
+    crate::sdk_codex::register_with_runner(lua, host_root, config, dept, runner)?;
     crate::raise::register(lua, raise_buf, resolver, owner_namespace)?;
     Ok(())
 }
