@@ -183,3 +183,101 @@ fn generated_shim_consumes_same_bucket_as_cli_acquire() {
     assert_eq!(stdout(&shim), "shim-real");
     assert_eq!(ledger_tokens(&root.join("gh.bucket")), 0);
 }
+
+#[cfg(unix)]
+#[test]
+fn generated_shim_bakes_resolved_config_from_fkst_env_style_registry() {
+    let tmp = tempfile::tempdir().unwrap();
+    let host = tmp.path().join("host");
+    let run_cwd = tmp.path().join("run-cwd");
+    let real_dir = tmp.path().join("bin");
+    std::fs::create_dir_all(&host).unwrap();
+    std::fs::create_dir_all(&run_cwd).unwrap();
+    std::fs::create_dir_all(&real_dir).unwrap();
+    std::fs::write(
+        host.join("fkst.env"),
+        "FKST_RATE_POOL_ROOT=relative-rate-pools\nFKST_RATE_POOL_GH=2,1\n",
+    )
+    .unwrap();
+    executable(&real_dir.join("gh"), "#!/bin/sh\nprintf shim-real\n");
+
+    let original_cwd = std::env::current_dir().unwrap();
+    std::env::set_current_dir(&host).unwrap();
+    let config = config_registry::ConfigContext::from_host_root(&host).unwrap();
+    let registry = RatePoolRegistry::from_config(&config).unwrap();
+    std::env::set_current_dir(original_cwd).unwrap();
+    seed_ledger(registry.root(), "gh", 2);
+    let generator_path = std::env::join_paths([real_dir.as_path()]).unwrap();
+    let shim_dir = rate_shim::ensure_rate_shims_with_path(
+        &registry,
+        Path::new(framework_bin()),
+        &generator_path,
+    )
+    .unwrap();
+    let path = std::env::join_paths([shim_dir.as_path(), real_dir.as_path()]).unwrap();
+
+    let shim = Command::new(shim_dir.join("gh"))
+        .current_dir(&run_cwd)
+        .env("PATH", path)
+        .env_remove("FKST_RATE_POOL_ROOT")
+        .env_remove("FKST_RATE_POOL_GH")
+        .output()
+        .unwrap();
+
+    assert_exit(&shim, 0);
+    assert_eq!(stdout(&shim), "shim-real");
+    assert_eq!(ledger_tokens(&registry.root().join("gh.bucket")), 1);
+    assert!(!run_cwd.join("relative-rate-pools/gh.bucket").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn generated_shim_skips_symlinked_shim_path_before_real_program() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("rate-pools");
+    let real_dir = tmp.path().join("bin");
+    let count_file = tmp.path().join("count");
+    std::fs::create_dir_all(&real_dir).unwrap();
+    executable(
+        &real_dir.join("gh"),
+        &format!(
+            "#!/bin/sh\ncount=$(cat {} 2>/dev/null || printf 0)\ncount=$((count + 1))\nprintf '%s' \"$count\" > {}\nprintf real-once\n",
+            count_file.display(),
+            count_file.display()
+        ),
+    );
+    let registry = RatePoolRegistry::for_test(
+        root.clone(),
+        BTreeMap::from([(
+            "gh".to_string(),
+            RatePoolConfig {
+                burst: 2,
+                refill_per_minute: 1,
+            },
+        )]),
+    );
+    seed_ledger(&root, "gh", 2);
+    let generator_path = std::env::join_paths([real_dir.as_path()]).unwrap();
+    let shim_dir = rate_shim::ensure_rate_shims_with_path(
+        &registry,
+        Path::new(framework_bin()),
+        &generator_path,
+    )
+    .unwrap();
+    let shim_link = tmp.path().join("shims-link");
+    std::os::unix::fs::symlink(&shim_dir, &shim_link).unwrap();
+    let path = std::env::join_paths([shim_link.as_path(), shim_dir.as_path(), real_dir.as_path()])
+        .unwrap();
+
+    let shim = Command::new(shim_dir.join("gh"))
+        .env("PATH", path)
+        .env_remove("FKST_RATE_POOL_ROOT")
+        .env_remove("FKST_RATE_POOL_GH")
+        .output()
+        .unwrap();
+
+    assert_exit(&shim, 0);
+    assert_eq!(stdout(&shim), "real-once");
+    assert_eq!(std::fs::read_to_string(count_file).unwrap(), "1");
+    assert_eq!(ledger_tokens(&root.join("gh.bucket")), 1);
+}

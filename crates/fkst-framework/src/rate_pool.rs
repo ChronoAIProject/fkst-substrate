@@ -70,8 +70,11 @@ impl Sleeper for ThreadSleeper {
 
 impl RatePoolRegistry {
     pub(crate) fn from_config(config: &ConfigContext) -> Result<Self> {
-        let root = expand_home(&config.resolved_string(ConfigKey::RatePoolRoot)?)?;
         let pools = parse_pool_definitions(config.rate_pool_env())?;
+        let root = canonicalize_configured_root(
+            expand_home(&config.resolved_string(ConfigKey::RatePoolRoot)?)?,
+            pools.is_empty(),
+        )?;
         Ok(Self { root, pools })
     }
 
@@ -101,6 +104,7 @@ impl RatePoolRegistry {
             }
         }
         let pools = parse_pool_definitions(values)?;
+        let root = canonicalize_configured_root(root, pools.is_empty())?;
         Ok(Self { root, pools })
     }
 
@@ -216,6 +220,16 @@ fn expand_home(raw: &str) -> Result<PathBuf> {
     } else {
         Ok(PathBuf::from(raw))
     }
+}
+
+fn canonicalize_configured_root(root: PathBuf, empty: bool) -> Result<PathBuf> {
+    if empty {
+        return Ok(root);
+    }
+    std::fs::create_dir_all(&root)
+        .with_context(|| format!("create rate pool root {}", root.display()))?;
+    root.canonicalize()
+        .with_context(|| format!("canonicalize rate pool root {}", root.display()))
 }
 
 fn pool_name_for_program(program: &str) -> Option<String> {

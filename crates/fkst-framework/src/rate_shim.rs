@@ -28,9 +28,10 @@ pub(crate) fn ensure_rate_shims_with_path(
     }
     std::fs::create_dir_all(&shim_dir)
         .with_context(|| format!("create rate shim dir {}", shim_dir.display()))?;
+    let shim_dir = canonical_shim_dir(&shim_dir)?;
     for name in registry.pools().keys() {
         if resolve_program_on_path(name, Some(path), &shim_dir).is_some() {
-            write_shim(&shim_dir, name, framework_bin)?;
+            write_shim(registry, &shim_dir, name, framework_bin)?;
         }
     }
     Ok(shim_dir)
@@ -44,9 +45,14 @@ pub(crate) fn prepend_shim_dir_to_path(cmd: &mut std::process::Command, shim_dir
     cmd.env("PATH", path);
 }
 
-fn write_shim(shim_dir: &Path, name: &str, framework_bin: &Path) -> Result<()> {
+fn write_shim(
+    registry: &RatePoolRegistry,
+    shim_dir: &Path,
+    name: &str,
+    framework_bin: &Path,
+) -> Result<()> {
     let shim_path = shim_dir.join(name);
-    let body = shim_body(name, framework_bin, shim_dir);
+    let body = shim_body(registry, name, framework_bin, shim_dir);
     if existing_shim_matches(&shim_path, &body) {
         return Ok(());
     }
@@ -114,19 +120,38 @@ fn set_executable(_path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn shim_body(name: &str, framework_bin: &Path, shim_dir: &Path) -> String {
+fn shim_body(
+    registry: &RatePoolRegistry,
+    name: &str,
+    framework_bin: &Path,
+    shim_dir: &Path,
+) -> String {
+    let rate_pool_exports = registry
+        .pools()
+        .iter()
+        .map(|(name, config)| {
+            format!(
+                "export FKST_RATE_POOL_{}={}\n",
+                name.to_ascii_uppercase(),
+                shell_single_quote(&format!("{},{}", config.burst, config.refill_per_minute))
+            )
+        })
+        .collect::<String>();
     format!(
         "#!/bin/sh\n\
 shim_dir={shim_dir}\n\
+shim_script=$shim_dir/{program}\n\
 program={program}\n\
 framework_bin={framework_bin}\n\
+export FKST_RATE_POOL_ROOT={rate_pool_root}\n\
+{rate_pool_exports}\
 real_program=\n\
 old_ifs=$IFS\n\
 IFS=:\n\
 for dir in $PATH; do\n\
   if [ -z \"$dir\" ]; then dir=.; fi\n\
-  if [ \"$dir\" = \"$shim_dir\" ]; then continue; fi\n\
   candidate=\"$dir/$program\"\n\
+  if [ \"$candidate\" -ef \"$shim_script\" ] 2>/dev/null; then continue; fi\n\
   if [ -f \"$candidate\" ] && [ -x \"$candidate\" ]; then\n\
     real_program=$candidate\n\
     break\n\
@@ -142,7 +167,20 @@ exec \"$real_program\" \"$@\"\n",
         shim_dir = shell_single_quote(&shim_dir.to_string_lossy()),
         program = shell_single_quote(name),
         framework_bin = shell_single_quote(&framework_bin.to_string_lossy()),
+        rate_pool_root = shell_single_quote(
+            &shim_dir
+                .parent()
+                .unwrap_or_else(|| registry.root())
+                .to_string_lossy(),
+        ),
+        rate_pool_exports = rate_pool_exports,
     )
+}
+
+fn canonical_shim_dir(shim_dir: &Path) -> Result<PathBuf> {
+    shim_dir
+        .canonicalize()
+        .with_context(|| format!("canonicalize rate shim dir {}", shim_dir.display()))
 }
 
 fn shell_single_quote(value: &str) -> String {
