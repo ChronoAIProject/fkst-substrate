@@ -146,12 +146,14 @@ framework_bin={framework_bin}\n\
 export FKST_RATE_POOL_ROOT={rate_pool_root}\n\
 {rate_pool_exports}\
 real_program=\n\
+real_path=\n\
 old_ifs=$IFS\n\
 IFS=:\n\
 for dir in $PATH; do\n\
   if [ -z \"$dir\" ]; then dir=.; fi\n\
   candidate=\"$dir/$program\"\n\
   if [ \"$candidate\" -ef \"$shim_script\" ] 2>/dev/null; then continue; fi\n\
+  if [ -z \"$real_path\" ]; then real_path=$dir; else real_path=$real_path:$dir; fi\n\
   if [ -f \"$candidate\" ] && [ -x \"$candidate\" ]; then\n\
     real_program=$candidate\n\
     break\n\
@@ -162,7 +164,7 @@ if [ -z \"$real_program\" ]; then\n\
   printf '%s\\n' \"fkst rate shim: real program not found: $program\" >&2\n\
   exit 127\n\
 fi\n\
-\"$framework_bin\" rate-acquire \"$program\" || exit $?\n\
+PATH=$real_path \"$framework_bin\" rate-acquire \"$program\" || exit $?\n\
 exec \"$real_program\" \"$@\"\n",
         shim_dir = shell_single_quote(&shim_dir.to_string_lossy()),
         program = shell_single_quote(name),
