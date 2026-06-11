@@ -10,15 +10,15 @@ use super::delivery_index::{
 use super::delivery_retry::ERROR_EXCERPT_LIMIT;
 use super::delivery_retry::{backoff_delay, bounded_jitter, error_excerpt};
 use super::delivery_transition::{lease_key, read_delivery_table, rebuild_due_indexes};
-use super::delivery_types::{DeadRecord, DeliveryRecord, RetryPolicy};
+use super::delivery_types::{DeadRecord, DeliveryRecord, RedrivePolicy, RetryPolicy};
 use super::delivery_watch::StoreOpWatch;
 use anyhow::{bail, Result};
 use redb::{Database, ReadableTable, TableDefinition};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::time::Duration;
 
-const SCHEMA_VERSION: &str = "2";
+const SCHEMA_VERSION: &str = "3";
 
 const DELIVERY_BY_ID: TableDefinition<&str, &[u8]> = TableDefinition::new("delivery_by_id");
 const DEAD_BY_ID: TableDefinition<&str, &[u8]> = TableDefinition::new("dead_by_id");
@@ -30,9 +30,16 @@ const OLD_LEASED_BY_UNTIL: TableDefinition<(u64, &str), ()> =
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum RetryOutcome {
     Scheduled,
-    Dead,
+    DeadPendingRedrive,
+    PermanentDead,
     Stale,
     Missing,
+}
+
+#[derive(Debug, PartialEq)]
+pub(crate) struct RedriveResult {
+    pub redriven: Vec<DeliveryRecord>,
+    pub permanent: Vec<DeadRecord>,
 }
 
 pub(crate) struct DeliveryStore {
@@ -62,6 +69,7 @@ impl DeliveryStore {
             if current_version.as_deref() != Some(SCHEMA_VERSION) {
                 delete_old_global_indexes(&write)?;
                 rebuild_due_indexes(&write, DELIVERY_BY_ID)?;
+                mark_existing_dead_records_permanent(&write)?;
             }
             let mut meta = write.open_table(META)?;
             meta.insert("schema_version", SCHEMA_VERSION)?;
@@ -299,6 +307,7 @@ impl DeliveryStore {
                     current.lease_until_ms = None;
 
                     if attempt >= policy.max_attempts {
+                        let replayable = is_transient_failure(error);
                         let dead = DeadRecord {
                             delivery_id: current.delivery_id.clone(),
                             queue: current.queue.clone(),
@@ -308,13 +317,21 @@ impl DeliveryStore {
                             not_before_ms: current.not_before_ms,
                             dead_at_ms: now_ms,
                             attempts: attempt,
+                            redrive_count: current.redrive_count,
+                            replayable,
+                            permanent: !replayable,
                             error_excerpt: current.last_error_excerpt.clone(),
+                            record: replayable.then_some(current.clone()),
                         };
                         let bytes = serde_json::to_vec(&dead)?;
                         let mut dead_table = write.open_table(DEAD_BY_ID)?;
                         dead_table.insert(delivery_id, bytes.as_slice())?;
                         delivery.remove(delivery_id)?;
-                        RetryOutcome::Dead
+                        if replayable {
+                            RetryOutcome::DeadPendingRedrive
+                        } else {
+                            RetryOutcome::PermanentDead
+                        }
                     } else {
                         let delay = backoff_delay(policy.base, policy.cap, attempt);
                         let jitter = bounded_jitter(delivery_id, attempt, policy.base);
@@ -338,6 +355,82 @@ impl DeliveryStore {
         };
         write.commit()?;
         Ok(outcome)
+    }
+
+    pub(crate) fn redrive_due(
+        &self,
+        policy: &RedrivePolicy,
+        now_ms: u64,
+        batch_limit: usize,
+    ) -> Result<RedriveResult> {
+        let _op = StoreOpWatch::new("redrive", "<any>");
+        let mut result = RedriveResult {
+            redriven: Vec::new(),
+            permanent: Vec::new(),
+        };
+        if batch_limit == 0 {
+            return Ok(result);
+        }
+        let write = self.db.begin_write()?;
+        {
+            let due_ids = collect_due_dead_ids(&write, policy, now_ms, batch_limit)?;
+            let mut dead_table = write.open_table(DEAD_BY_ID)?;
+            let mut delivery = write.open_table(DELIVERY_BY_ID)?;
+            let mut ready = write.open_table(READY_BY_DEPT_DUE)?;
+            for delivery_id in due_ids {
+                let Some(mut dead) = read_dead_table(&dead_table, &delivery_id)? else {
+                    continue;
+                };
+                if dead.permanent {
+                    continue;
+                }
+                let Some(mut record) = dead.record.clone() else {
+                    dead.permanent = true;
+                    dead.replayable = false;
+                    let bytes = serde_json::to_vec(&dead)?;
+                    dead_table.insert(delivery_id.as_str(), bytes.as_slice())?;
+                    result.permanent.push(dead);
+                    continue;
+                };
+                if dead.redrive_count >= policy.max_redrives {
+                    dead.permanent = true;
+                    dead.replayable = false;
+                    dead.record = None;
+                    let bytes = serde_json::to_vec(&dead)?;
+                    dead_table.insert(delivery_id.as_str(), bytes.as_slice())?;
+                    result.permanent.push(dead);
+                    continue;
+                }
+                if delivery.get(delivery_id.as_str())?.is_some() {
+                    dead.permanent = true;
+                    dead.replayable = false;
+                    dead.record = None;
+                    dead.error_excerpt =
+                        Some(error_excerpt("redrive collision with live delivery"));
+                    let bytes = serde_json::to_vec(&dead)?;
+                    dead_table.insert(delivery_id.as_str(), bytes.as_slice())?;
+                    result.permanent.push(dead);
+                    continue;
+                }
+                record.redrive_count = dead.redrive_count.saturating_add(1);
+                record.attempt = 0;
+                record.lease_until_ms = None;
+                record.lease_generation = record.lease_generation.saturating_add(1);
+                record.not_before_ms = now_ms;
+                record.last_error_excerpt = None;
+                let bytes = serde_json::to_vec(&record)?;
+                delivery.insert(delivery_id.as_str(), bytes.as_slice())?;
+                ready.insert(
+                    make_index_key(&record.dept, record.not_before_ms, delivery_id.as_str())
+                        .as_str(),
+                    &(),
+                )?;
+                dead_table.remove(delivery_id.as_str())?;
+                result.redriven.push(record);
+            }
+        }
+        write.commit()?;
+        Ok(result)
     }
 
     #[cfg(test)]
@@ -408,6 +501,81 @@ fn delete_old_global_indexes(write: &redb::WriteTransaction) -> Result<()> {
     Ok(())
 }
 
+fn mark_existing_dead_records_permanent(write: &redb::WriteTransaction) -> Result<()> {
+    let dead_rows = {
+        let dead = write.open_table(DEAD_BY_ID)?;
+        let mut rows = BTreeMap::new();
+        for entry in dead.iter()? {
+            let (key, bytes) = entry?;
+            rows.insert(key.value().to_string(), bytes.value().to_vec());
+        }
+        rows
+    };
+    let mut dead = write.open_table(DEAD_BY_ID)?;
+    for (delivery_id, bytes) in dead_rows {
+        let Ok(mut record) = serde_json::from_slice::<DeadRecord>(&bytes) else {
+            continue;
+        };
+        record.permanent = true;
+        record.replayable = false;
+        record.record = None;
+        let bytes = serde_json::to_vec(&record)?;
+        dead.insert(delivery_id.as_str(), bytes.as_slice())?;
+    }
+    Ok(())
+}
+
+fn collect_due_dead_ids(
+    write: &redb::WriteTransaction,
+    policy: &RedrivePolicy,
+    now_ms: u64,
+    batch_limit: usize,
+) -> Result<Vec<String>> {
+    let cooldown_ms = duration_millis(policy.cooldown);
+    let dead = write.open_table(DEAD_BY_ID)?;
+    let mut due = Vec::new();
+    for entry in dead.iter()? {
+        let (key, bytes) = entry?;
+        let Some(record) = decode_dead_record(key.value(), bytes.value()) else {
+            continue;
+        };
+        if record.permanent || !record.replayable {
+            continue;
+        }
+        if record.dead_at_ms.saturating_add(cooldown_ms) <= now_ms {
+            due.push(record.delivery_id);
+            if due.len() >= batch_limit {
+                break;
+            }
+        }
+    }
+    Ok(due)
+}
+
+fn decode_dead_record(delivery_id: &str, bytes: &[u8]) -> Option<DeadRecord> {
+    match serde_json::from_slice(bytes) {
+        Ok(record) => Some(record),
+        Err(err) => {
+            tracing::warn!(
+                delivery_id = %delivery_id,
+                error = %err,
+                "skipping undecodable dead delivery record"
+            );
+            None
+        }
+    }
+}
+
+fn read_dead_table(
+    table: &redb::Table<'_, &str, &[u8]>,
+    delivery_id: &str,
+) -> Result<Option<DeadRecord>> {
+    let Some(bytes) = table.get(delivery_id)? else {
+        return Ok(None);
+    };
+    Ok(decode_dead_record(delivery_id, bytes.value()))
+}
+
 fn read_delivery_read_only(
     table: &redb::ReadOnlyTable<&str, &[u8]>,
     delivery_id: &str,
@@ -420,6 +588,37 @@ fn read_delivery_read_only(
 
 fn duration_millis(duration: Duration) -> u64 {
     duration.as_millis().min(u64::MAX as u128) as u64
+}
+
+fn is_transient_failure(error: &str) -> bool {
+    let lower = error.to_ascii_lowercase();
+    [
+        "timeout",
+        "timed out",
+        "temporarily unavailable",
+        "temporary failure",
+        "connection reset",
+        "connection refused",
+        "connection closed",
+        "network is unreachable",
+        "could not resolve host",
+        "dns",
+        "http 429",
+        "status 429",
+        "rate limit",
+        "http 500",
+        "http 502",
+        "http 503",
+        "http 504",
+        "status 500",
+        "status 502",
+        "status 503",
+        "status 504",
+        "service unavailable",
+        "gateway timeout",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
 }
 
 #[cfg(test)]
@@ -441,6 +640,7 @@ mod tests {
             cron_payload: None,
             observed_at_ms: 10,
             attempt: 0,
+            redrive_count: 0,
             lease_generation: 0,
             lease_until_ms: None,
             not_before_ms,
@@ -720,13 +920,13 @@ mod tests {
             .retry(
                 "one",
                 1,
-                &format!("final {}", "x".repeat(800)),
+                &format!("timeout final {}", "x".repeat(800)),
                 &policy(1),
                 120,
             )
             .unwrap();
 
-        assert_eq!(outcome, RetryOutcome::Dead);
+        assert_eq!(outcome, RetryOutcome::DeadPendingRedrive);
         assert!(store.get("one").unwrap().is_none());
         let dead = store.get_dead("one").unwrap().unwrap();
         assert_eq!(dead.delivery_id, "one");
@@ -737,10 +937,13 @@ mod tests {
         assert_eq!(dead.not_before_ms, 100);
         assert_eq!(dead.dead_at_ms, 120);
         assert_eq!(dead.attempts, 1);
+        assert_eq!(dead.redrive_count, 0);
+        assert!(dead.replayable);
+        assert!(!dead.permanent);
         assert!(dead.error_excerpt.as_ref().unwrap().len() <= ERROR_EXCERPT_LIMIT);
         let dead_json = serde_json::to_value(&dead).unwrap();
         assert!(dead_json.get("payload").is_none());
-        assert!(dead_json.get("record").is_none());
+        assert!(dead_json.get("record").is_some());
     }
 
     #[test]
@@ -794,12 +997,147 @@ mod tests {
 
         let outcome = store.retry("one", 1, "final", &policy(1), 120).unwrap();
 
-        assert_eq!(outcome, RetryOutcome::Dead);
+        assert_eq!(outcome, RetryOutcome::PermanentDead);
         assert_eq!(store.ready_index_len().unwrap(), 0);
         assert_eq!(store.leased_index_len().unwrap(), 0);
         assert!(store
             .lease(151, 10, Duration::from_millis(50))
             .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn transient_dead_record_redrives_after_cooldown() {
+        let temp = TempDir::new().unwrap();
+        let store = store(&temp);
+        store.enqueue(&record("one", 100)).unwrap();
+        store.lease(100, 10, Duration::from_millis(50)).unwrap();
+        assert_eq!(
+            store
+                .retry("one", 1, "timeout from upstream", &policy(1), 120)
+                .unwrap(),
+            RetryOutcome::DeadPendingRedrive
+        );
+        let policy = RedrivePolicy {
+            max_redrives: 3,
+            cooldown: Duration::from_millis(50),
+        };
+
+        let early = store.redrive_due(&policy, 169, 10).unwrap();
+        assert!(early.redriven.is_empty());
+        assert!(early.permanent.is_empty());
+        let due = store.redrive_due(&policy, 170, 10).unwrap();
+
+        assert_eq!(due.redriven.len(), 1);
+        assert!(due.permanent.is_empty());
+        assert!(store.get_dead("one").unwrap().is_none());
+        let current = store.get("one").unwrap().unwrap();
+        assert_eq!(current.delivery_id, "one");
+        assert_eq!(current.attempt, 0);
+        assert_eq!(current.redrive_count, 1);
+        assert_eq!(current.lease_until_ms, None);
+        assert_eq!(current.not_before_ms, 170);
+        assert_eq!(current.last_error_excerpt, None);
+        let leased = store
+            .lease_for_dept("worker", 170, 1, Duration::from_millis(50))
+            .unwrap();
+        assert_eq!(leased.len(), 1);
+        assert_eq!(leased[0].redrive_count, 1);
+    }
+
+    #[test]
+    fn redrive_count_survives_reopen_and_caps_to_permanent_dead() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("delivery.redb");
+        {
+            let store = DeliveryStore::open(&path).unwrap();
+            store.enqueue(&record("one", 100)).unwrap();
+            store.lease(100, 10, Duration::from_millis(50)).unwrap();
+            assert_eq!(
+                store
+                    .retry("one", 1, "timeout from upstream", &policy(1), 120)
+                    .unwrap(),
+                RetryOutcome::DeadPendingRedrive
+            );
+            let redriven = store
+                .redrive_due(
+                    &RedrivePolicy {
+                        max_redrives: 1,
+                        cooldown: Duration::ZERO,
+                    },
+                    121,
+                    10,
+                )
+                .unwrap();
+            assert_eq!(redriven.redriven[0].redrive_count, 1);
+        }
+        let store = DeliveryStore::open(&path).unwrap();
+        let record = store.get("one").unwrap().unwrap();
+        assert_eq!(record.redrive_count, 1);
+        let leased = store
+            .lease_for_dept("worker", 121, 1, Duration::from_millis(50))
+            .unwrap()
+            .remove(0);
+        assert_eq!(
+            store
+                .retry(
+                    &leased.delivery_id,
+                    leased.lease_generation,
+                    "timeout from upstream",
+                    &policy(1),
+                    130,
+                )
+                .unwrap(),
+            RetryOutcome::DeadPendingRedrive
+        );
+
+        let capped = store
+            .redrive_due(
+                &RedrivePolicy {
+                    max_redrives: 1,
+                    cooldown: Duration::ZERO,
+                },
+                131,
+                10,
+            )
+            .unwrap();
+
+        assert!(capped.redriven.is_empty());
+        assert_eq!(capped.permanent.len(), 1);
+        let dead = store.get_dead("one").unwrap().unwrap();
+        assert!(dead.permanent);
+        assert!(!dead.replayable);
+        assert_eq!(dead.redrive_count, 1);
+        assert!(dead.record.is_none());
+    }
+
+    #[test]
+    fn non_transient_dead_record_is_permanent_without_redrive_payload() {
+        let temp = TempDir::new().unwrap();
+        let store = store(&temp);
+        store.enqueue(&record("one", 100)).unwrap();
+        store.lease(100, 10, Duration::from_millis(50)).unwrap();
+
+        let outcome = store
+            .retry("one", 1, "validation failed", &policy(1), 120)
+            .unwrap();
+
+        assert_eq!(outcome, RetryOutcome::PermanentDead);
+        let dead = store.get_dead("one").unwrap().unwrap();
+        assert!(dead.permanent);
+        assert!(!dead.replayable);
+        assert!(dead.record.is_none());
+        assert!(store
+            .redrive_due(
+                &RedrivePolicy {
+                    max_redrives: 3,
+                    cooldown: Duration::ZERO,
+                },
+                120,
+                10,
+            )
+            .unwrap()
+            .redriven
             .is_empty());
     }
 

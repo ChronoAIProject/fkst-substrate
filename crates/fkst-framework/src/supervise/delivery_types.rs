@@ -29,6 +29,8 @@ pub(crate) struct DeliveryRecord {
     pub cron_payload: Option<JsonValue>,
     pub observed_at_ms: u64,
     pub attempt: u64,
+    #[serde(default)]
+    pub redrive_count: u64,
     pub lease_generation: u64,
     pub lease_until_ms: Option<u64>,
     pub not_before_ms: u64,
@@ -45,7 +47,15 @@ pub(crate) struct DeadRecord {
     pub not_before_ms: u64,
     pub dead_at_ms: u64,
     pub attempts: u64,
+    #[serde(default)]
+    pub redrive_count: u64,
+    #[serde(default)]
+    pub replayable: bool,
+    #[serde(default = "default_dead_permanent")]
+    pub permanent: bool,
     pub error_excerpt: Option<String>,
+    #[serde(default)]
+    pub record: Option<DeliveryRecord>,
 }
 
 #[derive(Clone, Debug)]
@@ -53,4 +63,14 @@ pub(crate) struct RetryPolicy {
     pub max_attempts: u64,
     pub base: Duration,
     pub cap: Duration,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct RedrivePolicy {
+    pub max_redrives: u64,
+    pub cooldown: Duration,
+}
+
+fn default_dead_permanent() -> bool {
+    true
 }
