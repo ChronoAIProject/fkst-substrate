@@ -19,6 +19,7 @@ use crate::config_registry::{ConfigContext, ConfigKey, ConfigValueType};
 use crate::path_resolver::{
     package_root_path, validate_name_segment, GraphRoot, GraphRootKind, NameResolver, PackageRoots,
 };
+const FAILURE_FACT_QUEUE: &str = "fkst.failure_fact";
 
 /// Deserialization helper for a department's `M.spec` table.
 #[derive(Deserialize)]
@@ -123,7 +124,9 @@ pub fn load_roots(roots: &PackageRoots) -> Result<Config> {
     }
 
     let defaults = HostGraphDefaults::load(roots)?;
-    let resolver = roots.name_resolver();
+    let resolver = roots
+        .name_resolver()
+        .add_recorded_only_queue(FAILURE_FACT_QUEUE);
     let mut departments: BTreeMap<String, DepartmentDecl> = BTreeMap::new();
     let mut raisers: BTreeMap<String, RaiserDecl> = BTreeMap::new();
     let mut department_fanout: HashMap<String, Vec<String>> = HashMap::new();

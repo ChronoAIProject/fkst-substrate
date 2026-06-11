@@ -34,7 +34,12 @@ pub fn register_framework_sdk(
     crate::sdk_mark::register(lua, host_root)?;
     crate::sdk_cache::register(lua, host_root)?;
     crate::sdk_codex::register(lua, host_root, config)?;
-    crate::raise::register(lua, raise_buf, resolver, owner_namespace)?;
+    crate::raise::register(
+        lua,
+        raise_buf,
+        add_engine_recorded_only_queues(resolver),
+        owner_namespace,
+    )?;
     Ok(())
 }
 
@@ -57,8 +62,17 @@ pub(crate) fn register_framework_sdk_with_runner(
     crate::sdk_mark::register(lua, host_root)?;
     crate::sdk_cache::register(lua, host_root)?;
     crate::sdk_codex::register_with_runner(lua, host_root, config, runner)?;
-    crate::raise::register(lua, raise_buf, resolver, owner_namespace)?;
+    crate::raise::register(
+        lua,
+        raise_buf,
+        add_engine_recorded_only_queues(resolver),
+        owner_namespace,
+    )?;
     Ok(())
+}
+
+fn add_engine_recorded_only_queues(resolver: NameResolver) -> NameResolver {
+    resolver.add_recorded_only_queue(crate::supervise::failure_fact::FAILURE_FACT_QUEUE)
 }
 
 /// Convert serde_json::Value to mlua::Value via LuaSerdeExt.

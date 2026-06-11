@@ -237,6 +237,33 @@ mod tests {
     }
 
     #[test]
+    fn namespaced_raise_allows_engine_failure_fact_queue_only_when_recorded() {
+        let lua = Lua::new();
+        let buf = RaiseBuffer::new();
+        register(
+            &lua,
+            buf.clone(),
+            NameResolver::new(["pkg".to_string(), "host".to_string()])
+                .add_recorded_only_queue("fkst.failure_fact"),
+            "pkg".to_string(),
+        )
+        .unwrap();
+
+        lua.load(r#"raise("fkst.failure_fact", {n=1})"#)
+            .exec()
+            .unwrap();
+        let err = lua
+            .load(r#"raise("fkst.other", {n=1})"#)
+            .exec()
+            .unwrap_err();
+
+        assert!(err.to_string().contains("unknown namespace"), "got: {err}");
+        let entries = buf.0.lock().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].queue, "fkst.failure_fact");
+    }
+
+    #[test]
     fn empty_buffer_emits_nothing() {
         let buf = RaiseBuffer::new();
         // Just verify no panic; output goes to real stdout in tests so we can't capture cleanly.

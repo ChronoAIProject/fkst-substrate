@@ -1,9 +1,13 @@
 //! Slow operation watchdog for the durable delivery store.
 
+use super::delivery_router::FailureFactPublisher;
+use super::failure_fact::store_watchdog_failure_fact;
+use std::sync::{OnceLock, RwLock};
 use std::time::{Duration, Instant};
 use tracing::warn;
 
 const STORE_OP_WARN_AFTER: Duration = Duration::from_millis(250);
+static FAILURE_FACT_PUBLISHER: OnceLock<RwLock<Option<FailureFactPublisher>>> = OnceLock::new();
 
 pub(crate) struct StoreOpWatch<'a> {
     op: &'static str,
@@ -49,6 +53,19 @@ impl Drop for StoreOpWatch<'_> {
             elapsed_ms = warning.elapsed_ms,
             "durable delivery store operation exceeded watchdog threshold"
         );
+        publish_store_watchdog_fact(warning);
+    }
+}
+
+pub(crate) fn set_failure_fact_publisher(publisher: FailureFactPublisher) {
+    let slot = FAILURE_FACT_PUBLISHER.get_or_init(|| RwLock::new(None));
+    match slot.write() {
+        Ok(mut current) => {
+            *current = Some(publisher);
+        }
+        Err(err) => {
+            warn!(error = %err, "failure fact publisher lock failed");
+        }
     }
 }
 
@@ -73,6 +90,29 @@ fn watchdog_warning<'a>(
         })
     } else {
         None
+    }
+}
+
+fn publish_store_watchdog_fact(warning: WatchdogWarning<'_>) {
+    let Some(slot) = FAILURE_FACT_PUBLISHER.get() else {
+        return;
+    };
+    let publisher = match slot.read() {
+        Ok(current) => current.clone(),
+        Err(err) => {
+            warn!(error = %err, "failure fact publisher lock failed");
+            None
+        }
+    };
+    let Some(publisher) = publisher else {
+        return;
+    };
+    if let Err(err) = publisher.publish(store_watchdog_failure_fact(
+        warning.op,
+        warning.dept,
+        warning.elapsed_ms,
+    )) {
+        warn!(error = %err, "failure fact publish failed");
     }
 }
 

@@ -328,6 +328,11 @@ impl NameResolver {
         self
     }
 
+    pub(crate) fn add_recorded_only_queue(mut self, queue: impl Into<String>) -> Self {
+        self.recorded_only_queues.insert(queue.into());
+        self
+    }
+
     #[cfg(test)]
     pub(crate) fn mode(&self) -> &NameResolutionMode {
         &self.mode

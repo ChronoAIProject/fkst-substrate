@@ -66,6 +66,29 @@ fn seed_ledger(root: &Path, name: &str, tokens: u64) {
     .unwrap();
 }
 
+struct EnvGuard {
+    key: &'static str,
+    old: Option<std::ffi::OsString>,
+}
+
+impl EnvGuard {
+    fn unset(key: &'static str) -> Self {
+        let old = std::env::var_os(key);
+        std::env::remove_var(key);
+        Self { key, old }
+    }
+}
+
+impl Drop for EnvGuard {
+    fn drop(&mut self) {
+        if let Some(old) = self.old.take() {
+            std::env::set_var(self.key, old);
+        } else {
+            std::env::remove_var(self.key);
+        }
+    }
+}
+
 #[test]
 fn rate_acquire_unconfigured_pool_is_passthrough() {
     let tmp = tempfile::tempdir().unwrap();
@@ -187,6 +210,8 @@ fn generated_shim_consumes_same_bucket_as_cli_acquire() {
 #[cfg(unix)]
 #[test]
 fn generated_shim_bakes_resolved_config_from_fkst_env_style_registry() {
+    let _root_guard = EnvGuard::unset("FKST_RATE_POOL_ROOT");
+    let _gh_guard = EnvGuard::unset("FKST_RATE_POOL_GH");
     let tmp = tempfile::tempdir().unwrap();
     let host = tmp.path().join("host");
     let run_cwd = tmp.path().join("run-cwd");

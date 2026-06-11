@@ -238,6 +238,30 @@ return M
 }
 
 #[test]
+fn graph_scan_accepts_engine_failure_fact_queue() {
+    let dir = write_repo(
+        &[(
+            "triage",
+            r#"
+local M = {}
+M.spec = { consumes = {"fkst.failure_fact"}, ephemeral = {"fkst.failure_fact"}, stall_window = "30s", retry = false }
+function pipeline(_) end
+return M
+"#,
+        )],
+        &[],
+    );
+
+    let cfg = load(dir.path()).unwrap();
+
+    assert!(cfg.queue.contains_key("fkst.failure_fact"));
+    assert_eq!(
+        cfg.department.get("triage").unwrap().consumes,
+        vec!["fkst.failure_fact"]
+    );
+}
+
+#[test]
 fn scans_department_retry_with_defaults() {
     let dir = write_repo(
         &[(
