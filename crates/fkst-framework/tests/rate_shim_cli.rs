@@ -7,14 +7,16 @@ mod rate_shim;
 mod support;
 
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 use rate_pool::{RatePoolConfig, RatePoolRegistry};
 use support::process_sandbox::ProcessSandbox;
 
-fn framework_bin() -> &'static str {
-    env!("CARGO_BIN_EXE_fkst-framework")
+fn framework_bin() -> PathBuf {
+    let exe = std::env::current_exe().unwrap();
+    let deps_dir = exe.parent().unwrap();
+    deps_dir.parent().unwrap().join("fkst-framework")
 }
 
 fn stdout(output: &Output) -> String {
@@ -185,12 +187,9 @@ fn generated_shim_consumes_same_bucket_as_cli_acquire() {
     seed_ledger(&root, "gh", 2);
 
     let generator_path = std::env::join_paths([real_dir.as_path()]).unwrap();
-    let shim_dir = rate_shim::ensure_rate_shims_with_path(
-        &registry,
-        Path::new(framework_bin()),
-        &generator_path,
-    )
-    .unwrap();
+    let shim_dir =
+        rate_shim::ensure_rate_shims_with_path(&registry, &framework_bin(), &generator_path)
+            .unwrap();
 
     let direct = Command::new(framework_bin())
         .arg("rate-acquire")
@@ -243,12 +242,9 @@ fn generated_shim_bakes_resolved_config_from_fkst_env_style_registry() {
         });
     seed_ledger(registry.root(), "gh", 2);
     let generator_path = std::env::join_paths([real_dir.as_path()]).unwrap();
-    let shim_dir = rate_shim::ensure_rate_shims_with_path(
-        &registry,
-        Path::new(framework_bin()),
-        &generator_path,
-    )
-    .unwrap();
+    let shim_dir =
+        rate_shim::ensure_rate_shims_with_path(&registry, &framework_bin(), &generator_path)
+            .unwrap();
     let path = std::env::join_paths([shim_dir.as_path(), real_dir.as_path()]).unwrap();
 
     let shim = Command::new(shim_dir.join("gh"))
@@ -293,12 +289,9 @@ fn generated_shim_skips_symlinked_shim_path_before_real_program() {
     );
     seed_ledger(&root, "gh", 2);
     let generator_path = std::env::join_paths([real_dir.as_path()]).unwrap();
-    let shim_dir = rate_shim::ensure_rate_shims_with_path(
-        &registry,
-        Path::new(framework_bin()),
-        &generator_path,
-    )
-    .unwrap();
+    let shim_dir =
+        rate_shim::ensure_rate_shims_with_path(&registry, &framework_bin(), &generator_path)
+            .unwrap();
     let shim_link = tmp.path().join("shims-link");
     std::os::unix::fs::symlink(&shim_dir, &shim_link).unwrap();
     let path = std::env::join_paths([shim_link.as_path(), shim_dir.as_path(), real_dir.as_path()])

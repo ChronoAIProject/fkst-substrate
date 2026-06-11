@@ -40,6 +40,14 @@ target/debug/fkst-framework config \
   --package-root "$PWD/examples/minimal-package"
 ```
 
+## Package repo scaffold
+
+`fkst-framework init-package-repo [--ref <substrate-ref>] [--force]` materializes the package-repo bootstrap scaffold in the current git repository. It writes the engine-owned templates for `scripts/run.sh`, `scripts/check_repo.py`, `.github/workflows/ci.yml`, `env.example`, `.fkst-substrate-ref`, `.gitignore` entries and a minimal `README.md` pointer.
+
+The command is idempotent: identical files are reported as `UNCHANGED`; missing files are created; local edits to owned template files are refused by default and require `--force` to overwrite. `.gitignore` is append-only for the scaffold entries. The command does not touch `packages/`, git history or remotes.
+
+With no `--ref`, the scaffold pins the running engine binary's build-time source revision. Operators can pass `--ref <substrate-ref>` when they need an explicit release tag or commit.
+
 ## 边界资源
 
 边界资源遵循 capability security 的 no ambient authority 模型：engine 能触达的外部资源必须先进入静态 registry，并通过 adapter grant、meter、budget/backpressure 与 typed error contract 访问。当前 registry 由 `crates/fkst-framework/src/boundary_resource.rs` 定义，覆盖 `codex.process`、`shell.process`、`git.process`、`runtime.filesystem` 与 `wall-clock`。

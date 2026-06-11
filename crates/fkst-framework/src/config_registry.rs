@@ -62,7 +62,6 @@ pub(crate) struct Resolved {
 
 #[derive(Clone, Debug)]
 pub(crate) struct ConfigContext {
-    #[allow(dead_code)]
     host_root: PathBuf,
     process_env: HashMap<String, String>,
     fkst_env: HashMap<String, String>,
@@ -93,6 +92,10 @@ impl ConfigContext {
 
     pub(crate) fn resolved_string(&self, key: ConfigKey) -> Result<String> {
         self.resolve(key).map(|resolved| resolved.value)
+    }
+
+    pub(crate) fn host_root(&self) -> &Path {
+        &self.host_root
     }
 
     pub(crate) fn rate_pool_env(&self) -> BTreeMap<String, String> {

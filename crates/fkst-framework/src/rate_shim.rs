@@ -137,10 +137,12 @@ fn shim_body(
             )
         })
         .collect::<String>();
+    let shim_script = shim_dir.join(name);
     format!(
         "#!/bin/sh\n\
 shim_dir={shim_dir}\n\
-shim_script=$shim_dir/{program}\n\
+shim_script={shim_script}\n\
+shim_dir_private={shim_dir_private}\n\
 program={program}\n\
 framework_bin={framework_bin}\n\
 export FKST_RATE_POOL_ROOT={rate_pool_root}\n\
@@ -151,6 +153,8 @@ old_ifs=$IFS\n\
 IFS=:\n\
 for dir in $PATH; do\n\
   if [ -z \"$dir\" ]; then dir=.; fi\n\
+  if [ \"$dir\" = \"$shim_dir\" ]; then continue; fi\n\
+  if [ -n \"$shim_dir_private\" ] && [ \"$dir\" = \"$shim_dir_private\" ]; then continue; fi\n\
   candidate=\"$dir/$program\"\n\
   if [ \"$candidate\" -ef \"$shim_script\" ] 2>/dev/null; then continue; fi\n\
   if [ -z \"$real_path\" ]; then real_path=$dir; else real_path=$real_path:$dir; fi\n\
@@ -167,6 +171,8 @@ fi\n\
 PATH=$real_path \"$framework_bin\" rate-acquire \"$program\" || exit $?\n\
 exec \"$real_program\" \"$@\"\n",
         shim_dir = shell_single_quote(&shim_dir.to_string_lossy()),
+        shim_script = shell_single_quote(&shim_script.to_string_lossy()),
+        shim_dir_private = shell_single_quote(&private_var_alias(shim_dir).unwrap_or_default()),
         program = shell_single_quote(name),
         framework_bin = shell_single_quote(&framework_bin.to_string_lossy()),
         rate_pool_root = shell_single_quote(
@@ -187,6 +193,13 @@ fn canonical_shim_dir(shim_dir: &Path) -> Result<PathBuf> {
 
 fn shell_single_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\"'\"'"))
+}
+
+fn private_var_alias(path: &Path) -> Option<String> {
+    let value = path.to_string_lossy();
+    value
+        .strip_prefix("/var/")
+        .map(|rest| format!("/private/var/{rest}"))
 }
 
 pub(crate) fn resolve_program_on_path(

@@ -81,7 +81,10 @@ pub(crate) fn dead_letter_payload(record: &DeliveryRecord, error: &str) -> JsonV
 }
 
 pub(crate) fn dead_record_payload(dead: &DeadRecord) -> JsonValue {
-    let error = dead.error_excerpt.as_deref().unwrap_or("unknown delivery failure");
+    let error = dead
+        .error_excerpt
+        .as_deref()
+        .unwrap_or("unknown delivery failure");
     let error_class = classify_delivery_error(error);
     json!({
         "delivery_id": dead.delivery_id,
