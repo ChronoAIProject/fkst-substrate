@@ -6,9 +6,34 @@ const RUN_SH: &str = r#"#!/usr/bin/env bash
 set -euo pipefail
 
 repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-framework_bin="${FKST_FRAMEWORK_BIN:-fkst-framework}"
 
 python3 "$repo/scripts/check_repo.py"
+
+framework_bin="${FKST_FRAMEWORK_BIN:-}"
+if [[ -z "$framework_bin" ]]; then
+  substrate_ref="$(< "$repo/.fkst-substrate-ref")"
+  substrate_ref="${substrate_ref%%$'\n'*}"
+  substrate_ref="${substrate_ref%$'\r'}"
+  if [[ -z "$substrate_ref" ]]; then
+    echo "scripts/run.sh: .fkst-substrate-ref must not be empty" >&2
+    exit 1
+  fi
+
+  substrate_repo="${FKST_SUBSTRATE_REPO:-https://github.com/ChronoAIProject/fkst-substrate.git}"
+  substrate_src="${FKST_SUBSTRATE_SRC:-$repo/.fkst/substrate-src}"
+  if [[ ! -d "$substrate_src/.git" ]]; then
+    if [[ -e "$substrate_src" ]]; then
+      echo "scripts/run.sh: FKST_SUBSTRATE_SRC exists but is not a git checkout: $substrate_src" >&2
+      exit 1
+    fi
+    mkdir -p "$(dirname "$substrate_src")"
+    git clone "$substrate_repo" "$substrate_src"
+  fi
+  git -C "$substrate_src" fetch --tags origin
+  git -C "$substrate_src" checkout --detach "$substrate_ref"
+  cargo build --manifest-path "$substrate_src/Cargo.toml" -p fkst-framework --release
+  framework_bin="$substrate_src/target/release/fkst-framework"
+fi
 
 export FKST_RUNTIME_ROOT="${FKST_RUNTIME_ROOT:-$repo/.fkst/runtime}"
 

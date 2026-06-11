@@ -69,6 +69,14 @@ fn init_package_repo_materializes_empty_repo() {
         .contains("fkst.env\n"));
     assert!(std::fs::read_to_string(repo.path().join("scripts/run.sh"))
         .unwrap()
+        .contains("substrate_ref=\"$(< \"$repo/.fkst-substrate-ref\")\""));
+    assert!(std::fs::read_to_string(repo.path().join("scripts/run.sh"))
+        .unwrap()
+        .contains(
+            "cargo build --manifest-path \"$substrate_src/Cargo.toml\" -p fkst-framework --release"
+        ));
+    assert!(std::fs::read_to_string(repo.path().join("scripts/run.sh"))
+        .unwrap()
         .contains("\"$framework_bin\" test --project-root \"$repo\" --package-root \"$repo\""));
 }
 
