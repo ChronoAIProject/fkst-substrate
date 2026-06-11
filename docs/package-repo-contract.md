@@ -156,6 +156,12 @@ package source tree 在运行期承载代码、fixture 和 asset，不承载“�
 
 恢复模型是 raiser 从 git / external source / explicit host fact 重新推导，再 enqueue；下游 Department 通过 source-derived `dedup_key` 或 git / external fact 幂等处理重复。没有 durable fact，就不要把“进程内觉得发生了”当事实。
 
+### 6.1 Host command rate pools
+
+Named rate pools are host posture env facts for external command pressure, not package API. A host may set `FKST_RATE_POOL_<NAME>=<burst>,<refill_per_minute>` such as `FKST_RATE_POOL_GH=50,50`; when a real external command's program basename matches `<NAME>` case-insensitively, the engine acquires one token before spawning it. `exec_sync("gh ...")` and git SDK calls go through this adapter; Codex subprocesses keep only the existing `codex-permits` fcntl pool. `fkst.test.mock_command` bypasses rate pools and does not consume tokens.
+
+Pool ledgers live under `FKST_RATE_POOL_ROOT`, default `~/.fkst/rate-pools`. This root is deliberately outside `FKST_RUNTIME_ROOT` so independent `supervise` instances on the same host share one command posture. Invalid pool definitions fail closed at startup/config parsing. Packages must not depend on ledger file contents as business facts.
+
 ## 7. CLI subcommand contract
 
 当前 `fkst-framework` CLI surface 来自 `crates/fkst-framework/src/main.rs`：

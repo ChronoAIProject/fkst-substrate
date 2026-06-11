@@ -16,6 +16,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::config_registry::{ConfigContext, ConfigKey};
 use crate::external_command::{format_command, MockCommandState};
+use crate::rate_pool::RatePoolRegistry;
 use crate::runtime_context;
 
 pub fn register(lua: &Lua, host_root: &Path, config: ConfigContext) -> Result<()> {
@@ -29,12 +30,19 @@ pub(crate) fn register_with_runner(
     runner: Option<MockCommandState>,
 ) -> Result<()> {
     let host_root = host_root.to_path_buf();
+    let rate_pools = RatePoolRegistry::from_config(&config).map_err(mlua::Error::external)?;
     register_with_lock(lua, host_root.clone())?;
-    register_setup_worktree(lua, host_root.clone(), config, runner.clone())?;
-    register_git_log_count(lua, host_root.clone(), runner.clone())?;
-    register_git_log_grep(lua, host_root.clone(), runner.clone())?;
-    register_count_worktrees(lua, host_root.clone(), runner.clone())?;
-    register_list_orphan_worktrees(lua, host_root, runner)?;
+    register_setup_worktree(
+        lua,
+        host_root.clone(),
+        config,
+        rate_pools.clone(),
+        runner.clone(),
+    )?;
+    register_git_log_count(lua, host_root.clone(), rate_pools.clone(), runner.clone())?;
+    register_git_log_grep(lua, host_root.clone(), rate_pools.clone(), runner.clone())?;
+    register_count_worktrees(lua, host_root.clone(), rate_pools.clone(), runner.clone())?;
+    register_list_orphan_worktrees(lua, host_root, rate_pools, runner)?;
     Ok(())
 }
 
@@ -89,6 +97,7 @@ fn register_setup_worktree(
     lua: &Lua,
     host_root: PathBuf,
     config: ConfigContext,
+    rate_pools: RatePoolRegistry,
     runner: Option<MockCommandState>,
 ) -> Result<()> {
     lua.globals().set(
@@ -101,7 +110,8 @@ fn register_setup_worktree(
             let worktrees = layout.runtime_dir(RuntimeKind::Worktrees);
             let path = worktrees.join(format!("{}-{}", prefix, ulid));
             let path = path.to_string_lossy().into_owned();
-            let parent_ref = current_parent_ref_with_runner(&host_root, runner.as_ref())?;
+            let parent_ref =
+                current_parent_ref_with_runner(&host_root, &rate_pools, runner.as_ref())?;
             let parent_name = branch_slug(&parent_ref);
             let branch = format!(
                 "{}-{}-{}-{}{}{}",
@@ -119,6 +129,7 @@ fn register_setup_worktree(
             let out = run_git_command(
                 &host_root,
                 ["worktree", "add", "-b", &branch, &path, &parent_ref],
+                Some(&rate_pools),
                 runner.as_ref(),
             )?;
 
@@ -170,9 +181,15 @@ fn validate_branch_fragment(name: &str, value: &str) -> Result<()> {
 
 fn current_parent_ref_with_runner(
     host_root: &Path,
+    rate_pools: &RatePoolRegistry,
     runner: Option<&MockCommandState>,
 ) -> Result<String> {
-    let branch = run_git_command(host_root, ["rev-parse", "--abbrev-ref", "HEAD"], runner)?;
+    let branch = run_git_command(
+        host_root,
+        ["rev-parse", "--abbrev-ref", "HEAD"],
+        Some(rate_pools),
+        runner,
+    )?;
     if !branch.status.success() {
         return Err(read_failure("git-current-branch-failed", &branch.stderr));
     }
@@ -181,7 +198,12 @@ fn current_parent_ref_with_runner(
         return Ok(branch);
     }
 
-    let sha = run_git_command(host_root, ["rev-parse", "--short=12", "HEAD"], runner)?;
+    let sha = run_git_command(
+        host_root,
+        ["rev-parse", "--short=12", "HEAD"],
+        Some(rate_pools),
+        runner,
+    )?;
     if !sha.status.success() {
         return Err(read_failure("git-current-sha-failed", &sha.stderr));
     }
@@ -242,6 +264,7 @@ fn civil_from_days(days_since_epoch: i64) -> (i32, u32, u32) {
 fn register_git_log_count(
     lua: &Lua,
     host_root: PathBuf,
+    rate_pools: RatePoolRegistry,
     runner: Option<MockCommandState>,
 ) -> Result<()> {
     lua.globals().set(
@@ -255,6 +278,7 @@ fn register_git_log_count(
                     &format!("--since={}", since),
                     "--oneline",
                 ],
+                Some(&rate_pools),
                 runner.as_ref(),
             )?;
 
@@ -272,6 +296,7 @@ fn register_git_log_count(
 fn register_git_log_grep(
     lua: &Lua,
     host_root: PathBuf,
+    rate_pools: RatePoolRegistry,
     runner: Option<MockCommandState>,
 ) -> Result<()> {
     lua.globals().set(
@@ -285,6 +310,7 @@ fn register_git_log_grep(
                     &format!("--since={}", since),
                     "--format=%H",
                 ],
+                Some(&rate_pools),
                 runner.as_ref(),
             )?;
 
@@ -316,6 +342,7 @@ pub(crate) fn parse_worktree_paths(stdout: &[u8]) -> Vec<String> {
 fn register_count_worktrees(
     lua: &Lua,
     host_root: PathBuf,
+    rate_pools: RatePoolRegistry,
     runner: Option<MockCommandState>,
 ) -> Result<()> {
     lua.globals().set(
@@ -324,6 +351,7 @@ fn register_count_worktrees(
             let out = run_git_command(
                 &host_root,
                 ["worktree", "list", "--porcelain"],
+                Some(&rate_pools),
                 runner.as_ref(),
             )?;
 
@@ -341,6 +369,7 @@ fn register_count_worktrees(
 fn register_list_orphan_worktrees(
     lua: &Lua,
     host_root: PathBuf,
+    rate_pools: RatePoolRegistry,
     runner: Option<MockCommandState>,
 ) -> Result<()> {
     lua.globals().set(
@@ -349,6 +378,7 @@ fn register_list_orphan_worktrees(
             let out = run_git_command(
                 &host_root,
                 ["worktree", "list", "--porcelain"],
+                Some(&rate_pools),
                 runner.as_ref(),
             )?;
 
@@ -384,6 +414,7 @@ fn git_command(host_root: &Path) -> Command {
 fn run_git_command<'a>(
     host_root: &Path,
     args: impl IntoIterator<Item = &'a str>,
+    rate_pools: Option<&RatePoolRegistry>,
     runner: Option<&MockCommandState>,
 ) -> Result<Output> {
     let mut rendered_args = vec!["-C".to_string(), host_root.to_string_lossy().into_owned()];
@@ -396,6 +427,12 @@ fn run_git_command<'a>(
             String::new(),
         )?;
         return Ok(mock_output(result.stdout, result.stderr, result.exit_code));
+    }
+
+    if let Some(rate_pools) = rate_pools {
+        rate_pools
+            .acquire_for_program("git")
+            .map_err(mlua::Error::external)?;
     }
 
     git_command(host_root)

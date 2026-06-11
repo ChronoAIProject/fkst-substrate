@@ -4,6 +4,7 @@
 //! registration, write path, manifest, DSL, plugin, or tunables fallback.
 
 use anyhow::{bail, Context, Result};
+use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
@@ -35,6 +36,7 @@ pub(crate) enum ConfigKey {
     QueueCapacity,
     DepartmentDefaultStallWindow,
     CodexPermitSlots,
+    RatePoolRoot,
     RetryDefaultMaxAttempts,
     RetryDefaultBase,
     RetryDefaultCap,
@@ -91,6 +93,26 @@ impl ConfigContext {
 
     pub(crate) fn resolved_string(&self, key: ConfigKey) -> Result<String> {
         self.resolve(key).map(|resolved| resolved.value)
+    }
+
+    pub(crate) fn rate_pool_env(&self) -> BTreeMap<String, String> {
+        let mut values = self
+            .fkst_env
+            .iter()
+            .filter(|(key, _)| {
+                key.starts_with("FKST_RATE_POOL_") && key.as_str() != "FKST_RATE_POOL_ROOT"
+            })
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect::<BTreeMap<_, _>>();
+        values.extend(
+            self.process_env
+                .iter()
+                .filter(|(key, _)| {
+                    key.starts_with("FKST_RATE_POOL_") && key.as_str() != "FKST_RATE_POOL_ROOT"
+                })
+                .map(|(key, value)| (key.clone(), value.clone())),
+        );
+        values
     }
 }
 
@@ -151,6 +173,16 @@ pub(crate) static CONFIG_REGISTRY: &[ConfigEntry] = &[
         kind: ConfigKind::Operational { default: "20" },
         value_type: ConfigValueType::Usize,
         doc: "Global Codex process permit pool slot count.",
+    },
+    ConfigEntry {
+        key: ConfigKey::RatePoolRoot,
+        name: "rate_pool_root",
+        env_key: "FKST_RATE_POOL_ROOT",
+        kind: ConfigKind::Operational {
+            default: "~/.fkst/rate-pools",
+        },
+        value_type: ConfigValueType::String,
+        doc: "Host-stable root shared by named external-command token bucket pools.",
     },
     ConfigEntry {
         key: ConfigKey::RetryDefaultMaxAttempts,
@@ -239,6 +271,17 @@ pub(crate) fn process_env_for_registry() -> Result<HashMap<String, String>> {
             Err(std::env::VarError::NotUnicode(_)) => {
                 bail!("{} must be valid UTF-8", entry.env_key);
             }
+        }
+    }
+    for (key, value) in std::env::vars_os() {
+        let Some(key) = key.to_str() else {
+            continue;
+        };
+        if key.starts_with("FKST_RATE_POOL_") && key != "FKST_RATE_POOL_ROOT" {
+            let Some(value) = value.to_str() else {
+                bail!("{key} must be valid UTF-8");
+            };
+            values.insert(key.to_string(), value.to_string());
         }
     }
     Ok(values)

@@ -25,6 +25,7 @@ mod host_conformance;
 mod mlua_init;
 mod path_resolver;
 mod raise;
+mod rate_pool;
 mod runtime_context;
 mod sdk_basic;
 mod sdk_cache;
@@ -323,6 +324,7 @@ fn run_pipeline(
 
 fn run_config_command(options: ConfigCli) -> Result<i32> {
     let config = config_registry::ConfigContext::from_host_root(options.roots.host_root())?;
+    rate_pool::RatePoolRegistry::from_config(&config)?;
     for entry in config_registry::CONFIG_REGISTRY {
         let resolved = config.resolve(entry.key);
         let (value, source) = match resolved {

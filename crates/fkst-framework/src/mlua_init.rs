@@ -24,8 +24,9 @@ pub fn register_framework_sdk(
     owner_namespace: String,
 ) -> mlua::Result<()> {
     let config = ConfigContext::from_host_root(host_root).map_err(mlua::Error::external)?;
+    crate::rate_pool::RatePoolRegistry::from_config(&config).map_err(mlua::Error::external)?;
     crate::sdk_log::register(lua)?;
-    crate::sdk_basic::register(lua)?;
+    crate::sdk_basic::register_with_runner(lua, config.clone(), None)?;
     crate::sdk_strings::register(lua)?;
     crate::sdk_fs::register(lua)?;
     crate::sdk_json::register(lua)?;
@@ -46,8 +47,9 @@ pub(crate) fn register_framework_sdk_with_runner(
     runner: Option<MockCommandState>,
 ) -> mlua::Result<()> {
     let config = ConfigContext::from_host_root(host_root).map_err(mlua::Error::external)?;
+    crate::rate_pool::RatePoolRegistry::from_config(&config).map_err(mlua::Error::external)?;
     crate::sdk_log::register(lua)?;
-    crate::sdk_basic::register_with_runner(lua, runner.clone())?;
+    crate::sdk_basic::register_with_runner(lua, config.clone(), runner.clone())?;
     crate::sdk_strings::register(lua)?;
     crate::sdk_fs::register(lua)?;
     crate::sdk_json::register(lua)?;

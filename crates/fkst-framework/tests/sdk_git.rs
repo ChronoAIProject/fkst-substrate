@@ -4,6 +4,8 @@
 mod config_registry;
 #[path = "../src/external_command.rs"]
 mod external_command;
+#[path = "../src/rate_pool.rs"]
+mod rate_pool;
 #[path = "../src/runtime_context.rs"]
 mod runtime_context;
 #[path = "../src/sdk_git.rs"]
@@ -107,6 +109,15 @@ fn register_for_host(lua: &Lua, host_root: &Path) {
         lua,
         host_root,
         ConfigContext::from_host_root(host_root).unwrap(),
+    )
+    .unwrap();
+}
+
+fn seed_pool_token(root: &Path, name: &str) {
+    std::fs::create_dir_all(root).unwrap();
+    std::fs::write(
+        root.join(format!("{name}.bucket")),
+        "updated_nanos=0\ntokens=1\nremainder_nanos=0\n",
     )
     .unwrap();
 }
@@ -249,6 +260,33 @@ fn git_log_count_returns_int() {
     });
 
     assert_eq!(r, 0);
+}
+
+#[test]
+fn git_log_count_consumes_git_rate_pool_token() {
+    let lua = Lua::new();
+    let repo = repo_with_commit("git rate pool token");
+    let pool_root = tempdir().unwrap();
+    seed_pool_token(pool_root.path(), "git");
+    let mut sandbox = ProcessSandbox::new();
+    sandbox
+        .enter_cwd(repo.path())
+        .set_env(
+            "FKST_RATE_POOL_ROOT",
+            pool_root.path().as_os_str().to_owned(),
+        )
+        .set_env("FKST_RATE_POOL_GIT", "1,1");
+    let (_lock, guard) = sandbox.enter();
+    register_for_host(&lua, repo.path());
+    let count: i64 = lua
+        .load(r#"return git_log_count("git rate pool token", "1970-01-01T00:00:00Z")"#)
+        .eval()
+        .unwrap();
+    drop(guard);
+
+    assert_eq!(count, 1);
+    let ledger = std::fs::read_to_string(pool_root.path().join("git.bucket")).unwrap();
+    assert!(ledger.contains("tokens=0\n"), "{ledger}");
 }
 
 #[cfg(unix)]
