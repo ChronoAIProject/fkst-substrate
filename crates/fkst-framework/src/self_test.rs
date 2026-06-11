@@ -136,6 +136,7 @@ fn check_sdk_registration(host_root: &std::path::Path) -> Result<()> {
         host_root,
         NameResolver::new(["pkg".to_string()]),
         "pkg".to_string(),
+        None,
     )
     .context("register framework SDK")?;
     lua.load(
@@ -159,6 +160,7 @@ fn check_sdk_registration(host_root: &std::path::Path) -> Result<()> {
         expect_type("log.error", log.error, "function")
         expect_type("now", now, "function")
         expect_type("truncate_utf8", truncate_utf8, "function")
+        expect_type("graph_json", graph_json, "function")
         expect_type("exec_sync", exec_sync, "function")
         expect_type("file", file, "table")
         expect_type("file.read", file.read, "function")

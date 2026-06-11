@@ -33,6 +33,7 @@ mod sdk_cache;
 mod sdk_codex;
 mod sdk_fs;
 mod sdk_git;
+mod sdk_graph;
 mod sdk_json;
 mod sdk_log;
 mod sdk_mark;
@@ -314,6 +315,7 @@ fn run_pipeline(
         roots.host_root(),
         roots.name_resolver(),
         owner_namespace,
+        Some(roots.clone()),
     )?;
 
     let exit_code = match mlua_init::run_dept_with_require_roots(

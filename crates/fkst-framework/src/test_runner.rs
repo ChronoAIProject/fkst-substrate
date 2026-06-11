@@ -27,6 +27,7 @@ pub(crate) fn run_tests(roots: PackageRoots, report_json: Option<PathBuf>) -> Re
             roots.name_resolver(),
             file.owner_namespace.clone(),
             Some(mock_commands.clone()),
+            Some(roots.clone()),
         )
         .with_context(|| format!("register SDK for {}", relpath))?;
         register_test_sdk(
@@ -446,6 +447,7 @@ fn run_department(
             .with_recorded_only_queues(qualified_produces),
         owner_namespace.to_string(),
         Some(mock_commands),
+        Some(roots.clone()),
     )?;
 
     let exit_code = match crate::mlua_init::run_dept_with_require_roots(

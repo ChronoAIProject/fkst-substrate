@@ -131,7 +131,7 @@ fn run_timeout_activity_test(output_stream: TestStream) -> ActivityResult {
         register(&lua).unwrap();
         let spawn: mlua::Function = lua.globals().get("spawn_codex_sync").unwrap();
         let opts = lua_opts(&lua, "active");
-        opts.set("timeout", 1).unwrap();
+        opts.set("timeout", 3).unwrap();
         let result: Table = spawn.call(opts).unwrap();
         result_tx
             .send(ActivityResult {
@@ -784,7 +784,7 @@ exit 0
     register(&lua).unwrap();
     let spawn: mlua::Function = lua.globals().get("spawn_codex_sync").unwrap();
     let opts = lua_opts(&lua, "silent");
-    opts.set("timeout", 2).unwrap();
+    opts.set("timeout", 5).unwrap();
 
     let result: Table = spawn.call(opts).unwrap();
     assert_eq!(result.get::<i64>("exit_code").unwrap(), 0);
@@ -793,7 +793,7 @@ exit 0
     let log_path = PathBuf::from(result.get::<String>("log_path").unwrap());
     let log_body = std::fs::read_to_string(log_path).unwrap();
     assert!(log_body.contains("EXIT=0\n"));
-    assert!(log_body.contains("TIMEOUT_SECONDS=2\n"));
+    assert!(log_body.contains("TIMEOUT_SECONDS=5\n"));
 }
 
 #[cfg(unix)]

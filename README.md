@@ -121,6 +121,8 @@ production Lua SDK 包含 `once(key, fn) -> boolean`。它是 best-effort per-ke
 
 production Lua SDK 还包含 `cache_set(key, value)` 与 `cache_get(key) -> string | nil`。它们是 best-effort scratch KV primitive，不是 durable state。`key` 使用同一 runtime key 合约，framework 直接读写 `<RT>/cache/<key>`，所以 `<RT>/cache` 是人工可浏览的目录树；`cache_set` 原子覆盖写入 string value，`cache_get` 命中时返回 string，缺失时返回 nil。`<RT>` 被清空或换 host 后，`cache_get` 返回 nil，调用者必须从 durable source 重新推导；需要 read-compare-write 原子性时由调用者外层使用 `with_lock`。
 
+production Lua SDK 包含 `graph_json() -> string`。它是只读 composed graph introspection：按当前 fixed package roots input set 与 host root 重新扫描并验证 graph，返回稳定排序的 `fkst.graph.v1` JSON string，供 package/host 渲染 topology view。输出包含 raiser / queue / department nodes、消息流 edges、department `consumes` / `produces` / `ephemeral` / `stall_window` / materialized `retry` metadata；node `id` 与 edge endpoint 使用 `kind:canonical_name` 形态；不包含 runtime state、queue capacity、`lua` path 或 `owner_root`。
+
 ## 安装与更新
 
 `scripts/install.sh` 是 operator 便利脚本，和 `scripts/verify.sh` 同级，不是 engine surface：它只生成本机 operator 配置,不改 SPEC、conformance、supervisor 或任何二进制默认值。更新走独立的 `fkst-update` 二进制(见下)。

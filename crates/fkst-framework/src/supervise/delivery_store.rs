@@ -851,7 +851,8 @@ mod tests {
     fn lease_for_dept_is_not_starved_by_other_dept_backlog() {
         let temp = TempDir::new().unwrap();
         let store = store(&temp);
-        for index in 0..10_000 {
+        let other_backlog = scan_budget(1, 0) + 1;
+        for index in 0..other_backlog {
             let mut other = record(&format!("other-{index:05}"), 100);
             other.dept = "other".to_string();
             store.enqueue(&other).unwrap();
@@ -864,7 +865,7 @@ mod tests {
 
         assert_eq!(leased.len(), 1);
         assert_eq!(leased[0].delivery_id, "worker-record");
-        assert_eq!(store.ready_index_len().unwrap(), 10_000);
+        assert_eq!(store.ready_index_len().unwrap(), other_backlog);
         assert_eq!(store.leased_index_len().unwrap(), 1);
     }
 

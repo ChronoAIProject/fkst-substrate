@@ -274,6 +274,7 @@ engine 维护 durable 在途 delivery state，但它不是实体业务真相、a
 | `once(key, fn)` | `sdk_mark.rs`，locked per-key marker，成功后写入 scratch marker |
 | `cache_set(key, value)` | `sdk_cache.rs`，best-effort scratch KV 原子覆盖写 |
 | `cache_get(key)` | `sdk_cache.rs`，best-effort scratch KV 读取，缺失返回 nil |
+| `graph_json()` | `sdk_graph.rs`，只读 composed graph JSON snapshot |
 | `git_log_count(grep, since)` | `sdk_git.rs`，调用 `git log --grep --since --oneline` |
 | `git_log_grep(grep, since)` | `sdk_git.rs`，调用 `git log --format=%H` |
 | `count_worktrees()` | `sdk_git.rs`，解析 `git worktree list --porcelain` |
@@ -284,6 +285,8 @@ engine 维护 durable 在途 delivery state，但它不是实体业务真相、a
 | `now()` | `sdk_basic.rs`，Unix seconds |
 
 `json` surface 只包含 `json.decode`，不包含 `json.encode` 或 `json.array`。`json.decode` 产生的 JSON array table 会带有 `LuaSerdeExt` 可识别的数组标记，因此 `json.decode("[]")` 经 `raise` 仍是 `[]`；裸 `{}` 经 `raise` 是 `{}`。非空 sequence 序列化为 JSON array，非空 map 序列化为 JSON object。
+
+`graph_json()` 是只读 topology introspection。它按当前 fixed package roots input set 与 host root 重新扫描并验证 composed graph，返回 `fkst.graph.v1` JSON string。schema 包含 `nodes` 与 `edges`：raiser nodes 带 `source`，queue nodes 带 `fanout`，department nodes 带 `consumes`、`produces`、`ephemeral`、`stall_window` 与 materialized `retry` metadata；edges 表示 raiser→queue、queue→department 和 department→queue。node `id` 与 edge endpoint 使用 `kind:canonical_name` 形态，避免同名 raiser / queue / department 在图渲染时碰撞。输出排序稳定，不包含 `lua` path、`owner_root`、queue capacity 或 runtime state。
 
 `M.spec.retry` 默认启用；`retry=false` 表示失败不重试；`retry={...}` 支持 `max_attempts`、`base`、`cap` 子集覆盖。全局默认由 registry 的 `retry_default_max_attempts`、`retry_default_base`、`retry_default_cap` 提供。可靠 / 非可靠投递由 `M.spec.ephemeral` 决定，不由 retry 决定。可靠路径不依赖 payload dedup key、runtime marker 或 retry scratch 文件；delivery store 使用 `delivery_id`、`lease_generation` 和 redb 事务提供 fencing、ack、retry 和 dead 表。
 

@@ -229,6 +229,197 @@ end
     assert_eq!(raises[0]["payload"]["isolated"], true);
 }
 
+#[test]
+fn graph_json_returns_stable_composed_topology_snapshot() {
+    let temp = tempfile::tempdir().unwrap();
+    let host = temp.path().join("host");
+    let alpha = temp.path().join("alpha");
+    let beta = temp.path().join("beta");
+    fs::create_dir_all(host.join("departments/dashboard")).unwrap();
+    fs::create_dir_all(host.join("raisers")).unwrap();
+    fs::create_dir_all(alpha.join("departments/producer")).unwrap();
+    fs::create_dir_all(alpha.join("raisers")).unwrap();
+    fs::create_dir_all(beta.join("departments/consumer")).unwrap();
+    fs::create_dir_all(&host).unwrap();
+    fs::write(
+        host.join("fkst.env"),
+        "FKST_QUEUE_CAPACITY=8\nFKST_DEPARTMENT_DEFAULT_STALL_WINDOW=45s\nFKST_CODEX_PERMIT_SLOTS=3\nFKST_RETRY_DEFAULT_MAX_ATTEMPTS=5\nFKST_RETRY_DEFAULT_BASE=2s\nFKST_RETRY_DEFAULT_CAP=20s\n",
+    )
+    .unwrap();
+    fs::write(
+        alpha.join("departments/producer/main.lua"),
+        r#"
+local M = {}
+M.spec = {
+  consumes = { "tick" },
+  produces = { "beta.jobs" },
+  ephemeral = { "tick" },
+  fanout = { "tick" },
+  stall_window = "9s",
+  retry = { max_attempts = 2, base = "1s", cap = "4s" },
+}
+function pipeline(_) end
+return M
+"#,
+    )
+    .unwrap();
+    fs::write(
+        beta.join("departments/consumer/main.lua"),
+        r#"
+local M = {}
+M.spec = {
+  consumes = { "jobs" },
+  produces = { "host.render" },
+  ephemeral = { "jobs" },
+  retry = false,
+}
+function pipeline(_) end
+return M
+"#,
+    )
+    .unwrap();
+    let dashboard = host.join("departments/dashboard/main.lua");
+    fs::write(
+        &dashboard,
+        r#"
+local M = {}
+M.spec = {
+  consumes = { "render" },
+  produces = { "snapshot" },
+  ephemeral = { "render" },
+  stall_window = "7s",
+}
+function pipeline(_)
+  raise("snapshot", { graph = json.decode(graph_json()) })
+end
+return M
+"#,
+    )
+    .unwrap();
+    fs::write(
+        alpha.join("raisers/tick.lua"),
+        r#"return { type = "cron", interval = "10s", produces = "tick" }"#,
+    )
+    .unwrap();
+    fs::write(
+        host.join("raisers/render_file.lua"),
+        r#"return { type = "file_watch", glob = "input/*.json", produces = "render" }"#,
+    )
+    .unwrap();
+
+    let output = run_command(&host, &dashboard)
+        .arg("--package-root")
+        .arg(&alpha)
+        .arg("--package-root")
+        .arg(&beta)
+        .arg("--owner-namespace")
+        .arg("host")
+        .output()
+        .unwrap();
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stdout: {}\nstderr: {}",
+        stdout(&output),
+        stderr(&output)
+    );
+    let raises = raised_entries(&output);
+    let graph = &raises[0]["payload"]["graph"];
+    assert_eq!(
+        graph,
+        &serde_json::json!({
+            "schema": "fkst.graph.v1",
+            "nodes": [
+                {
+                    "kind": "raiser",
+                    "id": "raiser:alpha.tick",
+                    "name": "tick",
+                    "package": "alpha",
+                    "source": { "type": "cron", "interval": "10s" }
+                },
+                {
+                    "kind": "raiser",
+                    "id": "raiser:host.render_file",
+                    "name": "render_file",
+                    "package": "host",
+                    "source": { "type": "file_watch", "glob": "input/*.json" }
+                },
+                {
+                    "kind": "queue",
+                    "id": "queue:alpha.tick",
+                    "name": "tick",
+                    "package": "alpha",
+                    "fanout": true
+                },
+                {
+                    "kind": "queue",
+                    "id": "queue:beta.jobs",
+                    "name": "jobs",
+                    "package": "beta",
+                    "fanout": false
+                },
+                {
+                    "kind": "queue",
+                    "id": "queue:host.render",
+                    "name": "render",
+                    "package": "host",
+                    "fanout": false
+                },
+                {
+                    "kind": "queue",
+                    "id": "queue:host.snapshot",
+                    "name": "snapshot",
+                    "package": "host",
+                    "fanout": false
+                },
+                {
+                    "kind": "department",
+                    "id": "department:alpha.producer",
+                    "name": "producer",
+                    "package": "alpha",
+                    "consumes": ["alpha.tick"],
+                    "produces": ["beta.jobs"],
+                    "ephemeral": ["alpha.tick"],
+                    "stall_window": "9s",
+                    "retry": { "max_attempts": 2, "base": "1s", "cap": "4s" }
+                },
+                {
+                    "kind": "department",
+                    "id": "department:beta.consumer",
+                    "name": "consumer",
+                    "package": "beta",
+                    "consumes": ["beta.jobs"],
+                    "produces": ["host.render"],
+                    "ephemeral": ["beta.jobs"],
+                    "stall_window": "45s"
+                },
+                {
+                    "kind": "department",
+                    "id": "department:host.dashboard",
+                    "name": "dashboard",
+                    "package": "host",
+                    "consumes": ["host.render"],
+                    "produces": ["host.snapshot"],
+                    "ephemeral": ["host.render"],
+                    "stall_window": "7s",
+                    "retry": { "max_attempts": 5, "base": "2s", "cap": "20s" }
+                }
+            ],
+            "edges": [
+                { "from": "department:alpha.producer", "to": "queue:beta.jobs", "relation": "produces" },
+                { "from": "department:beta.consumer", "to": "queue:host.render", "relation": "produces" },
+                { "from": "department:host.dashboard", "to": "queue:host.snapshot", "relation": "produces" },
+                { "from": "queue:alpha.tick", "to": "department:alpha.producer", "relation": "consumes" },
+                { "from": "queue:beta.jobs", "to": "department:beta.consumer", "relation": "consumes" },
+                { "from": "queue:host.render", "to": "department:host.dashboard", "relation": "consumes" },
+                { "from": "raiser:alpha.tick", "to": "queue:alpha.tick", "relation": "raises" },
+                { "from": "raiser:host.render_file", "to": "queue:host.render", "relation": "raises" }
+            ]
+        })
+    );
+}
+
 fn namespace(root: &Path) -> String {
     root.canonicalize()
         .unwrap()
