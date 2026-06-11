@@ -4,6 +4,8 @@
 mod config_registry;
 #[path = "../src/external_command.rs"]
 mod external_command;
+#[path = "../src/rate_pool.rs"]
+mod rate_pool;
 #[path = "../src/runtime_context.rs"]
 mod runtime_context;
 #[path = "../src/sdk_codex.rs"]

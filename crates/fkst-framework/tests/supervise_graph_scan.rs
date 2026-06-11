@@ -6,6 +6,8 @@ mod config_registry;
 mod graph_scan;
 #[path = "../src/path_resolver.rs"]
 mod path_resolver;
+#[path = "../src/rate_pool.rs"]
+mod rate_pool;
 
 use fkst_common::config::RaiserDecl;
 use fkst_common::validation::validate;

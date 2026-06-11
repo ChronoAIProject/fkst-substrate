@@ -64,6 +64,7 @@ struct HostGraphDefaults {
 impl HostGraphDefaults {
     fn load(roots: &PackageRoots) -> Result<Self> {
         let config = ConfigContext::from_host_root(roots.host_root())?;
+        crate::rate_pool::RatePoolRegistry::from_config(&config)?;
         Ok(Self {
             queue_capacity: resolve_usize(&config, ConfigKey::QueueCapacity)?,
             department_default_stall_window: resolve_stall_window(

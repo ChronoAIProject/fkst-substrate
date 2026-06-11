@@ -23,6 +23,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::config_registry::{ConfigContext, ConfigKey};
 use crate::external_command::{format_command, MockCommandState};
+use crate::rate_pool::RatePoolRegistry;
 use crate::runtime_context;
 
 pub(crate) const CODEX_PERMIT_SLOTS_ENV: &str = "FKST_CODEX_PERMIT_SLOTS";
@@ -347,6 +348,48 @@ fn run_codex_request(
 ) -> Result<CodexResult> {
     if let Some(runner) = runner {
         return run_mocked_codex_request(request, runner);
+    }
+
+    let rate_pools = match RatePoolRegistry::from_config(config) {
+        Ok(rate_pools) => rate_pools,
+        Err(err) => {
+            let message = format!("codex rate pool config failed: {err}");
+            write_codex_log(
+                &request.log_path,
+                "",
+                &message,
+                -1,
+                &command_line_for_request(&request),
+                request.timeout_seconds,
+            );
+            return Ok(CodexResult::failure(
+                "rate_pool",
+                message,
+                String::new(),
+                String::new(),
+                -1,
+                request.log_path.to_string_lossy().into_owned(),
+            ));
+        }
+    };
+    if let Err(err) = rate_pools.acquire_for_program("codex") {
+        let message = format!("codex rate pool acquire failed: {err}");
+        write_codex_log(
+            &request.log_path,
+            "",
+            &message,
+            -1,
+            &command_line_for_request(&request),
+            request.timeout_seconds,
+        );
+        return Ok(CodexResult::failure(
+            "rate_pool",
+            message,
+            String::new(),
+            String::new(),
+            -1,
+            request.log_path.to_string_lossy().into_owned(),
+        ));
     }
 
     if let Err(err) = ensure_pool_with_context(host_root, config) {
