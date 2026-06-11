@@ -4,50 +4,14 @@ mod config_registry;
 mod rate_pool;
 #[path = "../src/rate_shim.rs"]
 mod rate_shim;
+mod support;
 
 use std::collections::BTreeMap;
-use std::ffi::OsString;
 use std::path::Path;
-use std::path::PathBuf;
 use std::process::{Command, Output};
-use std::sync::{Mutex, OnceLock};
 
 use rate_pool::{RatePoolConfig, RatePoolRegistry};
-
-static PROCESS_STATE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-const RATE_POOL_PROCESS_ENVS: &[&str] = &["FKST_RATE_POOL_ROOT", "FKST_RATE_POOL_GH"];
-
-struct ProcessStateGuard {
-    cwd: PathBuf,
-    envs: Vec<(&'static str, Option<OsString>)>,
-}
-
-impl ProcessStateGuard {
-    fn enter_without_rate_pool_env() -> Self {
-        let cwd = std::env::current_dir().unwrap();
-        let envs = RATE_POOL_PROCESS_ENVS
-            .iter()
-            .map(|key| (*key, std::env::var_os(key)))
-            .collect::<Vec<_>>();
-        for key in RATE_POOL_PROCESS_ENVS {
-            std::env::remove_var(key);
-        }
-        Self { cwd, envs }
-    }
-}
-
-impl Drop for ProcessStateGuard {
-    fn drop(&mut self) {
-        let _ = std::env::set_current_dir(&self.cwd);
-        for (key, value) in self.envs.drain(..).rev() {
-            if let Some(value) = value {
-                std::env::set_var(key, value);
-            } else {
-                std::env::remove_var(key);
-            }
-        }
-    }
-}
+use support::process_sandbox::ProcessSandbox;
 
 fn framework_bin() -> &'static str {
     env!("CARGO_BIN_EXE_fkst-framework")
@@ -102,6 +66,35 @@ fn seed_ledger(root: &Path, name: &str, tokens: u64) {
         format!("updated_nanos={updated_nanos}\ntokens={tokens}\nremainder_nanos=0\n"),
     )
     .unwrap();
+}
+
+struct EnvGuard {
+    vars: Vec<(&'static str, Option<std::ffi::OsString>)>,
+}
+
+impl EnvGuard {
+    fn remove(keys: &[&'static str]) -> Self {
+        let vars = keys
+            .iter()
+            .map(|key| {
+                let previous = std::env::var_os(key);
+                std::env::remove_var(key);
+                (*key, previous)
+            })
+            .collect();
+        Self { vars }
+    }
+}
+
+impl Drop for EnvGuard {
+    fn drop(&mut self) {
+        for (key, previous) in self.vars.drain(..) {
+            match previous {
+                Some(value) => std::env::set_var(key, value),
+                None => std::env::remove_var(key),
+            }
+        }
+    }
 }
 
 #[test]
@@ -225,11 +218,7 @@ fn generated_shim_consumes_same_bucket_as_cli_acquire() {
 #[cfg(unix)]
 #[test]
 fn generated_shim_bakes_resolved_config_from_fkst_env_style_registry() {
-    let _lock = PROCESS_STATE_LOCK
-        .get_or_init(|| Mutex::new(()))
-        .lock()
-        .unwrap_or_else(|err| err.into_inner());
-    let _state = ProcessStateGuard::enter_without_rate_pool_env();
+    let _env = EnvGuard::remove(&["FKST_RATE_POOL_ROOT", "FKST_RATE_POOL_GH"]);
     let tmp = tempfile::tempdir().unwrap();
     let host = tmp.path().join("host");
     let run_cwd = tmp.path().join("run-cwd");
@@ -244,10 +233,14 @@ fn generated_shim_bakes_resolved_config_from_fkst_env_style_registry() {
     .unwrap();
     executable(&real_dir.join("gh"), "#!/bin/sh\nprintf shim-real\n");
 
-    std::env::set_current_dir(&host).unwrap();
-    let config = config_registry::ConfigContext::from_host_root(&host).unwrap();
-    let registry = RatePoolRegistry::from_config(&config).unwrap();
-    std::env::set_current_dir(&run_cwd).unwrap();
+    let registry = ProcessSandbox::new()
+        .enter_cwd(&host)
+        .unset_env("FKST_RATE_POOL_ROOT")
+        .unset_env("FKST_RATE_POOL_GH")
+        .run(|| {
+            let config = config_registry::ConfigContext::from_host_root(&host).unwrap();
+            RatePoolRegistry::from_config(&config).unwrap()
+        });
     seed_ledger(registry.root(), "gh", 2);
     let generator_path = std::env::join_paths([real_dir.as_path()]).unwrap();
     let shim_dir = rate_shim::ensure_rate_shims_with_path(

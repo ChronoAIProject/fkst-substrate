@@ -82,9 +82,11 @@ queue 是包内命名空间。多 graph-root 组合时，裸 queue 名按 owner 
 
 Lua SDK surface 固定为：
 
-`pipeline / source / raise / spawn_codex_sync / spawn_codex / exec_sync / await_all / with_lock / git_log_count / git_log_grep / count_worktrees / list_orphan_worktrees / setup_worktree / file / json.decode / log.{info,warn,error} / now`
+`pipeline / source / raise / spawn_codex_sync / spawn_codex / exec_sync / await_all / with_lock / once / cache_set / cache_get / truncate_utf8 / git_log_count / git_log_grep / count_worktrees / list_orphan_worktrees / setup_worktree / file / json.decode / log.{info,warn,error} / now`
 
-其中 `pipeline` 与 `source` 是 graph/package 侧约定，Rust 注册的运行时 primitive 是 `raise`、codex、exec、await、lock、git/worktree、file、json、log、now。`json` 仅 decode（`json.decode`）：JSON 是 engine wire format，Lua 值经 `raise` 出引擎，故不提供 `json.encode`。新增 SDK 函数就是扩 trusted base，必须走 Tier III 测试和 conformance，不能顺手加入。
+其中 `pipeline` 与 `source` 是 graph/package 侧约定，Rust 注册的运行时 primitive 是 `raise`、codex、exec、await、lock、mark/cache、git/worktree、file、json、log、now。`json` 仅 decode（`json.decode`）：JSON 是 engine wire format，Lua 值经 `raise` 出引擎，故不提供 `json.encode`。`truncate_utf8` 是已发布的 blessed utility name，保持精确语义与全上下文可用性；新增同类纯数据能力不得顺手变成 Rust primitive。
+
+Lua-side capability 的决策顺序固定为：第一，Lua 5.4 stdlib first；所有 engine-constructed Lua context 都通过 `Lua::new()` 创建并加载 safe standard library，`utf8`、`string`、`table`、`math`、`coroutine`、`os` 和 base functions 已覆盖的需求是文档任务，不是新 SDK 任务。第二，stdlib 之外的纯 utility 只能进入 engine-vendored pure Lua prelude；prelude 必须由 engine 在 production、test、conformance、graph-scan/spec-eval 等所有 Lua context 中统一加载，新增能力按 curated battery 处理，不按 incident 增长。第三，Rust primitive 只用于 host authority / side effects（`raise`、subprocess、locks、cache、worktree）、性能瓶颈或 fail-closed boundary enforcement（如 `json.decode`）。任何新增 Rust primitive 提案必须先证明前两层不能承载。
 
 framework 看得见的概念只有 `event`、`source`、`queue`、`pipeline`、`coroutine/Lua state`、`worktree`、`subprocess`、`git ref`、`filesystem`、`file lock`、`time`。framework 看不见业务轮次、业务关卡、业务阶段、判断策略、审查策略、退避策略、重试策略、修复尝试、审计会话或任何具体业务部门名。
 
