@@ -319,7 +319,7 @@ fn dispatch_due(
                     router,
                     retry_policy,
                     &record,
-                    format!("build spawn args: {err}"),
+                    DeliveryFailure::permanent(format!("build spawn args: {err}")),
                 );
                 continue;
             }
@@ -356,13 +356,12 @@ async fn run_durable_record(
         Ok(result) if result.exit_code == 0 => {
             match publish_raised(router, &result.stdout, &record) {
                 Ok(()) => None,
-                Err(err) => Some(format!("raised publish error: {err}")),
+                Err(err) => Some(DeliveryFailure::permanent(format!(
+                    "raised publish error: {err}"
+                ))),
             }
         }
-        Ok(result) => Some(format!(
-            "exit={} stderr={}",
-            result.exit_code, result.stderr
-        )),
+        Ok(result) => Some(DeliveryFailure::from_spawn_result(&result)),
         Err(err) => {
             error!(
                 dept = %dept_name,
@@ -370,7 +369,7 @@ async fn run_durable_record(
                 error = %err,
                 "framework spawn error"
             );
-            Some(format!("spawn error: {err}"))
+            Some(DeliveryFailure::permanent(format!("spawn error: {err}")))
         }
     };
 
@@ -469,7 +468,7 @@ fn retry_record(
     router: &DeliveryRouter,
     retry_policy: Option<&RetryPolicy>,
     record: &DeliveryRecord,
-    error: String,
+    failure: DeliveryFailure,
 ) {
     let Some(policy) = retry_policy else {
         if let Err(err) = store.ack(&record.delivery_id, record.lease_generation) {
@@ -486,8 +485,8 @@ fn retry_record(
         &record.delivery_id,
         record.lease_generation,
         &RetryFailure {
-            message: error,
-            replayable: false,
+            message: failure.message,
+            replayable: failure.replayable,
         },
         policy,
         now_unix_millis(),
@@ -724,7 +723,29 @@ struct RunningDelivery {
 
 struct CompletedDelivery {
     record: DeliveryRecord,
-    failure: Option<String>,
+    failure: Option<DeliveryFailure>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct DeliveryFailure {
+    message: String,
+    replayable: bool,
+}
+
+impl DeliveryFailure {
+    fn permanent(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            replayable: false,
+        }
+    }
+
+    fn from_spawn_result(result: &SpawnResult) -> Self {
+        Self {
+            message: format!("exit={} stderr={}", result.exit_code, result.stderr),
+            replayable: result.exit_code == 124,
+        }
+    }
 }
 
 fn policy_from_decl(decl: &RetryDecl) -> anyhow::Result<RetryPolicy> {
@@ -1011,11 +1032,38 @@ mod tests {
             &router,
             Some(&policy(1)),
             &leased,
-            "failure".to_string(),
+            DeliveryFailure::permanent("failure"),
         );
 
         assert!(store.get("one").unwrap().is_none());
         assert!(store.get_dead("one").unwrap().is_some());
+    }
+
+    #[test]
+    fn durable_timeout_failure_is_stored_as_replayable_dead_record() {
+        let temp = TempDir::new().unwrap();
+        let store = Arc::new(DeliveryStore::open(temp.path().join("delivery.redb")).unwrap());
+        store.enqueue(&record("one")).unwrap();
+        let leased = store
+            .lease_for_dept("worker", now_unix_millis(), 8, Duration::from_millis(50))
+            .unwrap()
+            .remove(0);
+        let router = router_with_dead_letter(store.clone());
+        let failure = DeliveryFailure::from_spawn_result(&SpawnResult {
+            exit_code: 124,
+            stdout: String::new(),
+            stderr: "codex timed out".to_string(),
+            elapsed_ms: 1_000,
+            log_path: None,
+        });
+
+        retry_record(&store, &router, Some(&policy(1)), &leased, failure);
+
+        assert!(store.get("one").unwrap().is_none());
+        let dead = store.get_dead("one").unwrap().unwrap();
+        assert!(dead.replayable);
+        assert!(!dead.permanent);
+        assert!(dead.record.is_some());
     }
 
     #[test]
