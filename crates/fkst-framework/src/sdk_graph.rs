@@ -3,6 +3,7 @@
 use fkst_common::config::{Config, RaiserDecl, RetryDecl};
 use mlua::{Lua, Result};
 use serde::Serialize;
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use crate::path_resolver::PackageRoots;
@@ -10,12 +11,14 @@ use crate::path_resolver::PackageRoots;
 #[derive(Clone)]
 struct GraphJsonState {
     roots: PackageRoots,
+    authorized: bool,
     cached: Arc<Mutex<Option<String>>>,
 }
 
-pub(crate) fn register(lua: &Lua, roots: Option<PackageRoots>) -> Result<()> {
+pub(crate) fn register(lua: &Lua, roots: Option<PackageRoots>, authorized: bool) -> Result<()> {
     let state = roots.map(|roots| GraphJsonState {
         roots,
+        authorized,
         cached: Arc::new(Mutex::new(None)),
     });
     lua.globals().set(
@@ -26,6 +29,11 @@ pub(crate) fn register(lua: &Lua, roots: Option<PackageRoots>) -> Result<()> {
                     "graph_json unavailable without composed graph roots",
                 ));
             };
+            if !state.authorized {
+                return Err(mlua::Error::external(
+                    "graph_json requires M.spec.graph_json = true",
+                ));
+            }
             state.graph_json()
         })?,
     )?;
@@ -51,6 +59,35 @@ impl GraphJsonState {
         *cached = Some(json.clone());
         Ok(json)
     }
+}
+
+pub(crate) fn department_authorized(
+    roots: &PackageRoots,
+    owner_root: &Path,
+    lua_path: &Path,
+) -> Result<bool> {
+    let config = crate::supervise::graph_scan::load_roots(roots).map_err(mlua::Error::external)?;
+    let canonical_lua = lua_path.canonicalize().map_err(mlua::Error::external)?;
+    for dept in config.department.values() {
+        if dept.owner_root != owner_root
+            && dept
+                .owner_root
+                .canonicalize()
+                .map_err(mlua::Error::external)?
+                != owner_root
+        {
+            continue;
+        }
+        let dept_lua = if dept.lua.is_absolute() {
+            dept.lua.clone()
+        } else {
+            owner_root.join(&dept.lua)
+        };
+        if dept_lua.canonicalize().map_err(mlua::Error::external)? == canonical_lua {
+            return Ok(dept.graph_json);
+        }
+    }
+    Ok(false)
 }
 
 #[derive(Debug, Serialize)]
@@ -259,6 +296,7 @@ mod tests {
                 produces: vec![],
                 ephemeral: vec![],
                 stall_window: "30s".to_string(),
+                graph_json: false,
                 retry: None,
             },
         );
@@ -272,6 +310,7 @@ mod tests {
                 produces: vec!["host.done".to_string()],
                 ephemeral: vec!["pkg.tick".to_string()],
                 stall_window: "45s".to_string(),
+                graph_json: false,
                 retry: Some(RetryDecl {
                     max_attempts: 3,
                     base: "10s".to_string(),
@@ -377,7 +416,7 @@ mod tests {
     #[test]
     fn graph_json_requires_composed_roots() {
         let lua = Lua::new();
-        register(&lua, None).unwrap();
+        register(&lua, None, true).unwrap();
 
         let err = lua
             .load("return graph_json()")
@@ -387,6 +426,41 @@ mod tests {
         assert!(
             err.to_string()
                 .contains("graph_json unavailable without composed graph roots"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn graph_json_requires_authorization() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(temp.path().join("departments/worker")).unwrap();
+        std::fs::write(
+            temp.path().join("fkst.env"),
+            "FKST_QUEUE_CAPACITY=8\nFKST_DEPARTMENT_DEFAULT_STALL_WINDOW=30s\nFKST_CODEX_PERMIT_SLOTS=1\n",
+        )
+        .unwrap();
+        std::fs::write(
+            temp.path().join("departments/worker/main.lua"),
+            r#"
+local M = {}
+M.spec = { consumes = { "tick" }, stall_window = "30s" }
+function pipeline(_) end
+return M
+"#,
+        )
+        .unwrap();
+        let roots = PackageRoots::resolve(temp.path(), vec![temp.path().to_path_buf()]).unwrap();
+        let lua = Lua::new();
+        register(&lua, Some(roots), false).unwrap();
+
+        let err = lua
+            .load("return graph_json()")
+            .eval::<String>()
+            .unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("graph_json requires M.spec.graph_json = true"),
             "{err}"
         );
     }

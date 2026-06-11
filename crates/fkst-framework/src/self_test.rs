@@ -113,6 +113,7 @@ fn minimal_config(lua_rel: PathBuf, owner_root: &std::path::Path) -> Config {
             produces: vec![],
             ephemeral: vec![],
             stall_window: "30s".into(),
+            graph_json: false,
             retry: None,
         },
     );
@@ -137,6 +138,7 @@ fn check_sdk_registration(host_root: &std::path::Path) -> Result<()> {
         NameResolver::new(["pkg".to_string()]),
         "pkg".to_string(),
         None,
+        false,
     )
     .context("register framework SDK")?;
     lua.load(

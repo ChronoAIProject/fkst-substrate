@@ -413,6 +413,7 @@ mod tests {
                     Vec::new()
                 },
                 stall_window: "30s".to_string(),
+                graph_json: false,
                 retry: None,
             },
         );
@@ -452,6 +453,7 @@ mod tests {
                     produces: Vec::new(),
                     ephemeral: Vec::new(),
                     stall_window: "30s".to_string(),
+                    graph_json: false,
                     retry: None,
                 },
             );

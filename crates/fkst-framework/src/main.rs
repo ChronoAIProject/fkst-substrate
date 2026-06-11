@@ -308,6 +308,8 @@ fn run_pipeline(
         .owner_root_for_namespace(&owner_namespace)
         .ok_or_else(|| anyhow::anyhow!("unknown owner namespace `{owner_namespace}`"))?;
     let require_roots = roots.require_roots_for_owner(owner_root);
+    let graph_json_authorized =
+        sdk_graph::department_authorized(&roots, owner_root, &lua_path).unwrap_or(false);
 
     mlua_init::register_framework_sdk(
         &lua,
@@ -316,6 +318,7 @@ fn run_pipeline(
         roots.name_resolver(),
         owner_namespace,
         Some(roots.clone()),
+        graph_json_authorized,
     )?;
 
     let exit_code = match mlua_init::run_dept_with_require_roots(

@@ -40,6 +40,7 @@ fn cfg_minimal(lua_file: &Path) -> Config {
             produces: vec![],
             ephemeral: vec![],
             stall_window: "30m".into(),
+            graph_json: false,
             retry: None,
         },
     );
@@ -72,6 +73,7 @@ fn department_decl(lua_file: &Path, consumes: Vec<&str>, produces: Vec<&str>) ->
         produces: produces.into_iter().map(String::from).collect(),
         ephemeral: vec![],
         stall_window: "30m".into(),
+        graph_json: false,
         retry: None,
     }
 }
@@ -292,6 +294,7 @@ fn duplicate_consumers_without_fanout_rejected() {
             produces: vec![],
             ephemeral: vec![],
             stall_window: "30m".into(),
+            graph_json: false,
             retry: None,
         },
     );
@@ -318,6 +321,7 @@ fn duplicate_consumers_with_fanout_pass() {
             produces: vec![],
             ephemeral: vec![],
             stall_window: "30m".into(),
+            graph_json: false,
             retry: None,
         },
     );
@@ -348,6 +352,7 @@ fn mixed_retry_consumers_on_fanout_queue_pass() {
             produces: vec![],
             ephemeral: vec![],
             stall_window: "30m".into(),
+            graph_json: false,
             retry: None,
         },
     );

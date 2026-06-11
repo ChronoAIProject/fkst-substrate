@@ -46,6 +46,7 @@ fn fanout_router(queue_name: &str) -> (Fanout, DeliveryRouter) {
             produces: Vec::new(),
             ephemeral: vec![queue_name.to_string()],
             stall_window: "30s".to_string(),
+            graph_json: false,
             retry: None,
             owner_root: std::path::PathBuf::from("."),
             owner_namespace: "pkg".to_string(),

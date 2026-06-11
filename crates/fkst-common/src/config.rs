@@ -48,6 +48,8 @@ pub struct DepartmentDecl {
     pub ephemeral: Vec<String>,
     pub stall_window: String,
     #[serde(default)]
+    pub graph_json: bool,
+    #[serde(default)]
     pub retry: Option<RetryDecl>,
 }
 

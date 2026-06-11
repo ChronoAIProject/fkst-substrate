@@ -17,7 +17,7 @@ mod delivery_transition;
 pub(crate) mod delivery_types;
 mod delivery_watch;
 pub mod event_fanout;
-mod graph_scan;
+pub(crate) mod graph_scan;
 mod raised;
 pub(crate) mod source_runner;
 mod spawner;
@@ -185,6 +185,7 @@ mod tests {
                     Vec::new()
                 },
                 stall_window: "30s".to_string(),
+                graph_json: false,
                 retry: None,
             },
         );

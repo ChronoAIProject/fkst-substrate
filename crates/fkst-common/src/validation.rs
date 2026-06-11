@@ -413,6 +413,7 @@ mod tests {
                 produces: Vec::new(),
                 ephemeral: Vec::new(),
                 stall_window: "30s".into(),
+                graph_json: false,
                 retry: None,
             },
         );

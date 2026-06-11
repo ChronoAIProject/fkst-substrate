@@ -288,6 +288,7 @@ M.spec = {
   produces = { "snapshot" },
   ephemeral = { "render" },
   stall_window = "7s",
+  graph_json = true,
 }
 function pipeline(_)
   raise("snapshot", { graph = json.decode(graph_json()) })
@@ -417,6 +418,49 @@ return M
                 { "from": "raiser:host.render_file", "to": "queue:host.render", "relation": "raises" }
             ]
         })
+    );
+}
+
+#[test]
+fn graph_json_requires_department_spec_authorization() {
+    let temp = tempfile::tempdir().unwrap();
+    let host = temp.path().join("host");
+    fs::create_dir_all(host.join("departments/dashboard")).unwrap();
+    fs::write(
+        host.join("fkst.env"),
+        "FKST_QUEUE_CAPACITY=8\nFKST_DEPARTMENT_DEFAULT_STALL_WINDOW=30s\nFKST_CODEX_PERMIT_SLOTS=1\n",
+    )
+    .unwrap();
+    fs::write(
+        host.join("departments/dashboard/main.lua"),
+        r#"
+local M = {}
+M.spec = {
+  consumes = { "render" },
+  produces = { "snapshot" },
+  stall_window = "7s",
+}
+function pipeline(_)
+  graph_json()
+end
+return M
+"#,
+    )
+    .unwrap();
+
+    let output = run_command(&host, &host.join("departments/dashboard/main.lua"))
+        .arg("--package-root")
+        .arg(&host)
+        .arg("--owner-namespace")
+        .arg("host")
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(1), "stdout: {}", stdout(&output));
+    assert!(
+        stderr(&output).contains("graph_json requires M.spec.graph_json = true"),
+        "stderr: {}",
+        stderr(&output)
     );
 }
 
