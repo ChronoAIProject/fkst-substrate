@@ -138,9 +138,115 @@ fn valid_minimal_host_exits_zero() {
     let log = combined_log(&output);
     assert!(log.contains("PASS runtime-layout"), "{log}");
     assert!(log.contains("PASS project-layout"), "{log}");
+    assert!(log.contains("PASS locale-catalogs"), "{log}");
     assert!(log.contains("PASS graph-scan"), "{log}");
     assert!(log.contains("PASS department-non-empty"), "{log}");
     assert!(log.contains("PASS schema-validation"), "{log}");
+}
+
+#[test]
+fn locale_catalogs_pass_with_complete_non_reference_locale() {
+    let host = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
+    write_minimal_host(host.path());
+    fs::create_dir_all(host.path().join("locales")).unwrap();
+    fs::write(
+        host.path().join("locales/en.lua"),
+        r#"return { ["greeting.title"] = "Hello {name}", body = "Ready" }"#,
+    )
+    .unwrap();
+    fs::write(
+        host.path().join("locales/zh-CN.lua"),
+        r#"return { ["greeting.title"] = "你好 {name}", body = "就绪" }"#,
+    )
+    .unwrap();
+
+    let args = [
+        std::ffi::OsStr::new("--project-root"),
+        path_arg(host.path()),
+    ];
+    let output = run_conformance(&args, host.path());
+
+    assert_exit(&output, 0);
+    let log = combined_log(&output);
+    assert!(log.contains("PASS locale-catalogs"), "{log}");
+    assert!(
+        log.contains("validated locale catalogs for 1 graph roots"),
+        "{log}"
+    );
+}
+
+#[test]
+fn locale_catalogs_reject_missing_non_reference_key() {
+    let host = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
+    write_minimal_host(host.path());
+    fs::create_dir_all(host.path().join("locales")).unwrap();
+    fs::write(
+        host.path().join("locales/en.lua"),
+        r#"return { title = "Title", body = "Body" }"#,
+    )
+    .unwrap();
+    fs::write(
+        host.path().join("locales/zh.lua"),
+        r#"return { title = "标题" }"#,
+    )
+    .unwrap();
+
+    let args = [
+        std::ffi::OsStr::new("--project-root"),
+        path_arg(host.path()),
+    ];
+    let output = run_conformance(&args, host.path());
+
+    assert_exit(&output, 1);
+    let log = combined_log(&output);
+    assert!(log.contains("FAIL locale-catalogs"), "{log}");
+    assert!(log.contains("missing reference key `body`"), "{log}");
+}
+
+#[test]
+fn locale_catalogs_reject_decode_helper_wrapped_literals() {
+    let host = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
+    write_minimal_host(host.path());
+    fs::create_dir_all(host.path().join("locales")).unwrap();
+    fs::write(
+        host.path().join("locales/en.lua"),
+        r#"return { title = string.char(84) }"#,
+    )
+    .unwrap();
+
+    let args = [
+        std::ffi::OsStr::new("--project-root"),
+        path_arg(host.path()),
+    ];
+    let output = run_conformance(&args, host.path());
+
+    assert_exit(&output, 1);
+    let log = combined_log(&output);
+    assert!(log.contains("FAIL locale-catalogs"), "{log}");
+    assert!(log.contains("forbidden decode helper pattern"), "{log}");
+}
+
+#[test]
+fn locale_catalogs_reject_machine_tokens() {
+    let host = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
+    write_minimal_host(host.path());
+    fs::create_dir_all(host.path().join("locales")).unwrap();
+    fs::write(
+        host.path().join("locales/en.lua"),
+        r#"return { title = "RAISED: hidden" }"#,
+    )
+    .unwrap();
+
+    let args = [
+        std::ffi::OsStr::new("--project-root"),
+        path_arg(host.path()),
+    ];
+    let output = run_conformance(&args, host.path());
+
+    assert_exit(&output, 1);
+    let log = combined_log(&output);
+    assert!(log.contains("FAIL locale-catalogs"), "{log}");
+    assert!(log.contains("forbidden machine token"), "{log}");
 }
 
 #[test]

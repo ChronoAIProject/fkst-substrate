@@ -37,6 +37,7 @@ mod sdk_codex;
 mod sdk_fs;
 mod sdk_git;
 mod sdk_graph;
+mod sdk_i18n;
 mod sdk_json;
 mod sdk_log;
 mod sdk_mark;
@@ -369,6 +370,7 @@ fn run_pipeline(
         &lua,
         raise_buf.clone(),
         roots.host_root(),
+        owner_root,
         department_name_for_lua(&lua_path, owner_root, &owner_namespace),
         roots.name_resolver(),
         owner_namespace.clone(),

@@ -10,6 +10,10 @@ mod path_resolver;
 mod rate_pool;
 #[path = "../src/sdk_strings.rs"]
 mod sdk_strings;
+#[path = "../src/sdk_log.rs"]
+mod sdk_log;
+#[path = "../src/sdk_i18n.rs"]
+mod sdk_i18n;
 
 use fkst_common::config::RaiserDecl;
 use fkst_common::validation::validate;

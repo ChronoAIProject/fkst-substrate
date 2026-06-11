@@ -24,6 +24,7 @@ pub(crate) fn run_tests(roots: PackageRoots, report_json: Option<PathBuf>) -> Re
             &lua,
             RaiseBuffer::new(),
             roots.host_root(),
+            &file.owner_root,
             None,
             roots.name_resolver(),
             file.owner_namespace.clone(),
@@ -446,6 +447,7 @@ fn run_department(
         &dept_lua,
         raise_buf.clone(),
         roots.host_root(),
+        owner_root,
         department_name_for_lua(&lua_path, owner_root, owner_namespace),
         roots
             .name_resolver()

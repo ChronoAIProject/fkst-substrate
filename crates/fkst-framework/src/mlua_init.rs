@@ -20,6 +20,7 @@ pub fn register_framework_sdk(
     lua: &Lua,
     raise_buf: RaiseBuffer,
     host_root: &Path,
+    owner_root: &Path,
     dept: Option<String>,
     resolver: NameResolver,
     owner_namespace: String,
@@ -29,6 +30,7 @@ pub fn register_framework_sdk(
     let config = ConfigContext::from_host_root(host_root).map_err(mlua::Error::external)?;
     crate::rate_pool::RatePoolRegistry::from_config(&config).map_err(mlua::Error::external)?;
     crate::sdk_log::register(lua)?;
+    crate::sdk_i18n::register(lua, owner_root)?;
     crate::sdk_basic::register_with_runner(lua, config.clone(), None)?;
     crate::sdk_strings::register(lua)?;
     crate::sdk_graph::register(lua, graph_roots, graph_json_authorized)?;
@@ -46,6 +48,7 @@ pub(crate) fn register_framework_sdk_with_runner(
     lua: &Lua,
     raise_buf: RaiseBuffer,
     host_root: &Path,
+    owner_root: &Path,
     dept: Option<String>,
     resolver: NameResolver,
     owner_namespace: String,
@@ -56,6 +59,7 @@ pub(crate) fn register_framework_sdk_with_runner(
     let config = ConfigContext::from_host_root(host_root).map_err(mlua::Error::external)?;
     crate::rate_pool::RatePoolRegistry::from_config(&config).map_err(mlua::Error::external)?;
     crate::sdk_log::register(lua)?;
+    crate::sdk_i18n::register(lua, owner_root)?;
     crate::sdk_basic::register_with_runner(lua, config.clone(), runner.clone())?;
     crate::sdk_strings::register(lua)?;
     crate::sdk_graph::register(lua, graph_roots, graph_json_authorized)?;
