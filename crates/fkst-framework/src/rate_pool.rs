@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use crate::config_registry::{ConfigContext, ConfigKey};
+use crate::config_registry::{ConfigContext, ConfigKey, ConfigKind};
 
 const ENV_PREFIX: &str = "FKST_RATE_POOL_";
 const ROOT_ENV: &str = "FKST_RATE_POOL_ROOT";
@@ -75,9 +75,50 @@ impl RatePoolRegistry {
         Ok(Self { root, pools })
     }
 
+    pub(crate) fn from_env() -> Result<Self> {
+        let root = match std::env::var(ROOT_ENV) {
+            Ok(value) if !value.trim().is_empty() => expand_home(value.trim())?,
+            Ok(_) | Err(std::env::VarError::NotPresent) => {
+                let ConfigKind::Operational { default } =
+                    crate::config_registry::entry(ConfigKey::RatePoolRoot).kind
+                else {
+                    bail!("{ROOT_ENV} has no operational default");
+                };
+                expand_home(default)?
+            }
+            Err(std::env::VarError::NotUnicode(_)) => bail!("{ROOT_ENV} must be valid UTF-8"),
+        };
+        let mut values = BTreeMap::new();
+        for (key, value) in std::env::vars_os() {
+            let Some(key) = key.to_str() else {
+                continue;
+            };
+            if key.starts_with(ENV_PREFIX) && key != ROOT_ENV {
+                let Some(value) = value.to_str() else {
+                    bail!("{key} must be valid UTF-8");
+                };
+                values.insert(key.to_string(), value.to_string());
+            }
+        }
+        let pools = parse_pool_definitions(values)?;
+        Ok(Self { root, pools })
+    }
+
     #[cfg(test)]
     pub(crate) fn for_test(root: PathBuf, pools: BTreeMap<String, RatePoolConfig>) -> Self {
         Self { root, pools }
+    }
+
+    pub(crate) fn root(&self) -> &Path {
+        &self.root
+    }
+
+    pub(crate) fn pools(&self) -> &BTreeMap<String, RatePoolConfig> {
+        &self.pools
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.pools.is_empty()
     }
 
     pub(crate) fn acquire_for_program(&self, program: &str) -> Result<bool> {
@@ -94,11 +135,18 @@ impl RatePoolRegistry {
         self.acquire_for_program(&program)
     }
 
-    fn acquire_for_name(&self, name: &str) -> Result<bool> {
-        let Some(config) = self.pools.get(name) else {
+    pub(crate) fn acquire_for_name(&self, name: &str) -> Result<bool> {
+        let normalized = name.to_ascii_lowercase();
+        let Some(config) = self.pools.get(&normalized) else {
             return Ok(false);
         };
-        acquire_token(&self.root, name, config, &SystemClock, &ThreadSleeper)?;
+        acquire_token(
+            &self.root,
+            &normalized,
+            config,
+            &SystemClock,
+            &ThreadSleeper,
+        )?;
         Ok(true)
     }
 }

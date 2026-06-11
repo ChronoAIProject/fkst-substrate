@@ -53,6 +53,13 @@ pub async fn supervise(roots: PackageRoots, framework_bin: PathBuf) -> Result<()
         warn!(warning = %warning, "schema validation warning");
     }
     info!("schema validation passed");
+    let config_context = crate::config_registry::ConfigContext::from_host_root(&project_root)?;
+    let rate_pools = crate::rate_pool::RatePoolRegistry::from_config(&config_context)?;
+    if !rate_pools.is_empty() {
+        let framework_for_shim = std::env::current_exe().unwrap_or_else(|_| framework_bin.clone());
+        let shim_dir = crate::rate_shim::ensure_rate_shims(&rate_pools, &framework_for_shim)?;
+        info!(shim_dir = %shim_dir.display(), "rate pool shims ensured");
+    }
 
     let fanout = Fanout::new();
     let delivery_store = delivery_store_for_config(&cfg)?;

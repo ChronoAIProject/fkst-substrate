@@ -391,7 +391,7 @@ fn run_codex_request(
         }
     };
 
-    Ok(run_codex_request_with_permit(request))
+    Ok(run_codex_request_with_permit(request, config))
 }
 
 fn run_mocked_codex_request(
@@ -422,8 +422,38 @@ fn run_mocked_codex_request(
     ))
 }
 
-fn run_codex_request_with_permit(mut request: CodexRequest) -> CodexResult {
-    let (mut cmd, cmd_line) = command_for_request(&request);
+fn run_codex_request_with_permit(mut request: CodexRequest, config: &ConfigContext) -> CodexResult {
+    let shim_dir = match prepare_rate_shims_for_codex(config) {
+        Ok(shim_dir) => shim_dir,
+        Err(err) => {
+            let cmd_line = command_line_for_request(&request);
+            return logged_failure(
+                &request,
+                &cmd_line,
+                "rate_pool",
+                format!("codex rate shim setup failed: {err}"),
+                String::new(),
+                String::new(),
+                -1,
+            );
+        }
+    };
+    let codex_program = resolve_codex_program(shim_dir.as_deref());
+    let (mut cmd, cmd_line) = command_for_request(&request, &codex_program);
+    if let Some(shim_dir) = shim_dir.as_deref() {
+        crate::rate_shim::prepend_shim_dir_to_path(&mut cmd, shim_dir);
+    }
+    if let Err(err) = validate_codex_program(&codex_program) {
+        return logged_failure(
+            &request,
+            &cmd_line,
+            "spawn",
+            format!("codex spawn failed: {err}"),
+            String::new(),
+            String::new(),
+            -1,
+        );
+    }
     eprintln!(
         "SPAWN: log={} cd={} timeout={}",
         request.log_path.display(),
@@ -442,6 +472,35 @@ fn run_codex_request_with_permit(mut request: CodexRequest) -> CodexResult {
     };
 
     wait_for_codex_child(child, stdin_writer, &request, &cmd_line)
+}
+
+fn prepare_rate_shims_for_codex(config: &ConfigContext) -> Result<Option<PathBuf>> {
+    let registry =
+        crate::rate_pool::RatePoolRegistry::from_config(config).map_err(mlua::Error::external)?;
+    if registry.is_empty() {
+        return Ok(None);
+    }
+    let framework_bin = std::env::current_exe().map_err(mlua::Error::external)?;
+    let shim_dir = crate::rate_shim::ensure_rate_shims(&registry, &framework_bin)
+        .map_err(mlua::Error::external)?;
+    Ok(Some(shim_dir))
+}
+
+fn resolve_codex_program(shim_dir: Option<&Path>) -> PathBuf {
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    let shim_dir = shim_dir.unwrap_or_else(|| Path::new(""));
+    crate::rate_shim::resolve_program_on_path("codex", Some(&path), shim_dir)
+        .unwrap_or_else(|| PathBuf::from("codex"))
+}
+
+fn validate_codex_program(program: &Path) -> std::result::Result<(), String> {
+    if program == Path::new("codex") || program.is_file() {
+        return Ok(());
+    }
+    Err(format!(
+        "resolved codex path is not a file: {}",
+        program.display()
+    ))
 }
 
 // only the rare error path is boxed while preserving the success path shape.
@@ -748,8 +807,8 @@ fn logged_failure(
     )
 }
 
-fn command_for_request(request: &CodexRequest) -> (Command, String) {
-    let mut cmd = Command::new("codex");
+fn command_for_request(request: &CodexRequest, program: &Path) -> (Command, String) {
+    let mut cmd = Command::new(program);
     let cmd_args = command_args_for_request(request);
     cmd.args(&cmd_args);
     #[cfg(unix)]

@@ -6,6 +6,8 @@ mod config_registry;
 mod external_command;
 #[path = "../src/rate_pool.rs"]
 mod rate_pool;
+#[path = "../src/rate_shim.rs"]
+mod rate_shim;
 #[path = "../src/runtime_context.rs"]
 mod runtime_context;
 #[path = "../src/sdk_codex.rs"]
@@ -346,7 +348,7 @@ printf 'ok'
 
 #[cfg(unix)]
 #[test]
-fn spawn_codex_sync_bypasses_named_rate_pool() {
+fn spawn_codex_sync_keeps_codex_permit_and_prepares_rate_shims() {
     let tmp = tempfile::tempdir().unwrap();
     let bin_dir = tmp.path().join("bin");
     let pool_root = tmp.path().join("rate-pools");
@@ -373,6 +375,7 @@ printf 'codex-ok'
 
     assert_eq!(result.get::<i64>("exit_code").unwrap(), 0);
     assert_eq!(result.get::<String>("stdout").unwrap(), "codex-ok");
+    assert!(pool_root.join("shims").exists());
     assert!(!pool_root.join("codex.bucket").exists());
     assert!(tmp
         .path()

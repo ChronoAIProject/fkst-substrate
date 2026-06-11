@@ -26,6 +26,7 @@ mod mlua_init;
 mod path_resolver;
 mod raise;
 mod rate_pool;
+mod rate_shim;
 mod runtime_context;
 mod sdk_basic;
 mod sdk_cache;
@@ -60,6 +61,9 @@ enum CliCommand {
     },
     Conformance(HostConformanceOptions),
     Config(ConfigCli),
+    RateAcquire {
+        pool: String,
+    },
     Test(TestCli),
     SelfTest,
 }
@@ -69,7 +73,7 @@ fn parse_args() -> Result<CliCommand> {
     let mut args_iter = args.into_iter();
     let sub = args_iter.next().ok_or_else(|| {
         anyhow::anyhow!(
-            "usage: fkst-framework run <lua> --project-root <path> --package-root <path> [--package-root <path> ...] [--owner-namespace <id>] --event <json> | fkst-framework supervise --project-root <path> --framework-bin <path> [--package-root <path> ...] | fkst-framework conformance --project-root <path> [--package-root <path> ...] | fkst-framework config --project-root <path> [--package-root <path> ...] | fkst-framework test --project-root <path> [--package-root <path> ...] [--report-json <path>] | fkst-framework --self-test"
+            "usage: fkst-framework run <lua> --project-root <path> --package-root <path> [--package-root <path> ...] [--owner-namespace <id>] --event <json> | fkst-framework supervise --project-root <path> --framework-bin <path> [--package-root <path> ...] | fkst-framework conformance --project-root <path> [--package-root <path> ...] | fkst-framework config --project-root <path> [--package-root <path> ...] | fkst-framework rate-acquire <pool> | fkst-framework test --project-root <path> [--package-root <path> ...] [--report-json <path>] | fkst-framework --self-test"
         )
     })?;
     if sub == "--self-test" {
@@ -106,6 +110,13 @@ fn parse_args() -> Result<CliCommand> {
     if sub == "config" {
         let rest = args_iter.collect::<Vec<_>>();
         return Ok(CliCommand::Config(parse_config_args(&rest)?));
+    }
+    if sub == "rate-acquire" {
+        let pool = next_iter_value(&mut args_iter, "<pool>")?;
+        if let Some(other) = args_iter.next() {
+            anyhow::bail!("unknown rate-acquire argument: {}", other);
+        }
+        return Ok(CliCommand::RateAcquire { pool });
     }
     if sub == "test" {
         let rest = args_iter.collect::<Vec<_>>();
@@ -350,6 +361,13 @@ fn run_config_command(options: ConfigCli) -> Result<i32> {
     Ok(0)
 }
 
+fn run_rate_acquire(pool: &str) -> Result<i32> {
+    let registry = rate_pool::RatePoolRegistry::from_env()
+        .with_context(|| "parse rate pool configuration for rate-acquire")?;
+    registry.acquire_for_name(pool)?;
+    Ok(0)
+}
+
 fn run() -> Result<i32> {
     match parse_args()? {
         CliCommand::Run {
@@ -377,6 +395,7 @@ fn run() -> Result<i32> {
         }
         CliCommand::Conformance(options) => host_conformance::run(options),
         CliCommand::Config(options) => run_config_command(options),
+        CliCommand::RateAcquire { pool } => run_rate_acquire(&pool),
         CliCommand::Test(options) => test_runner::run_tests(options.roots, options.report_json),
         CliCommand::SelfTest => match self_test::run() {
             Ok(()) => Ok(0),
