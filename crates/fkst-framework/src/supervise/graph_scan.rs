@@ -167,7 +167,7 @@ fn reject_removed_surfaces(graph_root: &GraphRoot) -> Result<()> {
 }
 
 fn register_spec_eval_pure_primitives(lua: &Lua) -> mlua::Result<()> {
-    crate::sdk_strings::register(lua)
+    crate::sdk_strings::register_truncate_utf8(lua)
 }
 
 fn scan_departments(
