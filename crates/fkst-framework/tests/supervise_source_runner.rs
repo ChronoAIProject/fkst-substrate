@@ -82,6 +82,26 @@ async fn cron_emits_startup_tick_without_waiting_full_interval() {
 }
 
 #[tokio::test]
+async fn cron_keeps_interval_after_startup_tick() {
+    let (fanout, router) = fanout_router("ticks");
+    let mut rx = fanout.subscribe("ticks", 10).await;
+    let handle = spawn_cron("tick".to_string(), "1s", "ticks".to_string(), router).unwrap();
+
+    timeout(Duration::from_millis(500), rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(timeout(Duration::from_millis(700), rx.recv()).await.is_err());
+
+    let next = timeout(Duration::from_secs(1), rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(next.queue, "ticks");
+    handle.abort();
+}
+
+#[tokio::test]
 async fn file_watch_existing_file_emits_event() {
     let tmp = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
     let file = tmp.path().join("existing.txt");
