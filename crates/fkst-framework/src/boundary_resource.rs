@@ -45,6 +45,15 @@ pub(crate) static BOUNDARY_RESOURCE_REGISTRY: &[BoundaryResourceEntry] = &[
         errors: "quota-exhausted,auth-degraded,provider-unavailable,provider-throttle",
     },
     BoundaryResourceEntry {
+        id: "department.process",
+        resource_type: "subprocess",
+        adapters: "supervise department dispatch",
+        grant: "supervise-owned semaphore before durable lease and framework child spawn",
+        meter: "delivery lease state, framework-child log, process group registry",
+        budget: "internal department process slots derived from FKST_CODEX_PERMIT_SLOTS",
+        errors: "provider-unavailable",
+    },
+    BoundaryResourceEntry {
         id: "shell.process",
         resource_type: "subprocess",
         adapters: "exec_sync",
@@ -179,6 +188,7 @@ mod tests {
             .map(|entry| entry.id)
             .collect::<std::collections::BTreeSet<_>>();
         assert!(ids.contains("codex.process"));
+        assert!(ids.contains("department.process"));
         assert!(ids.contains("shell.process"));
         assert!(ids.contains("git.process"));
         assert!(ids.contains("runtime.filesystem"));

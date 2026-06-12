@@ -902,6 +902,7 @@ mod tests {
     use std::fs;
     use std::path::Path;
     use tempfile::TempDir;
+    use tokio::sync::Semaphore;
 
     fn package_namespace(root: &Path) -> String {
         root.canonicalize()
@@ -971,8 +972,134 @@ mod tests {
         assert!(reliable_wake_rx.is_none());
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn reliable_dispatch_leases_only_available_process_slots() {
+        let temp = TempDir::new().unwrap();
+        let host = temp.path();
+        let store = Arc::new(DeliveryStore::open(host.join("delivery.redb")).unwrap());
+        store.enqueue(&record("one")).unwrap();
+        store.enqueue(&record("two")).unwrap();
+        let roots = PackageRoots::resolve(host, vec![host.to_path_buf()]).unwrap();
+        let decl = DepartmentDecl {
+            lua: "departments/worker/main.lua".into(),
+            owner_root: host.to_path_buf(),
+            owner_namespace: "pkg".to_string(),
+            consumes: vec!["jobs".to_string()],
+            produces: Vec::new(),
+            ephemeral: Vec::new(),
+            stall_window: "30s".to_string(),
+            graph_json: false,
+            retry: None,
+        };
+        let router = router_with_jobs(store.clone());
+        let process_slots = Arc::new(Semaphore::new(1));
+        let permit = process_slots.clone().try_acquire_owned().unwrap();
+        let (complete_tx, _complete_rx) = mpsc::channel::<CompletedDelivery>(4);
+        let mut running = BTreeMap::new();
+
+        dispatch_due(
+            "worker",
+            &decl,
+            host,
+            &roots,
+            &host.join("fkst-framework"),
+            &router,
+            Some(store.clone()),
+            None,
+            &host.join("logs"),
+            Duration::from_secs(30),
+            1,
+            process_slots.clone(),
+            ProcessGroupRegistry::default(),
+            &complete_tx,
+            &mut running,
+        );
+
+        assert!(
+            running.is_empty(),
+            "dispatch should queue behind process-slot backpressure"
+        );
+        let one = store.get("one").unwrap().unwrap();
+        let two = store.get("two").unwrap().unwrap();
+        assert!(
+            one.lease_until_ms.is_none() && two.lease_until_ms.is_none(),
+            "deliveries should remain ready until a process slot is available"
+        );
+
+        drop(permit);
+        dispatch_due(
+            "worker",
+            &decl,
+            host,
+            &roots,
+            &host.join("fkst-framework"),
+            &router,
+            Some(store.clone()),
+            None,
+            &host.join("logs"),
+            Duration::from_secs(30),
+            1,
+            process_slots,
+            ProcessGroupRegistry::default(),
+            &complete_tx,
+            &mut running,
+        );
+
+        assert_eq!(running.len(), 1);
+        let leased = ["one", "two"]
+            .iter()
+            .filter(|delivery_id| {
+                store
+                    .get(delivery_id)
+                    .unwrap()
+                    .unwrap()
+                    .lease_until_ms
+                    .is_some()
+            })
+            .count();
+        assert_eq!(leased, 1);
+        for running_delivery in running.into_values() {
+            running_delivery.handle.abort();
+        }
+    }
+
     fn router_with_dead_letter(store: Arc<DeliveryStore>) -> DeliveryRouter {
         router_with_dead_letter_and_fanout(store, Fanout::new())
+    }
+
+    fn router_with_jobs(store: Arc<DeliveryStore>) -> DeliveryRouter {
+        let mut queue = BTreeMap::new();
+        queue.insert(
+            "jobs".to_string(),
+            QueueDecl {
+                capacity: 8,
+                fanout: false,
+            },
+        );
+        let mut department = BTreeMap::new();
+        department.insert(
+            "worker".to_string(),
+            DepartmentDecl {
+                lua: "departments/worker/main.lua".into(),
+                owner_root: std::path::PathBuf::from("."),
+                owner_namespace: "pkg".to_string(),
+                consumes: vec!["jobs".to_string()],
+                produces: Vec::new(),
+                ephemeral: Vec::new(),
+                stall_window: "30s".to_string(),
+                graph_json: false,
+                retry: None,
+            },
+        );
+        let cfg = Config {
+            queue,
+            raiser: BTreeMap::new(),
+            department,
+            limits: LimitsDecl {
+                global_codex_processes: 1,
+            },
+        };
+        DeliveryRouter::new(&cfg, Fanout::new(), Some(store))
     }
 
     fn router_with_dead_letter_and_fanout(
