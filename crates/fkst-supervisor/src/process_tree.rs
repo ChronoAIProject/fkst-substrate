@@ -1,6 +1,4 @@
-use nix::errno::Errno;
-use nix::sys::signal::{killpg, Signal};
-use nix::unistd::Pid;
+use nix::{errno::Errno, sys::signal::killpg, sys::signal::Signal, unistd::Pid};
 use std::time::{Duration, Instant};
 use tokio::process::Child;
 use tracing::warn;
