@@ -14,11 +14,12 @@ use crate::path_resolver::PackageRoots;
 use crate::process_tree::ProcessGroupRegistry;
 use fkst_common::config::{DepartmentDecl, RetryDecl};
 use fkst_common::{Event, RuntimeKind};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinHandle;
 use tracing::{error, info, warn};
 
@@ -39,6 +40,7 @@ pub async fn spawn_consumer(
     store: Option<Arc<DeliveryStore>>,
     queue_capacity: usize,
     codex_permit_slots: usize,
+    department_process_slots: Arc<Semaphore>,
     process_groups: ProcessGroupRegistry,
 ) -> JoinHandle<()> {
     let reliable_queues: Vec<String> = decl
@@ -75,6 +77,7 @@ pub async fn spawn_consumer(
             .expect("validation already accepted retry");
 
         let (ephemeral_tx, mut ephemeral_rx) = mpsc::channel::<Event>(queue_capacity);
+        let (ephemeral_done_tx, mut ephemeral_done_rx) = mpsc::channel::<()>(queue_capacity);
         let mut ephemeral_open = !receivers.is_empty();
         for mut rx in receivers {
             let tx = ephemeral_tx.clone();
@@ -98,6 +101,7 @@ pub async fn spawn_consumer(
             Some(rx)
         };
         let (complete_tx, mut complete_rx) = mpsc::channel::<CompletedDelivery>(queue_capacity);
+        let mut pending_ephemeral = VecDeque::new();
         let mut running: BTreeMap<String, RunningDelivery> = BTreeMap::new();
 
         info!(
@@ -125,7 +129,8 @@ pub async fn spawn_consumer(
                         }
                     };
                     if ephemeral_queues.iter().any(|queue| queue == &ev.queue) {
-                        spawn_ephemeral(
+                        pending_ephemeral.push_back(ev);
+                        dispatch_ephemeral_pending(
                             &name,
                             &decl,
                             &project_root,
@@ -133,10 +138,12 @@ pub async fn spawn_consumer(
                             &framework_binary,
                             &router,
                             &framework_child_log_dir,
-                            ev,
                             stall_window,
                             codex_permit_slots,
+                            department_process_slots.clone(),
                             process_groups.clone(),
+                            &ephemeral_done_tx,
+                            &mut pending_ephemeral,
                         );
                     }
                 }
@@ -157,36 +164,75 @@ pub async fn spawn_consumer(
                         &framework_child_log_dir,
                         stall_window,
                         codex_permit_slots,
+                        department_process_slots.clone(),
                         process_groups.clone(),
                         &complete_tx,
                         &mut running,
                     );
                 }
-                _ = tick.tick(), if !reliable_queues.is_empty() => {
-                    renew_running(&name, store.as_deref(), stall_window, &running);
-                    maintain_dead_letters(&name, store.as_deref(), &router);
-                    dispatch_due(
+                _ = tick.tick() => {
+                    dispatch_ephemeral_pending(
                         &name,
                         &decl,
                         &project_root,
                         &roots,
                         &framework_binary,
                         &router,
-                        store.clone(),
-                        retry_policy.as_ref(),
                         &framework_child_log_dir,
                         stall_window,
                         codex_permit_slots,
+                        department_process_slots.clone(),
                         process_groups.clone(),
-                        &complete_tx,
-                        &mut running,
+                        &ephemeral_done_tx,
+                        &mut pending_ephemeral,
                     );
+                    if !reliable_queues.is_empty() {
+                        renew_running(&name, store.as_deref(), stall_window, &running);
+                        maintain_dead_letters(&name, store.as_deref(), &router);
+                        dispatch_due(
+                            &name,
+                            &decl,
+                            &project_root,
+                            &roots,
+                            &framework_binary,
+                            &router,
+                            store.clone(),
+                            retry_policy.as_ref(),
+                            &framework_child_log_dir,
+                            stall_window,
+                            codex_permit_slots,
+                            department_process_slots.clone(),
+                            process_groups.clone(),
+                            &complete_tx,
+                            &mut running,
+                        );
+                    }
                 }
                 maybe_done = complete_rx.recv(), if !running.is_empty() => {
                     if let Some(done) = maybe_done {
                         running.remove(&done.record.delivery_id);
                         finish_durable_record(&name, store.as_deref(), &router, retry_policy.as_ref(), done);
                     }
+                }
+                maybe_done = ephemeral_done_rx.recv() => {
+                    if maybe_done.is_none() {
+                        warn!(dept = %name, "consumer ephemeral completion inbox disconnected");
+                    }
+                    dispatch_ephemeral_pending(
+                        &name,
+                        &decl,
+                        &project_root,
+                        &roots,
+                        &framework_binary,
+                        &router,
+                        &framework_child_log_dir,
+                        stall_window,
+                        codex_permit_slots,
+                        department_process_slots.clone(),
+                        process_groups.clone(),
+                        &ephemeral_done_tx,
+                        &mut pending_ephemeral,
+                    );
                 }
             }
         }
@@ -220,6 +266,48 @@ fn on_wake_disconnect(reliable_wake_rx: &mut Option<mpsc::Receiver<()>>) {
 }
 
 #[allow(clippy::too_many_arguments)]
+fn dispatch_ephemeral_pending(
+    name: &str,
+    decl: &DepartmentDecl,
+    project_root: &std::path::Path,
+    roots: &PackageRoots,
+    framework_binary: &std::path::Path,
+    router: &DeliveryRouter,
+    log_dir: &std::path::Path,
+    stall_window: Duration,
+    codex_permit_slots: usize,
+    department_process_slots: Arc<Semaphore>,
+    process_groups: ProcessGroupRegistry,
+    done_tx: &mpsc::Sender<()>,
+    pending: &mut VecDeque<Event>,
+) {
+    while let Some(event) = pending.pop_front() {
+        let permit = match department_process_slots.clone().try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) => {
+                pending.push_front(event);
+                return;
+            }
+        };
+        spawn_ephemeral(
+            name,
+            decl,
+            project_root,
+            roots,
+            framework_binary,
+            router,
+            log_dir,
+            event,
+            stall_window,
+            codex_permit_slots,
+            permit,
+            process_groups.clone(),
+            done_tx.clone(),
+        );
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn spawn_ephemeral(
     name: &str,
     decl: &DepartmentDecl,
@@ -231,7 +319,9 @@ fn spawn_ephemeral(
     event: Event,
     stall_window: Duration,
     codex_permit_slots: usize,
+    process_permit: OwnedSemaphorePermit,
     process_groups: ProcessGroupRegistry,
+    done_tx: mpsc::Sender<()>,
 ) {
     let args = match spawn_args(
         decl,
@@ -253,7 +343,7 @@ fn spawn_ephemeral(
     let dept_name = name.to_string();
     let router = router.clone();
     tokio::spawn(async move {
-        match spawn_and_report(&dept_name, &args).await {
+        match spawn_and_report(&dept_name, &args, process_permit).await {
             Ok(result) => {
                 if let Err(err) = publish_ephemeral_raised(&router, &result.stdout) {
                     error!(dept = %dept_name, error = %err, "publish raised failed");
@@ -268,6 +358,7 @@ fn spawn_ephemeral(
                 );
             }
         }
+        let _ = done_tx.send(()).await;
     });
 }
 
@@ -284,6 +375,7 @@ fn dispatch_due(
     log_dir: &std::path::Path,
     stall_window: Duration,
     codex_permit_slots: usize,
+    department_process_slots: Arc<Semaphore>,
     process_groups: ProcessGroupRegistry,
     complete_tx: &mpsc::Sender<CompletedDelivery>,
     running: &mut BTreeMap<String, RunningDelivery>,
@@ -292,12 +384,22 @@ fn dispatch_due(
         error!(dept = %name, "reliable consumer missing delivery store");
         return;
     };
+    let mut permits = Vec::new();
+    for _ in 0..DISPATCH_BATCH {
+        match department_process_slots.clone().try_acquire_owned() {
+            Ok(permit) => permits.push(permit),
+            Err(_) => break,
+        }
+    }
+    if permits.is_empty() {
+        return;
+    }
     let lease = retry_lease(stall_window);
     let excluded = running.keys().cloned().collect();
     let leased = match store.lease_for_dept_excluding(
         name,
         now_unix_millis(),
-        DISPATCH_BATCH,
+        permits.len(),
         lease,
         &excluded,
     ) {
@@ -308,6 +410,9 @@ fn dispatch_due(
         }
     };
     for record in leased {
+        let Some(permit) = permits.pop() else {
+            break;
+        };
         if running.contains_key(&record.delivery_id) {
             continue;
         }
@@ -340,7 +445,7 @@ fn dispatch_due(
         let running_record = record.clone();
         let delivery_id = record.delivery_id.clone();
         let handle = tokio::spawn(async move {
-            let result = run_durable_record(&dept_name, &router, record, args).await;
+            let result = run_durable_record(&dept_name, &router, record, args, permit).await;
             if complete_tx.send(result).await.is_err() {
                 warn!(dept = %dept_name, delivery_id = %delivery_id, "delivery completion receiver closed");
             }
@@ -360,8 +465,9 @@ async fn run_durable_record(
     router: &DeliveryRouter,
     record: DeliveryRecord,
     args: SpawnArgs,
+    process_permit: OwnedSemaphorePermit,
 ) -> CompletedDelivery {
-    let result = spawn_and_report(dept_name, &args).await;
+    let result = spawn_and_report(dept_name, &args, process_permit).await;
     let failure = match result {
         Ok(result) if result.exit_code == 0 => {
             match publish_raised(router, &result.stdout, &record) {
@@ -700,7 +806,11 @@ struct SpawnArgs {
     process_groups: ProcessGroupRegistry,
 }
 
-async fn spawn_and_report(dept_name: &str, args: &SpawnArgs) -> anyhow::Result<SpawnResult> {
+async fn spawn_and_report(
+    dept_name: &str,
+    args: &SpawnArgs,
+    _process_permit: OwnedSemaphorePermit,
+) -> anyhow::Result<SpawnResult> {
     let result = spawn_framework(
         &args.framework_bin,
         &args.lua_full,

@@ -357,6 +357,123 @@ return M
 }
 
 #[test]
+fn supervise_bounds_concurrent_department_processes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    fs::create_dir_all(root.join("raisers")).unwrap();
+    fs::write(
+        root.join("fkst.env"),
+        "FKST_QUEUE_CAPACITY=100\nFKST_DEPARTMENT_DEFAULT_STALL_WINDOW=30s\nFKST_CODEX_PERMIT_SLOTS=2\n",
+    )
+    .unwrap();
+    fs::write(root.join("input.txt"), "ready").unwrap();
+    fs::write(
+        root.join("raisers/input.lua"),
+        format!(
+            r#"return {{ type = "file_watch", glob = {}, produces = "input" }}"#,
+            lua_string(&root.join("input.txt"))
+        ),
+    )
+    .unwrap();
+
+    for dept in ["alpha", "beta", "gamma", "delta"] {
+        fs::create_dir_all(root.join(format!("departments/{dept}"))).unwrap();
+        fs::write(
+            root.join(format!("departments/{dept}/main.lua")),
+            r#"
+local M = {}
+M.spec = {
+  consumes = { "input" },
+  fanout = { "input" },
+  ephemeral = { "input" },
+  stall_window = "30s",
+}
+function pipeline(event) end
+return M
+"#,
+        )
+        .unwrap();
+    }
+
+    let fake = root.join("fkst-framework");
+    write_executable(
+        &fake,
+        r#"
+lockdir="$PWD/process-count.lockdir"
+current="$PWD/current-count.txt"
+max="$PWD/max-count.txt"
+done="$PWD/done-count.txt"
+acquire_lock() {
+  while ! mkdir "$lockdir" 2>/dev/null; do
+    sleep 0.01
+  done
+}
+release_lock() {
+  rmdir "$lockdir"
+}
+acquire_lock
+  cur=0
+  [ -f "$current" ] && cur=$(cat "$current")
+  cur=$((cur + 1))
+  printf '%s\n' "$cur" > "$current"
+  max_seen=0
+  [ -f "$max" ] && max_seen=$(cat "$max")
+  if [ "$cur" -gt "$max_seen" ]; then
+    printf '%s\n' "$cur" > "$max"
+  fi
+release_lock
+sleep 0.4
+acquire_lock
+  cur=$(cat "$current")
+  printf '%s\n' "$((cur - 1))" > "$current"
+  done_count=0
+  [ -f "$done" ] && done_count=$(cat "$done")
+  done_count=$((done_count + 1))
+  printf '%s\n' "$done_count" > "$done"
+release_lock
+exit 0
+"#,
+    );
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_fkst-framework"))
+        .current_dir(root)
+        .arg("supervise")
+        .arg("--project-root")
+        .arg(root)
+        .arg("--package-root")
+        .arg(root)
+        .arg("--framework-bin")
+        .arg(&fake)
+        .env("FKST_RUNTIME_ROOT", root.join(".fkst/runtime"))
+        .env("FKST_DURABLE_ROOT", root.join(".fkst/durable"))
+        .env("FKST_CODEX_PERMIT_SLOTS", "2")
+        .spawn()
+        .unwrap();
+
+    wait_for_file_containing(&root.join("done-count.txt"), "4", Duration::from_secs(10))
+        .unwrap_or_else(|| {
+            let _ = child.kill();
+            panic!("timed out waiting for all departments to finish");
+        });
+    nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(child.id() as i32),
+        nix::sys::signal::Signal::SIGTERM,
+    )
+    .unwrap();
+    let status = child.wait().unwrap();
+    assert!(status.success(), "status={status}");
+    let max_running: usize = fs::read_to_string(root.join("max-count.txt"))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    assert!(
+        max_running <= 2,
+        "department process budget exceeded: {max_running}"
+    );
+}
+
+#[test]
 fn supervise_delivers_cross_package_raise_from_composed_child() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path();

@@ -9,10 +9,11 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc as std_mpsc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::{Child, Command};
-use tokio::sync::mpsc;
+use tokio::sync::mpsc as tokio_mpsc;
 use tokio::task::JoinHandle;
 use tracing::info;
 
@@ -141,7 +142,7 @@ async fn wait_for_framework_child(
     mut log: FrameworkChildLog,
     _registration: ProcessGroupRegistration,
 ) -> Result<SpawnResult> {
-    let (tx, mut rx) = mpsc::unbounded_channel();
+    let (tx, mut rx) = tokio_mpsc::unbounded_channel();
     let mut readers = Vec::new();
     if let Some(stdout) = child.stdout.take() {
         readers.push(spawn_stream_reader(
@@ -182,7 +183,7 @@ async fn wait_for_framework_child(
     let _ = waiter.await;
     drain_framework_events(&mut rx, &mut output, &mut log);
 
-    spawn_result_from_status(status, output, start, log)
+    spawn_result_from_status(status, output, start, log).await
 }
 
 // buffers accumulate incrementally as output events arrive.
@@ -203,7 +204,7 @@ impl FrameworkOutput {
 
 // drain queued output events before constructing the final spawn result.
 fn drain_framework_events(
-    rx: &mut mpsc::UnboundedReceiver<FrameworkEvent>,
+    rx: &mut tokio_mpsc::UnboundedReceiver<FrameworkEvent>,
     output: &mut FrameworkOutput,
     log: &mut FrameworkChildLog,
 ) {
@@ -216,7 +217,7 @@ fn drain_framework_events(
 }
 
 // natural exits keep their child status.
-fn spawn_result_from_status(
+async fn spawn_result_from_status(
     status: std::result::Result<std::process::ExitStatus, String>,
     output: FrameworkOutput,
     start: Instant,
@@ -228,7 +229,7 @@ fn spawn_result_from_status(
     let elapsed_ms = start.elapsed().as_millis();
     log.write_line(&format!("EXIT={exit_code}"));
     log.write_line(&format!("ELAPSED_MS={elapsed_ms}"));
-    let log_path = log.path().map(Path::to_path_buf);
+    let log_path = log.finish().await;
     Ok(SpawnResult {
         exit_code,
         stdout,
@@ -242,7 +243,7 @@ fn spawn_result_from_status(
 fn spawn_stream_reader<R>(
     mut reader: R,
     stream: FrameworkStream,
-    tx: mpsc::UnboundedSender<FrameworkEvent>,
+    tx: tokio_mpsc::UnboundedSender<FrameworkEvent>,
 ) -> JoinHandle<()>
 where
     R: AsyncRead + Unpin + Send + 'static,
@@ -271,7 +272,8 @@ where
 // without changing RAISED parsing or spawn success semantics.
 struct FrameworkChildLog {
     path: Option<PathBuf>,
-    file: Option<std::fs::File>,
+    tx: Option<std_mpsc::Sender<Vec<u8>>>,
+    writer: Option<std::thread::JoinHandle<()>>,
 }
 
 impl FrameworkChildLog {
@@ -287,14 +289,25 @@ impl FrameworkChildLog {
                     .open(&path)
                     .ok()
             });
+        let (tx, writer) = match file {
+            Some(mut file) => {
+                let (tx, rx) = std_mpsc::channel::<Vec<u8>>();
+                let writer = std::thread::spawn(move || {
+                    while let Ok(bytes) = rx.recv() {
+                        if file.write_all(&bytes).and_then(|_| file.flush()).is_err() {
+                            break;
+                        }
+                    }
+                });
+                (Some(tx), Some(writer))
+            }
+            None => (None, None),
+        };
         Self {
-            path: file.as_ref().map(|_| path),
-            file,
+            path: tx.as_ref().map(|_| path),
+            tx,
+            writer,
         }
-    }
-
-    fn path(&self) -> Option<&Path> {
-        self.path.as_deref()
     }
 
     fn write_line(&mut self, line: &str) {
@@ -315,13 +328,21 @@ impl FrameworkChildLog {
     }
 
     fn write_all(&mut self, bytes: &[u8]) {
-        let Some(file) = self.file.as_mut() else {
+        let Some(tx) = self.tx.as_ref() else {
             return;
         };
-        if file.write_all(bytes).and_then(|_| file.flush()).is_err() {
-            self.file = None;
+        if tx.send(bytes.to_vec()).is_err() {
+            self.tx = None;
             self.path = None;
         }
+    }
+
+    async fn finish(mut self) -> Option<PathBuf> {
+        drop(self.tx.take());
+        if let Some(writer) = self.writer.take() {
+            let _ = tokio::task::spawn_blocking(move || writer.join()).await;
+        }
+        self.path
     }
 }
 

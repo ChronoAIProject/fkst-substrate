@@ -4,6 +4,7 @@ use fkst_common::validation::validate;
 use fkst_common::DurableLayout;
 use std::path::PathBuf;
 use std::sync::Arc;
+use tokio::sync::Semaphore;
 use tracing::{error, info, warn};
 
 use crate::path_resolver::PackageRoots;
@@ -71,6 +72,7 @@ pub async fn supervise(roots: PackageRoots, framework_bin: PathBuf) -> Result<()
     let router = DeliveryRouter::new(&cfg, fanout.clone(), delivery_store.clone());
     delivery_watch::set_failure_fact_publisher(router.failure_fact_publisher());
     let codex_permit_slots = cfg.limits.global_codex_processes;
+    let department_process_slots = Arc::new(Semaphore::new(codex_permit_slots));
     let process_groups = ProcessGroupRegistry::default();
     let mut handles = vec![];
 
@@ -101,6 +103,7 @@ pub async fn supervise(roots: PackageRoots, framework_bin: PathBuf) -> Result<()
                 delivery_store.clone(),
                 q_cap,
                 codex_permit_slots,
+                department_process_slots.clone(),
                 process_groups.clone(),
             )
             .await,
