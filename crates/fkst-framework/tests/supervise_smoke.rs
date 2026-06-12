@@ -595,6 +595,54 @@ async fn spawn_framework_passes_codex_permit_slots_env() {
     assert_eq!(result.stdout.trim(), "7");
 }
 
+#[tokio::test(flavor = "current_thread")]
+async fn spawn_framework_reaps_fast_exit_burst_on_current_thread_runtime() {
+    let sandbox = ProcessSandbox::new();
+    let binary = fake_framework(sandbox.root(), r#"exit 0"#);
+    let lua_dummy = sandbox.temp_path("dept.lua");
+    fs::write(&lua_dummy, "return {}\n").unwrap();
+    let logs = sandbox.temp_path("logs");
+    let process_groups = process_tree::ProcessGroupRegistry::default();
+
+    let mut handles = Vec::new();
+    for index in 0..64 {
+        let binary = binary.clone();
+        let lua_dummy = lua_dummy.clone();
+        let host_root = sandbox.root().to_path_buf();
+        let package_roots = vec![sandbox.root().to_path_buf()];
+        let logs = logs.clone();
+        let process_groups = process_groups.clone();
+        handles.push(tokio::spawn(async move {
+            let label = format!("burst-{index}");
+            spawn_framework(
+                &binary,
+                &lua_dummy,
+                &host_root,
+                &package_roots,
+                "pkg",
+                "{}",
+                20,
+                &label,
+                &logs,
+                process_groups,
+            )
+            .await
+        }));
+    }
+
+    for handle in handles {
+        let result = tokio::time::timeout(Duration::from_secs(10), handle)
+            .await
+            .expect("burst child wait timed out")
+            .expect("burst spawn task panicked")
+            .expect("burst spawn failed");
+        assert_eq!(result.exit_code, 0);
+        let log = read_log(&result);
+        assert!(log.contains("PID="), "log={log}");
+        assert!(log.contains("EXIT=0\n"), "log={log}");
+    }
+}
+
 #[tokio::test]
 async fn framework_child_log_records_final_metadata_for_exit_modes() {
     let sandbox = ProcessSandbox::new();

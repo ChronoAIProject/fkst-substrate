@@ -5,16 +5,15 @@
 use crate::process_tree::{ProcessGroupRegistration, ProcessGroupRegistry};
 use anyhow::{Context, Result};
 use std::ffi::OsStr;
-use std::io::Write;
+use std::io::{Read, Write};
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
+use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc as std_mpsc;
+use std::thread::JoinHandle as ThreadJoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tokio::io::{AsyncRead, AsyncReadExt};
-use tokio::process::{Child, Command};
 use tokio::sync::mpsc as tokio_mpsc;
-use tokio::task::JoinHandle;
 use tracing::info;
 
 static NEXT_FRAMEWORK_CHILD_LOG_ID: AtomicU64 = AtomicU64::new(1);
@@ -100,7 +99,6 @@ pub async fn spawn_framework(
     cmd.current_dir(host_root);
 
     // Set a new process group before exec so framework becomes its own group leader.
-    // tokio::process exposes `process_group(0)` to call setpgid(0,0); equivalent for our purposes.
     cmd.process_group(0);
 
     let child = match cmd.spawn() {
@@ -110,9 +108,7 @@ pub async fn spawn_framework(
             return Err(err).context("spawn fkst-framework");
         }
     };
-    let pid = child
-        .id()
-        .ok_or_else(|| anyhow::anyhow!("no pid after spawn"))?;
+    let pid = child.id();
     log.write_line(&format!("PID={pid}"));
     info!(pid = pid, lua = %lua_path.display(), "framework spawned");
     let registration = process_groups.register(pid);
@@ -158,8 +154,8 @@ async fn wait_for_framework_child(
             tx.clone(),
         ));
     }
-    let waiter = tokio::spawn(async move {
-        let result = child.wait().await.map_err(|err| err.to_string());
+    let waiter = std::thread::spawn(move || {
+        let result = child.wait().map_err(|err| err.to_string());
         let _ = tx.send(FrameworkEvent::Exited(result));
     });
 
@@ -178,9 +174,9 @@ async fn wait_for_framework_child(
     };
 
     for reader in readers {
-        let _ = reader.await;
+        let _ = tokio::task::spawn_blocking(move || reader.join()).await;
     }
-    let _ = waiter.await;
+    let _ = tokio::task::spawn_blocking(move || waiter.join()).await;
     drain_framework_events(&mut rx, &mut output, &mut log);
 
     spawn_result_from_status(status, output, start, log).await
@@ -244,14 +240,14 @@ fn spawn_stream_reader<R>(
     mut reader: R,
     stream: FrameworkStream,
     tx: tokio_mpsc::UnboundedSender<FrameworkEvent>,
-) -> JoinHandle<()>
+) -> ThreadJoinHandle<()>
 where
-    R: AsyncRead + Unpin + Send + 'static,
+    R: Read + Send + 'static,
 {
-    tokio::spawn(async move {
+    std::thread::spawn(move || {
         let mut buf = [0_u8; 8192];
         loop {
-            match reader.read(&mut buf).await {
+            match reader.read(&mut buf) {
                 Ok(0) => break,
                 Ok(n) => {
                     if tx
