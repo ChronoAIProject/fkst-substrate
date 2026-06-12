@@ -25,7 +25,7 @@ mod source_runner;
 use delivery_router::DeliveryRouter;
 use event_fanout::Fanout;
 use fkst_common::config::{Config, DepartmentDecl, LimitsDecl, QueueDecl};
-use source_runner::spawn_file_watch;
+use source_runner::{spawn_cron, spawn_file_watch};
 use std::collections::BTreeMap;
 use tokio::time::{timeout, Duration};
 
@@ -64,6 +64,21 @@ fn fanout_router(queue_name: &str) -> (Fanout, DeliveryRouter) {
     };
     let router = DeliveryRouter::new(&cfg, fanout.clone(), None);
     (fanout, router)
+}
+
+#[tokio::test]
+async fn cron_emits_startup_tick_without_waiting_full_interval() {
+    let (fanout, router) = fanout_router("ticks");
+    let mut rx = fanout.subscribe("ticks", 10).await;
+    let handle = spawn_cron("tick".to_string(), "60s", "ticks".to_string(), router).unwrap();
+
+    let got = timeout(Duration::from_secs(2), rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(got.queue, "ticks");
+    assert_eq!(got.payload, serde_json::json!({"raiser": "tick"}));
+    handle.abort();
 }
 
 #[tokio::test]

@@ -4,13 +4,18 @@ use super::delivery_router::{DeliveryRouter, PublishEnvelope};
 use super::delivery_types::{SourceKind, SourceRef};
 use fkst_common::Event;
 use notify::{Config, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
+use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::time::Instant;
 use tracing::{info, warn};
 
-/// Spawn a Cron raiser as a tokio task. Fires every `interval` from supervisor start (monotonic).
+const STARTUP_JITTER_CAP: Duration = Duration::from_secs(1);
+const STARTUP_JITTER_DIVISOR: u128 = 10;
+
+/// Spawn a Cron raiser as a tokio task. Fires once at startup plus bounded jitter, then every `interval` (monotonic).
 /// Missed ticks during sleep/pause coalesce to one tick.
 ///
 /// `interval_str` formats: `Ns`, `Nm`, or `Nh`, for example "10s", "5m", or "1h".
@@ -23,7 +28,7 @@ pub fn spawn_cron(
     let interval = parse_duration(interval_str)?;
     let handle = tokio::spawn(async move {
         info!(raiser = %name, interval_s = interval.as_secs(), "cron raiser starting");
-        let mut next = Instant::now() + interval;
+        let mut next = Instant::now() + startup_jitter(&name, &produces, interval);
         loop {
             tokio::time::sleep_until(next).await;
             let payload = cron_payload(&name);
@@ -46,6 +51,21 @@ pub fn spawn_cron(
         }
     });
     Ok(handle)
+}
+
+fn startup_jitter(name: &str, produces: &str, interval: Duration) -> Duration {
+    let interval_jitter_cap = interval.as_millis() / STARTUP_JITTER_DIVISOR;
+    let max = interval_jitter_cap
+        .min(STARTUP_JITTER_CAP.as_millis())
+        .min(u64::MAX as u128) as u64;
+    if max == 0 {
+        return Duration::ZERO;
+    }
+    let mut hasher = DefaultHasher::new();
+    name.hash(&mut hasher);
+    produces.hash(&mut hasher);
+    interval.as_millis().hash(&mut hasher);
+    Duration::from_millis(hasher.finish() % (max + 1))
 }
 
 fn cron_payload(name: &str) -> serde_json::Value {
@@ -573,6 +593,16 @@ mod tests {
         assert_eq!(cron_source_reference("tick", 1_000), "tick/slot/1000");
         let slot = cron_slot_unix_millis(Duration::from_secs(60));
         assert_eq!(slot % 60_000, 0);
+    }
+
+    #[test]
+    fn startup_jitter_is_bounded_and_deterministic() {
+        let interval = Duration::from_secs(300);
+        let first = startup_jitter("tick", "jobs", interval);
+        let second = startup_jitter("tick", "jobs", interval);
+
+        assert_eq!(first, second);
+        assert!(first <= STARTUP_JITTER_CAP);
     }
 
     #[test]
