@@ -41,7 +41,7 @@ pub(crate) static BOUNDARY_RESOURCE_REGISTRY: &[BoundaryResourceEntry] = &[
         adapters: "spawn_codex_sync,spawn_codex",
         grant: "codex-permit fcntl pool plus optional rate-pool shim",
         meter: "codex log, codex-permit lock witness, optional rate-pool ledger",
-        budget: "FKST_CODEX_PERMIT_SLOTS and optional FKST_RATE_POOL_CODEX",
+        budget: "FKST_CODEX_PERMIT_SLOTS, optional FKST_RATE_POOL_CODEX, FKST_CODEX_LOG_MAX_AGE, and optional FKST_CODEX_LOG_MAX_BYTES",
         errors: "quota-exhausted,auth-degraded,provider-unavailable,provider-throttle",
     },
     BoundaryResourceEntry {
