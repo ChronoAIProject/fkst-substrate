@@ -139,25 +139,12 @@ pub async fn supervise(roots: PackageRoots, framework_bin: PathBuf) -> Result<()
     info!(handles = handles.len(), "event runtime running");
     let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
-    let parent_pid = crate::process_tree::current_parent_pid();
-    let mut parent_watch = tokio::time::interval(std::time::Duration::from_millis(250));
-    parent_watch.tick().await;
     tokio::select! {
         _ = sigint.recv() => {
             warn!("event runtime received SIGINT");
         }
         _ = sigterm.recv() => {
             warn!("event runtime received SIGTERM");
-        }
-        _ = async {
-            loop {
-                parent_watch.tick().await;
-                if crate::process_tree::parent_changed(parent_pid) {
-                    break;
-                }
-            }
-        } => {
-            warn!(parent_pid = parent_pid, current_parent_pid = crate::process_tree::current_parent_pid(), "event runtime parent changed");
         }
     }
     shutdown_runtime(handles, &process_groups).await;

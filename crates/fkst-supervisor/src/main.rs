@@ -1,31 +1,24 @@
-//! fkst-supervisor process root.
-
 use anyhow::{Context, Result};
-use nix::sys::wait::{waitpid, WaitStatus};
+use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
 use nix::unistd::Pid;
+use std::env::{current_dir, current_exe, var_os};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 use tokio::process::Command;
 use tracing::{info, warn};
-
 mod process_tree;
-
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::from_default_env()
-                .add_directive(tracing::Level::INFO.into()),
-        )
-        .init();
+    let filter = tracing_subscriber::EnvFilter::from_default_env()
+        .add_directive(tracing::Level::INFO.into());
+    tracing_subscriber::fmt().with_env_filter(filter).init();
 
-    let project_root = std::env::current_dir().context("get cwd")?;
+    let project_root = current_dir().context("get cwd")?;
     let framework_bin = framework_binary()?;
     let code = run(&project_root, &framework_bin).await?;
     std::process::exit(code);
 }
-
 async fn run(project_root: &Path, framework_bin: &Path) -> Result<i32> {
     let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
@@ -52,7 +45,6 @@ async fn run(project_root: &Path, framework_bin: &Path) -> Result<i32> {
             info!(pid = pid, exit_code = code, "event runtime exited");
             break code;
         }
-
         tokio::select! {
             _ = sigint.recv() => {
                 warn!(pid = pid, signal = "interrupt", "terminating event runtime process group");
@@ -71,12 +63,11 @@ async fn run(project_root: &Path, framework_bin: &Path) -> Result<i32> {
     reap_children();
     Ok(code)
 }
-
 fn framework_binary() -> Result<PathBuf> {
-    if let Some(path) = std::env::var_os("FKST_FRAMEWORK_BIN") {
+    if let Some(path) = var_os("FKST_FRAMEWORK_BIN") {
         return Ok(PathBuf::from(path));
     }
-    let exe_dir = std::env::current_exe()?
+    let exe_dir = current_exe()?
         .parent()
         .ok_or_else(|| anyhow::anyhow!("current executable has no parent"))?
         .to_path_buf();
@@ -89,13 +80,9 @@ fn framework_binary() -> Result<PathBuf> {
     }
     Ok(framework_bin)
 }
-
 fn reap_children() {
     loop {
-        match waitpid(
-            Pid::from_raw(-1),
-            Some(nix::sys::wait::WaitPidFlag::WNOHANG),
-        ) {
+        match waitpid(Pid::from_raw(-1), Some(WaitPidFlag::WNOHANG)) {
             Ok(WaitStatus::StillAlive) => break,
             Ok(_) => {}
             Err(nix::errno::Errno::ECHILD) => break,
