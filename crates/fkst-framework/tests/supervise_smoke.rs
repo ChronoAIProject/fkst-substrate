@@ -283,6 +283,7 @@ fn supervise_sigterm_terminates_department_process_tree() {
     fs::create_dir_all(root.join("departments/sleeper")).unwrap();
     fs::create_dir_all(root.join("raisers")).unwrap();
     write_fkst_env(root);
+    write_persistence_decl(root);
     fs::write(root.join("input.txt"), "ready").unwrap();
     fs::write(
         root.join("raisers/input.lua"),
