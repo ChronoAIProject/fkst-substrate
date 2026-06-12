@@ -24,7 +24,7 @@ use sdk_codex::{
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 use support::process_sandbox::ProcessSandbox;
 
 const DEFAULT_CODEX_PERMIT_SLOTS: usize = 20;
@@ -159,6 +159,11 @@ fn lua_opts(lua: &Lua, prompt: &str) -> Table {
     let opts = lua.create_table().unwrap();
     opts.set("prompt", prompt).unwrap();
     opts
+}
+
+fn write_log_with_mtime(path: &Path, body: &str, modified: SystemTime) {
+    std::fs::write(path, body).unwrap();
+    filetime::set_file_mtime(path, filetime::FileTime::from_system_time(modified)).unwrap();
 }
 
 fn table_len(table: &Table, key: &str) -> usize {
@@ -791,6 +796,133 @@ printf 'still-ok'
         .get::<String>("log_path")
         .unwrap()
         .contains("not-a-dir"));
+}
+
+#[cfg(unix)]
+#[test]
+fn spawn_codex_sync_prunes_aged_codex_logs_and_retains_fresh_logs() {
+    let tmp = tempfile::tempdir().unwrap();
+    let bin_dir = tmp.path().join("bin");
+    install_codex_script(
+        &bin_dir,
+        r#"#!/bin/sh
+cat >/dev/null
+printf 'ok'
+"#,
+    );
+
+    let log_dir = tmp.path().join("runtime/codex");
+    std::fs::create_dir_all(&log_dir).unwrap();
+    let old_log = log_dir.join("old.log");
+    let fresh_log = log_dir.join("fresh.log");
+    let ignored = log_dir.join("old.txt");
+    let now = SystemTime::now();
+    write_log_with_mtime(&old_log, "old", now - Duration::from_secs(2 * 60 * 60));
+    write_log_with_mtime(&fresh_log, "fresh", now - Duration::from_secs(5 * 60));
+    write_log_with_mtime(&ignored, "ignored", now - Duration::from_secs(2 * 60 * 60));
+
+    let mut sandbox = ProcessSandbox::new();
+    sandbox.enter_cwd(tmp.path()).runtime_root(".fkst/runtime");
+    sandbox.prepend_path(&bin_dir);
+    sandbox.runtime_log_dir(tmp.path().join("runtime"));
+    sandbox.set_env("FKST_CODEX_LOG_MAX_AGE", "1h");
+    sandbox.unset_env("FKST_CODEX_LOG_MAX_BYTES");
+    let (_lock, _guard) = sandbox.enter();
+
+    let lua = Lua::new();
+    register(&lua).unwrap();
+    let spawn: mlua::Function = lua.globals().get("spawn_codex_sync").unwrap();
+    let result: Table = spawn.call(lua_opts(&lua, "retention")).unwrap();
+    let current_log = PathBuf::from(result.get::<String>("log_path").unwrap());
+
+    assert_eq!(result.get::<i64>("exit_code").unwrap(), 0);
+    assert!(!old_log.exists());
+    assert!(fresh_log.exists());
+    assert!(ignored.exists());
+    assert!(current_log.exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn spawn_codex_sync_prunes_oldest_codex_logs_to_size_budget() {
+    let tmp = tempfile::tempdir().unwrap();
+    let bin_dir = tmp.path().join("bin");
+    install_codex_script(
+        &bin_dir,
+        r#"#!/bin/sh
+cat >/dev/null
+printf 'ok'
+"#,
+    );
+
+    let log_dir = tmp.path().join("runtime/codex");
+    std::fs::create_dir_all(&log_dir).unwrap();
+    let oldest = log_dir.join("oldest.log");
+    let middle = log_dir.join("middle.log");
+    let newest = log_dir.join("newest.log");
+    let now = SystemTime::now();
+    write_log_with_mtime(&oldest, "aaaaaa", now - Duration::from_secs(30));
+    write_log_with_mtime(&middle, "bbbbbb", now - Duration::from_secs(20));
+    write_log_with_mtime(&newest, "cccccc", now - Duration::from_secs(10));
+
+    let mut sandbox = ProcessSandbox::new();
+    sandbox.enter_cwd(tmp.path()).runtime_root(".fkst/runtime");
+    sandbox.prepend_path(&bin_dir);
+    sandbox.runtime_log_dir(tmp.path().join("runtime"));
+    sandbox.set_env("FKST_CODEX_LOG_MAX_AGE", "0");
+    sandbox.set_env("FKST_CODEX_LOG_MAX_BYTES", "12");
+    let (_lock, _guard) = sandbox.enter();
+
+    let lua = Lua::new();
+    register(&lua).unwrap();
+    let spawn: mlua::Function = lua.globals().get("spawn_codex_sync").unwrap();
+    let result: Table = spawn.call(lua_opts(&lua, "retention")).unwrap();
+    let current_log = PathBuf::from(result.get::<String>("log_path").unwrap());
+
+    assert_eq!(result.get::<i64>("exit_code").unwrap(), 0);
+    assert!(!oldest.exists());
+    assert!(middle.exists());
+    assert!(newest.exists());
+    assert!(current_log.exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn spawn_codex_sync_respects_age_override_when_pruning_codex_logs() {
+    let tmp = tempfile::tempdir().unwrap();
+    let bin_dir = tmp.path().join("bin");
+    install_codex_script(
+        &bin_dir,
+        r#"#!/bin/sh
+cat >/dev/null
+printf 'ok'
+"#,
+    );
+
+    let log_dir = tmp.path().join("runtime/codex");
+    std::fs::create_dir_all(&log_dir).unwrap();
+    let retained_by_override = log_dir.join("retained.log");
+    write_log_with_mtime(
+        &retained_by_override,
+        "fresh-enough-for-override",
+        SystemTime::now() - Duration::from_secs(2 * 60 * 60),
+    );
+
+    let mut sandbox = ProcessSandbox::new();
+    sandbox.enter_cwd(tmp.path()).runtime_root(".fkst/runtime");
+    sandbox.prepend_path(&bin_dir);
+    sandbox.runtime_log_dir(tmp.path().join("runtime"));
+    sandbox.set_env("FKST_CODEX_LOG_MAX_AGE", "3h");
+    sandbox.unset_env("FKST_CODEX_LOG_MAX_BYTES");
+    let (_lock, _guard) = sandbox.enter();
+
+    let lua = Lua::new();
+    register(&lua).unwrap();
+    let spawn: mlua::Function = lua.globals().get("spawn_codex_sync").unwrap();
+    let result: Table = spawn.call(lua_opts(&lua, "retention")).unwrap();
+
+    assert_eq!(result.get::<i64>("exit_code").unwrap(), 0);
+    assert!(retained_by_override.exists());
 }
 
 #[cfg(unix)]
