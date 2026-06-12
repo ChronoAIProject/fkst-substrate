@@ -23,6 +23,7 @@ mod raised;
 pub(crate) mod source_runner;
 mod spawner;
 
+use crate::process_tree::ProcessGroupRegistry;
 use consumer::spawn_consumer;
 use delivery_router::DeliveryRouter;
 use delivery_store::DeliveryStore;
@@ -70,6 +71,7 @@ pub async fn supervise(roots: PackageRoots, framework_bin: PathBuf) -> Result<()
     let router = DeliveryRouter::new(&cfg, fanout.clone(), delivery_store.clone());
     delivery_watch::set_failure_fact_publisher(router.failure_fact_publisher());
     let codex_permit_slots = cfg.limits.global_codex_processes;
+    let process_groups = ProcessGroupRegistry::default();
     let mut handles = vec![];
 
     let mut departments = cfg.department.iter().collect::<Vec<_>>();
@@ -99,6 +101,7 @@ pub async fn supervise(roots: PackageRoots, framework_bin: PathBuf) -> Result<()
                 delivery_store.clone(),
                 q_cap,
                 codex_permit_slots,
+                process_groups.clone(),
             )
             .await,
         );
@@ -133,14 +136,39 @@ pub async fn supervise(roots: PackageRoots, framework_bin: PathBuf) -> Result<()
     info!(handles = handles.len(), "event runtime running");
     let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    let parent_pid = crate::process_tree::current_parent_pid();
+    let mut parent_watch = tokio::time::interval(std::time::Duration::from_millis(250));
+    parent_watch.tick().await;
     tokio::select! {
-        _ = sigint.recv() => {}
-        _ = sigterm.recv() => {}
+        _ = sigint.recv() => {
+            warn!("event runtime received SIGINT");
+        }
+        _ = sigterm.recv() => {
+            warn!("event runtime received SIGTERM");
+        }
+        _ = async {
+            loop {
+                parent_watch.tick().await;
+                if crate::process_tree::parent_changed(parent_pid) {
+                    break;
+                }
+            }
+        } => {
+            warn!(parent_pid = parent_pid, current_parent_pid = crate::process_tree::current_parent_pid(), "event runtime parent changed");
+        }
     }
+    shutdown_runtime(handles, &process_groups).await;
+    Ok(())
+}
+
+async fn shutdown_runtime(
+    handles: Vec<tokio::task::JoinHandle<()>>,
+    process_groups: &ProcessGroupRegistry,
+) {
+    process_groups.terminate_all("department").await;
     for handle in handles {
         handle.abort();
     }
-    Ok(())
 }
 
 fn delivery_store_for_config(cfg: &Config) -> Result<Option<Arc<DeliveryStore>>> {
@@ -179,7 +207,10 @@ mod tests {
     use fkst_common::config::{DepartmentDecl, LimitsDecl, QueueDecl};
     use fkst_common::DURABLE_ROOT_ENV;
     use std::collections::BTreeMap;
+    use std::process::Command;
     use std::sync::{Mutex, OnceLock};
+    use std::time::{Duration, Instant};
+    use tokio::sync::oneshot;
 
     static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
@@ -262,5 +293,49 @@ mod tests {
         let _guard = EnvGuard::unset();
 
         assert!(delivery_store_for_config(&config(true)).unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn shutdown_terminates_process_groups_before_aborting_tasks() {
+        use std::os::unix::process::CommandExt;
+
+        let process_groups = ProcessGroupRegistry::default();
+        let mut child = Command::new("/bin/sh")
+            .arg("-c")
+            .arg("trap '' TERM; sleep 60")
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let child_pid = child.id();
+        let (registered_tx, registered_rx) = oneshot::channel();
+        let process_groups_for_task = process_groups.clone();
+        let handle = tokio::spawn(async move {
+            let _registration = process_groups_for_task.register(child_pid);
+            let _ = registered_tx.send(());
+            std::future::pending::<()>().await;
+        });
+        registered_rx.await.unwrap();
+
+        shutdown_runtime(vec![handle], &process_groups).await;
+
+        assert!(
+            wait_for_child_exit(&mut child, Duration::from_secs(5)),
+            "process group registration was dropped before termination"
+        );
+    }
+
+    fn wait_for_child_exit(child: &mut std::process::Child, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if child.try_wait().unwrap().is_some() {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
     }
 }

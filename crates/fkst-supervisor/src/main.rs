@@ -5,8 +5,11 @@ use nix::sys::wait::{waitpid, WaitStatus};
 use nix::unistd::Pid;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::time::Duration;
 use tokio::process::Command;
 use tracing::{info, warn};
+
+mod process_tree;
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
@@ -43,23 +46,25 @@ async fn run(project_root: &Path, framework_bin: &Path) -> Result<i32> {
         .ok_or_else(|| anyhow::anyhow!("spawned runtime has no pid"))?;
     info!(pid = pid, framework = %framework_bin.display(), "event runtime spawned");
 
-    let wait = child.wait();
-    tokio::pin!(wait);
-
-    let code = tokio::select! {
-        status = &mut wait => {
-            let status = status.context("wait for event runtime")?;
+    let code = loop {
+        if let Some(status) = child.try_wait().context("poll event runtime")? {
             let code = status.code().unwrap_or(128);
             info!(pid = pid, exit_code = code, "event runtime exited");
-            code
+            break code;
         }
-        _ = sigint.recv() => {
-            warn!(pid = pid, signal = "interrupt", "supervisor exiting without signaling event runtime");
-            130
-        }
-        _ = sigterm.recv() => {
-            warn!(pid = pid, signal = "terminate", "supervisor exiting without signaling event runtime");
-            143
+
+        tokio::select! {
+            _ = sigint.recv() => {
+                warn!(pid = pid, signal = "interrupt", "terminating event runtime process group");
+                process_tree::terminate_process_group(&mut child, pid, "event runtime").await;
+                break 130;
+            }
+            _ = sigterm.recv() => {
+                warn!(pid = pid, signal = "terminate", "terminating event runtime process group");
+                process_tree::terminate_process_group(&mut child, pid, "event runtime").await;
+                break 143;
+            }
+            _ = tokio::time::sleep(Duration::from_millis(25)) => {}
         }
     };
 
