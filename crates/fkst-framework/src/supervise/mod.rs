@@ -157,11 +157,18 @@ pub async fn supervise(roots: PackageRoots, framework_bin: PathBuf) -> Result<()
             warn!(parent_pid = parent_pid, current_parent_pid = crate::process_tree::current_parent_pid(), "event runtime parent changed");
         }
     }
+    shutdown_runtime(handles, &process_groups).await;
+    Ok(())
+}
+
+async fn shutdown_runtime(
+    handles: Vec<tokio::task::JoinHandle<()>>,
+    process_groups: &ProcessGroupRegistry,
+) {
+    process_groups.terminate_all("department").await;
     for handle in handles {
         handle.abort();
     }
-    process_groups.terminate_all("department").await;
-    Ok(())
 }
 
 fn delivery_store_for_config(cfg: &Config) -> Result<Option<Arc<DeliveryStore>>> {
@@ -200,7 +207,10 @@ mod tests {
     use fkst_common::config::{DepartmentDecl, LimitsDecl, QueueDecl};
     use fkst_common::DURABLE_ROOT_ENV;
     use std::collections::BTreeMap;
+    use std::process::Command;
     use std::sync::{Mutex, OnceLock};
+    use std::time::{Duration, Instant};
+    use tokio::sync::oneshot;
 
     static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
@@ -283,5 +293,49 @@ mod tests {
         let _guard = EnvGuard::unset();
 
         assert!(delivery_store_for_config(&config(true)).unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn shutdown_terminates_process_groups_before_aborting_tasks() {
+        use std::os::unix::process::CommandExt;
+
+        let process_groups = ProcessGroupRegistry::default();
+        let mut child = Command::new("/bin/sh")
+            .arg("-c")
+            .arg("trap '' TERM; sleep 60")
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let child_pid = child.id();
+        let (registered_tx, registered_rx) = oneshot::channel();
+        let process_groups_for_task = process_groups.clone();
+        let handle = tokio::spawn(async move {
+            let _registration = process_groups_for_task.register(child_pid);
+            let _ = registered_tx.send(());
+            std::future::pending::<()>().await;
+        });
+        registered_rx.await.unwrap();
+
+        shutdown_runtime(vec![handle], &process_groups).await;
+
+        assert!(
+            wait_for_child_exit(&mut child, Duration::from_secs(5)),
+            "process group registration was dropped before termination"
+        );
+    }
+
+    fn wait_for_child_exit(child: &mut std::process::Child, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if child.try_wait().unwrap().is_some() {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
     }
 }
