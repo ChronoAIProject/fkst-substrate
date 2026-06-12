@@ -213,7 +213,7 @@ queue 是包内命名空间。多 graph-root 组合时，裸 queue 名按 owner 
 - `RuntimeLayout` 只提供固定 runtime dir 解析，framework 先把相对 runtime root 锚到 `<HOST>` 再建路径。
 - `with_lock`、`once` 与 `cache` 共用 runtime key 合约：key / name 必须是非空相对 filesystem path，`/` 表示目录；每个 segment 非空、匹配 `[A-Za-z0-9._-]+`，且不是 `.` 或 `..`；禁止 leading / trailing `/`、`//`、反斜杠、NUL 与绝对路径。校验后的 key 直接 join 到 `<RT>/{locks,marks,cache}/<key>`，形成可人工浏览的目录树，不做 byte hex 编码。`locks/once/` 是 `once` 内部锁的保留子目录，不属于 `with_lock` 用户锁命名空间。
 - `file_watch` 只接受 host-root 相对或绝对 glob；不支持 runtime scheme。
-- codex log **不属** `RuntimeKind`/`<RT>`:`sdk_codex` 把它落到 `FKST_RUNTIME_LOG_DIR` 或平台默认目录(如 `~/Library/Logs/fkst`)下的 `codex/`。它与 `<RT>/logs` 同属 process-trace scratch(可 grep、非事实源),但落点不同,`supervise` 也不给 framework child 注入 `FKST_RUNTIME_LOG_DIR`。
+- codex log **不属** `RuntimeKind`/`<RT>`:`sdk_codex` 把它落到 `FKST_RUNTIME_LOG_DIR` 或平台默认目录(如 `~/Library/Logs/fkst`)下的 `codex/`。它与 `<RT>/logs` 同属 process-trace scratch(可 grep、非事实源),但落点不同,`supervise` 也不给 framework child 注入 `FKST_RUNTIME_LOG_DIR`。每次 `spawn_codex_sync` / `spawn_codex` 会在写入本次 log 前 best-effort 修剪同一个 `codex/` 目录中的旧 `.log` 文件：`FKST_CODEX_LOG_MAX_AGE` 默认 `48h`，`0` 或空值表示关闭年龄修剪；`FKST_CODEX_LOG_MAX_BYTES` 为空或 `0` 表示不启用容量上限，启用时优先删除最旧 log；当前请求的 log path 永远豁免，删除或扫描失败只写 warning。
 - engine **不写** runtime 持久状态；accepted-state / rollback 是外部 release pipeline 的事实，见 §13。
 
 ## 7. 运行态数据流

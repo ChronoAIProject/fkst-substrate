@@ -28,7 +28,10 @@ use crate::runtime_context;
 
 pub(crate) const CODEX_PERMIT_SLOTS_ENV: &str = "FKST_CODEX_PERMIT_SLOTS";
 pub const RUNTIME_LOG_DIR_ENV: &str = "FKST_RUNTIME_LOG_DIR";
+const CODEX_LOG_MAX_AGE_ENV: &str = "FKST_CODEX_LOG_MAX_AGE";
+const CODEX_LOG_MAX_BYTES_ENV: &str = "FKST_CODEX_LOG_MAX_BYTES";
 const DEFAULT_CODEX_TIMEOUT_SECONDS: i64 = 3600;
+const DEFAULT_CODEX_LOG_MAX_AGE: Duration = Duration::from_secs(48 * 60 * 60);
 const CODEX_STATUS_RECENT_LIMIT: usize = 50;
 const CODEX_STATUS_LOG_PREFIX: &str = "CODEX_STATUS:";
 static NEXT_PIPELINE_OWNER_ID: AtomicU64 = AtomicU64::new(1);
@@ -422,6 +425,7 @@ fn run_codex_request(
     config: &ConfigContext,
     runner: Option<&MockCommandState>,
 ) -> Result<CodexResult> {
+    prune_codex_logs_for_request(&request);
     if let Some(runner) = runner {
         return run_mocked_codex_request(request, runner);
     }
@@ -1130,6 +1134,201 @@ fn codex_log_path(worktree: Option<&str>) -> PathBuf {
     runtime_log_dir()
         .join("codex")
         .join(format!("{basename}-{timestamp}.log"))
+}
+
+fn prune_codex_logs_for_request(request: &CodexRequest) {
+    let Some(log_dir) = request.log_path.parent() else {
+        return;
+    };
+    let policy = CodexLogRetentionPolicy::from_env();
+    if let Err(err) = prune_codex_logs(log_dir, &request.log_path, policy, SystemTime::now()) {
+        eprintln!(
+            "WARN: codex log prune failed dir={} current_log={} error={err}",
+            log_dir.display(),
+            request.log_path.display()
+        );
+    }
+}
+
+#[derive(Clone, Copy)]
+struct CodexLogRetentionPolicy {
+    max_age: Option<Duration>,
+    max_bytes: Option<u64>,
+}
+
+impl CodexLogRetentionPolicy {
+    fn from_env() -> Self {
+        Self {
+            max_age: retention_max_age_from_env(),
+            max_bytes: retention_max_bytes_from_env(),
+        }
+    }
+}
+
+struct CodexLogEntry {
+    path: PathBuf,
+    len: u64,
+    modified: SystemTime,
+}
+
+fn prune_codex_logs(
+    log_dir: &Path,
+    current_log_path: &Path,
+    policy: CodexLogRetentionPolicy,
+    now: SystemTime,
+) -> anyhow::Result<()> {
+    if policy.max_age.is_none() && policy.max_bytes.is_none() {
+        return Ok(());
+    }
+    let entries = match std::fs::read_dir(log_dir) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(err.into()),
+    };
+
+    let current_log_path = current_log_path.to_path_buf();
+    let mut retained = Vec::new();
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(err) => {
+                eprintln!(
+                    "WARN: codex log prune entry skipped dir={} error={err}",
+                    log_dir.display()
+                );
+                continue;
+            }
+        };
+        let path = entry.path();
+        if path == current_log_path || path.extension().and_then(OsStr::to_str) != Some("log") {
+            continue;
+        }
+        let metadata = match entry.metadata() {
+            Ok(metadata) => metadata,
+            Err(err) => {
+                eprintln!(
+                    "WARN: codex log prune metadata skipped path={} error={err}",
+                    path.display()
+                );
+                continue;
+            }
+        };
+        if !metadata.is_file() {
+            continue;
+        }
+        let modified = metadata.modified().unwrap_or(UNIX_EPOCH);
+        if let Some(max_age) = policy.max_age {
+            if now.duration_since(modified).unwrap_or(Duration::ZERO) > max_age {
+                remove_codex_log(&path);
+                continue;
+            }
+        }
+        retained.push(CodexLogEntry {
+            path,
+            len: metadata.len(),
+            modified,
+        });
+    }
+
+    if let Some(max_bytes) = policy.max_bytes {
+        prune_codex_logs_by_size(retained, max_bytes);
+    }
+    Ok(())
+}
+
+fn prune_codex_logs_by_size(mut entries: Vec<CodexLogEntry>, max_bytes: u64) {
+    let mut total = entries
+        .iter()
+        .fold(0_u64, |sum, entry| sum.saturating_add(entry.len));
+    if total <= max_bytes {
+        return;
+    }
+    entries.sort_by(|left, right| {
+        left.modified
+            .cmp(&right.modified)
+            .then_with(|| left.path.cmp(&right.path))
+    });
+    for entry in entries {
+        if total <= max_bytes {
+            break;
+        }
+        remove_codex_log(&entry.path);
+        total = total.saturating_sub(entry.len);
+    }
+}
+
+fn remove_codex_log(path: &Path) {
+    if let Err(err) = std::fs::remove_file(path) {
+        eprintln!(
+            "WARN: codex log prune remove failed path={} error={err}",
+            path.display()
+        );
+    }
+}
+
+fn retention_max_age_from_env() -> Option<Duration> {
+    match std::env::var(CODEX_LOG_MAX_AGE_ENV) {
+        Ok(raw) => parse_retention_duration(&raw).unwrap_or_else(|err| {
+            eprintln!("WARN: {CODEX_LOG_MAX_AGE_ENV} ignored value={raw:?} error={err}");
+            Some(DEFAULT_CODEX_LOG_MAX_AGE)
+        }),
+        Err(std::env::VarError::NotPresent) => Some(DEFAULT_CODEX_LOG_MAX_AGE),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            eprintln!("WARN: {CODEX_LOG_MAX_AGE_ENV} ignored non-unicode value");
+            Some(DEFAULT_CODEX_LOG_MAX_AGE)
+        }
+    }
+}
+
+fn retention_max_bytes_from_env() -> Option<u64> {
+    match std::env::var(CODEX_LOG_MAX_BYTES_ENV) {
+        Ok(raw) => parse_optional_u64(&raw).unwrap_or_else(|err| {
+            eprintln!("WARN: {CODEX_LOG_MAX_BYTES_ENV} ignored value={raw:?} error={err}");
+            None
+        }),
+        Err(std::env::VarError::NotPresent) => None,
+        Err(std::env::VarError::NotUnicode(_)) => {
+            eprintln!("WARN: {CODEX_LOG_MAX_BYTES_ENV} ignored non-unicode value");
+            None
+        }
+    }
+}
+
+fn parse_retention_duration(raw: &str) -> std::result::Result<Option<Duration>, String> {
+    let value = raw.trim();
+    if value.is_empty() || value == "0" {
+        return Ok(None);
+    }
+    let (number, multiplier) = match value.as_bytes().last().copied() {
+        Some(b's') => (&value[..value.len() - 1], 1_u64),
+        Some(b'm') => (&value[..value.len() - 1], 60),
+        Some(b'h') => (&value[..value.len() - 1], 60 * 60),
+        Some(b'd') => (&value[..value.len() - 1], 24 * 60 * 60),
+        Some(byte) if byte.is_ascii_digit() => (value, 1),
+        _ => return Err("expected integer seconds or s/m/h/d suffix".to_string()),
+    };
+    let count = number
+        .parse::<u64>()
+        .map_err(|_| "expected positive integer duration".to_string())?;
+    if count == 0 {
+        return Ok(None);
+    }
+    count
+        .checked_mul(multiplier)
+        .map(Duration::from_secs)
+        .map(Some)
+        .ok_or_else(|| "duration overflow".to_string())
+}
+
+fn parse_optional_u64(raw: &str) -> std::result::Result<Option<u64>, String> {
+    let value = raw.trim();
+    if value.is_empty() || value == "0" {
+        return Ok(None);
+    }
+    value
+        .parse::<u64>()
+        .map(Some)
+        .map_err(|_| "expected non-negative integer bytes".to_string())
 }
 
 fn codex_run_id() -> String {
