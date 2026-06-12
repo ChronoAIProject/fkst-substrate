@@ -30,10 +30,14 @@ pub(crate) const CODEX_PERMIT_SLOTS_ENV: &str = "FKST_CODEX_PERMIT_SLOTS";
 pub const RUNTIME_LOG_DIR_ENV: &str = "FKST_RUNTIME_LOG_DIR";
 const CODEX_LOG_MAX_AGE_ENV: &str = "FKST_CODEX_LOG_MAX_AGE";
 const CODEX_LOG_MAX_BYTES_ENV: &str = "FKST_CODEX_LOG_MAX_BYTES";
+const CODEX_WORKER_BIN_ENV: &str = "FKST_CODEX_WORKER_BIN";
 const DEFAULT_CODEX_TIMEOUT_SECONDS: i64 = 3600;
 const DEFAULT_CODEX_LOG_MAX_AGE: Duration = Duration::from_secs(48 * 60 * 60);
 const CODEX_STATUS_RECENT_LIMIT: usize = 50;
 const CODEX_STATUS_LOG_PREFIX: &str = "CODEX_STATUS:";
+const CODEX_ADOPTION_DIR: &str = ".fkst-codex";
+const CODEX_ADOPTION_POLL: Duration = Duration::from_millis(100);
+const CODEX_ADOPTION_TIMEOUT_GRACE: Duration = Duration::from_secs(2);
 static NEXT_PIPELINE_OWNER_ID: AtomicU64 = AtomicU64::new(1);
 static NEXT_CODEX_RUN_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -49,6 +53,17 @@ struct CodexRequest {
     proposal_id: Option<String>,
     dept: Option<String>,
     started_at_ms: u64,
+    adoption_status_path: Option<PathBuf>,
+}
+
+#[derive(Clone, Debug)]
+struct CodexAdoptionPaths {
+    key: String,
+    dir: PathBuf,
+    prompt: PathBuf,
+    stdout: PathBuf,
+    stderr: PathBuf,
+    status: PathBuf,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -65,6 +80,23 @@ struct CodexStatusRecord {
     status: String,
     exit_code: Option<i32>,
     permit_slot: Option<usize>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct CodexAdoptionRecord {
+    key: String,
+    run_id: String,
+    status: String,
+    started_at_ms: u64,
+    ended_at_ms: Option<u64>,
+    timeout_seconds: i64,
+    worker_pid: Option<u32>,
+    codex_pid: Option<u32>,
+    exit_code: Option<i32>,
+    log_path: String,
+    cmd_line: String,
+    error_kind: Option<String>,
+    error: Option<String>,
 }
 
 // worker threads return the same result shape before Lua table conversion.
@@ -333,6 +365,7 @@ fn codex_request_from_opts(opts: Table, runtime_dept: Option<String>) -> CodexRe
         proposal_id,
         dept,
         started_at_ms,
+        adoption_status_path: None,
     }
 }
 
@@ -432,6 +465,10 @@ fn run_codex_request(
         return run_mocked_codex_request(request, runner);
     }
 
+    if let Some(paths) = adoption_paths_for_request(&request) {
+        return run_adoptable_codex_request(request, paths, host_root, config);
+    }
+
     let mut status = CodexStatusRecord::from_request(&request, None);
     write_codex_status(&request.log_path, &status);
     if let Err(err) = ensure_pool_with_context(host_root, config) {
@@ -490,6 +527,38 @@ fn run_codex_request(
     Ok(result)
 }
 
+fn run_adoptable_codex_request(
+    request: CodexRequest,
+    paths: CodexAdoptionPaths,
+    host_root: &Path,
+    config: &ConfigContext,
+) -> Result<CodexResult> {
+    if let Some(result) = read_completed_adoption_result(&paths)? {
+        return Ok(result);
+    }
+    std::fs::create_dir_all(&paths.dir).map_err(mlua::Error::external)?;
+    let lock_path = paths.dir.join("run.lock");
+    let lock_file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(lock_path)
+        .map_err(mlua::Error::external)?;
+    flock(lock_file.as_raw_fd(), FlockArg::LockExclusive).map_err(mlua::Error::external)?;
+    if let Some(result) = read_completed_adoption_result(&paths)? {
+        drop(lock_file);
+        return Ok(result);
+    }
+    let running = read_adoption_record(&paths.status)?
+        .filter(|record| record.status == "running" && adoption_worker_alive(&record));
+    if running.is_none() {
+        start_adoption_worker(&request, &paths, host_root, config)?;
+    }
+    drop(lock_file);
+    wait_for_adoption_result(&request, &paths)
+}
+
 fn run_mocked_codex_request(
     request: CodexRequest,
     runner: &MockCommandState,
@@ -520,6 +589,492 @@ fn run_mocked_codex_request(
         result.exit_code,
         request.log_path.to_string_lossy().into_owned(),
     ))
+}
+
+fn adoption_paths_for_request(request: &CodexRequest) -> Option<CodexAdoptionPaths> {
+    let worktree = request.worktree.as_deref()?;
+    if worktree.trim().is_empty() {
+        return None;
+    }
+    let worktree_path = PathBuf::from(worktree);
+    let key = adoption_key_for_worktree(&worktree_path);
+    let dir = worktree_path.join(CODEX_ADOPTION_DIR).join(&key);
+    Some(CodexAdoptionPaths {
+        key,
+        prompt: dir.join("prompt.txt"),
+        stdout: dir.join("stdout.txt"),
+        stderr: dir.join("stderr.txt"),
+        status: dir.join("status.json"),
+        dir,
+    })
+}
+
+fn adoption_key_for_worktree(worktree: &Path) -> String {
+    let basename = worktree
+        .file_name()
+        .and_then(OsStr::to_str)
+        .filter(|name| !name.is_empty())
+        .unwrap_or("worktree");
+    let mut key = String::new();
+    for byte in basename.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-') {
+            key.push(byte as char);
+        } else {
+            key.push('-');
+        }
+    }
+    if key.is_empty() {
+        "worktree".to_string()
+    } else {
+        key
+    }
+}
+
+fn read_completed_adoption_result(paths: &CodexAdoptionPaths) -> Result<Option<CodexResult>> {
+    let Some(record) = read_adoption_record(&paths.status)? else {
+        return Ok(None);
+    };
+    if record.status != "completed" {
+        return Ok(None);
+    }
+    let stdout = read_optional_string(&paths.stdout).map_err(mlua::Error::external)?;
+    let stderr = read_optional_string(&paths.stderr).map_err(mlua::Error::external)?;
+    let exit_code = record.exit_code.unwrap_or(-1);
+    if let Some(kind) = record.error_kind.as_deref() {
+        return Ok(Some(CodexResult::failure(
+            kind,
+            record
+                .error
+                .clone()
+                .unwrap_or_else(|| "adopted codex failed".to_string()),
+            stdout,
+            stderr,
+            exit_code,
+            record.log_path,
+        )));
+    }
+    Ok(Some(CodexResult::success(
+        stdout,
+        stderr,
+        exit_code,
+        record.log_path,
+    )))
+}
+
+fn read_adoption_record(path: &Path) -> Result<Option<CodexAdoptionRecord>> {
+    match std::fs::read_to_string(path) {
+        Ok(body) => serde_json::from_str(&body)
+            .map(Some)
+            .map_err(mlua::Error::external),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(mlua::Error::external(err)),
+    }
+}
+
+fn read_optional_string(path: &Path) -> anyhow::Result<String> {
+    match std::fs::read_to_string(path) {
+        Ok(body) => Ok(body),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
+        Err(err) => Err(err.into()),
+    }
+}
+
+fn adoption_worker_alive(record: &CodexAdoptionRecord) -> bool {
+    let Some(pid) = record.worker_pid else {
+        return false;
+    };
+    process_exists(pid)
+}
+
+#[cfg(unix)]
+fn process_exists(pid: u32) -> bool {
+    use nix::errno::Errno;
+    use nix::sys::signal::kill;
+    use nix::unistd::Pid;
+
+    match kill(Pid::from_raw(pid as i32), None) {
+        Ok(()) => true,
+        Err(Errno::EPERM) => true,
+        Err(_) => false,
+    }
+}
+
+#[cfg(not(unix))]
+fn process_exists(_pid: u32) -> bool {
+    false
+}
+
+fn start_adoption_worker(
+    request: &CodexRequest,
+    paths: &CodexAdoptionPaths,
+    host_root: &Path,
+    config: &ConfigContext,
+) -> Result<()> {
+    ensure_pool_with_context(host_root, config)?;
+    std::fs::write(&paths.prompt, &request.prompt).map_err(mlua::Error::external)?;
+    let worker_bin = codex_worker_bin().map_err(mlua::Error::external)?;
+    let args = codex_worker_args(request, paths, host_root);
+    let mut command = Command::new(&worker_bin);
+    command.args(&args);
+    command.stdin(Stdio::null());
+    command.stdout(Stdio::null());
+    command.stderr(Stdio::null());
+    #[cfg(unix)]
+    command.process_group(0);
+    let child = command.spawn().map_err(mlua::Error::external)?;
+    let record = CodexAdoptionRecord {
+        key: paths.key.clone(),
+        run_id: request.run_id.clone(),
+        status: "running".to_string(),
+        started_at_ms: request.started_at_ms,
+        ended_at_ms: None,
+        timeout_seconds: request.timeout_seconds,
+        worker_pid: Some(child.id()),
+        codex_pid: None,
+        exit_code: None,
+        log_path: request.log_path.to_string_lossy().into_owned(),
+        cmd_line: command_line_for_request(request),
+        error_kind: None,
+        error: None,
+    };
+    drop(child);
+    if read_adoption_record(&paths.status)?.is_none() {
+        write_adoption_record(&paths.status, &record).map_err(mlua::Error::external)?;
+    }
+    Ok(())
+}
+
+fn codex_worker_bin() -> anyhow::Result<PathBuf> {
+    if let Some(path) = std::env::var_os(CODEX_WORKER_BIN_ENV).filter(|value| !value.is_empty()) {
+        return Ok(PathBuf::from(path));
+    }
+    let current = std::env::current_exe()?;
+    if current.file_stem().and_then(OsStr::to_str) == Some("fkst-framework") {
+        return Ok(current);
+    }
+    if let Some(sibling) = current
+        .parent()
+        .and_then(Path::parent)
+        .map(|target| target.join("fkst-framework"))
+        .filter(|path| path.is_file())
+    {
+        return Ok(sibling);
+    }
+    Ok(current)
+}
+
+fn codex_worker_args(
+    request: &CodexRequest,
+    paths: &CodexAdoptionPaths,
+    host_root: &Path,
+) -> Vec<String> {
+    let mut args = vec![
+        "__codex-worker".to_string(),
+        "--host-root".to_string(),
+        host_root.to_string_lossy().into_owned(),
+        "--work-dir".to_string(),
+        paths.dir.to_string_lossy().into_owned(),
+        "--prompt-file".to_string(),
+        paths.prompt.to_string_lossy().into_owned(),
+        "--stdout-file".to_string(),
+        paths.stdout.to_string_lossy().into_owned(),
+        "--stderr-file".to_string(),
+        paths.stderr.to_string_lossy().into_owned(),
+        "--status-file".to_string(),
+        paths.status.to_string_lossy().into_owned(),
+        "--log-path".to_string(),
+        request.log_path.to_string_lossy().into_owned(),
+        "--run-id".to_string(),
+        request.run_id.clone(),
+        "--key".to_string(),
+        paths.key.clone(),
+        "--started-at-ms".to_string(),
+        request.started_at_ms.to_string(),
+        "--timeout".to_string(),
+        request.timeout_seconds.to_string(),
+    ];
+    if let Some(context) = request.context.as_deref() {
+        args.push("--context".to_string());
+        args.push(context.to_string());
+    }
+    if let Some(worktree) = request.worktree.as_deref() {
+        args.push("--worktree".to_string());
+        args.push(worktree.to_string());
+    }
+    if let Some(label) = request.label.as_deref() {
+        args.push("--label".to_string());
+        args.push(label.to_string());
+    }
+    if let Some(proposal_id) = request.proposal_id.as_deref() {
+        args.push("--proposal-id".to_string());
+        args.push(proposal_id.to_string());
+    }
+    if let Some(dept) = request.dept.as_deref() {
+        args.push("--dept".to_string());
+        args.push(dept.to_string());
+    }
+    args
+}
+
+fn wait_for_adoption_result(
+    request: &CodexRequest,
+    paths: &CodexAdoptionPaths,
+) -> Result<CodexResult> {
+    let deadline = Instant::now()
+        + overall_timeout(request.timeout_seconds)
+            .unwrap_or_else(|| Duration::from_secs(DEFAULT_CODEX_TIMEOUT_SECONDS as u64))
+        + CODEX_ADOPTION_TIMEOUT_GRACE;
+    loop {
+        if let Some(result) = read_completed_adoption_result(paths)? {
+            return Ok(result);
+        }
+        if Instant::now() >= deadline {
+            if let Some(record) = read_adoption_record(&paths.status)? {
+                kill_adoption_worker_group(&record);
+            }
+            let message = format!(
+                "adopted codex timed out waiting for result after {}s wall clock",
+                request.timeout_seconds
+            );
+            return Ok(CodexResult::failure(
+                "timeout",
+                message,
+                read_optional_string(&paths.stdout).map_err(mlua::Error::external)?,
+                read_optional_string(&paths.stderr).map_err(mlua::Error::external)?,
+                124,
+                request.log_path.to_string_lossy().into_owned(),
+            ));
+        }
+        std::thread::sleep(CODEX_ADOPTION_POLL);
+    }
+}
+
+#[cfg(unix)]
+fn kill_adoption_worker_group(record: &CodexAdoptionRecord) {
+    if let Some(pid) = record.codex_pid {
+        kill_process_group_by_pid(pid);
+    }
+    let Some(pid) = record.worker_pid else {
+        return;
+    };
+    kill_process_group_by_pid(pid);
+}
+
+#[cfg(unix)]
+fn kill_process_group_by_pid(pid: u32) {
+    use nix::sys::signal::{killpg, Signal};
+    use nix::unistd::Pid;
+
+    let _ = killpg(Pid::from_raw(pid as i32), Signal::SIGKILL);
+}
+
+#[cfg(not(unix))]
+fn kill_adoption_worker_group(_record: &CodexAdoptionRecord) {}
+
+fn write_adoption_child_pid(request: &CodexRequest, child_pid: u32) {
+    let Some(path) = request.adoption_status_path.as_deref() else {
+        return;
+    };
+    let Ok(Some(mut record)) = read_adoption_record(path) else {
+        return;
+    };
+    record.codex_pid = Some(child_pid);
+    if let Err(err) = write_adoption_record(path, &record) {
+        eprintln!(
+            "WARN: codex adoption child pid write failed run_id={} error={err}",
+            request.run_id
+        );
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct CodexWorkerOptions {
+    host_root: PathBuf,
+    work_dir: PathBuf,
+    prompt_file: PathBuf,
+    stdout_file: PathBuf,
+    stderr_file: PathBuf,
+    status_file: PathBuf,
+    log_path: PathBuf,
+    run_id: String,
+    key: String,
+    started_at_ms: u64,
+    timeout_seconds: i64,
+    context: Option<String>,
+    worktree: Option<String>,
+    label: Option<String>,
+    proposal_id: Option<String>,
+    dept: Option<String>,
+}
+
+pub(crate) fn parse_worker_args(args: Vec<String>) -> anyhow::Result<CodexWorkerOptions> {
+    let mut parser = WorkerArgParser::new(args);
+    let host_root = parser.required_path("--host-root")?;
+    let work_dir = parser.required_path("--work-dir")?;
+    let prompt_file = parser.required_path("--prompt-file")?;
+    let stdout_file = parser.required_path("--stdout-file")?;
+    let stderr_file = parser.required_path("--stderr-file")?;
+    let status_file = parser.required_path("--status-file")?;
+    let log_path = parser.required_path("--log-path")?;
+    let run_id = parser.required_string("--run-id")?;
+    let key = parser.required_string("--key")?;
+    let started_at_ms = parser.required_string("--started-at-ms")?.parse::<u64>()?;
+    let timeout_seconds = parser.required_string("--timeout")?.parse::<i64>()?;
+    let context = parser.optional_string("--context");
+    let worktree = parser.optional_string("--worktree");
+    let label = parser.optional_string("--label");
+    let proposal_id = parser.optional_string("--proposal-id");
+    let dept = parser.optional_string("--dept");
+    parser.finish()?;
+    Ok(CodexWorkerOptions {
+        host_root,
+        work_dir,
+        prompt_file,
+        stdout_file,
+        stderr_file,
+        status_file,
+        log_path,
+        run_id,
+        key,
+        started_at_ms,
+        timeout_seconds,
+        context,
+        worktree,
+        label,
+        proposal_id,
+        dept,
+    })
+}
+
+pub(crate) fn run_codex_worker(options: CodexWorkerOptions) -> anyhow::Result<i32> {
+    std::fs::create_dir_all(&options.work_dir)?;
+    let prompt = std::fs::read_to_string(&options.prompt_file)?;
+    let request = CodexRequest {
+        run_id: options.run_id.clone(),
+        prompt,
+        context: options.context.clone(),
+        worktree: options.worktree.clone(),
+        timeout_seconds: options.timeout_seconds,
+        log_path: options.log_path.clone(),
+        label: options.label.clone(),
+        proposal_id: options.proposal_id.clone(),
+        dept: options.dept.clone(),
+        started_at_ms: options.started_at_ms,
+        adoption_status_path: Some(options.status_file.clone()),
+    };
+    let config = ConfigContext::from_host_root(&options.host_root)?;
+    let mut status = CodexStatusRecord::from_request(&request, None);
+    write_codex_status(&request.log_path, &status);
+    let mut adoption = CodexAdoptionRecord {
+        key: options.key,
+        run_id: options.run_id,
+        status: "running".to_string(),
+        started_at_ms: options.started_at_ms,
+        ended_at_ms: None,
+        timeout_seconds: options.timeout_seconds,
+        worker_pid: Some(std::process::id()),
+        codex_pid: None,
+        exit_code: None,
+        log_path: options.log_path.to_string_lossy().into_owned(),
+        cmd_line: command_line_for_request(&request),
+        error_kind: None,
+        error: None,
+    };
+    write_adoption_record(&options.status_file, &adoption)?;
+
+    let result = match acquire_permit_with_context(&options.host_root, &config) {
+        Ok(permit) => {
+            status.permit_slot = Some(permit.slot);
+            write_codex_status(&request.log_path, &status);
+            let result = run_codex_request_with_permit(request, &config);
+            drop(permit);
+            result
+        }
+        Err(err) => {
+            let message = format!("codex permit acquire failed: {err}");
+            let cmd_line = adoption.cmd_line.clone();
+            logged_failure(
+                &request,
+                &cmd_line,
+                "permit",
+                message,
+                String::new(),
+                String::new(),
+                -1,
+            )
+        }
+    };
+
+    write_atomic(&options.stdout_file, result.stdout.as_bytes())?;
+    write_atomic(&options.stderr_file, result.stderr.as_bytes())?;
+    adoption.status = "completed".to_string();
+    adoption.ended_at_ms = Some(unix_duration().as_millis() as u64);
+    adoption.exit_code = Some(result.exit_code);
+    adoption.error_kind = result.error_kind.clone();
+    adoption.error = result.error.clone();
+    write_adoption_record(&options.status_file, &adoption)?;
+    status.finish(result.exit_code);
+    write_codex_status(Path::new(&result.log_path), &status);
+    Ok(0)
+}
+
+struct WorkerArgParser {
+    args: Vec<String>,
+}
+
+impl WorkerArgParser {
+    fn new(args: Vec<String>) -> Self {
+        Self { args }
+    }
+
+    fn required_path(&mut self, flag: &str) -> anyhow::Result<PathBuf> {
+        self.required_string(flag).map(PathBuf::from)
+    }
+
+    fn required_string(&mut self, flag: &str) -> anyhow::Result<String> {
+        self.take(flag)
+            .ok_or_else(|| anyhow::anyhow!("missing {flag}"))
+    }
+
+    fn optional_string(&mut self, flag: &str) -> Option<String> {
+        self.take(flag)
+    }
+
+    fn take(&mut self, flag: &str) -> Option<String> {
+        let index = self.args.iter().position(|arg| arg == flag)?;
+        if index + 1 >= self.args.len() {
+            return None;
+        }
+        let value = self.args.remove(index + 1);
+        self.args.remove(index);
+        Some(value)
+    }
+
+    fn finish(self) -> anyhow::Result<()> {
+        if self.args.is_empty() {
+            Ok(())
+        } else {
+            anyhow::bail!("unknown __codex-worker argument: {}", self.args[0])
+        }
+    }
+}
+
+fn write_adoption_record(path: &Path, record: &CodexAdoptionRecord) -> anyhow::Result<()> {
+    write_atomic(path, serde_json::to_string(record)?.as_bytes())
+}
+
+fn write_atomic(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let tmp = path.with_extension(format!(
+        "tmp-{}-{}",
+        std::process::id(),
+        filename_timestamp()
+    ));
+    std::fs::write(&tmp, bytes)?;
+    std::fs::rename(tmp, path)?;
+    Ok(())
 }
 
 impl CodexStatusRecord {
@@ -732,6 +1287,7 @@ fn run_codex_request_with_permit(mut request: CodexRequest, config: &ConfigConte
         Err(result) => return *result,
     };
     let child_pid = child.id();
+    write_adoption_child_pid(&request, child_pid);
     let registration = crate::process_tree::sdk_process_groups().register(child_pid);
     let prompt = std::mem::take(&mut request.prompt);
     let (child, stdin_writer) = match spawn_stdin_writer(child, prompt, &request, &cmd_line) {

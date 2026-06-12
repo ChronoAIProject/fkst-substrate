@@ -73,6 +73,7 @@ enum CliCommand {
     },
     Test(TestCli),
     InitPackageRepo(init_package_repo::InitPackageRepoOptions),
+    CodexWorker(sdk_codex::CodexWorkerOptions),
     SelfTest,
 }
 
@@ -89,6 +90,11 @@ fn parse_args() -> Result<CliCommand> {
             anyhow::bail!("unknown --self-test option: {}", other);
         }
         return Ok(CliCommand::SelfTest);
+    }
+    if sub == "__codex-worker" {
+        return Ok(CliCommand::CodexWorker(sdk_codex::parse_worker_args(
+            args_iter.collect(),
+        )?));
     }
     if sub == "supervise" {
         let mut project_root: Option<PathBuf> = None;
@@ -512,6 +518,7 @@ fn run() -> Result<i32> {
         CliCommand::RateAcquire { pool } => run_rate_acquire(&pool),
         CliCommand::Test(options) => test_runner::run_tests(options.roots, options.report_json),
         CliCommand::InitPackageRepo(options) => init_package_repo::run(options),
+        CliCommand::CodexWorker(options) => sdk_codex::run_codex_worker(options),
         CliCommand::SelfTest => match self_test::run() {
             Ok(()) => Ok(0),
             Err(err) => {
