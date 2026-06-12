@@ -27,6 +27,7 @@ mod host_conformance;
 mod init_package_repo;
 mod mlua_init;
 mod path_resolver;
+mod process_tree;
 mod raise;
 mod rate_pool;
 mod rate_shim;
@@ -366,6 +367,17 @@ fn run_pipeline(
     owner_namespace: String,
     event: JsonValue,
 ) -> Result<i32> {
+    crate::process_tree::install_sdk_shutdown_watch();
+    let parent_pid = std::env::var("FKST_SUPERVISOR_PID")
+        .ok()
+        .and_then(|value| value.parse::<u32>().ok());
+    if parent_pid
+        .map(crate::process_tree::parent_changed)
+        .unwrap_or(false)
+    {
+        eprintln!("[framework] supervisor parent lost before pipeline start");
+        return Ok(125);
+    }
     let lua = mlua_init::new_lua();
     let raise_buf = RaiseBuffer::new();
     let owner_root = roots

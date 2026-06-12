@@ -11,6 +11,7 @@ use super::raised::parse_raised;
 use super::source_runner::parse_duration;
 use super::spawner::{spawn_framework, SpawnResult};
 use crate::path_resolver::PackageRoots;
+use crate::process_tree::ProcessGroupRegistry;
 use fkst_common::config::{DepartmentDecl, RetryDecl};
 use fkst_common::{Event, RuntimeKind};
 use std::collections::BTreeMap;
@@ -38,6 +39,7 @@ pub async fn spawn_consumer(
     store: Option<Arc<DeliveryStore>>,
     queue_capacity: usize,
     codex_permit_slots: usize,
+    process_groups: ProcessGroupRegistry,
 ) -> JoinHandle<()> {
     let reliable_queues: Vec<String> = decl
         .consumes
@@ -134,6 +136,7 @@ pub async fn spawn_consumer(
                             ev,
                             stall_window,
                             codex_permit_slots,
+                            process_groups.clone(),
                         );
                     }
                 }
@@ -154,6 +157,7 @@ pub async fn spawn_consumer(
                         &framework_child_log_dir,
                         stall_window,
                         codex_permit_slots,
+                        process_groups.clone(),
                         &complete_tx,
                         &mut running,
                     );
@@ -173,6 +177,7 @@ pub async fn spawn_consumer(
                         &framework_child_log_dir,
                         stall_window,
                         codex_permit_slots,
+                        process_groups.clone(),
                         &complete_tx,
                         &mut running,
                     );
@@ -226,6 +231,7 @@ fn spawn_ephemeral(
     event: Event,
     stall_window: Duration,
     codex_permit_slots: usize,
+    process_groups: ProcessGroupRegistry,
 ) {
     let args = match spawn_args(
         decl,
@@ -236,6 +242,7 @@ fn spawn_ephemeral(
         event,
         stall_window,
         codex_permit_slots,
+        process_groups,
     ) {
         Ok(args) => args,
         Err(err) => {
@@ -277,6 +284,7 @@ fn dispatch_due(
     log_dir: &std::path::Path,
     stall_window: Duration,
     codex_permit_slots: usize,
+    process_groups: ProcessGroupRegistry,
     complete_tx: &mpsc::Sender<CompletedDelivery>,
     running: &mut BTreeMap<String, RunningDelivery>,
 ) {
@@ -312,6 +320,7 @@ fn dispatch_due(
             event_from_record(&record),
             stall_window,
             codex_permit_slots,
+            process_groups.clone(),
         ) {
             Ok(args) => args,
             Err(err) => {
@@ -658,6 +667,7 @@ fn spawn_args(
     event: Event,
     stall_window: Duration,
     codex_permit_slots: usize,
+    process_groups: ProcessGroupRegistry,
 ) -> anyhow::Result<SpawnArgs> {
     Ok(SpawnArgs {
         framework_bin: framework_binary.to_path_buf(),
@@ -673,6 +683,7 @@ fn spawn_args(
         codex_permit_slots,
         log_dir: log_dir.to_path_buf(),
         owner_namespace: decl.owner_namespace.clone(),
+        process_groups,
     })
 }
 
@@ -686,6 +697,7 @@ struct SpawnArgs {
     codex_permit_slots: usize,
     log_dir: PathBuf,
     owner_namespace: String,
+    process_groups: ProcessGroupRegistry,
 }
 
 async fn spawn_and_report(dept_name: &str, args: &SpawnArgs) -> anyhow::Result<SpawnResult> {
@@ -699,6 +711,7 @@ async fn spawn_and_report(dept_name: &str, args: &SpawnArgs) -> anyhow::Result<S
         args.codex_permit_slots,
         dept_name,
         &args.log_dir,
+        args.process_groups.clone(),
     )
     .await?;
 
@@ -959,6 +972,7 @@ mod tests {
             Event::new("github-devloop.tick", serde_json::json!({})),
             Duration::from_secs(30),
             1,
+            ProcessGroupRegistry::default(),
         )
         .unwrap();
 
@@ -993,6 +1007,7 @@ mod tests {
             Event::new("tick", serde_json::json!({})),
             Duration::from_secs(30),
             1,
+            ProcessGroupRegistry::default(),
         )
         .unwrap();
 

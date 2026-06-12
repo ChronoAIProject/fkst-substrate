@@ -59,6 +59,7 @@ pub fn register(
     lua.globals().set(
         "raise",
         lua.create_function(move |lua, (queue, payload): (String, mlua::Value)| {
+            crate::process_tree::ensure_supervisor_parent_alive()?;
             let queue = resolver
                 .resolve(&owner_namespace, &queue)
                 .map_err(mlua::Error::external)?;

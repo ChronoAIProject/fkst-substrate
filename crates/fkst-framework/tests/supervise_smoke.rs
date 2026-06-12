@@ -7,6 +7,8 @@ use std::time::{Duration, Instant};
 mod sdk_codex {
     pub const CODEX_PERMIT_SLOTS_ENV: &str = "FKST_CODEX_PERMIT_SLOTS";
 }
+#[path = "../src/process_tree.rs"]
+mod process_tree;
 #[path = "../src/supervise/spawner.rs"]
 mod spawner;
 mod support;
@@ -87,6 +89,19 @@ fn wait_for_file_containing(path: &Path, needle: &str, timeout: Duration) -> Opt
         }
         if Instant::now() >= deadline {
             return None;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
+fn wait_for_process_exit(pid: i32, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None).is_err() {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
         }
         std::thread::sleep(Duration::from_millis(25));
     }
@@ -259,6 +274,100 @@ return M
 }
 
 #[test]
+fn supervise_sigterm_terminates_department_process_tree() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let ready = root.join("ready.txt");
+    let dept_pid = root.join("dept.pid");
+    let descendant_pid = root.join("descendant.pid");
+    fs::create_dir_all(root.join("departments/sleeper")).unwrap();
+    fs::create_dir_all(root.join("raisers")).unwrap();
+    write_fkst_env(root);
+    fs::write(root.join("input.txt"), "ready").unwrap();
+    fs::write(
+        root.join("raisers/input.lua"),
+        format!(
+            r#"return {{ type = "file_watch", glob = {}, produces = "input" }}"#,
+            lua_string(&root.join("input.txt"))
+        ),
+    )
+    .unwrap();
+    fs::write(
+        root.join("departments/sleeper/main.lua"),
+        format!(
+            r#"
+local M = {{}}
+M.spec = {{
+  consumes = {{ "input" }},
+  ephemeral = {{ "input" }},
+  stall_window = "30s",
+}}
+function pipeline(event)
+  local shell = [[
+printf '%s\n' $$ > {}
+(sleep 60) &
+printf '%s\n' $! > {}
+printf ready > {}
+sleep 60
+]]
+  exec_sync({{ cmd = shell, timeout = 120 }})
+end
+return M
+"#,
+            lua_string(&dept_pid),
+            lua_string(&descendant_pid),
+            lua_string(&ready)
+        ),
+    )
+    .unwrap();
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_fkst-framework"))
+        .current_dir(root)
+        .arg("supervise")
+        .arg("--project-root")
+        .arg(root)
+        .arg("--package-root")
+        .arg(root)
+        .arg("--framework-bin")
+        .arg(env!("CARGO_BIN_EXE_fkst-framework"))
+        .env("FKST_RUNTIME_ROOT", root.join(".fkst/runtime"))
+        .env("FKST_DURABLE_ROOT", root.join(".fkst/durable"))
+        .spawn()
+        .unwrap();
+
+    wait_for_file_containing(&ready, "ready", Duration::from_secs(10)).unwrap_or_else(|| {
+        let _ = child.kill();
+        panic!("timed out waiting for {}", ready.display());
+    });
+    let dept_pid: i32 = fs::read_to_string(&dept_pid)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    let descendant_pid: i32 = fs::read_to_string(&descendant_pid)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+
+    nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(child.id() as i32),
+        nix::sys::signal::Signal::SIGTERM,
+    )
+    .unwrap();
+    let status = child.wait().unwrap();
+    assert!(status.success(), "status={status}");
+    assert!(
+        wait_for_process_exit(dept_pid, Duration::from_secs(5)),
+        "department process survived supervise SIGTERM"
+    );
+    assert!(
+        wait_for_process_exit(descendant_pid, Duration::from_secs(5)),
+        "department descendant survived supervise SIGTERM"
+    );
+}
+
+#[test]
 fn supervise_delivers_cross_package_raise_from_composed_child() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path();
@@ -374,6 +483,7 @@ async fn spawn_framework_passes_codex_permit_slots_env() {
         7,
         "permit",
         &logs,
+        process_tree::ProcessGroupRegistry::default(),
     )
     .await
     .unwrap();
@@ -400,6 +510,7 @@ async fn framework_child_log_records_final_metadata_for_exit_modes() {
         20,
         "success",
         &logs,
+        process_tree::ProcessGroupRegistry::default(),
     )
     .await
     .unwrap();
@@ -426,6 +537,7 @@ async fn framework_child_log_records_final_metadata_for_exit_modes() {
         20,
         "nonzero-meta",
         &logs,
+        process_tree::ProcessGroupRegistry::default(),
     )
     .await
     .unwrap();
@@ -450,6 +562,7 @@ async fn framework_child_log_records_final_metadata_for_exit_modes() {
         20,
         "silent-meta",
         &logs,
+        process_tree::ProcessGroupRegistry::default(),
     )
     .await
     .unwrap();
@@ -488,6 +601,7 @@ async fn framework_child_log_failure_preserves_spawn_result() {
         20,
         "blocked",
         &blocked_log_path,
+        process_tree::ProcessGroupRegistry::default(),
     )
     .await
     .unwrap();
