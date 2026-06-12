@@ -98,6 +98,10 @@ fn wait_for_process_exit(pid: i32, timeout: Duration) -> bool {
     }
 }
 
+fn process_exists(pid: i32) -> bool {
+    nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None).is_ok()
+}
+
 #[test]
 fn supervise_dispatches_file_watch_event_to_department() {
     let tmp = tempfile::tempdir().unwrap();
@@ -165,6 +169,113 @@ return M
     assert!(
         !root.join(".fkst/runtime/codex-permits").exists(),
         "supervise should not create codex permits"
+    );
+}
+
+#[test]
+fn supervise_survives_launcher_parent_exit() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let input_dir = root.join("input");
+    let fact = root.join("seen.txt");
+    let supervise_pid = root.join("supervise.pid");
+    let launcher = root.join("launch-supervise.sh");
+    fs::create_dir_all(root.join("departments/recorder")).unwrap();
+    fs::create_dir_all(root.join("raisers")).unwrap();
+    fs::create_dir_all(&input_dir).unwrap();
+    write_fkst_env(root);
+    fs::write(
+        root.join("departments/recorder/main.lua"),
+        format!(
+            r#"
+local M = {{}}
+M.spec = {{
+  consumes = {{ "files" }},
+  ephemeral = {{ "files" }},
+  stall_window = "5s",
+}}
+function pipeline(event)
+  local f = assert(io.open({}, "w"))
+  f:write(event.payload.path or "")
+  f:close()
+end
+return M
+"#,
+            lua_string(&fact)
+        ),
+    )
+    .unwrap();
+    fs::write(
+        root.join("raisers/files.lua"),
+        format!(
+            r#"return {{ type = "file_watch", glob = {}, produces = "files" }}"#,
+            lua_string(&input_dir.join("*.txt"))
+        ),
+    )
+    .unwrap();
+    write_executable(
+        &launcher,
+        &format!(
+            r#"#!/bin/sh
+"{}" supervise \
+  --project-root "{}" \
+  --package-root "{}" \
+  --framework-bin "{}" \
+  > "{}" 2> "{}" &
+printf '%s\n' "$!" > "{}"
+exit 0
+"#,
+            env!("CARGO_BIN_EXE_fkst-framework"),
+            root.display(),
+            root.display(),
+            env!("CARGO_BIN_EXE_fkst-framework"),
+            root.join("supervise.stdout").display(),
+            root.join("supervise.stderr").display(),
+            supervise_pid.display()
+        ),
+    );
+
+    let status = Command::new(&launcher)
+        .current_dir(root)
+        .env("FKST_RUNTIME_ROOT", root.join(".fkst/runtime"))
+        .env("FKST_DURABLE_ROOT", root.join(".fkst/durable"))
+        .status()
+        .unwrap();
+    assert!(status.success(), "launcher status={status}");
+    let pid: i32 = wait_for_file_containing(&supervise_pid, "\n", Duration::from_secs(5))
+        .unwrap_or_else(|| panic!("timed out waiting for {}", supervise_pid.display()))
+        .trim()
+        .parse()
+        .unwrap();
+
+    std::thread::sleep(Duration::from_secs(2));
+    assert!(
+        process_exists(pid),
+        "supervise exited after launcher parent exit"
+    );
+    fs::write(input_dir.join("after-parent-exit.txt"), "ready").unwrap();
+    let body = wait_for_file_containing(&fact, "after-parent-exit.txt", Duration::from_secs(10))
+        .unwrap_or_else(|| {
+            let _ = nix::sys::signal::kill(
+                nix::unistd::Pid::from_raw(pid),
+                nix::sys::signal::Signal::SIGTERM,
+            );
+            panic!("timed out waiting for {}", fact.display());
+        });
+    assert!(body.contains("after-parent-exit.txt"), "body={body}");
+    assert!(
+        process_exists(pid),
+        "supervise exited before explicit signal"
+    );
+
+    nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(pid),
+        nix::sys::signal::Signal::SIGTERM,
+    )
+    .unwrap();
+    assert!(
+        wait_for_process_exit(pid, Duration::from_secs(5)),
+        "supervise process survived cleanup SIGTERM"
     );
 }
 
