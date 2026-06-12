@@ -34,6 +34,15 @@ fn copy_codex_package(host: &Path) {
     copy_dir(&repo_root().join("examples/codex-package"), host);
 }
 
+fn write_persistence_decl(root: &Path) {
+    fs::create_dir_all(root.join("fkst")).unwrap();
+    fs::write(
+        root.join("fkst/persistence.lua"),
+        r#"return { persistence_class = "stateless_adapter" }"#,
+    )
+    .unwrap();
+}
+
 fn run_lua_tests(host: &Path, package: &Path) -> Output {
     Command::new(framework_bin())
         .arg("test")
@@ -289,6 +298,9 @@ fn graph_json_returns_stable_composed_topology_snapshot() {
     fs::create_dir_all(alpha.join("raisers")).unwrap();
     fs::create_dir_all(beta.join("departments/consumer")).unwrap();
     fs::create_dir_all(&host).unwrap();
+    write_persistence_decl(&host);
+    write_persistence_decl(&alpha);
+    write_persistence_decl(&beta);
     fs::write(
         host.join("fkst.env"),
         "FKST_QUEUE_CAPACITY=8\nFKST_DEPARTMENT_DEFAULT_STALL_WINDOW=45s\nFKST_CODEX_PERMIT_SLOTS=3\nFKST_RETRY_DEFAULT_MAX_ATTEMPTS=5\nFKST_RETRY_DEFAULT_BASE=2s\nFKST_RETRY_DEFAULT_CAP=20s\n",

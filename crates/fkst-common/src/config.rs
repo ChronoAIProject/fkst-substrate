@@ -9,6 +9,8 @@ pub struct Config {
     // BTreeMap keeps queue/raiser/department iteration order deterministic
     // (startup validation, logs, spawn order) instead of HashMap random order.
     #[serde(default)]
+    pub package: BTreeMap<String, PackageDecl>,
+    #[serde(default)]
     pub queue: BTreeMap<String, QueueDecl>,
     #[serde(default)]
     pub raiser: BTreeMap<String, RaiserDecl>,
@@ -63,4 +65,59 @@ pub struct RetryDecl {
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 pub struct LimitsDecl {
     pub global_codex_processes: usize,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct PackageDecl {
+    pub persistence_class: PersistenceClass,
+    #[serde(default)]
+    pub states: Vec<String>,
+    #[serde(default)]
+    pub terminal_states: Vec<String>,
+    #[serde(default)]
+    pub transitions: Vec<SagaTransitionDecl>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum PersistenceClass {
+    Saga,
+    StatelessAdapter,
+    JudgmentPipeline,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct SagaTransitionDecl {
+    pub from: String,
+    pub to: String,
+    pub queue: String,
+    pub dedup: String,
+    #[serde(default)]
+    pub payload_fields: BTreeMap<String, String>,
+    #[serde(default)]
+    pub required_facts: Vec<SagaRequiredFactDecl>,
+    pub effect: SagaEffectDecl,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct SagaRequiredFactDecl {
+    pub name: String,
+    pub freshness: SagaFactFreshness,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum SagaFactFreshness {
+    Current,
+    Snapshot,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct SagaEffectDecl {
+    pub intent: String,
+    pub completeness: String,
 }

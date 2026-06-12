@@ -10,7 +10,9 @@
 //! Host graph defaults are read before graph materialization.
 
 use anyhow::{anyhow, bail, Context, Result};
-use fkst_common::config::{Config, DepartmentDecl, LimitsDecl, QueueDecl, RaiserDecl, RetryDecl};
+use fkst_common::config::{
+    Config, DepartmentDecl, LimitsDecl, PackageDecl, QueueDecl, RaiserDecl, RetryDecl,
+};
 use mlua::{Lua, LuaSerdeExt, Table, Value as LuaValue};
 use serde::Deserialize;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -131,6 +133,7 @@ pub fn load_roots(roots: &PackageRoots) -> Result<Config> {
     let subscribe_resolver = resolver.clone().add_recorded_only_queue(FAILURE_FACT_QUEUE);
     let mut departments: BTreeMap<String, DepartmentDecl> = BTreeMap::new();
     let mut raisers: BTreeMap<String, RaiserDecl> = BTreeMap::new();
+    let mut packages: BTreeMap<String, PackageDecl> = BTreeMap::new();
     let mut department_fanout: HashMap<String, Vec<String>> = HashMap::new();
 
     for graph_root in &graph_roots {
@@ -138,6 +141,7 @@ pub fn load_roots(roots: &PackageRoots) -> Result<Config> {
         register_spec_eval_pure_primitives(&lua, &graph_root.root)
             .context("register graph-scan pure primitives")?;
         let require_roots = roots.require_roots_for_owner(&graph_root.root);
+        scan_package_decl(&lua, graph_root, &require_roots, &resolver, &mut packages)?;
         scan_departments(
             &lua,
             graph_root,
@@ -154,6 +158,7 @@ pub fn load_roots(roots: &PackageRoots) -> Result<Config> {
     let queues = derive_queues(&departments, &raisers, &department_fanout, &defaults)?;
 
     Ok(Config {
+        package: packages,
         queue: queues,
         raiser: raisers,
         department: departments,
@@ -168,6 +173,55 @@ fn reject_removed_surfaces(graph_root: &GraphRoot) -> Result<()> {
         bail!(
             "{} is a removed graph surface; use departments/<dept>/main.lua M.spec.fanout",
             graph_root.root.join("package.lua").display()
+        );
+    }
+    Ok(())
+}
+
+fn scan_package_decl(
+    lua: &Lua,
+    graph_root: &GraphRoot,
+    require_roots: &[PathBuf],
+    resolver: &NameResolver,
+    packages: &mut BTreeMap<String, PackageDecl>,
+) -> Result<()> {
+    let path = graph_root.root.join("fkst/persistence.lua");
+    if !path.is_file() {
+        bail!(
+            "package `{}` missing `fkst/persistence.lua` persistence declaration",
+            graph_root.namespace
+        );
+    }
+
+    let val = eval_lua_value(lua, require_roots, &path).with_context(|| {
+        format!(
+            "eval package persistence declaration `{}` from {}",
+            graph_root.namespace,
+            path.display()
+        )
+    })?;
+    let package: PackageDecl = lua.from_value(val).with_context(|| {
+        format!(
+            "parse package persistence declaration `{}` from {}",
+            graph_root.namespace,
+            path.display()
+        )
+    })?;
+    let package =
+        resolve_package_decl(resolver, &graph_root.namespace, package).with_context(|| {
+            format!(
+                "resolve package persistence declaration `{}`",
+                graph_root.namespace
+            )
+        })?;
+    if packages
+        .insert(graph_root.namespace.clone(), package)
+        .is_some()
+    {
+        bail!(
+            "duplicate package persistence declaration for `{}` at {}",
+            graph_root.namespace,
+            path.display()
         );
     }
     Ok(())
@@ -409,6 +463,17 @@ fn resolve_raiser(
             produces: resolver.resolve(owner_namespace, &produces)?,
         }),
     }
+}
+
+fn resolve_package_decl(
+    resolver: &NameResolver,
+    owner_namespace: &str,
+    mut package: PackageDecl,
+) -> Result<PackageDecl> {
+    for transition in &mut package.transitions {
+        transition.queue = resolver.resolve(owner_namespace, &transition.queue)?;
+    }
+    Ok(package)
 }
 
 fn derive_queues(

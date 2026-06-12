@@ -1,6 +1,9 @@
 // crate-level integration tests own behavior coverage while runtime modules keep runtime code.
 
-use fkst_common::config::{Config, DepartmentDecl, LimitsDecl, QueueDecl, RaiserDecl, RetryDecl};
+use fkst_common::config::{
+    Config, DepartmentDecl, LimitsDecl, PackageDecl, PersistenceClass, QueueDecl, RaiserDecl,
+    RetryDecl,
+};
 use fkst_common::validation::{validate, validate_runtime_key};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -45,6 +48,7 @@ fn cfg_minimal(lua_file: &Path) -> Config {
         },
     );
     Config {
+        package: package_map(["pkg"]),
         queue,
         raiser,
         department,
@@ -52,6 +56,25 @@ fn cfg_minimal(lua_file: &Path) -> Config {
             global_codex_processes: 1,
         },
     }
+}
+
+fn package_map(
+    namespaces: impl IntoIterator<Item = &'static str>,
+) -> BTreeMap<String, PackageDecl> {
+    namespaces
+        .into_iter()
+        .map(|namespace| {
+            (
+                namespace.to_string(),
+                PackageDecl {
+                    persistence_class: PersistenceClass::StatelessAdapter,
+                    states: Vec::new(),
+                    terminal_states: Vec::new(),
+                    transitions: Vec::new(),
+                },
+            )
+        })
+        .collect()
 }
 
 fn add_queue(cfg: &mut Config, name: &str) {

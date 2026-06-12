@@ -8,12 +8,12 @@ mod graph_scan;
 mod path_resolver;
 #[path = "../src/rate_pool.rs"]
 mod rate_pool;
-#[path = "../src/sdk_strings.rs"]
-mod sdk_strings;
-#[path = "../src/sdk_log.rs"]
-mod sdk_log;
 #[path = "../src/sdk_i18n.rs"]
 mod sdk_i18n;
+#[path = "../src/sdk_log.rs"]
+mod sdk_log;
+#[path = "../src/sdk_strings.rs"]
+mod sdk_strings;
 
 use fkst_common::config::RaiserDecl;
 use fkst_common::validation::validate;
@@ -115,9 +115,24 @@ fn write_host_defaults(root: &std::path::Path, queue: &str, stall_window: &str, 
     .unwrap();
 }
 
+fn write_persistence_decl(root: &std::path::Path, class: &str) {
+    fs::create_dir_all(root.join("fkst")).unwrap();
+    fs::write(
+        root.join("fkst/persistence.lua"),
+        format!(r#"return {{ persistence_class = "{}" }}"#, class),
+    )
+    .unwrap();
+}
+
+fn write_persistence_source(root: &std::path::Path, source: &str) {
+    fs::create_dir_all(root.join("fkst")).unwrap();
+    fs::write(root.join("fkst/persistence.lua"), source).unwrap();
+}
+
 fn write_repo(depts: &[(&str, &str)], raisers: &[(&str, &str)]) -> TempDir {
     let dir = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
     write_host_defaults(dir.path(), "100\n", "30m\n", "20\n");
+    write_persistence_decl(dir.path(), "stateless_adapter");
     let depts_root = dir.path().join("departments");
     for (name, content) in depts {
         let d = depts_root.join(name);
@@ -130,6 +145,96 @@ fn write_repo(depts: &[(&str, &str)], raisers: &[(&str, &str)]) -> TempDir {
         fs::write(raisers_root.join(format!("{}.lua", name)), content).unwrap();
     }
     dir
+}
+
+#[test]
+fn graph_scan_validates_saga_transition_table() {
+    let dir = write_repo(
+        &[(
+            "worker",
+            r#"
+local M = {}
+M.spec = { consumes = {"tick"}, produces = {"done"}, stall_window = "30s" }
+function pipeline(_) end
+return M
+"#,
+        )],
+        &[(
+            "cron_a",
+            r#"return { type = "cron", interval = "10s", produces = "tick" }"#,
+        )],
+    );
+    write_persistence_source(
+        dir.path(),
+        r#"
+return {
+  persistence_class = "saga",
+  states = {"open", "complete"},
+  terminal_states = {"complete"},
+  transitions = {
+    {
+      from = "open",
+      to = "complete",
+      queue = "tick",
+      dedup = "source_ref.ref",
+      payload_fields = { id = "source_ref.ref", marker = "marker.id" },
+      required_facts = { { name = "marker_stream", freshness = "current" } },
+      effect = { intent = "emit_done", completeness = "complete" },
+    },
+  },
+}
+"#,
+    );
+
+    let cfg = load(dir.path()).unwrap();
+    validate(&cfg, dir.path()).unwrap();
+    assert_eq!(cfg.package[&ns(dir.path())].transitions[0].queue, "tick");
+}
+
+#[test]
+fn graph_scan_rejects_broken_saga_payload_field_reference() {
+    let dir = write_repo(
+        &[(
+            "worker",
+            r#"
+local M = {}
+M.spec = { consumes = {"tick"}, stall_window = "30s" }
+function pipeline(_) end
+return M
+"#,
+        )],
+        &[(
+            "cron_a",
+            r#"return { type = "cron", interval = "10s", produces = "tick" }"#,
+        )],
+    );
+    write_persistence_source(
+        dir.path(),
+        r#"
+return {
+  persistence_class = "saga",
+  states = {"open", "complete"},
+  terminal_states = {"complete"},
+  transitions = {
+    {
+      from = "open",
+      to = "complete",
+      queue = "tick",
+      dedup = "source_ref.ref",
+      payload_fields = { id = "payload.id" },
+      required_facts = { { name = "marker_stream", freshness = "current" } },
+      effect = { intent = "emit_done", completeness = "complete" },
+    },
+  },
+}
+"#,
+    );
+
+    let cfg = load(dir.path()).unwrap();
+    let err = validate(&cfg, dir.path()).unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.contains("saga-payload-field-reference"), "got: {msg}");
+    assert!(msg.contains("payload.id"), "got: {msg}");
 }
 
 fn ns(root: &std::path::Path) -> String {
@@ -463,6 +568,7 @@ fn host_graph_defaults_use_operational_defaults_when_env_and_fkst_env_are_absent
     let _retry_base = EnvGuard::unset(RETRY_DEFAULT_BASE_ENV);
     let _retry_cap = EnvGuard::unset(RETRY_DEFAULT_CAP_ENV);
     let dir = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
+    write_persistence_decl(dir.path(), "stateless_adapter");
     let depts_root = dir.path().join("departments");
     fs::create_dir_all(depts_root.join("hello")).unwrap();
     fs::write(
@@ -653,6 +759,7 @@ fn operational_defaults_ignore_removed_txt_files() {
     fs::create_dir_all(dir.path().join("raisers")).unwrap();
     fs::create_dir_all(dir.path().join("tunables")).unwrap();
     fs::write(dir.path().join("tunables/queue_capacity.txt"), "99\n").unwrap();
+    write_persistence_decl(dir.path(), "stateless_adapter");
     fs::write(
         dir.path()
             .join("tunables/department_default_stall_window.txt"),
@@ -1235,6 +1342,7 @@ fn package_basename_host_with_independent_host_fails_closed() {
 fn folded_single_package_same_namespace_qualified_queue_stays_flat() {
     let dir = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
     write_host_defaults(dir.path(), "100\n", "30m\n", "20\n");
+    write_persistence_decl(dir.path(), "stateless_adapter");
     let namespace = ns(dir.path());
     let dept_dir = dir.path().join("departments/hello");
     fs::create_dir_all(&dept_dir).unwrap();
@@ -1393,6 +1501,7 @@ fn runtime_file_watch_glob_is_removed_surface() {
 fn skips_dept_without_main_lua() {
     let dir = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
     write_host_defaults(dir.path(), "100\n", "30m\n", "20\n");
+    write_persistence_decl(dir.path(), "stateless_adapter");
     fs::create_dir_all(dir.path().join("departments/empty")).unwrap();
     let cfg = load(dir.path()).unwrap();
     assert!(cfg.department.is_empty());

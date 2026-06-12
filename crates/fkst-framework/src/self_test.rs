@@ -1,7 +1,9 @@
 //! Framework-local startup self-test.
 
 use anyhow::{Context, Result};
-use fkst_common::config::{Config, DepartmentDecl, LimitsDecl, QueueDecl, RaiserDecl};
+use fkst_common::config::{
+    Config, DepartmentDecl, LimitsDecl, PackageDecl, PersistenceClass, QueueDecl, RaiserDecl,
+};
 use fkst_common::validation::validate;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -119,6 +121,16 @@ fn minimal_config(lua_rel: PathBuf, owner_root: &std::path::Path) -> Config {
     );
 
     Config {
+        package: [(
+            "pkg".to_string(),
+            PackageDecl {
+                persistence_class: PersistenceClass::StatelessAdapter,
+                states: Vec::new(),
+                terminal_states: Vec::new(),
+                transitions: Vec::new(),
+            },
+        )]
+        .into(),
         queue,
         raiser,
         department,

@@ -18,6 +18,8 @@
 ├── locales/
 │   ├── en.lua
 │   └── <locale>.lua
+├── fkst/
+│   └── persistence.lua
 ├── raisers/
 │   └── <raiser>.lua
 └── tests/
@@ -29,6 +31,37 @@
 flat package 指 `package-root == host-root` 且只有一个 graph root；它保持 LegacyFlat：裸 queue 名、`Event.queue`、`RAISED`、delivery id 和 `source_ref` 字节仍是裸名。composed packages 指多个 package root 与 host root 组合成一张 composed graph；此时 package root basename 是 namespace，裸 queue 名按 owner namespace 归一化为 `<pkg>.<queue>` 或 `host.<queue>`，跨包消费必须显式写 `pkg.queue`。详见 `SPEC.md` 的“身份边界 / SDK surface”和 `docs/architecture.md` §4。
 
 `composed.deps` 不是当前引擎 surface。当前仓库没有任何源码读取 `composed.deps`；如果 package-repo 使用这个文件，它只能是外部 test assembly / wrapper convention，用来决定给 `--package-root` 传哪些目录，不是依赖解析、版本解析、override、order 或跨包 `require` 机制。
+
+Each graph root MUST declare `fkst/persistence.lua`. The file returns a static Lua table:
+
+```lua
+return { persistence_class = "stateless_adapter" }
+```
+
+Allowed `persistence_class` values are `saga`, `stateless_adapter`, and `judgment_pipeline`. Non-saga classes must not declare saga `states`, `terminal_states`, or `transitions`.
+
+Saga packages declare a static transition table:
+
+```lua
+return {
+  persistence_class = "saga",
+  states = {"open", "complete"},
+  terminal_states = {"complete"},
+  transitions = {
+    {
+      from = "open",
+      to = "complete",
+      queue = "tick",
+      dedup = "source_ref.ref",
+      payload_fields = { id = "source_ref.ref" },
+      required_facts = { { name = "marker_stream", freshness = "current" } },
+      effect = { intent = "consume_tick", completeness = "complete" },
+    },
+  },
+}
+```
+
+Engine graph-scan parses this declaration with the same owner-scoped `package.path` as Department spec evaluation. `schema-validation` requires every non-terminal state to have at least one outgoing transition, requires every transition queue to exist in the composed graph and have a consumer, and accepts `payload_fields` references only from `marker.<field>` or `source_ref.<field>`. It does not execute replay, persist workflow state, or create a second progress log. 中文补充：这是启动期静态契约校验，不是 workflow engine。
 
 ## 2. 固定 Lua SDK surface
 
@@ -190,7 +223,7 @@ Pool ledgers live under `FKST_RATE_POOL_ROOT`, default `~/.fkst/rate-pools`. Thi
 
 ```text
 fkst-framework --self-test
-fkst-framework conformance --project-root <path> [--package-root <path> ...]
+fkst-framework conformance --project-root <path> [--package-root <path> ...] [--report-json <path>]
 fkst-framework test --project-root <path> [--package-root <path> ...] [--report-json <path>]
 fkst-framework run <lua> --project-root <path> --package-root <path> [--package-root <path> ...] [--owner-namespace <id>] --event <json>
 fkst-framework supervise --project-root <path> --framework-bin <path> [--package-root <path> ...]
@@ -198,7 +231,7 @@ fkst-framework config --project-root <path> [--package-root <path> ...]
 fkst-framework init-package-repo [--ref <substrate-ref>] [--force]
 ```
 
-`--self-test` 运行引擎自检。`conformance` 支持 flat single-root 与 composed multi-root，通过 `--project-root` 和可重复 `--package-root` 形成 host + package graph。`test` 发现 `<ROOT>/departments/*/*_test.lua` 与 `<ROOT>/tests/*_test.lua`；`--report-json <path>` 写 schema 为 `fkst.test.report.v1` 的机器报告，条目身份是 `owner_namespace`、`file`、`name`。stdout 的 `PASS` / `FAIL` / summary 行只是 human / compatibility surface，不是 authoritative inventory。
+`--self-test` 运行引擎自检。`conformance` 支持 flat single-root 与 composed multi-root，通过 `--project-root` 和可重复 `--package-root` 形成 host + package graph；`conformance --report-json <path>` writes `fkst.conformance.report.v1` with check results plus per-package `persistence_class` and transition coverage. `test` 发现 `<ROOT>/departments/*/*_test.lua` 与 `<ROOT>/tests/*_test.lua`；`test --report-json <path>` 写 schema 为 `fkst.test.report.v1` 的机器报告，条目身份是 `owner_namespace`、`file`、`name`。stdout 的 `PASS` / `FAIL` / summary 行只是 human / compatibility surface，不是 authoritative inventory。
 
 `run` 执行一个 Lua entrypoint。无 `--owner-namespace` 时，只在单一 package root 可唯一确定 owner namespace 的情况下默认；多个 `--package-root` 时必须传 `--owner-namespace <id>`。当前 `run` 明确拒绝 `FKST_PACKAGE_ROOTS` env；应通过可重复 `--package-root` 传 composed namespace catalog。
 
@@ -219,11 +252,11 @@ department-non-empty
 schema-validation
 ```
 
-`graph-scan` 会执行 package root / host root 扫描、`package.lua` removed surface 拒绝、`M.spec` unknown fields 拒绝、`retry` 解析、namespace 解析、queue 归一化和 owner-scoped `package.path`。每个 graph root 用 fresh Lua state，package owner 只看自己的 root；host owner 可看 host + packages；`--package-root` 不是跨包 `require` 授权。
+`graph-scan` 会执行 package root / host root 扫描、`package.lua` removed surface 拒绝、`fkst/persistence.lua` persistence class declaration parsing、`M.spec` unknown fields 拒绝、`retry` 解析、namespace 解析、queue 归一化和 owner-scoped `package.path`。每个 graph root 用 fresh Lua state，package owner 只看自己的 root；host owner 可看 host + packages；`--package-root` 不是跨包 `require` 授权。
 
 `locale-catalogs` validates each graph root's `locales/` directory when present. It requires `en.lua` as the reference if any locale catalog exists, requires every non-`en` catalog to cover all `en` keys, and rejects decode-helper-hidden literals or machine protocol tokens in catalogs.
 
-`schema-validation` 会检查 queue capacity、raiser / department queue 引用、Department lua 文件存在、`ephemeral` 必须属于 `consumes`、`stall_window` 后缀、`retry` 数值与 duration、孤立 queue、多消费者 fanout、同 Department consume+produce 同 queue 必须 fanout，以及“只消费 ephemeral queue 的 Department 不能 produce 到 reliable downstream”这一 reliable `source_ref` 传播规则。
+`schema-validation` 会检查 queue capacity、raiser / department queue 引用、Department lua 文件存在、`ephemeral` 必须属于 `consumes`、`stall_window` 后缀、`retry` 数值与 duration、孤立 queue、多消费者 fanout、同 Department consume+produce 同 queue 必须 fanout、package persistence class / saga transition table，以及“只消费 ephemeral queue 的 Department 不能 produce 到 reliable downstream”这一 reliable `source_ref` 传播规则。
 
 需要特别澄清：当前 `host_conformance.rs` 没有名为 fixed-SDK-surface 的独立 check。固定 SDK surface 由 `SPEC.md` 锚定，并由 `--self-test` / Rust tests 覆盖；package-repo 的 release gate 应同时跑 `fkst-framework --self-test`、`fkst-framework test` 和 `fkst-framework conformance`。
 
@@ -240,6 +273,11 @@ schema-validation
 | `package.lua`、`FKST_STDLIB_ROOT`、`FKST_RUNTIME_PACKAGE_ROOT`、`FKST_GRAPH_ROOTS` removed surface | engine graph scan / path resolver |
 | owner-scoped `package.path` 与 package-root require isolation | engine graph scan / run / test-mode runner |
 | `M.spec` unknown fields 拒绝 | engine graph scan |
+| `fkst/persistence.lua` missing / unknown `persistence_class` 拒绝 | engine graph scan / schema validation |
+| non-saga package must not declare saga obligations | engine schema validation |
+| saga transition table covers all non-terminal states | engine schema validation |
+| saga transition queue exists in graph and has a consumer | engine schema validation |
+| saga `payload_fields` references only `marker.<field>` / `source_ref.<field>` | engine schema validation |
 | `M.spec.consumes` / `produces` / `fanout` queue 解析 | engine graph scan |
 | `M.spec.ephemeral` 必须引用 consumed queue | engine schema validation |
 | `M.spec.retry` 只能 nil / false / table，`retry=true` 拒绝 | engine graph scan |
@@ -260,6 +298,7 @@ schema-validation
 | `locales/*.lua` completeness, no decode-helper-hidden literals, no machine tokens | engine conformance `locale-catalogs` |
 | `fkst.test.*` 不泄漏到 production | engine test-mode registration + Rust tests |
 | machine test inventory 只能来自 `--report-json` 的 `fkst.test.report.v1` | engine test runner |
+| conformance machine report uses `fkst.conformance.report.v1` and includes package persistence classes / transition coverage | engine host conformance |
 | stdout `PASS` lines 不作为 authoritative inventory | doctrine + test runner contract |
 | no lifecycle hooks / no shared memory / same pipeline run independent | engine process model + doctrine |
 | cross-pipeline truth 只来自 git / external source / explicit host fact | doctrine-only；review 与 package tests |

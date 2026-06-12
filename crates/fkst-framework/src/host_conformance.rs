@@ -1,12 +1,16 @@
 use crate::path_resolver::PackageRoots;
 use crate::supervise;
 use anyhow::{Context, Result};
+use fkst_common::config::{Config, PersistenceClass};
 use fkst_common::runtime_layout::RUNTIME_ROOT_ENV;
 use fkst_common::validation::validate;
 use fkst_common::RuntimeKind;
+use serde::Serialize;
+use std::path::{Path, PathBuf};
 
 pub(crate) struct HostConformanceOptions {
     pub(crate) roots: PackageRoots,
+    pub(crate) report_json: Option<PathBuf>,
 }
 
 pub(crate) struct HostConformanceSuite {
@@ -31,6 +35,7 @@ impl HostConformanceSuite {
 
     pub(crate) fn run(&self) -> Result<i32> {
         let mut checks = Vec::new();
+        let mut graph_config = None;
 
         checks.push(self.check_runtime_layout());
         checks.push(self.check_project_layout());
@@ -50,6 +55,7 @@ impl HostConformanceSuite {
                 ));
                 checks.push(self.check_department_non_empty(cfg));
                 checks.push(self.check_schema_validation(cfg));
+                graph_config = Some(cfg.clone());
                 true
             }
             Err(err) => {
@@ -73,11 +79,16 @@ impl HostConformanceSuite {
         }
 
         let mut failed = false;
-        for check in checks {
+        for check in &checks {
             if matches!(check.status, CheckStatus::Fail) {
                 failed = true;
             }
             check.print();
+        }
+
+        if let Some(path) = &self.options.report_json {
+            let report = ConformanceReport::from_checks(&checks, graph_config.as_ref());
+            write_report_json(path, &report)?;
         }
 
         Ok(if failed { 1 } else { 0 })
@@ -218,6 +229,111 @@ impl HostCheck {
         };
         println!("{status} {} {}", self.id, self.message);
     }
+}
+
+#[derive(Debug, Serialize)]
+struct ConformanceReport {
+    schema: &'static str,
+    checks: Vec<ConformanceReportCheck>,
+    packages: Vec<ConformanceReportPackage>,
+}
+
+#[derive(Debug, Serialize)]
+struct ConformanceReportCheck {
+    id: &'static str,
+    status: ConformanceReportStatus,
+    message: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "lowercase")]
+enum ConformanceReportStatus {
+    Pass,
+    Fail,
+}
+
+#[derive(Debug, Serialize)]
+struct ConformanceReportPackage {
+    name: String,
+    persistence_class: String,
+    transitions: Vec<ConformanceReportTransition>,
+}
+
+#[derive(Debug, Serialize)]
+struct ConformanceReportTransition {
+    from: String,
+    to: String,
+    queue: String,
+    covered: bool,
+}
+
+impl ConformanceReport {
+    fn from_checks(checks: &[HostCheck], cfg: Option<&Config>) -> Self {
+        Self {
+            schema: "fkst.conformance.report.v1",
+            checks: checks
+                .iter()
+                .map(|check| ConformanceReportCheck {
+                    id: check.id,
+                    status: match check.status {
+                        CheckStatus::Pass => ConformanceReportStatus::Pass,
+                        CheckStatus::Fail => ConformanceReportStatus::Fail,
+                    },
+                    message: check.message.clone(),
+                })
+                .collect(),
+            packages: cfg.map(package_reports).unwrap_or_default(),
+        }
+    }
+}
+
+fn package_reports(cfg: &Config) -> Vec<ConformanceReportPackage> {
+    cfg.package
+        .iter()
+        .map(|(name, package)| ConformanceReportPackage {
+            name: name.clone(),
+            persistence_class: persistence_class_label(&package.persistence_class).to_string(),
+            transitions: package
+                .transitions
+                .iter()
+                .map(|transition| ConformanceReportTransition {
+                    from: transition.from.clone(),
+                    to: transition.to.clone(),
+                    queue: transition.queue.clone(),
+                    covered: cfg.queue.contains_key(&transition.queue),
+                })
+                .collect(),
+        })
+        .collect()
+}
+
+fn persistence_class_label(class: &PersistenceClass) -> &'static str {
+    match class {
+        PersistenceClass::Saga => "saga",
+        PersistenceClass::StatelessAdapter => "stateless_adapter",
+        PersistenceClass::JudgmentPipeline => "judgment_pipeline",
+    }
+}
+
+fn write_report_json(path: &Path, report: &ConformanceReport) -> Result<()> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| anyhow::anyhow!("report path has no file name"))?;
+    let tmp_path = parent.join(format!(
+        ".{}.{}.tmp",
+        file_name.to_string_lossy(),
+        std::process::id()
+    ));
+    let data = serde_json::to_vec_pretty(report)?;
+    std::fs::write(&tmp_path, data)
+        .with_context(|| format!("write temporary report {}", tmp_path.display()))?;
+    std::fs::rename(&tmp_path, path)
+        .with_context(|| format!("rename {} to {}", tmp_path.display(), path.display()))?;
+    Ok(())
 }
 
 pub(crate) fn run(options: HostConformanceOptions) -> Result<i32> {

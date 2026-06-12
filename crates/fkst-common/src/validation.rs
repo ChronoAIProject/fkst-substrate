@@ -1,6 +1,6 @@
 //! Schema validation on config load. Refuse-to-start on any violation.
 
-use crate::config::{Config, RaiserDecl, RetryDecl};
+use crate::config::{Config, PersistenceClass, RaiserDecl, RetryDecl, SagaTransitionDecl};
 use crate::error::FkstError;
 
 /// Validate a runtime scratch key before joining it below a RuntimeLayout subdir.
@@ -80,6 +80,8 @@ pub fn validate(cfg: &Config, project_root: &std::path::Path) -> Result<Vec<Stri
             "limits.global_codex_processes must be > 0".to_string(),
         ));
     }
+
+    validate_package_persistence(cfg)?;
 
     // Build set of declared queue names.
     let queues: std::collections::HashSet<&String> = cfg.queue.keys().collect();
@@ -222,6 +224,189 @@ pub fn validate(cfg: &Config, project_root: &std::path::Path) -> Result<Vec<Stri
     }
 
     Ok(warnings)
+}
+
+fn validate_package_persistence(cfg: &Config) -> Result<(), FkstError> {
+    let mut namespaces = std::collections::BTreeSet::new();
+    for dept in cfg.department.values() {
+        namespaces.insert(dept.owner_namespace.as_str());
+    }
+    for name in cfg.raiser.keys() {
+        namespaces.insert(package_namespace(name, cfg));
+    }
+    for namespace in namespaces {
+        if !cfg.package.contains_key(namespace) {
+            return Err(FkstError::Schema(format!(
+                "saga-persistence-class-missing: package '{}' has no persistence declaration",
+                namespace
+            )));
+        }
+    }
+
+    for (package_name, package) in &cfg.package {
+        match package.persistence_class {
+            PersistenceClass::Saga => validate_saga_package(cfg, package_name)?,
+            PersistenceClass::StatelessAdapter | PersistenceClass::JudgmentPipeline => {
+                if !package.states.is_empty()
+                    || !package.terminal_states.is_empty()
+                    || !package.transitions.is_empty()
+                {
+                    return Err(FkstError::Schema(format!(
+                        "saga-obligation-forbidden: non-saga package '{}' must not declare saga states or transitions",
+                        package_name
+                    )));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_saga_package(cfg: &Config, package_name: &str) -> Result<(), FkstError> {
+    let package = cfg.package.get(package_name).ok_or_else(|| {
+        FkstError::Schema(format!(
+            "saga-persistence-class-missing: package '{}' has no persistence declaration",
+            package_name
+        ))
+    })?;
+    if package.states.is_empty() {
+        return Err(FkstError::Schema(format!(
+            "saga-state-table-empty: saga package '{}' must declare states",
+            package_name
+        )));
+    }
+    if package.transitions.is_empty() {
+        return Err(FkstError::Schema(format!(
+            "saga-transition-table-empty: saga package '{}' must declare transitions",
+            package_name
+        )));
+    }
+
+    let states = package
+        .states
+        .iter()
+        .map(String::as_str)
+        .collect::<std::collections::BTreeSet<_>>();
+    if states.len() != package.states.len() {
+        return Err(FkstError::Schema(format!(
+            "saga-state-duplicate: saga package '{}' declares duplicate states",
+            package_name
+        )));
+    }
+    let terminal_states = package
+        .terminal_states
+        .iter()
+        .map(String::as_str)
+        .collect::<std::collections::BTreeSet<_>>();
+    for terminal in &terminal_states {
+        if !states.contains(terminal) {
+            return Err(FkstError::Schema(format!(
+                "saga-terminal-state-unknown: saga package '{}' terminal state '{}' is not declared",
+                package_name, terminal
+            )));
+        }
+    }
+
+    let mut covered = std::collections::BTreeSet::new();
+    for transition in &package.transitions {
+        validate_saga_transition(cfg, package_name, &states, transition)?;
+        covered.insert(transition.from.as_str());
+    }
+
+    for state in &package.states {
+        if !terminal_states.contains(state.as_str()) && !covered.contains(state.as_str()) {
+            return Err(FkstError::Schema(format!(
+                "saga-transition-coverage: saga package '{}' non-terminal state '{}' has no outgoing transition",
+                package_name, state
+            )));
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_saga_transition(
+    cfg: &Config,
+    package_name: &str,
+    states: &std::collections::BTreeSet<&str>,
+    transition: &SagaTransitionDecl,
+) -> Result<(), FkstError> {
+    if !states.contains(transition.from.as_str()) {
+        return Err(FkstError::Schema(format!(
+            "saga-transition-state-unknown: saga package '{}' transition from '{}' is not declared",
+            package_name, transition.from
+        )));
+    }
+    if !states.contains(transition.to.as_str()) {
+        return Err(FkstError::Schema(format!(
+            "saga-transition-state-unknown: saga package '{}' transition to '{}' is not declared",
+            package_name, transition.to
+        )));
+    }
+    if !cfg.queue.contains_key(&transition.queue) {
+        return Err(FkstError::Schema(format!(
+            "saga-transition-queue-unknown: saga package '{}' transition '{}->{}' references queue '{}' which is not declared",
+            package_name, transition.from, transition.to, transition.queue
+        )));
+    }
+    let consumers = queue_consumers(cfg, &transition.queue);
+    if consumers.is_empty() {
+        return Err(FkstError::Schema(format!(
+            "saga-transition-queue-not-consumed: saga package '{}' transition '{}->{}' references queue '{}' with no consumer",
+            package_name, transition.from, transition.to, transition.queue
+        )));
+    }
+    if transition.dedup.trim().is_empty() {
+        return Err(FkstError::Schema(format!(
+            "saga-transition-dedup-empty: saga package '{}' transition '{}->{}' has empty dedup",
+            package_name, transition.from, transition.to
+        )));
+    }
+    if transition.effect.intent.trim().is_empty()
+        || transition.effect.completeness.trim().is_empty()
+    {
+        return Err(FkstError::Schema(format!(
+            "saga-transition-effect-empty: saga package '{}' transition '{}->{}' has empty effect intent or completeness",
+            package_name, transition.from, transition.to
+        )));
+    }
+    for (field, source) in &transition.payload_fields {
+        if !valid_saga_payload_source(source) {
+            return Err(FkstError::Schema(format!(
+                "saga-payload-field-reference: saga package '{}' transition '{}->{}' payload field '{}' references invalid source '{}'",
+                package_name, transition.from, transition.to, field, source
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn valid_saga_payload_source(source: &str) -> bool {
+    let Some((prefix, field)) = source.split_once('.') else {
+        return false;
+    };
+    if field.is_empty() || field.contains('.') {
+        return false;
+    }
+    matches!(prefix, "marker" | "source_ref")
+        && field
+            .bytes()
+            .all(|byte| matches!(byte, b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'_'))
+}
+
+fn package_namespace<'a>(name: &'a str, cfg: &'a Config) -> &'a str {
+    if let Some((pkg, _)) = name.split_once('.') {
+        return pkg;
+    }
+    if cfg.package.len() == 1 {
+        return cfg
+            .package
+            .keys()
+            .next()
+            .map(String::as_str)
+            .unwrap_or("host");
+    }
+    "host"
 }
 
 // Startup validation enforces each queue contract in one place; queues are
@@ -371,7 +556,7 @@ fn queue_feedback_departments(cfg: &Config, qname: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{DepartmentDecl, LimitsDecl, QueueDecl};
+    use crate::config::{DepartmentDecl, LimitsDecl, PackageDecl, QueueDecl};
     use tempfile::tempdir;
 
     fn touch(root: &std::path::Path, name: &str) -> std::path::PathBuf {
@@ -382,6 +567,7 @@ mod tests {
 
     fn cfg_minimal(lua: &std::path::Path) -> Config {
         let mut cfg = Config {
+            package: Default::default(),
             queue: Default::default(),
             raiser: Default::default(),
             department: Default::default(),
@@ -415,6 +601,15 @@ mod tests {
                 stall_window: "30s".into(),
                 graph_json: false,
                 retry: None,
+            },
+        );
+        cfg.package.insert(
+            "pkg".into(),
+            PackageDecl {
+                persistence_class: PersistenceClass::StatelessAdapter,
+                states: Vec::new(),
+                terminal_states: Vec::new(),
+                transitions: Vec::new(),
             },
         );
         cfg

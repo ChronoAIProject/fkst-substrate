@@ -66,6 +66,7 @@ fn write_minimal_host(root: &std::path::Path) {
     fs::create_dir_all(root.join("departments/hello")).unwrap();
     fs::create_dir_all(root.join("raisers")).unwrap();
     write_host_defaults(root);
+    write_persistence_decl(root, "stateless_adapter");
     fs::write(
         root.join("departments/hello/main.lua"),
         r#"
@@ -91,8 +92,27 @@ fn write_host_defaults(root: &std::path::Path) {
     .unwrap();
 }
 
+fn write_persistence_decl(root: &std::path::Path, class: &str) {
+    fs::create_dir_all(root.join("fkst")).unwrap();
+    fs::write(
+        root.join("fkst/persistence.lua"),
+        format!(r#"return {{ persistence_class = "{}" }}"#, class),
+    )
+    .unwrap();
+}
+
+fn write_persistence_source(root: &std::path::Path, source: &str) {
+    fs::create_dir_all(root.join("fkst")).unwrap();
+    fs::write(root.join("fkst/persistence.lua"), source).unwrap();
+}
+
+fn read_json(path: &std::path::Path) -> serde_json::Value {
+    serde_json::from_slice(&fs::read(path).unwrap()).unwrap()
+}
+
 fn write_package_raiser(root: &std::path::Path) {
     write_host_defaults(root);
+    write_persistence_decl(root, "stateless_adapter");
     fs::create_dir_all(root.join("raisers")).unwrap();
     fs::write(
         root.join("raisers/tick.lua"),
@@ -101,7 +121,90 @@ fn write_package_raiser(root: &std::path::Path) {
     .unwrap();
 }
 
+#[test]
+fn conformance_report_json_lists_package_persistence_classes_and_transitions() {
+    let host = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
+    write_minimal_host(host.path());
+    write_persistence_source(
+        host.path(),
+        r#"
+return {
+  persistence_class = "saga",
+  states = {"open", "complete"},
+  terminal_states = {"complete"},
+  transitions = {
+    {
+      from = "open",
+      to = "complete",
+      queue = "tick",
+      dedup = "source_ref.ref",
+      payload_fields = { id = "source_ref.ref" },
+      required_facts = { { name = "marker_stream", freshness = "current" } },
+      effect = { intent = "consume_tick", completeness = "complete" },
+    },
+  },
+}
+"#,
+    );
+    let report_path = host.path().join("conformance-report.json");
+
+    let args = [
+        std::ffi::OsStr::new("--project-root"),
+        path_arg(host.path()),
+        std::ffi::OsStr::new("--report-json"),
+        path_arg(&report_path),
+    ];
+    let output = run_conformance(&args, host.path());
+
+    assert_exit(&output, 0);
+    let report = read_json(&report_path);
+    assert_eq!(report["schema"], "fkst.conformance.report.v1");
+    assert_eq!(report["packages"][0]["persistence_class"], "saga");
+    assert_eq!(report["packages"][0]["transitions"][0]["from"], "open");
+    assert_eq!(report["packages"][0]["transitions"][0]["queue"], "tick");
+    assert_eq!(report["packages"][0]["transitions"][0]["covered"], true);
+}
+
+#[test]
+fn conformance_rejects_broken_saga_payload_field_reference() {
+    let host = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
+    write_minimal_host(host.path());
+    write_persistence_source(
+        host.path(),
+        r#"
+return {
+  persistence_class = "saga",
+  states = {"open", "complete"},
+  terminal_states = {"complete"},
+  transitions = {
+    {
+      from = "open",
+      to = "complete",
+      queue = "tick",
+      dedup = "source_ref.ref",
+      payload_fields = { id = "payload.id" },
+      required_facts = { { name = "marker_stream", freshness = "current" } },
+      effect = { intent = "consume_tick", completeness = "complete" },
+    },
+  },
+}
+"#,
+    );
+
+    let args = [
+        std::ffi::OsStr::new("--project-root"),
+        path_arg(host.path()),
+    ];
+    let output = run_conformance(&args, host.path());
+
+    assert_exit(&output, 1);
+    let log = combined_log(&output);
+    assert!(log.contains("FAIL schema-validation"), "{log}");
+    assert!(log.contains("saga-payload-field-reference"), "{log}");
+}
+
 fn write_host_department(root: &std::path::Path) {
+    write_persistence_decl(root, "stateless_adapter");
     fs::create_dir_all(root.join("departments/hello")).unwrap();
     fs::write(
         root.join("departments/hello/main.lua"),
@@ -441,6 +544,7 @@ fn host_failures_exit_one_with_check_ids() {
     let missing_departments = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
     fs::create_dir_all(missing_departments.path().join("raisers")).unwrap();
     write_host_defaults(missing_departments.path());
+    write_persistence_decl(missing_departments.path(), "stateless_adapter");
     let args = [
         std::ffi::OsStr::new("--project-root"),
         path_arg(missing_departments.path()),
@@ -455,6 +559,7 @@ fn host_failures_exit_one_with_check_ids() {
     fs::create_dir_all(empty_graph.path().join("departments/empty")).unwrap();
     fs::create_dir_all(empty_graph.path().join("raisers")).unwrap();
     write_host_defaults(empty_graph.path());
+    write_persistence_decl(empty_graph.path(), "stateless_adapter");
     let args = [
         std::ffi::OsStr::new("--project-root"),
         path_arg(empty_graph.path()),
@@ -467,6 +572,7 @@ fn host_failures_exit_one_with_check_ids() {
     let schema_invalid = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
     fs::create_dir_all(schema_invalid.path().join("departments/bad")).unwrap();
     write_host_defaults(schema_invalid.path());
+    write_persistence_decl(schema_invalid.path(), "stateless_adapter");
     fs::write(
         schema_invalid.path().join("departments/bad/main.lua"),
         r#"

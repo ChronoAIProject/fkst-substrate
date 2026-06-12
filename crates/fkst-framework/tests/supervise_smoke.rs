@@ -37,6 +37,15 @@ fn write_fkst_env(root: &std::path::Path) {
     .unwrap();
 }
 
+fn write_persistence_decl(root: &std::path::Path) {
+    fs::create_dir_all(root.join("fkst")).unwrap();
+    fs::write(
+        root.join("fkst/persistence.lua"),
+        r#"return { persistence_class = "stateless_adapter" }"#,
+    )
+    .unwrap();
+}
+
 fn fake_framework(root: &Path, body: &str) -> PathBuf {
     let id = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -89,6 +98,7 @@ fn supervise_dispatches_file_watch_event_to_department() {
     let root = tmp.path();
     fs::create_dir_all(root.join("departments/recorder")).unwrap();
     fs::create_dir_all(root.join("raisers")).unwrap();
+    write_persistence_decl(root);
     fs::write(
         root.join("fkst.env"),
         "FKST_QUEUE_CAPACITY=100\nFKST_DEPARTMENT_DEFAULT_STALL_WINDOW=30m\nFKST_CODEX_PERMIT_SLOTS=20\n",
@@ -161,7 +171,8 @@ fn supervise_env_package_root_reaches_child_framework() {
     let host = root.join("host-root");
     let fact = host.join("package-root-fact.txt");
     write_graph_defaults(&package);
-    fs::create_dir_all(package.join("fkst")).unwrap();
+    write_persistence_decl(&package);
+    write_persistence_decl(&host);
     fs::create_dir_all(package.join("raisers")).unwrap();
     fs::create_dir_all(host.join("departments/host_worker")).unwrap();
     fs::write(package.join("input.txt"), "ready").unwrap();
@@ -255,6 +266,9 @@ fn supervise_delivers_cross_package_raise_from_composed_child() {
     let producer_pkg = root.join("github-devloop");
     let consumer_pkg = root.join("consensus");
     let fact = host.join("proposal-fact.txt");
+    write_persistence_decl(&producer_pkg);
+    write_persistence_decl(&consumer_pkg);
+    write_persistence_decl(&host);
     fs::create_dir_all(producer_pkg.join("departments/producer")).unwrap();
     fs::create_dir_all(producer_pkg.join("raisers")).unwrap();
     fs::create_dir_all(consumer_pkg.join("departments/proposal_sink")).unwrap();

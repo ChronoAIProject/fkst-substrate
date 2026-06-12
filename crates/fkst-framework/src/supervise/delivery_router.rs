@@ -472,6 +472,7 @@ mod tests {
             },
         );
         Config {
+            package: BTreeMap::new(),
             queue,
             raiser: BTreeMap::new(),
             department,
@@ -513,6 +514,7 @@ mod tests {
             );
         }
         Config {
+            package: BTreeMap::new(),
             queue,
             raiser: BTreeMap::new(),
             department,

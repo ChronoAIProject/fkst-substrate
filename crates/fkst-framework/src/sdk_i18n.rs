@@ -171,8 +171,8 @@ fn requested_locale() -> String {
 
 fn load_all_catalogs(locales_dir: &Path) -> Result<BTreeMap<String, BTreeMap<String, String>>> {
     let mut catalogs = BTreeMap::new();
-    for entry in std::fs::read_dir(locales_dir)
-        .with_context(|| format!("read {}", locales_dir.display()))?
+    for entry in
+        std::fs::read_dir(locales_dir).with_context(|| format!("read {}", locales_dir.display()))?
     {
         let entry = entry?;
         let path = entry.path();
@@ -214,7 +214,10 @@ fn load_catalog_file(path: &Path) -> Result<BTreeMap<String, String>> {
                 .to_str()
                 .map_err(|_| anyhow!("locale catalog key must be valid UTF-8"))?
                 .to_string(),
-            other => bail!("locale catalog key must be string, got {}", other.type_name()),
+            other => bail!(
+                "locale catalog key must be string, got {}",
+                other.type_name()
+            ),
         };
         validate_catalog_key(&key)?;
         let value = match value {
@@ -272,7 +275,9 @@ fn validate_locale_name(locale: &str) -> Result<()> {
 
 fn validate_catalog_key(key: &str) -> mlua::Result<()> {
     if key.is_empty() {
-        return Err(mlua::Error::external("locale catalog key must not be empty"));
+        return Err(mlua::Error::external(
+            "locale catalog key must not be empty",
+        ));
     }
     if !key.bytes().all(|byte| {
         matches!(
@@ -443,7 +448,11 @@ mod tests {
     fn t_rejects_output_lang_path_traversal_and_falls_back_to_en() {
         let dir = TempDir::new().unwrap();
         write_catalog(dir.path(), "en", r#"return { answer = "Answer" }"#);
-        std::fs::write(dir.path().join("core.lua"), r#"return { answer = "Pwned" }"#).unwrap();
+        std::fs::write(
+            dir.path().join("core.lua"),
+            r#"return { answer = "Pwned" }"#,
+        )
+        .unwrap();
         let _env = EnvGuard::set_output_lang("../core");
         let lua = Lua::new();
         register(&lua, dir.path()).unwrap();

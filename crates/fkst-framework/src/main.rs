@@ -4,7 +4,7 @@
 //! Multiple `--package-root` flags give composed namespace knowledge; `--owner-namespace`
 //! selects the owner root used for Lua `require`.
 //! CLI: `fkst-framework supervise --project-root <path> --framework-bin <path>`
-//! CLI: `fkst-framework conformance --project-root <path>`
+//! CLI: `fkst-framework conformance --project-root <path> [--package-root <path> ...] [--report-json <path>]`
 //! CLI: `fkst-framework test --project-root <path> [--package-root <path> ...] [--report-json <path>]`
 //! CLI: `fkst-framework init-package-repo [--ref <substrate-ref>] [--force]`
 //! CLI: `fkst-framework --self-test`
@@ -80,7 +80,7 @@ fn parse_args() -> Result<CliCommand> {
     let mut args_iter = args.into_iter();
     let sub = args_iter.next().ok_or_else(|| {
         anyhow::anyhow!(
-            "usage: fkst-framework run <lua> --project-root <path> --package-root <path> [--package-root <path> ...] [--owner-namespace <id>] --event <json> | fkst-framework supervise --project-root <path> --framework-bin <path> [--package-root <path> ...] | fkst-framework conformance --project-root <path> [--package-root <path> ...] | fkst-framework config --project-root <path> [--package-root <path> ...] | fkst-framework boundary-resources | fkst-framework rate-acquire <pool> | fkst-framework test --project-root <path> [--package-root <path> ...] [--report-json <path>] | fkst-framework init-package-repo [--ref <substrate-ref>] [--force] | fkst-framework --self-test"
+            "usage: fkst-framework run <lua> --project-root <path> --package-root <path> [--package-root <path> ...] [--owner-namespace <id>] --event <json> | fkst-framework supervise --project-root <path> --framework-bin <path> [--package-root <path> ...] | fkst-framework conformance --project-root <path> [--package-root <path> ...] [--report-json <path>] | fkst-framework config --project-root <path> [--package-root <path> ...] | fkst-framework boundary-resources | fkst-framework rate-acquire <pool> | fkst-framework test --project-root <path> [--package-root <path> ...] [--report-json <path>] | fkst-framework init-package-repo [--ref <substrate-ref>] [--force] | fkst-framework --self-test"
         )
     })?;
     if sub == "--self-test" {
@@ -211,6 +211,7 @@ struct TestCli {
 fn parse_conformance_args(args: &[String]) -> Result<HostConformanceOptions> {
     let mut project_root: Option<PathBuf> = None;
     let mut package_roots: Vec<PathBuf> = Vec::new();
+    let mut report_json: Option<PathBuf> = None;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -225,6 +226,13 @@ fn parse_conformance_args(args: &[String]) -> Result<HostConformanceOptions> {
                 i += 1;
                 package_roots.push(next_value(args, i, "--package-root")?.into());
             }
+            "--report-json" => {
+                if report_json.is_some() {
+                    anyhow::bail!("duplicate --report-json");
+                }
+                i += 1;
+                report_json = Some(next_value(args, i, "--report-json")?.into());
+            }
             other => anyhow::bail!("unknown conformance argument: {}", other),
         }
         i += 1;
@@ -233,6 +241,7 @@ fn parse_conformance_args(args: &[String]) -> Result<HostConformanceOptions> {
     let root = project_root.ok_or_else(|| anyhow::anyhow!("missing --project-root"))?;
     Ok(HostConformanceOptions {
         roots: PackageRoots::resolve(root, package_roots)?,
+        report_json,
     })
 }
 

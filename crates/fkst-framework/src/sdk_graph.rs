@@ -320,6 +320,7 @@ mod tests {
         );
 
         let config = Config {
+            package: BTreeMap::new(),
             queue,
             raiser,
             department,

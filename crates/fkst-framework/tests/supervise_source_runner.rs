@@ -55,6 +55,7 @@ fn fanout_router(queue_name: &str) -> (Fanout, DeliveryRouter) {
         },
     );
     let cfg = Config {
+        package: BTreeMap::new(),
         queue,
         raiser: BTreeMap::new(),
         department,
