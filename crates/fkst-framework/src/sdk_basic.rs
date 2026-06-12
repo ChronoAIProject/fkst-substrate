@@ -55,6 +55,7 @@ pub(crate) fn register_with_runner(
     lua.globals().set(
         "exec_sync",
         lua.create_function(move |lua, arg: Value| {
+            crate::process_tree::ensure_supervisor_parent_alive()?;
             let opts = parse_exec_options(arg)?;
             let out = run_exec_sync(opts, runner.as_ref(), &rate_pools)?;
             let t = lua.create_table()?;
@@ -199,6 +200,7 @@ fn run_exec_sync_with_timeout(opts: &ExecOptions, timeout: Duration) -> Result<E
         .spawn()
         .map_err(mlua::Error::external)?;
     let child_pid = child.id();
+    let _registration = crate::process_tree::sdk_process_groups().register(child_pid);
     let stdout_reader = child
         .stdout
         .take()

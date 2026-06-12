@@ -157,7 +157,20 @@ fn process_root_reports_missing_default_sibling_runtime() {
     );
 }
 
-fn assert_process_root_detaches_without_signaling_runtime(
+fn wait_for_process_exit(pid: i32, timeout: std::time::Duration) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None).is_err() {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+}
+
+fn assert_process_root_terminates_runtime_group(
     signal: nix::sys::signal::Signal,
     expected_code: i32,
 ) {
@@ -189,8 +202,9 @@ fn assert_process_root_detaches_without_signaling_runtime(
     nix::sys::signal::kill(nix::unistd::Pid::from_raw(child.id() as i32), signal).unwrap();
     let status = child.wait().unwrap();
     assert_eq!(status.code(), Some(expected_code), "status={status}");
+    assert!(signal_path.exists(), "runtime signal trap did not fire");
     assert!(
-        !signal_path.exists(),
+        ["TERM", "INT"].contains(&fs::read_to_string(&signal_path).unwrap().as_str()),
         "runtime signal trap fired with {}",
         fs::read_to_string(&signal_path).unwrap_or_default()
     );
@@ -200,22 +214,17 @@ fn assert_process_root_detaches_without_signaling_runtime(
         .parse()
         .unwrap();
     assert!(
-        nix::sys::signal::kill(nix::unistd::Pid::from_raw(runtime_pid), None).is_ok(),
-        "runtime process exited"
+        wait_for_process_exit(runtime_pid, std::time::Duration::from_secs(2)),
+        "runtime process survived supervisor termination"
     );
-    nix::sys::signal::killpg(
-        nix::unistd::Pid::from_raw(runtime_pid),
-        nix::sys::signal::Signal::SIGKILL,
-    )
-    .unwrap();
 }
 
 #[test]
-fn process_root_detaches_on_sigterm_without_signaling_runtime() {
-    assert_process_root_detaches_without_signaling_runtime(nix::sys::signal::Signal::SIGTERM, 143);
+fn process_root_terminates_runtime_group_on_sigterm() {
+    assert_process_root_terminates_runtime_group(nix::sys::signal::Signal::SIGTERM, 143);
 }
 
 #[test]
-fn process_root_detaches_on_sigint_without_signaling_runtime() {
-    assert_process_root_detaches_without_signaling_runtime(nix::sys::signal::Signal::SIGINT, 130);
+fn process_root_terminates_runtime_group_on_sigint() {
+    assert_process_root_terminates_runtime_group(nix::sys::signal::Signal::SIGINT, 130);
 }

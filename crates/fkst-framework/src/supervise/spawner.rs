@@ -2,6 +2,7 @@
 //!
 //! Spawn `fkst-framework run <lua_path> --project-root <path> --package-root <path> ... --owner-namespace <id> --event <json>` with setsid.
 
+use crate::process_tree::{ProcessGroupRegistration, ProcessGroupRegistry};
 use anyhow::{Context, Result};
 use std::ffi::OsStr;
 use std::io::Write;
@@ -50,6 +51,7 @@ pub async fn spawn_framework(
     codex_permit_slots: usize,
     child_label: &str,
     log_dir: &Path,
+    process_groups: ProcessGroupRegistry,
 ) -> Result<SpawnResult> {
     let start = std::time::Instant::now();
     let cmd_line = format!(
@@ -90,6 +92,10 @@ pub async fn spawn_framework(
         crate::sdk_codex::CODEX_PERMIT_SLOTS_ENV,
         codex_permit_slots.to_string(),
     );
+    cmd.env(
+        "FKST_SUPERVISOR_PID",
+        crate::process_tree::current_pid().to_string(),
+    );
     cmd.current_dir(host_root);
 
     // Set a new process group before exec so framework becomes its own group leader.
@@ -108,8 +114,9 @@ pub async fn spawn_framework(
         .ok_or_else(|| anyhow::anyhow!("no pid after spawn"))?;
     log.write_line(&format!("PID={pid}"));
     info!(pid = pid, lua = %lua_path.display(), "framework spawned");
+    let registration = process_groups.register(pid);
 
-    wait_for_framework_child(child, start, log).await
+    wait_for_framework_child(child, start, log, registration).await
 }
 
 fn package_root_flags(package_roots: &[PathBuf]) -> String {
@@ -132,6 +139,7 @@ async fn wait_for_framework_child(
     mut child: Child,
     start: Instant,
     mut log: FrameworkChildLog,
+    _registration: ProcessGroupRegistration,
 ) -> Result<SpawnResult> {
     let (tx, mut rx) = mpsc::unbounded_channel();
     let mut readers = Vec::new();

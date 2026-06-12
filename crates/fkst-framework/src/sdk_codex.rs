@@ -264,6 +264,7 @@ pub(crate) fn register_with_runner(
         let dept = Arc::clone(&dept);
         let runner = Arc::clone(&runner);
         lua.create_function(move |lua, opts: Table| {
+            crate::process_tree::ensure_supervisor_parent_alive()?;
             let request = codex_request_from_opts(opts, dept.as_deref().map(str::to_string));
             run_codex_request(request, &host_root, &config, runner.as_ref().as_ref())?
                 .into_lua_table(lua)
@@ -276,6 +277,7 @@ pub(crate) fn register_with_runner(
         let dept = Arc::clone(&dept);
         let runner = Arc::clone(&runner);
         lua.create_function(move |_, opts: Table| {
+            crate::process_tree::ensure_supervisor_parent_alive()?;
             let request = codex_request_from_opts(opts, dept.as_deref().map(str::to_string));
             let task_id = next_task_id.fetch_add(1, Ordering::Relaxed);
             let host_root = Arc::clone(&host_root);
@@ -725,13 +727,15 @@ fn run_codex_request_with_permit(mut request: CodexRequest, config: &ConfigConte
         Ok(child) => child,
         Err(result) => return *result,
     };
+    let child_pid = child.id();
+    let registration = crate::process_tree::sdk_process_groups().register(child_pid);
     let prompt = std::mem::take(&mut request.prompt);
     let (child, stdin_writer) = match spawn_stdin_writer(child, prompt, &request, &cmd_line) {
         Ok(parts) => parts,
         Err(result) => return *result,
     };
 
-    wait_for_codex_child(child, stdin_writer, &request, &cmd_line)
+    wait_for_codex_child(child, stdin_writer, &request, &cmd_line, registration)
 }
 
 fn prepare_rate_shims_for_codex(config: &ConfigContext) -> Result<Option<PathBuf>> {
@@ -820,6 +824,7 @@ fn wait_for_codex_child(
     stdin_writer: JoinHandle<std::io::Result<()>>,
     request: &CodexRequest,
     cmd_line: &str,
+    _registration: crate::process_tree::ProcessGroupRegistration,
 ) -> CodexResult {
     let wait_outcome = wait_codex_with_timeout(child, request.timeout_seconds);
     let stdin_result = join_stdin_writer(stdin_writer);

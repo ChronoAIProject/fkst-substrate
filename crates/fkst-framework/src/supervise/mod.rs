@@ -23,6 +23,7 @@ mod raised;
 pub(crate) mod source_runner;
 mod spawner;
 
+use crate::process_tree::ProcessGroupRegistry;
 use consumer::spawn_consumer;
 use delivery_router::DeliveryRouter;
 use delivery_store::DeliveryStore;
@@ -70,6 +71,7 @@ pub async fn supervise(roots: PackageRoots, framework_bin: PathBuf) -> Result<()
     let router = DeliveryRouter::new(&cfg, fanout.clone(), delivery_store.clone());
     delivery_watch::set_failure_fact_publisher(router.failure_fact_publisher());
     let codex_permit_slots = cfg.limits.global_codex_processes;
+    let process_groups = ProcessGroupRegistry::default();
     let mut handles = vec![];
 
     let mut departments = cfg.department.iter().collect::<Vec<_>>();
@@ -99,6 +101,7 @@ pub async fn supervise(roots: PackageRoots, framework_bin: PathBuf) -> Result<()
                 delivery_store.clone(),
                 q_cap,
                 codex_permit_slots,
+                process_groups.clone(),
             )
             .await,
         );
@@ -133,13 +136,31 @@ pub async fn supervise(roots: PackageRoots, framework_bin: PathBuf) -> Result<()
     info!(handles = handles.len(), "event runtime running");
     let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    let parent_pid = crate::process_tree::current_parent_pid();
+    let mut parent_watch = tokio::time::interval(std::time::Duration::from_millis(250));
+    parent_watch.tick().await;
     tokio::select! {
-        _ = sigint.recv() => {}
-        _ = sigterm.recv() => {}
+        _ = sigint.recv() => {
+            warn!("event runtime received SIGINT");
+        }
+        _ = sigterm.recv() => {
+            warn!("event runtime received SIGTERM");
+        }
+        _ = async {
+            loop {
+                parent_watch.tick().await;
+                if crate::process_tree::parent_changed(parent_pid) {
+                    break;
+                }
+            }
+        } => {
+            warn!(parent_pid = parent_pid, current_parent_pid = crate::process_tree::current_parent_pid(), "event runtime parent changed");
+        }
     }
     for handle in handles {
         handle.abort();
     }
+    process_groups.terminate_all("department").await;
     Ok(())
 }
 
