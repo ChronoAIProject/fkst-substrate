@@ -606,6 +606,14 @@ mod tests {
     }
 
     #[test]
+    fn startup_jitter_for_short_intervals_stays_below_interval_fraction() {
+        let interval = Duration::from_millis(500);
+        let jitter = startup_jitter("tick", "jobs", interval);
+
+        assert!(jitter <= interval / STARTUP_JITTER_DIVISOR as u32);
+    }
+
+    #[test]
     fn file_source_reference_includes_stable_change_version() {
         let identity = FileIdentity {
             len: 4,
