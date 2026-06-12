@@ -182,7 +182,7 @@ return {
       to = "complete",
       queue = "tick",
       dedup = "source_ref.ref",
-      payload_fields = { id = "payload.id" },
+      payload_fields = { id = "source_ref.not_a_real_field" },
       required_facts = { { name = "marker_stream", freshness = "current" } },
       effect = { intent = "consume_tick", completeness = "complete" },
     },

@@ -221,7 +221,7 @@ return {
       to = "complete",
       queue = "tick",
       dedup = "source_ref.ref",
-      payload_fields = { id = "payload.id" },
+      payload_fields = { id = "source_ref.not_a_real_field" },
       required_facts = { { name = "marker_stream", freshness = "current" } },
       effect = { intent = "emit_done", completeness = "complete" },
     },
@@ -234,7 +234,7 @@ return {
     let err = validate(&cfg, dir.path()).unwrap_err();
     let msg = err.to_string();
     assert!(msg.contains("saga-payload-field-reference"), "got: {msg}");
-    assert!(msg.contains("payload.id"), "got: {msg}");
+    assert!(msg.contains("source_ref.not_a_real_field"), "got: {msg}");
 }
 
 fn ns(root: &std::path::Path) -> String {

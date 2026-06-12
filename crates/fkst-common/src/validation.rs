@@ -388,10 +388,11 @@ fn valid_saga_payload_source(source: &str) -> bool {
     if field.is_empty() || field.contains('.') {
         return false;
     }
-    matches!(prefix, "marker" | "source_ref")
-        && field
-            .bytes()
-            .all(|byte| matches!(byte, b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'_'))
+    match prefix {
+        "marker" => matches!(field, "id"),
+        "source_ref" => matches!(field, "kind" | "ref"),
+        _ => false,
+    }
 }
 
 fn package_namespace<'a>(name: &'a str, cfg: &'a Config) -> &'a str {
