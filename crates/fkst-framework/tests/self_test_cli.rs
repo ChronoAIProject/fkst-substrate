@@ -214,6 +214,7 @@ end
         .arg("--event")
         .arg(r#"{"name":"ok"}"#)
         .env(RUNTIME_ROOT_ENV, &runtime_root)
+        .env_remove("FKST_SUPERVISOR_PID")
         .env_remove(PACKAGE_ROOT_ENV)
         .env_remove(CODEX_PERMIT_SLOTS_ENV)
         .env_remove("FKST_SUPERVISOR_PID")

@@ -61,6 +61,7 @@ fn run_conformance(host: &Path, runtime: &Path) -> Output {
         .arg("--package-root")
         .arg(host)
         .current_dir(host)
+        .env_remove("FKST_SUPERVISOR_PID")
         .env("FKST_RUNTIME_ROOT", runtime)
         .output()
         .unwrap()

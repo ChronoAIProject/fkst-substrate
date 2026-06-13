@@ -144,6 +144,7 @@ pub(crate) fn install_sdk_shutdown_watch() {
     });
 }
 
+#[cfg(not(test))]
 pub(crate) fn ensure_supervisor_parent_alive() -> mlua::Result<()> {
     #[cfg(test)]
     {
@@ -165,6 +166,11 @@ pub(crate) fn ensure_supervisor_parent_alive() -> mlua::Result<()> {
         }
         Ok(())
     }
+}
+
+#[cfg(test)]
+pub(crate) fn ensure_supervisor_parent_alive() -> mlua::Result<()> {
+    Ok(())
 }
 
 fn install_signal_handler(signal: Signal) {
