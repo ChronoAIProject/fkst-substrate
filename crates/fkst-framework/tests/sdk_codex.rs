@@ -30,6 +30,7 @@ use std::time::{Duration, SystemTime};
 use support::process_sandbox::ProcessSandbox;
 
 const DEFAULT_CODEX_PERMIT_SLOTS: usize = 20;
+const CODEX_WORKER_BIN_ENV: &str = "FKST_CODEX_WORKER_BIN";
 
 fn register(lua: &Lua) -> mlua::Result<()> {
     register_with_dept(lua, None)
@@ -79,9 +80,15 @@ fn read_fifo(path: &Path) -> String {
         let _ = tx.send(result);
     });
     let result = rx
-        .recv_timeout(Duration::from_secs(5))
+        .recv_timeout(Duration::from_secs(15))
         .unwrap_or_else(|err| panic!("timed out reading FIFO {display}: {err}"));
     result.unwrap_or_else(|err| panic!("failed reading FIFO {display}: {err}"))
+}
+
+#[cfg(unix)]
+fn recv_result(rx: &std::sync::mpsc::Receiver<String>, label: &str) -> String {
+    rx.recv_timeout(Duration::from_secs(5))
+        .unwrap_or_else(|err| panic!("timed out waiting for {label}: {err}"))
 }
 
 #[cfg(unix)]
@@ -159,6 +166,10 @@ fn lua_opts(lua: &Lua, prompt: &str) -> Table {
     let opts = lua.create_table().unwrap();
     opts.set("prompt", prompt).unwrap();
     opts
+}
+
+fn framework_bin() -> &'static str {
+    env!("CARGO_BIN_EXE_fkst-framework")
 }
 
 fn write_log_with_mtime(path: &Path, body: &str, modified: SystemTime) {
@@ -418,6 +429,7 @@ fn spawn_codex_sync_sends_prompt_through_stdin_after_options() {
     let capture_dir = tmp.path().join("capture");
     fs::create_dir_all(&bin_dir).unwrap();
     fs::create_dir_all(&capture_dir).unwrap();
+    fs::create_dir_all(tmp.path().join("wt")).unwrap();
 
     install_codex_script(
         &bin_dir,
@@ -433,6 +445,7 @@ printf 'ok'
     sandbox.enter_cwd(tmp.path()).runtime_root(".fkst/runtime");
     sandbox.prepend_path(&bin_dir);
     sandbox.set_env("CAPTURE_DIR", capture_dir.to_string_lossy().into_owned());
+    sandbox.set_env(CODEX_WORKER_BIN_ENV, framework_bin());
     sandbox.runtime_log_dir(tmp.path().join("runtime"));
     let (_lock, _guard) = sandbox.enter();
 
@@ -482,6 +495,213 @@ printf 'ok'
     assert_eq!(
         fs::read_to_string(capture_dir.join("stdin")).unwrap(),
         prompt
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn spawn_codex_sync_adopts_completed_worktree_result_without_respawn() {
+    let tmp = tempfile::tempdir().unwrap();
+    let bin_dir = tmp.path().join("bin");
+    let worktree = tmp.path().join("wt");
+    let capture_dir = tmp.path().join("capture");
+    std::fs::create_dir_all(&worktree).unwrap();
+    std::fs::create_dir_all(&capture_dir).unwrap();
+    install_codex_script(
+        &bin_dir,
+        r#"#!/bin/sh
+cat >/dev/null
+count_file="$CAPTURE_DIR/spawns"
+count=0
+if [ -f "$count_file" ]; then
+  count=$(cat "$count_file")
+fi
+count=$((count + 1))
+printf '%s' "$count" > "$count_file"
+printf 'result-%s' "$count"
+"#,
+    );
+
+    let mut sandbox = ProcessSandbox::new();
+    sandbox.enter_cwd(tmp.path()).runtime_root(".fkst/runtime");
+    sandbox.prepend_path(&bin_dir);
+    sandbox.set_env("CAPTURE_DIR", capture_dir.to_string_lossy().into_owned());
+    sandbox.set_env(CODEX_WORKER_BIN_ENV, framework_bin());
+    sandbox.runtime_log_dir(tmp.path().join("runtime"));
+    let (_lock, _guard) = sandbox.enter();
+
+    let lua = Lua::new();
+    register(&lua).unwrap();
+    let spawn: mlua::Function = lua.globals().get("spawn_codex_sync").unwrap();
+    let first_opts = lua_opts(&lua, "same-work");
+    first_opts
+        .set("worktree", worktree.to_string_lossy().into_owned())
+        .unwrap();
+    first_opts.set("dedup_key", "same-dedup").unwrap();
+    let first: Table = spawn.call(first_opts).unwrap();
+    assert_eq!(first.get::<i64>("exit_code").unwrap(), 0);
+    assert_eq!(first.get::<String>("stdout").unwrap(), "result-1");
+
+    let second_opts = lua_opts(&lua, "same-work");
+    second_opts
+        .set("worktree", worktree.to_string_lossy().into_owned())
+        .unwrap();
+    second_opts.set("dedup_key", "same-dedup").unwrap();
+    let second: Table = spawn.call(second_opts).unwrap();
+    assert_eq!(second.get::<i64>("exit_code").unwrap(), 0);
+    assert_eq!(second.get::<String>("stdout").unwrap(), "result-1");
+    assert_eq!(
+        std::fs::read_to_string(capture_dir.join("spawns")).unwrap(),
+        "1"
+    );
+    assert!(worktree.join(".fkst-codex").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn spawn_codex_sync_does_not_reuse_completed_result_for_different_work_unit() {
+    let tmp = tempfile::tempdir().unwrap();
+    let bin_dir = tmp.path().join("bin");
+    let worktree = tmp.path().join("wt");
+    let capture_dir = tmp.path().join("capture");
+    std::fs::create_dir_all(&worktree).unwrap();
+    std::fs::create_dir_all(&capture_dir).unwrap();
+    install_codex_script(
+        &bin_dir,
+        r#"#!/bin/sh
+cat >/dev/null
+count_file="$CAPTURE_DIR/spawns"
+count=0
+if [ -f "$count_file" ]; then
+  count=$(cat "$count_file")
+fi
+count=$((count + 1))
+printf '%s' "$count" > "$count_file"
+printf 'result-%s' "$count"
+"#,
+    );
+
+    let mut sandbox = ProcessSandbox::new();
+    sandbox.enter_cwd(tmp.path()).runtime_root(".fkst/runtime");
+    sandbox.prepend_path(&bin_dir);
+    sandbox.set_env("CAPTURE_DIR", capture_dir.to_string_lossy().into_owned());
+    sandbox.set_env(CODEX_WORKER_BIN_ENV, framework_bin());
+    sandbox.runtime_log_dir(tmp.path().join("runtime"));
+    let (_lock, _guard) = sandbox.enter();
+
+    let lua = Lua::new();
+    register(&lua).unwrap();
+    let spawn: mlua::Function = lua.globals().get("spawn_codex_sync").unwrap();
+    let first_opts = lua_opts(&lua, "first-work");
+    first_opts
+        .set("worktree", worktree.to_string_lossy().into_owned())
+        .unwrap();
+    first_opts.set("dedup_key", "dedup-one").unwrap();
+    let first: Table = spawn.call(first_opts).unwrap();
+    assert_eq!(first.get::<String>("stdout").unwrap(), "result-1");
+
+    let second_opts = lua_opts(&lua, "second-work");
+    second_opts
+        .set("worktree", worktree.to_string_lossy().into_owned())
+        .unwrap();
+    second_opts.set("dedup_key", "dedup-two").unwrap();
+    let second: Table = spawn.call(second_opts).unwrap();
+    assert_eq!(second.get::<String>("stdout").unwrap(), "result-2");
+    assert_eq!(
+        std::fs::read_to_string(capture_dir.join("spawns")).unwrap(),
+        "2"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn spawn_codex_sync_adopts_running_worktree_result_without_respawn() {
+    let tmp = tempfile::tempdir().unwrap();
+    let bin_dir = tmp.path().join("bin");
+    let worktree = tmp.path().join("wt");
+    let capture_dir = tmp.path().join("capture");
+    let started_fifo = tmp.path().join("started.fifo");
+    let release_fifo = tmp.path().join("release.fifo");
+    std::fs::create_dir_all(&worktree).unwrap();
+    std::fs::create_dir_all(&capture_dir).unwrap();
+    make_fifo(&started_fifo);
+    make_fifo(&release_fifo);
+    install_codex_script(
+        &bin_dir,
+        r#"#!/bin/sh
+cat >/dev/null
+count_file="$CAPTURE_DIR/spawns"
+count=0
+if [ -f "$count_file" ]; then
+  count=$(cat "$count_file")
+fi
+count=$((count + 1))
+printf '%s' "$count" > "$count_file"
+printf 'started' > "$STARTED_FIFO"
+read _ < "$RELEASE_FIFO"
+printf 'adopted-%s' "$count"
+"#,
+    );
+
+    let mut sandbox = ProcessSandbox::new();
+    sandbox.enter_cwd(tmp.path()).runtime_root(".fkst/runtime");
+    sandbox.prepend_path(&bin_dir);
+    sandbox.set_env("CAPTURE_DIR", capture_dir.to_string_lossy().into_owned());
+    sandbox.set_env("STARTED_FIFO", started_fifo.to_string_lossy().into_owned());
+    sandbox.set_env("RELEASE_FIFO", release_fifo.to_string_lossy().into_owned());
+    sandbox.set_env(CODEX_WORKER_BIN_ENV, framework_bin());
+    sandbox.runtime_log_dir(tmp.path().join("runtime"));
+    let (_lock, _guard) = sandbox.enter();
+
+    let worktree_arg = worktree.to_string_lossy().into_owned();
+    let (first_tx, first_rx) = std::sync::mpsc::channel();
+    let first_thread = std::thread::spawn({
+        let worktree_arg = worktree_arg.clone();
+        move || {
+            let lua = Lua::new();
+            register(&lua).unwrap();
+            let spawn: mlua::Function = lua.globals().get("spawn_codex_sync").unwrap();
+            let opts = lua_opts(&lua, "running-work");
+            opts.set("worktree", worktree_arg).unwrap();
+            opts.set("dedup_key", "running-dedup").unwrap();
+            let result: Table = spawn.call(opts).unwrap();
+            first_tx
+                .send(result.get::<String>("stdout").unwrap())
+                .unwrap();
+        }
+    });
+    assert_eq!(read_fifo(&started_fifo), "started");
+
+    let lua = Lua::new();
+    register(&lua).unwrap();
+    let spawn: mlua::Function = lua.globals().get("spawn_codex_sync").unwrap();
+    let opts = lua_opts(&lua, "running-work");
+    opts.set("worktree", worktree_arg).unwrap();
+    opts.set("dedup_key", "running-dedup").unwrap();
+    let (second_tx, second_rx) = std::sync::mpsc::channel();
+    let second_thread = std::thread::spawn(move || {
+        let result: Table = spawn.call(opts).unwrap();
+        second_tx
+            .send(result.get::<String>("stdout").unwrap())
+            .unwrap();
+    });
+
+    std::thread::sleep(Duration::from_millis(250));
+    assert_eq!(
+        std::fs::read_to_string(capture_dir.join("spawns")).unwrap(),
+        "1"
+    );
+    write_fifo(&release_fifo, "go\n");
+    assert_eq!(recv_result(&first_rx, "first adopted result"), "adopted-1");
+    assert_eq!(
+        recv_result(&second_rx, "second adopted result"),
+        "adopted-1"
+    );
+    first_thread.join().unwrap();
+    second_thread.join().unwrap();
+    assert_eq!(
+        std::fs::read_to_string(capture_dir.join("spawns")).unwrap(),
+        "1"
     );
 }
 
