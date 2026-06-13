@@ -10,6 +10,7 @@ use super::failure_fact::{dead_record_payload, delivery_failure_fact, FAILURE_FA
 use super::raised::{parse_raised, parse_raised_line};
 use super::source_runner::parse_duration;
 use super::spawner::{spawn_framework_with_stdout_observer, SpawnResult, StdoutLineObserver};
+use super::supervisor_journal::SupervisorJournal;
 use crate::path_resolver::PackageRoots;
 use crate::process_tree::ProcessGroupRegistry;
 use fkst_common::config::{DepartmentDecl, RetryDecl};
@@ -42,6 +43,7 @@ pub async fn spawn_consumer(
     queue_capacity: usize,
     codex_permit_slots: usize,
     process_groups: ProcessGroupRegistry,
+    journal: SupervisorJournal,
 ) -> JoinHandle<()> {
     let reliable_queues: Vec<String> = decl
         .consumes
@@ -139,6 +141,7 @@ pub async fn spawn_consumer(
                             stall_window,
                             codex_permit_slots,
                             process_groups.clone(),
+                            journal.clone(),
                         );
                     }
                 }
@@ -160,13 +163,14 @@ pub async fn spawn_consumer(
                         stall_window,
                         codex_permit_slots,
                         process_groups.clone(),
+                        journal.clone(),
                         &complete_tx,
                         &mut running,
                     );
                 }
                 _ = tick.tick(), if !reliable_queues.is_empty() => {
                     renew_running(&name, store.as_deref(), stall_window, &running);
-                    maintain_dead_letters(&name, store.as_deref(), &router);
+                    maintain_dead_letters(&name, store.as_deref(), &router, &journal);
                     dispatch_due(
                         &name,
                         &decl,
@@ -180,6 +184,7 @@ pub async fn spawn_consumer(
                         stall_window,
                         codex_permit_slots,
                         process_groups.clone(),
+                        journal.clone(),
                         &complete_tx,
                         &mut running,
                     );
@@ -187,7 +192,7 @@ pub async fn spawn_consumer(
                 maybe_done = complete_rx.recv(), if !running.is_empty() => {
                     if let Some(done) = maybe_done {
                         running.remove(&done.record.delivery_id);
-                        finish_durable_record(&name, store.as_deref(), &router, retry_policy.as_ref(), done);
+                        finish_durable_record(&name, store.as_deref(), &router, retry_policy.as_ref(), &journal, done);
                     }
                 }
             }
@@ -234,6 +239,7 @@ fn spawn_ephemeral(
     stall_window: Duration,
     codex_permit_slots: usize,
     process_groups: ProcessGroupRegistry,
+    journal: SupervisorJournal,
 ) {
     let args = match spawn_args(
         decl,
@@ -255,7 +261,7 @@ fn spawn_ephemeral(
     let dept_name = name.to_string();
     let router = router.clone();
     tokio::spawn(async move {
-        match spawn_and_report(&dept_name, &args).await {
+        match spawn_and_report(&dept_name, &args, &journal).await {
             Ok(result) => {
                 if let Err(err) = publish_ephemeral_raised(&router, &result.stdout) {
                     error!(dept = %dept_name, error = %err, "publish raised failed");
@@ -287,6 +293,7 @@ fn dispatch_due(
     stall_window: Duration,
     codex_permit_slots: usize,
     process_groups: ProcessGroupRegistry,
+    journal: SupervisorJournal,
     complete_tx: &mpsc::Sender<CompletedDelivery>,
     running: &mut BTreeMap<String, RunningDelivery>,
 ) {
@@ -313,6 +320,16 @@ fn dispatch_due(
         if running.contains_key(&record.delivery_id) {
             continue;
         }
+        journal.event(
+            "lease",
+            &[
+                ("dept", name.to_string()),
+                ("queue", record.queue.clone()),
+                ("delivery_id", record.delivery_id.clone()),
+                ("generation", record.lease_generation.to_string()),
+                ("attempt", record.attempt.to_string()),
+            ],
+        );
         let args = match spawn_args(
             decl,
             project_root,
@@ -330,6 +347,7 @@ fn dispatch_due(
                     &store,
                     router,
                     retry_policy,
+                    &journal,
                     &record,
                     DeliveryFailure::permanent(format!("build spawn args: {err}")),
                 );
@@ -341,8 +359,10 @@ fn dispatch_due(
         let complete_tx = complete_tx.clone();
         let running_record = record.clone();
         let delivery_id = record.delivery_id.clone();
+        let journal_for_task = journal.clone();
         let handle = tokio::spawn(async move {
-            let result = run_durable_record(&dept_name, &router, record, args).await;
+            let result =
+                run_durable_record(&dept_name, &router, record, args, &journal_for_task).await;
             if complete_tx.send(result).await.is_err() {
                 warn!(dept = %dept_name, delivery_id = %delivery_id, "delivery completion receiver closed");
             }
@@ -362,12 +382,14 @@ async fn run_durable_record(
     router: &DeliveryRouter,
     record: DeliveryRecord,
     args: SpawnArgs,
+    journal: &SupervisorJournal,
 ) -> CompletedDelivery {
     let publish_state = Arc::new(StreamingRaiseState::new(router.clone(), record.clone()));
     let result = spawn_and_report_with_stdout_observer(
         dept_name,
         &args,
         Some(streaming_raise_observer(publish_state.clone())),
+        journal,
     )
     .await;
     let failure = match result {
@@ -394,6 +416,7 @@ fn finish_durable_record(
     store: Option<&DeliveryStore>,
     router: &DeliveryRouter,
     retry_policy: Option<&RetryPolicy>,
+    journal: &SupervisorJournal,
     done: CompletedDelivery,
 ) {
     let Some(store) = store else {
@@ -401,12 +424,21 @@ fn finish_durable_record(
         return;
     };
     if let Some(error) = done.failure {
-        retry_record(store, router, retry_policy, &done.record, error);
+        retry_record(store, router, retry_policy, journal, &done.record, error);
         return;
     }
 
     match store.ack(&done.record.delivery_id, done.record.lease_generation) {
         Ok(true) => {
+            journal.event(
+                "ack",
+                &[
+                    ("dept", dept_name.to_string()),
+                    ("queue", done.record.queue.clone()),
+                    ("delivery_id", done.record.delivery_id.clone()),
+                    ("generation", done.record.lease_generation.to_string()),
+                ],
+            );
             info!(
                 dept = %dept_name,
                 delivery_id = %done.record.delivery_id,
@@ -415,6 +447,15 @@ fn finish_durable_record(
             );
         }
         Ok(false) => {
+            journal.event(
+                "ack_stale",
+                &[
+                    ("dept", dept_name.to_string()),
+                    ("queue", done.record.queue.clone()),
+                    ("delivery_id", done.record.delivery_id.clone()),
+                    ("generation", done.record.lease_generation.to_string()),
+                ],
+            );
             warn!(
                 dept = %dept_name,
                 delivery_id = %done.record.delivery_id,
@@ -480,10 +521,21 @@ fn retry_record(
     store: &DeliveryStore,
     router: &DeliveryRouter,
     retry_policy: Option<&RetryPolicy>,
+    journal: &SupervisorJournal,
     record: &DeliveryRecord,
     failure: DeliveryFailure,
 ) {
     let Some(policy) = retry_policy else {
+        journal.event(
+            "drop",
+            &[
+                ("dept", record.dept.clone()),
+                ("queue", record.queue.clone()),
+                ("delivery_id", record.delivery_id.clone()),
+                ("generation", record.lease_generation.to_string()),
+                ("reason", "retry_policy_absent".to_string()),
+            ],
+        );
         if let Err(err) = store.ack(&record.delivery_id, record.lease_generation) {
             error!(
                 delivery_id = %record.delivery_id,
@@ -505,9 +557,32 @@ fn retry_record(
         policy,
         now_unix_millis(),
     ) {
-        Ok(RetryOutcome::DeadPendingRedrive) => {}
+        Ok(RetryOutcome::DeadPendingRedrive) => {
+            journal.event(
+                "dead_letter",
+                &[
+                    ("dept", record.dept.clone()),
+                    ("queue", record.queue.clone()),
+                    ("delivery_id", record.delivery_id.clone()),
+                    ("generation", record.lease_generation.to_string()),
+                    ("reason", failure_message),
+                    ("replayable", "true".to_string()),
+                ],
+            );
+        }
         Ok(RetryOutcome::PermanentDead) => match store.get_dead(&record.delivery_id) {
             Ok(Some(dead)) => {
+                journal.event(
+                    "dead_letter",
+                    &[
+                        ("dept", record.dept.clone()),
+                        ("queue", record.queue.clone()),
+                        ("delivery_id", record.delivery_id.clone()),
+                        ("generation", record.lease_generation.to_string()),
+                        ("reason", failure_message.clone()),
+                        ("replayable", dead.replayable.to_string()),
+                    ],
+                );
                 publish_failure_fact(router, delivery_failure_fact(record, &failure_message));
                 publish_permanent_dead_letter(router, &dead);
             }
@@ -521,7 +596,19 @@ fn retry_record(
                 "permanent dead delivery lookup failed"
             ),
         },
-        Ok(RetryOutcome::Scheduled | RetryOutcome::Stale | RetryOutcome::Missing) => {}
+        Ok(RetryOutcome::Scheduled) => {
+            journal.event(
+                "retry",
+                &[
+                    ("dept", record.dept.clone()),
+                    ("queue", record.queue.clone()),
+                    ("delivery_id", record.delivery_id.clone()),
+                    ("generation", record.lease_generation.to_string()),
+                    ("reason", failure_message),
+                ],
+            );
+        }
+        Ok(RetryOutcome::Stale | RetryOutcome::Missing) => {}
         Err(err) => {
             error!(
                 delivery_id = %record.delivery_id,
@@ -533,7 +620,12 @@ fn retry_record(
     }
 }
 
-fn maintain_dead_letters(dept_name: &str, store: Option<&DeliveryStore>, router: &DeliveryRouter) {
+fn maintain_dead_letters(
+    dept_name: &str,
+    store: Option<&DeliveryStore>,
+    router: &DeliveryRouter,
+    journal: &SupervisorJournal,
+) {
     let Some(store) = store else {
         error!(dept = %dept_name, "reliable consumer missing delivery store");
         return;
@@ -545,6 +637,15 @@ fn maintain_dead_letters(dept_name: &str, store: Option<&DeliveryStore>, router:
     match store.redrive_due(&policy, now_unix_millis(), DISPATCH_BATCH) {
         Ok(result) => {
             for record in result.redriven {
+                journal.event(
+                    "redrive",
+                    &[
+                        ("dept", record.dept.clone()),
+                        ("queue", record.queue.clone()),
+                        ("delivery_id", record.delivery_id.clone()),
+                        ("redrive_count", record.redrive_count.to_string()),
+                    ],
+                );
                 info!(
                     dept = %record.dept,
                     queue = %record.queue,
@@ -555,6 +656,16 @@ fn maintain_dead_letters(dept_name: &str, store: Option<&DeliveryStore>, router:
                 router.notify_reliable_public(&record.dept);
             }
             for dead in result.permanent {
+                journal.event(
+                    "dead_letter",
+                    &[
+                        ("dept", dead.dept.clone()),
+                        ("queue", dead.queue.clone()),
+                        ("delivery_id", dead.delivery_id.clone()),
+                        ("reason", dead.error_excerpt.clone().unwrap_or_default()),
+                        ("replayable", dead.replayable.to_string()),
+                    ],
+                );
                 publish_permanent_dead_letter(router, &dead);
             }
         }
@@ -779,14 +890,19 @@ struct SpawnArgs {
     process_groups: ProcessGroupRegistry,
 }
 
-async fn spawn_and_report(dept_name: &str, args: &SpawnArgs) -> anyhow::Result<SpawnResult> {
-    spawn_and_report_with_stdout_observer(dept_name, args, None).await
+async fn spawn_and_report(
+    dept_name: &str,
+    args: &SpawnArgs,
+    journal: &SupervisorJournal,
+) -> anyhow::Result<SpawnResult> {
+    spawn_and_report_with_stdout_observer(dept_name, args, None, journal).await
 }
 
 async fn spawn_and_report_with_stdout_observer(
     dept_name: &str,
     args: &SpawnArgs,
     stdout_observer: Option<StdoutLineObserver>,
+    journal: &SupervisorJournal,
 ) -> anyhow::Result<SpawnResult> {
     let result = spawn_framework_with_stdout_observer(
         &args.framework_bin,
@@ -800,9 +916,26 @@ async fn spawn_and_report_with_stdout_observer(
         &args.log_dir,
         args.process_groups.clone(),
         stdout_observer,
+        journal.clone(),
     )
     .await?;
 
+    journal.event(
+        "exit",
+        &[
+            ("dept", dept_name.to_string()),
+            ("exit_code", result.exit_code.to_string()),
+            ("elapsed_ms", result.elapsed_ms.to_string()),
+            (
+                "log_path",
+                result
+                    .log_path
+                    .as_ref()
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_default(),
+            ),
+        ],
+    );
     if result.exit_code != 0 {
         warn!(dept = %dept_name, exit = result.exit_code,
               stall_window_ms = args.stall_window.as_millis(),
@@ -995,7 +1128,7 @@ mod tests {
                 global_codex_processes: 1,
             },
         };
-        DeliveryRouter::new(&cfg, fanout, Some(store))
+        DeliveryRouter::new(&cfg, fanout, Some(store), SupervisorJournal::disabled())
     }
 
     fn router_with_failure_fact_and_fanout(fanout: Fanout) -> DeliveryRouter {
@@ -1030,7 +1163,7 @@ mod tests {
                 global_codex_processes: 1,
             },
         };
-        DeliveryRouter::new(&cfg, fanout, None)
+        DeliveryRouter::new(&cfg, fanout, None, SupervisorJournal::disabled())
     }
 
     #[test]
@@ -1162,7 +1295,7 @@ mod tests {
                 global_codex_processes: 1,
             },
         };
-        let router = DeliveryRouter::new(&cfg, fanout, None);
+        let router = DeliveryRouter::new(&cfg, fanout, None, SupervisorJournal::disabled());
         let spawned_router = router.clone();
         let args = SpawnArgs {
             framework_bin: binary,
@@ -1176,10 +1309,11 @@ mod tests {
             owner_namespace: "pkg".to_string(),
             process_groups: ProcessGroupRegistry::default(),
         };
+        let journal = SupervisorJournal::disabled();
 
         let started = std::time::Instant::now();
         let handle = tokio::spawn(async move {
-            run_durable_record("worker", &spawned_router, record("parent"), args).await
+            run_durable_record("worker", &spawned_router, record("parent"), args, &journal).await
         });
         let event = timeout(Duration::from_secs(4), rx.recv())
             .await
@@ -1284,6 +1418,7 @@ mod tests {
             &store,
             &router,
             Some(&policy(1)),
+            &SupervisorJournal::disabled(),
             &leased,
             DeliveryFailure::permanent("failure"),
         );
@@ -1309,6 +1444,7 @@ mod tests {
             &store,
             &router,
             Some(&policy(1)),
+            &SupervisorJournal::disabled(),
             &leased,
             DeliveryFailure::permanent("exit=7 stderr=bad"),
         );
@@ -1386,7 +1522,14 @@ mod tests {
             log_path: None,
         });
 
-        retry_record(&store, &router, Some(&policy(1)), &leased, failure);
+        retry_record(
+            &store,
+            &router,
+            Some(&policy(1)),
+            &SupervisorJournal::disabled(),
+            &leased,
+            failure,
+        );
 
         assert!(store.get("one").unwrap().is_none());
         let dead = store.get_dead("one").unwrap().unwrap();
@@ -1430,7 +1573,12 @@ mod tests {
         };
         let temp = TempDir::new().unwrap();
         let store = Arc::new(DeliveryStore::open(temp.path().join("delivery.redb")).unwrap());
-        let router = DeliveryRouter::new(&cfg, Fanout::new(), Some(store));
+        let router = DeliveryRouter::new(
+            &cfg,
+            Fanout::new(),
+            Some(store),
+            SupervisorJournal::disabled(),
+        );
         let stdout = format!(
             "RAISED: {}\n",
             base64::engine::general_purpose::URL_SAFE.encode(
@@ -1483,7 +1631,12 @@ mod tests {
         };
         let temp = TempDir::new().unwrap();
         let store = Arc::new(DeliveryStore::open(temp.path().join("delivery.redb")).unwrap());
-        let router = DeliveryRouter::new(&cfg, Fanout::new(), Some(store.clone()));
+        let router = DeliveryRouter::new(
+            &cfg,
+            Fanout::new(),
+            Some(store.clone()),
+            SupervisorJournal::disabled(),
+        );
         let parent = record("parent");
         let stdout = format!(
             "RAISED: {}\n",

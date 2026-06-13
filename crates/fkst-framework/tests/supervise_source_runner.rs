@@ -21,12 +21,15 @@ mod failure_fact;
 #[allow(dead_code)]
 #[path = "../src/supervise/source_runner.rs"]
 mod source_runner;
+#[path = "../src/supervise/supervisor_journal.rs"]
+mod supervisor_journal;
 
 use delivery_router::DeliveryRouter;
 use event_fanout::Fanout;
 use fkst_common::config::{Config, DepartmentDecl, LimitsDecl, QueueDecl};
 use source_runner::spawn_file_watch;
 use std::collections::BTreeMap;
+use supervisor_journal::SupervisorJournal;
 use tokio::time::{timeout, Duration};
 
 fn fanout_router(queue_name: &str) -> (Fanout, DeliveryRouter) {
@@ -62,7 +65,7 @@ fn fanout_router(queue_name: &str) -> (Fanout, DeliveryRouter) {
             global_codex_processes: 1,
         },
     };
-    let router = DeliveryRouter::new(&cfg, fanout.clone(), None);
+    let router = DeliveryRouter::new(&cfg, fanout.clone(), None, SupervisorJournal::disabled());
     (fanout, router)
 }
 
@@ -81,6 +84,7 @@ async fn file_watch_existing_file_emits_event() {
         tmp.path(),
         "files".to_string(),
         router,
+        SupervisorJournal::disabled(),
     )
     .unwrap();
 
@@ -109,6 +113,7 @@ async fn file_watch_new_file_emits_event() {
         tmp.path(),
         "files".to_string(),
         router,
+        SupervisorJournal::disabled(),
     )
     .unwrap();
 
@@ -141,6 +146,7 @@ async fn file_watch_periodic_scan_dedupes_unchanged_file() {
         tmp.path(),
         "files".to_string(),
         router,
+        SupervisorJournal::disabled(),
     )
     .unwrap();
 
@@ -171,6 +177,7 @@ async fn file_watch_periodic_scan_reemits_changed_file() {
         tmp.path(),
         "files".to_string(),
         router,
+        SupervisorJournal::disabled(),
     )
     .unwrap();
 
@@ -210,6 +217,7 @@ async fn file_watch_restart_startup_scan_replays_existing_file() {
         tmp.path(),
         "files".to_string(),
         router.clone(),
+        SupervisorJournal::disabled(),
     )
     .unwrap();
 
@@ -229,6 +237,7 @@ async fn file_watch_restart_startup_scan_replays_existing_file() {
         tmp.path(),
         "files".to_string(),
         router,
+        SupervisorJournal::disabled(),
     )
     .unwrap();
     let replayed = timeout(Duration::from_secs(2), rx.recv())

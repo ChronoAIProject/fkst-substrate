@@ -4,6 +4,7 @@ use super::delivery_store::DeliveryStore;
 use super::delivery_types::{DeliveryRecord, SourceKind, SourceRef};
 use super::event_fanout::Fanout;
 use super::failure_fact::{FAILURE_FACT_QUEUE, FAILURE_FACT_SCHEMA};
+use super::supervisor_journal::SupervisorJournal;
 use anyhow::{anyhow, bail, Context, Result};
 use fkst_common::config::Config;
 use fkst_common::validate_runtime_key;
@@ -23,6 +24,7 @@ pub(crate) struct DeliveryRouter {
     store: Option<Arc<DeliveryStore>>,
     subscriptions: Arc<BTreeMap<String, Vec<Subscription>>>,
     reliable_wakes: Arc<Mutex<BTreeMap<String, mpsc::Sender<()>>>>,
+    journal: SupervisorJournal,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -46,12 +48,18 @@ pub(crate) struct DerivedDelivery {
 }
 
 impl DeliveryRouter {
-    pub(crate) fn new(cfg: &Config, fanout: Fanout, store: Option<Arc<DeliveryStore>>) -> Self {
+    pub(crate) fn new(
+        cfg: &Config,
+        fanout: Fanout,
+        store: Option<Arc<DeliveryStore>>,
+        journal: SupervisorJournal,
+    ) -> Self {
         Self {
             fanout,
             store,
             subscriptions: Arc::new(subscriptions(cfg)),
             reliable_wakes: Arc::new(Mutex::new(BTreeMap::new())),
+            journal,
         }
     }
 
@@ -80,6 +88,37 @@ impl DeliveryRouter {
             .subscriptions
             .get(&queue)
             .ok_or_else(|| anyhow!("queue `{}` has no delivery subscriptions", queue))?;
+        self.journal.event(
+            "publish",
+            &[
+                ("queue", queue.clone()),
+                ("subscribers", subscribers.len().to_string()),
+                (
+                    "source_kind",
+                    envelope
+                        .source
+                        .as_ref()
+                        .map(|source| source_kind_label(&source.kind).to_string())
+                        .unwrap_or_else(|| "none".to_string()),
+                ),
+                (
+                    "source_ref",
+                    envelope
+                        .source
+                        .as_ref()
+                        .map(|source| source.reference.clone())
+                        .unwrap_or_default(),
+                ),
+                (
+                    "parent_delivery_id",
+                    envelope
+                        .derived
+                        .as_ref()
+                        .map(|derived| derived.parent_delivery_id.clone())
+                        .unwrap_or_default(),
+                ),
+            ],
+        );
         let mut sent_ephemeral = false;
         for sub in subscribers {
             if sub.reliable {
@@ -118,8 +157,26 @@ impl DeliveryRouter {
                 store
                     .enqueue(&record)
                     .with_context(|| format!("enqueue delivery `{}`", record.delivery_id))?;
+                self.journal.event(
+                    "deliver",
+                    &[
+                        ("mode", "reliable".to_string()),
+                        ("queue", queue.clone()),
+                        ("dept", sub.dept.clone()),
+                        ("delivery_id", record.delivery_id.clone()),
+                        ("attempt", record.attempt.to_string()),
+                    ],
+                );
                 self.notify_reliable(&sub.dept);
             } else {
+                self.journal.event(
+                    "deliver",
+                    &[
+                        ("mode", "ephemeral".to_string()),
+                        ("queue", queue.clone()),
+                        ("dept", sub.dept.clone()),
+                    ],
+                );
                 sent_ephemeral = true;
             }
         }
@@ -173,6 +230,15 @@ impl DeliveryRouter {
         if let Err(err) = wake.try_send(()) {
             warn!(dept = %dept, error = %err, "reliable wake notify failed");
         }
+    }
+}
+
+fn source_kind_label(kind: &SourceKind) -> &'static str {
+    match kind {
+        SourceKind::Cron => "cron",
+        SourceKind::File => "file_watch",
+        SourceKind::Git => "git",
+        SourceKind::External => "external",
     }
 }
 
@@ -525,7 +591,7 @@ mod tests {
     #[test]
     fn reliable_publish_requires_source_ref() {
         let cfg = config(false);
-        let router = DeliveryRouter::new(&cfg, Fanout::new(), None);
+        let router = DeliveryRouter::new(&cfg, Fanout::new(), None, SupervisorJournal::disabled());
 
         let err = router
             .publish(PublishEnvelope {
@@ -544,7 +610,7 @@ mod tests {
         let cfg = config(true);
         let fanout = Fanout::new();
         let mut rx = fanout.subscribe("jobs", 8).await;
-        let router = DeliveryRouter::new(&cfg, fanout, None);
+        let router = DeliveryRouter::new(&cfg, fanout, None, SupervisorJournal::disabled());
 
         router
             .publish(PublishEnvelope {
@@ -565,7 +631,12 @@ mod tests {
         let cfg = config(false);
         let temp = TempDir::new().unwrap();
         let store = Arc::new(DeliveryStore::open(temp.path().join("delivery.redb")).unwrap());
-        let router = DeliveryRouter::new(&cfg, Fanout::new(), Some(store.clone()));
+        let router = DeliveryRouter::new(
+            &cfg,
+            Fanout::new(),
+            Some(store.clone()),
+            SupervisorJournal::disabled(),
+        );
 
         router
             .publish(PublishEnvelope {
@@ -594,11 +665,49 @@ mod tests {
     }
 
     #[test]
+    fn reliable_publish_writes_supervisor_journal_events() {
+        let cfg = config(false);
+        let temp = TempDir::new().unwrap();
+        let store = Arc::new(DeliveryStore::open(temp.path().join("delivery.redb")).unwrap());
+        let journal = SupervisorJournal::open(temp.path());
+        let journal_path = journal.path().unwrap();
+        let router = DeliveryRouter::new(&cfg, Fanout::new(), Some(store), journal);
+
+        router
+            .publish(PublishEnvelope {
+                event: Event::new("jobs", serde_json::json!({"n": 1})),
+                source: Some(SourceRef {
+                    kind: SourceKind::Cron,
+                    reference: "tick".to_string(),
+                }),
+                cron_payload: Some(serde_json::json!({"raiser": "tick"})),
+                derived: None,
+            })
+            .unwrap();
+
+        let content = std::fs::read_to_string(journal_path).unwrap();
+        assert!(content.contains("event=\"publish\""), "{content}");
+        assert!(content.contains("event=\"deliver\""), "{content}");
+        assert!(content.contains("mode=\"reliable\""), "{content}");
+        assert!(
+            content.contains(
+                "delivery_id=\"delivery/v1/source/cron/queue/jobs/dept/worker/ref/tick\""
+            ),
+            "{content}"
+        );
+    }
+
+    #[test]
     fn reliable_publish_uses_namespaced_queue_and_dept_in_delivery_id() {
         let cfg = namespaced_config();
         let temp = TempDir::new().unwrap();
         let store = Arc::new(DeliveryStore::open(temp.path().join("delivery.redb")).unwrap());
-        let router = DeliveryRouter::new(&cfg, Fanout::new(), Some(store.clone()));
+        let router = DeliveryRouter::new(
+            &cfg,
+            Fanout::new(),
+            Some(store.clone()),
+            SupervisorJournal::disabled(),
+        );
         let source = SourceRef {
             kind: SourceKind::Cron,
             reference: "pkg.tick".to_string(),
@@ -716,7 +825,7 @@ mod tests {
         let store = Arc::new(DeliveryStore::open(temp.path().join("delivery.redb")).unwrap());
         let fanout = Fanout::new();
         let mut rx = fanout.subscribe("jobs", 8).await;
-        let router = DeliveryRouter::new(&cfg, fanout, Some(store));
+        let router = DeliveryRouter::new(&cfg, fanout, Some(store), SupervisorJournal::disabled());
 
         router
             .publish(PublishEnvelope {
@@ -740,7 +849,12 @@ mod tests {
         let cfg = config(false);
         let temp = TempDir::new().unwrap();
         let store = Arc::new(DeliveryStore::open(temp.path().join("delivery.redb")).unwrap());
-        let router = DeliveryRouter::new(&cfg, Fanout::new(), Some(store));
+        let router = DeliveryRouter::new(
+            &cfg,
+            Fanout::new(),
+            Some(store),
+            SupervisorJournal::disabled(),
+        );
 
         let err = router
             .publish(PublishEnvelope {

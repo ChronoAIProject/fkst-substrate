@@ -11,6 +11,8 @@ mod sdk_codex {
 mod process_tree;
 #[path = "../src/supervise/spawner.rs"]
 mod spawner;
+#[path = "../src/supervise/supervisor_journal.rs"]
+mod supervisor_journal;
 mod support;
 
 use spawner::{spawn_framework, SpawnResult};

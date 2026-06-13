@@ -48,6 +48,7 @@ fn run_department(host: &Path, runtime: &Path, lua: &str, event: &str) -> Output
         .arg(event)
         .current_dir(host)
         .env("FKST_RUNTIME_ROOT", runtime)
+        .env_remove("FKST_SUPERVISOR_PID")
         .output()
         .unwrap()
 }
@@ -61,6 +62,7 @@ fn run_conformance(host: &Path, runtime: &Path) -> Output {
         .arg(host)
         .current_dir(host)
         .env("FKST_RUNTIME_ROOT", runtime)
+        .env_remove("FKST_SUPERVISOR_PID")
         .output()
         .unwrap()
 }

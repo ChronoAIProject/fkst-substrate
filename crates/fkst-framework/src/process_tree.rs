@@ -144,6 +144,12 @@ pub(crate) fn install_sdk_shutdown_watch() {
     });
 }
 
+#[cfg(test)]
+pub(crate) fn ensure_supervisor_parent_alive() -> mlua::Result<()> {
+    Ok(())
+}
+
+#[cfg(not(test))]
 pub(crate) fn ensure_supervisor_parent_alive() -> mlua::Result<()> {
     let Some(expected_parent_pid) = std::env::var("FKST_SUPERVISOR_PID")
         .ok()

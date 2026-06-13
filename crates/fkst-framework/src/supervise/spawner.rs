@@ -2,6 +2,7 @@
 //!
 //! Spawn `fkst-framework run <lua_path> --project-root <path> --package-root <path> ... --owner-namespace <id> --event <json>` with setsid.
 
+use super::supervisor_journal::SupervisorJournal;
 use crate::process_tree::{ProcessGroupRegistration, ProcessGroupRegistry};
 use anyhow::{Context, Result};
 use std::ffi::OsStr;
@@ -68,6 +69,7 @@ pub async fn spawn_framework(
         log_dir,
         process_groups,
         None,
+        SupervisorJournal::disabled(),
     )
     .await
 }
@@ -85,6 +87,7 @@ pub async fn spawn_framework_with_stdout_observer(
     log_dir: &Path,
     process_groups: ProcessGroupRegistry,
     stdout_observer: Option<StdoutLineObserver>,
+    journal: SupervisorJournal,
 ) -> Result<SpawnResult> {
     let start = std::time::Instant::now();
     let cmd_line = format!(
@@ -139,6 +142,14 @@ pub async fn spawn_framework_with_stdout_observer(
         Ok(child) => child,
         Err(err) => {
             log.write_line(&format!("SPAWN_ERROR={err}"));
+            journal.event(
+                "spawn_error",
+                &[
+                    ("dept", child_label.to_string()),
+                    ("lua", lua_path.display().to_string()),
+                    ("error", err.to_string()),
+                ],
+            );
             return Err(err).context("spawn fkst-framework");
         }
     };
@@ -147,6 +158,15 @@ pub async fn spawn_framework_with_stdout_observer(
         .ok_or_else(|| anyhow::anyhow!("no pid after spawn"))?;
     log.write_line(&format!("PID={pid}"));
     info!(pid = pid, lua = %lua_path.display(), "framework spawned");
+    journal.event(
+        "spawn",
+        &[
+            ("dept", child_label.to_string()),
+            ("pid", pid.to_string()),
+            ("lua", lua_path.display().to_string()),
+            ("owner_namespace", owner_namespace.to_string()),
+        ],
+    );
     let registration = process_groups.register(pid);
 
     wait_for_framework_child(child, start, log, registration, stdout_observer).await

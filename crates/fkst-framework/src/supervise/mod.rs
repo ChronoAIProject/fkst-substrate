@@ -2,6 +2,7 @@ use anyhow::Result;
 use fkst_common::config::{Config, RaiserDecl};
 use fkst_common::validation::validate;
 use fkst_common::DurableLayout;
+use fkst_common::RuntimeKind;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tracing::{error, info, warn};
@@ -22,6 +23,7 @@ pub(crate) mod graph_scan;
 mod raised;
 pub(crate) mod source_runner;
 mod spawner;
+mod supervisor_journal;
 
 use crate::process_tree::ProcessGroupRegistry;
 use consumer::spawn_consumer;
@@ -30,6 +32,7 @@ use delivery_store::DeliveryStore;
 use event_fanout::Fanout;
 use failure_fact::schema_validation_failure_fact;
 use source_runner::{spawn_cron, spawn_file_watch};
+use supervisor_journal::SupervisorJournal;
 
 pub(crate) fn load_host_graph_for_conformance(roots: &PackageRoots) -> Result<Config> {
     graph_scan::load_roots(roots)
@@ -67,8 +70,33 @@ pub async fn supervise(roots: PackageRoots, framework_bin: PathBuf) -> Result<()
     }
 
     let fanout = Fanout::new();
+    let layout = crate::runtime_context::layout_from_host_root(&project_root)?;
+    let journal = SupervisorJournal::open(&layout.runtime_dir(RuntimeKind::Logs));
+    journal.event(
+        "startup",
+        &[
+            ("host_root", project_root.display().to_string()),
+            (
+                "package_roots",
+                roots
+                    .package_roots()
+                    .iter()
+                    .map(|root| root.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(";"),
+            ),
+            ("departments", cfg.department.len().to_string()),
+            ("raisers", cfg.raiser.len().to_string()),
+            ("queues", cfg.queue.len().to_string()),
+        ],
+    );
     let delivery_store = delivery_store_for_config(&cfg)?;
-    let router = DeliveryRouter::new(&cfg, fanout.clone(), delivery_store.clone());
+    let router = DeliveryRouter::new(
+        &cfg,
+        fanout.clone(),
+        delivery_store.clone(),
+        journal.clone(),
+    );
     delivery_watch::set_failure_fact_publisher(router.failure_fact_publisher());
     let codex_permit_slots = cfg.limits.global_codex_processes;
     let process_groups = ProcessGroupRegistry::default();
@@ -102,6 +130,7 @@ pub async fn supervise(roots: PackageRoots, framework_bin: PathBuf) -> Result<()
                 q_cap,
                 codex_permit_slots,
                 process_groups.clone(),
+                journal.clone(),
             )
             .await,
         );
@@ -119,6 +148,7 @@ pub async fn supervise(roots: PackageRoots, framework_bin: PathBuf) -> Result<()
                     interval,
                     produces.clone(),
                     router.clone(),
+                    journal.clone(),
                 )?);
             }
             RaiserDecl::FileWatch { glob, produces } => {
@@ -128,6 +158,7 @@ pub async fn supervise(roots: PackageRoots, framework_bin: PathBuf) -> Result<()
                     &project_root,
                     produces.clone(),
                     router.clone(),
+                    journal.clone(),
                 )?);
             }
         }
@@ -139,9 +170,13 @@ pub async fn supervise(roots: PackageRoots, framework_bin: PathBuf) -> Result<()
     tokio::select! {
         _ = sigint.recv() => {
             warn!("event runtime received SIGINT");
+            journal.event("signal", &[("signal", "SIGINT".to_string())]);
+            journal.event("shutdown", &[("reason", "signal".to_string()), ("signal", "SIGINT".to_string())]);
         }
         _ = sigterm.recv() => {
             warn!("event runtime received SIGTERM");
+            journal.event("signal", &[("signal", "SIGTERM".to_string())]);
+            journal.event("shutdown", &[("reason", "signal".to_string()), ("signal", "SIGTERM".to_string())]);
         }
     }
     shutdown_runtime(handles, &process_groups).await;
@@ -181,7 +216,7 @@ fn publish_startup_validation_failure(cfg: &Config, error: &str) {
             None
         }
     };
-    let router = DeliveryRouter::new(cfg, fanout, store);
+    let router = DeliveryRouter::new(cfg, fanout, store, SupervisorJournal::disabled());
     if let Err(err) = router.publish_failure_fact(fact.clone()) {
         warn!(error = %err, "startup failure fact publish failed");
     }

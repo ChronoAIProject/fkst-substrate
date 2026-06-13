@@ -43,6 +43,7 @@ fn run_lua_tests(host: &Path, package: &Path) -> Output {
         .arg(package)
         .current_dir(host)
         .env("FKST_RUNTIME_ROOT", host.join(".fkst/runtime"))
+        .env_remove("FKST_SUPERVISOR_PID")
         .output()
         .unwrap()
 }
@@ -55,6 +56,7 @@ fn run_lua_tests_with_packages(host: &Path, packages: &[&Path]) -> Output {
     }
     cmd.current_dir(host)
         .env("FKST_RUNTIME_ROOT", host.join(".fkst/runtime"))
+        .env_remove("FKST_SUPERVISOR_PID")
         .output()
         .unwrap()
 }
@@ -70,6 +72,7 @@ fn run_lua_tests_with_report(host: &Path, package: &Path, report: &Path) -> Outp
         .arg(report)
         .current_dir(host)
         .env("FKST_RUNTIME_ROOT", host.join(".fkst/runtime"))
+        .env_remove("FKST_SUPERVISOR_PID")
         .output()
         .unwrap()
 }
@@ -88,6 +91,7 @@ fn run_lua_tests_with_packages_and_report(
         .arg(report)
         .current_dir(host)
         .env("FKST_RUNTIME_ROOT", host.join(".fkst/runtime"))
+        .env_remove("FKST_SUPERVISOR_PID")
         .output()
         .unwrap()
 }
@@ -127,7 +131,8 @@ fn run_command(host: &Path, lua: &Path) -> Command {
         .current_dir(host)
         .env("FKST_RUNTIME_ROOT", host.join(".fkst/runtime"))
         .env_remove("FKST_PACKAGE_ROOT")
-        .env_remove("FKST_PACKAGE_ROOTS");
+        .env_remove("FKST_PACKAGE_ROOTS")
+        .env_remove("FKST_SUPERVISOR_PID");
     cmd
 }
 
@@ -1506,6 +1511,7 @@ end
         .arg("{}")
         .current_dir(host.path())
         .env("FKST_RUNTIME_ROOT", host.path().join(".fkst/runtime"))
+        .env_remove("FKST_SUPERVISOR_PID")
         .output()
         .unwrap();
 
@@ -1548,6 +1554,7 @@ end
         .arg("{}")
         .current_dir(host.path())
         .env("FKST_RUNTIME_ROOT", host.path().join(".fkst/runtime"))
+        .env_remove("FKST_SUPERVISOR_PID")
         .output()
         .unwrap();
 
@@ -1591,6 +1598,7 @@ end
         .arg(r#"{"payload":{"cmd":"printf 'HTTP 401 bad credentials' >&2; exit 1"}}"#)
         .current_dir(host.path())
         .env("FKST_RUNTIME_ROOT", host.path().join(".fkst/runtime"))
+        .env_remove("FKST_SUPERVISOR_PID")
         .output()
         .unwrap();
 
@@ -1618,6 +1626,7 @@ end
         .arg(r#"{"payload":{"cmd":"printf 'secondary rate limit' >&2; exit 1"}}"#)
         .current_dir(host.path())
         .env("FKST_RUNTIME_ROOT", host.path().join(".fkst/runtime"))
+        .env_remove("FKST_SUPERVISOR_PID")
         .output()
         .unwrap();
 

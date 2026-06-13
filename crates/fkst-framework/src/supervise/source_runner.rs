@@ -2,6 +2,7 @@
 
 use super::delivery_router::{DeliveryRouter, PublishEnvelope};
 use super::delivery_types::{SourceKind, SourceRef};
+use super::supervisor_journal::SupervisorJournal;
 use fkst_common::Event;
 use notify::{Config, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use std::collections::HashMap;
@@ -19,6 +20,7 @@ pub fn spawn_cron(
     interval_str: &str,
     produces: String,
     router: DeliveryRouter,
+    journal: SupervisorJournal,
 ) -> anyhow::Result<tokio::task::JoinHandle<()>> {
     let interval = parse_duration(interval_str)?;
     let handle = tokio::spawn(async move {
@@ -29,11 +31,21 @@ pub fn spawn_cron(
             let payload = cron_payload(&name);
             let ev = Event::new(&produces, payload);
             let slot = cron_slot_unix_millis(interval);
+            let source_ref = cron_source_reference(&name, slot);
+            journal.event(
+                "raiser_fire",
+                &[
+                    ("kind", "cron".to_string()),
+                    ("raiser", name.clone()),
+                    ("queue", produces.clone()),
+                    ("source_ref", source_ref.clone()),
+                ],
+            );
             if let Err(e) = router.publish(PublishEnvelope {
                 event: ev,
                 source: Some(SourceRef {
                     kind: SourceKind::Cron,
-                    reference: cron_source_reference(&name, slot),
+                    reference: source_ref,
                 }),
                 cron_payload: Some(cron_payload(&name)),
                 derived: None,
@@ -80,13 +92,14 @@ pub fn spawn_file_watch(
     host_root: &Path,
     produces: String,
     router: DeliveryRouter,
+    journal: SupervisorJournal,
 ) -> anyhow::Result<tokio::task::JoinHandle<()>> {
     let glob = absolutize_glob(glob, host_root)?;
     let handle = tokio::spawn(async move {
         info!(raiser = %name, glob = %glob, "file_watch raiser starting");
 
         let mut seen = HashMap::new();
-        emit_scan(&name, &glob, &produces, &router, &mut seen);
+        emit_scan(&name, &glob, &produces, &router, &journal, &mut seen);
 
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let tx_for_watcher = tx.clone();
@@ -130,7 +143,7 @@ pub fn spawn_file_watch(
                         Some(Ok(event)) => {
                             if is_file_creation_like(&event.kind) {
                                 for path in event.paths {
-                                    emit_if_match(&name, &glob, &produces, &router, &path, &mut seen);
+                                    emit_if_match(&name, &glob, &produces, &router, &journal, &path, &mut seen);
                                 }
                             }
                         }
@@ -138,12 +151,12 @@ pub fn spawn_file_watch(
                             warn!(raiser = %name, error = %e, "file_watch notify event error");
                         }
                         None => {
-                            emit_scan(&name, &glob, &produces, &router, &mut seen);
+                            emit_scan(&name, &glob, &produces, &router, &journal, &mut seen);
                         }
                     }
                 }
                 _ = poll.tick() => {
-                    emit_scan(&name, &glob, &produces, &router, &mut seen);
+                    emit_scan(&name, &glob, &produces, &router, &journal, &mut seen);
                 }
             }
         }
@@ -172,10 +185,11 @@ fn emit_scan(
     glob: &str,
     produces: &str,
     router: &DeliveryRouter,
+    journal: &SupervisorJournal,
     seen: &mut HashMap<PathBuf, FileIdentity>,
 ) {
     for path in existing_matches(glob) {
-        emit_changed_path(name, produces, router, path, seen);
+        emit_changed_path(name, produces, router, journal, path, seen);
     }
 }
 
@@ -184,6 +198,7 @@ fn emit_if_match(
     glob: &str,
     produces: &str,
     router: &DeliveryRouter,
+    journal: &SupervisorJournal,
     path: &Path,
     seen: &mut HashMap<PathBuf, FileIdentity>,
 ) {
@@ -194,7 +209,7 @@ fn emit_if_match(
         return;
     };
     if glob_matches_path(glob, &path) {
-        emit_changed_path(name, produces, router, path, seen);
+        emit_changed_path(name, produces, router, journal, path, seen);
     }
 }
 
@@ -202,6 +217,7 @@ fn emit_changed_path(
     name: &str,
     produces: &str,
     router: &DeliveryRouter,
+    journal: &SupervisorJournal,
     path: PathBuf,
     seen: &mut HashMap<PathBuf, FileIdentity>,
 ) {
@@ -212,7 +228,7 @@ fn emit_changed_path(
         return;
     }
     seen.insert(path.clone(), identity);
-    emit_abs_path(name, produces, router, path, identity);
+    emit_abs_path(name, produces, router, journal, path, identity);
 }
 
 fn file_identity(path: &Path) -> std::io::Result<FileIdentity> {
@@ -227,16 +243,27 @@ fn emit_abs_path(
     name: &str,
     produces: &str,
     router: &DeliveryRouter,
+    journal: &SupervisorJournal,
     path: PathBuf,
     identity: FileIdentity,
 ) {
     let payload = serde_json::json!({"path": path.to_string_lossy()});
     let ev = Event::new(produces, payload);
+    let source_ref = file_source_reference(&path, identity);
+    journal.event(
+        "raiser_fire",
+        &[
+            ("kind", "file_watch".to_string()),
+            ("raiser", name.to_string()),
+            ("queue", produces.to_string()),
+            ("source_ref", source_ref.clone()),
+        ],
+    );
     if let Err(e) = router.publish(PublishEnvelope {
         event: ev,
         source: Some(SourceRef {
             kind: SourceKind::File,
-            reference: file_source_reference(&path, identity),
+            reference: source_ref,
         }),
         cron_payload: None,
         derived: None,
@@ -526,7 +553,7 @@ mod tests {
                 global_codex_processes: 1,
             },
         };
-        let router = DeliveryRouter::new(&cfg, fanout.clone(), None);
+        let router = DeliveryRouter::new(&cfg, fanout.clone(), None, SupervisorJournal::disabled());
         (fanout, router)
     }
 
@@ -638,6 +665,7 @@ mod tests {
             tmp.path(),
             "files".to_string(),
             router,
+            SupervisorJournal::disabled(),
         )
         .unwrap();
 
@@ -666,6 +694,7 @@ mod tests {
             tmp.path(),
             "files".to_string(),
             router,
+            SupervisorJournal::disabled(),
         )
         .unwrap();
 
@@ -698,6 +727,7 @@ mod tests {
             tmp.path(),
             "files".to_string(),
             router,
+            SupervisorJournal::disabled(),
         )
         .unwrap();
 
@@ -728,6 +758,7 @@ mod tests {
             tmp.path(),
             "files".to_string(),
             router,
+            SupervisorJournal::disabled(),
         )
         .unwrap();
 
@@ -767,6 +798,7 @@ mod tests {
             tmp.path(),
             "files".to_string(),
             router.clone(),
+            SupervisorJournal::disabled(),
         )
         .unwrap();
 
@@ -786,6 +818,7 @@ mod tests {
             tmp.path(),
             "files".to_string(),
             router,
+            SupervisorJournal::disabled(),
         )
         .unwrap();
         let replayed = timeout(Duration::from_secs(2), rx.recv())
