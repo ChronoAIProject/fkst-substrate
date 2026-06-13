@@ -27,19 +27,6 @@ use tracing::{error, info, warn};
 
 const DISPATCH_INTERVAL: Duration = Duration::from_secs(1);
 const DISPATCH_BATCH: usize = 16;
-/// Bounds concurrent durable children per department as backpressure: accumulated durable backlog
-/// such as cron-tick or level-signal deliveries that piled up behind a lagging consumer drains
-/// serially instead of thundering-herd on restart.
-///
-/// Cross-department fairness is preserved because each department owns its consumer, `running` map,
-/// and `lease_for_dept_excluding` lease path; one department's backlog never blocks another.
-///
-/// A slow durable child only delays its own department's next dispatch until it exits naturally, so
-/// the backlog still drains. A genuinely deadlocked child blocks only that department. That is the
-/// least-bad option under the deliberate no-kill, renew-until-natural-exit policy that keeps long
-/// codex children alive; a never-exiting child is an application bug in the package, not something
-/// to fix by killing it here.
-const MAX_DURABLE_IN_FLIGHT_PER_DEPT: usize = 1;
 const REDRIVE_COOLDOWN: Duration = Duration::from_secs(600);
 const REDRIVE_MAX: u64 = 3;
 
@@ -55,6 +42,8 @@ pub async fn spawn_consumer(
     store: Option<Arc<DeliveryStore>>,
     queue_capacity: usize,
     codex_permit_slots: usize,
+    max_in_flight: usize,
+    admission_burst: usize,
     process_groups: ProcessGroupRegistry,
     journal: SupervisorJournal,
 ) -> JoinHandle<()> {
@@ -175,6 +164,8 @@ pub async fn spawn_consumer(
                         &framework_child_log_dir,
                         stall_window,
                         codex_permit_slots,
+                        max_in_flight,
+                        admission_burst,
                         process_groups.clone(),
                         journal.clone(),
                         &complete_tx,
@@ -196,6 +187,8 @@ pub async fn spawn_consumer(
                         &framework_child_log_dir,
                         stall_window,
                         codex_permit_slots,
+                        max_in_flight,
+                        admission_burst,
                         process_groups.clone(),
                         journal.clone(),
                         &complete_tx,
@@ -239,9 +232,14 @@ fn on_wake_disconnect(reliable_wake_rx: &mut Option<mpsc::Receiver<()>>) {
     *reliable_wake_rx = None;
 }
 
-fn durable_dispatch_capacity(running_len: usize) -> usize {
-    MAX_DURABLE_IN_FLIGHT_PER_DEPT
+fn durable_dispatch_capacity(
+    running_len: usize,
+    max_in_flight: usize,
+    admission_burst: usize,
+) -> usize {
+    max_in_flight
         .saturating_sub(running_len)
+        .min(admission_burst)
         .min(DISPATCH_BATCH)
 }
 
@@ -333,6 +331,8 @@ fn dispatch_due(
     log_dir: &std::path::Path,
     stall_window: Duration,
     codex_permit_slots: usize,
+    max_in_flight: usize,
+    admission_burst: usize,
     process_groups: ProcessGroupRegistry,
     journal: SupervisorJournal,
     complete_tx: &mpsc::Sender<CompletedDelivery>,
@@ -342,7 +342,7 @@ fn dispatch_due(
         error!(dept = %name, "reliable consumer missing delivery store");
         return;
     };
-    let capacity = durable_dispatch_capacity(running.len());
+    let capacity = durable_dispatch_capacity(running.len(), max_in_flight, admission_burst);
     if capacity == 0 {
         return;
     }
@@ -1188,10 +1188,29 @@ mod tests {
     }
 
     #[test]
-    fn durable_dispatch_capacity_bounds_one_running_delivery() {
-        assert_eq!(durable_dispatch_capacity(0), 1);
-        assert_eq!(durable_dispatch_capacity(1), 0);
-        assert_eq!(durable_dispatch_capacity(8), 0);
+    fn durable_dispatch_capacity_admits_one_per_pass_with_default_burst() {
+        assert_eq!(durable_dispatch_capacity(0, 16, 1), 1);
+        assert_eq!(durable_dispatch_capacity(1, 16, 1), 1);
+        assert_eq!(durable_dispatch_capacity(16, 16, 1), 0);
+    }
+
+    #[test]
+    fn durable_dispatch_capacity_honors_steady_state_ceiling() {
+        assert_eq!(durable_dispatch_capacity(15, 16, 1), 1);
+        assert_eq!(durable_dispatch_capacity(16, 16, 1), 0);
+        assert_eq!(durable_dispatch_capacity(17, 16, 1), 0);
+    }
+
+    #[test]
+    fn durable_dispatch_capacity_limits_restart_burst() {
+        assert_eq!(durable_dispatch_capacity(0, 16, 1), 1);
+        assert_eq!(durable_dispatch_capacity(0, 16, 4), 4);
+    }
+
+    #[test]
+    fn durable_dispatch_capacity_clamps_to_burst_and_dispatch_batch() {
+        assert_eq!(durable_dispatch_capacity(0, 16, 8), 8);
+        assert_eq!(durable_dispatch_capacity(0, 64, 32), DISPATCH_BATCH);
     }
 
     fn router_with_dead_letter(store: Arc<DeliveryStore>) -> DeliveryRouter {
@@ -1442,7 +1461,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn durable_dispatch_drains_one_child_per_dept_under_backlog() {
+    async fn durable_dispatch_admits_one_new_child_per_pass_under_backlog() {
         let temp = TempDir::new().unwrap();
         let store = Arc::new(DeliveryStore::open(temp.path().join("delivery.redb")).unwrap());
         store.enqueue(&record("one")).unwrap();
@@ -1508,6 +1527,8 @@ mod tests {
             &log_dir,
             Duration::from_secs(30),
             1,
+            16,
+            1,
             ProcessGroupRegistry::default(),
             SupervisorJournal::disabled(),
             &complete_tx,
@@ -1541,32 +1562,15 @@ mod tests {
             &log_dir,
             Duration::from_secs(30),
             1,
+            16,
+            1,
             ProcessGroupRegistry::default(),
             SupervisorJournal::disabled(),
             &complete_tx,
             &mut running,
         );
-        assert_eq!(
-            fs::read_to_string(&started).unwrap().lines().count(),
-            1,
-            "second due record must not spawn while one durable child is running"
-        );
-
-        fs::write(&release, "").unwrap();
-        let done = timeout(Duration::from_secs(2), complete_rx.recv())
-            .await
-            .expect("first durable child should complete")
-            .expect("completion channel should remain open");
-        running.remove(&done.record.delivery_id);
-        finish_durable_record(
-            "worker",
-            Some(store.as_ref()),
-            &router,
-            None,
-            done,
-            &SupervisorJournal::disabled(),
-        );
-        fs::remove_file(&release).unwrap();
+        wait_for_started_count(&started, 2).await;
+        assert_eq!(running.len(), 2);
 
         dispatch_due(
             "worker",
@@ -1580,44 +1584,147 @@ mod tests {
             &log_dir,
             Duration::from_secs(30),
             1,
+            16,
+            1,
             ProcessGroupRegistry::default(),
             SupervisorJournal::disabled(),
             &complete_tx,
             &mut running,
         );
-        timeout(Duration::from_secs(2), async {
-            loop {
-                if fs::read_to_string(&started)
-                    .map(|text| text.lines().count())
-                    .unwrap_or(0)
-                    == 2
-                {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .expect("second durable child should start after the first completes");
-        assert_eq!(running.len(), 1);
+        assert_eq!(
+            fs::read_to_string(&started).unwrap().lines().count(),
+            2,
+            "backlog admission should stay bounded by one new child per pass"
+        );
 
         fs::write(&release, "").unwrap();
-        let done = timeout(Duration::from_secs(2), complete_rx.recv())
-            .await
-            .expect("second durable child should complete")
-            .expect("completion channel should remain open");
-        running.remove(&done.record.delivery_id);
-        finish_durable_record(
-            "worker",
-            Some(store.as_ref()),
-            &router,
-            None,
-            done,
-            &SupervisorJournal::disabled(),
-        );
+        for _ in 0..2 {
+            let done = timeout(Duration::from_secs(2), complete_rx.recv())
+                .await
+                .expect("durable child should complete")
+                .expect("completion channel should remain open");
+            running.remove(&done.record.delivery_id);
+            finish_durable_record(
+                "worker",
+                Some(store.as_ref()),
+                &router,
+                None,
+                done,
+                &SupervisorJournal::disabled(),
+            );
+        }
 
         assert!(store.get("one").unwrap().is_none());
         assert!(store.get("two").unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn durable_dispatch_admits_burst_children_in_one_pass() {
+        // Guards the dispatch path itself (not just durable_dispatch_capacity arithmetic):
+        // with admission_burst = 2 a single dispatch_due pass must lease+spawn exactly two
+        // children, proving FKST_DURABLE_ADMISSION_BURST_PER_DEPT > 1 actually admits more
+        // than one per pass and is not silently pinned to one-at-a-time downstream.
+        let temp = TempDir::new().unwrap();
+        let store = Arc::new(DeliveryStore::open(temp.path().join("delivery.redb")).unwrap());
+        store.enqueue(&record("one")).unwrap();
+        store.enqueue(&record("two")).unwrap();
+        store.enqueue(&record("three")).unwrap();
+        let started = temp.path().join("started");
+        let release = temp.path().join("release");
+        let binary = temp.path().join("fkst-framework");
+        let lua = temp.path().join("departments/worker/main.lua");
+        let log_dir = temp.path().join("logs");
+        fs::create_dir_all(lua.parent().unwrap()).unwrap();
+        fs::write(&lua, "return {}\n").unwrap();
+        write_executable(
+            &binary,
+            &format!(
+                "printf 'started\\n' >> '{}'\nwhile [ ! -f '{}' ]; do sleep 0.05; done\nexit 0",
+                started.display(),
+                release.display()
+            ),
+        );
+        let roots = PackageRoots::resolve(temp.path(), vec![temp.path().to_path_buf()]).unwrap();
+        let decl = DepartmentDecl {
+            lua: "departments/worker/main.lua".into(),
+            owner_root: temp.path().canonicalize().unwrap(),
+            owner_namespace: package_namespace(temp.path()),
+            consumes: vec!["jobs".to_string()],
+            produces: Vec::new(),
+            ephemeral: Vec::new(),
+            stall_window: "30s".to_string(),
+            graph_json: false,
+            retry: None,
+        };
+        let mut queue = BTreeMap::new();
+        queue.insert(
+            "jobs".to_string(),
+            QueueDecl {
+                capacity: 8,
+                fanout: false,
+            },
+        );
+        let mut department = BTreeMap::new();
+        department.insert("worker".to_string(), decl.clone());
+        let cfg = Config {
+            queue,
+            raiser: BTreeMap::new(),
+            department,
+            limits: LimitsDecl {
+                global_codex_processes: 1,
+            },
+        };
+        let router = DeliveryRouter::new(&cfg, Fanout::new(), Some(store.clone()), None);
+        let (complete_tx, mut complete_rx) = mpsc::channel::<CompletedDelivery>(8);
+        let mut running = BTreeMap::new();
+
+        dispatch_due(
+            "worker",
+            &decl,
+            temp.path(),
+            &roots,
+            &binary,
+            &router,
+            Some(store.clone()),
+            None,
+            &log_dir,
+            Duration::from_secs(30),
+            1,
+            16,
+            2,
+            ProcessGroupRegistry::default(),
+            SupervisorJournal::disabled(),
+            &complete_tx,
+            &mut running,
+        );
+        wait_for_started_count(&started, 2).await;
+        assert_eq!(
+            running.len(),
+            2,
+            "admission_burst=2 should start exactly two children in one dispatch pass"
+        );
+        assert_eq!(
+            fs::read_to_string(&started).unwrap().lines().count(),
+            2,
+            "burst bounds a single pass at two children even with three queued"
+        );
+
+        fs::write(&release, "").unwrap();
+        for _ in 0..2 {
+            let done = timeout(Duration::from_secs(2), complete_rx.recv())
+                .await
+                .expect("durable child should complete")
+                .expect("completion channel should remain open");
+            running.remove(&done.record.delivery_id);
+            finish_durable_record(
+                "worker",
+                Some(store.as_ref()),
+                &router,
+                None,
+                done,
+                &SupervisorJournal::disabled(),
+            );
+        }
     }
 
     #[tokio::test]
@@ -1677,6 +1784,8 @@ mod tests {
             &log_dir,
             Duration::from_secs(30),
             1,
+            16,
+            1,
             ProcessGroupRegistry::default(),
             SupervisorJournal::disabled(),
             &complete_tx,
@@ -1696,6 +1805,8 @@ mod tests {
             None,
             &log_dir,
             Duration::from_secs(30),
+            1,
+            16,
             1,
             ProcessGroupRegistry::default(),
             SupervisorJournal::disabled(),
@@ -1770,6 +1881,8 @@ mod tests {
             &log_dir,
             Duration::from_millis(1),
             1,
+            16,
+            1,
             ProcessGroupRegistry::default(),
             SupervisorJournal::disabled(),
             &complete_tx,
@@ -1777,11 +1890,10 @@ mod tests {
         );
         wait_for_started_count(&started, 1).await;
         assert_eq!(running.len(), 1);
-        assert_eq!(durable_dispatch_capacity(running.len()), 0);
+        assert_eq!(durable_dispatch_capacity(running.len(), 1, 1), 0);
 
-        // The capacity gate is the same-department at-least-once guard while the child is still
-        // tracked in `running`; renewal can extend the lease, but expired or second due records
-        // cannot be leased until this department's slot is freed.
+        // A saturated max-in-flight gate keeps due records unleased while the running child
+        // renews its lease.
         renew_running(
             "worker",
             Some(store.as_ref()),
@@ -1800,6 +1912,8 @@ mod tests {
             &log_dir,
             Duration::from_millis(1),
             1,
+            1,
+            1,
             ProcessGroupRegistry::default(),
             SupervisorJournal::disabled(),
             &complete_tx,
@@ -1808,7 +1922,7 @@ mod tests {
         assert_eq!(
             fs::read_to_string(&started).unwrap().lines().count(),
             1,
-            "second due record must not dispatch while this department has a running child"
+            "second due record must not dispatch while max-in-flight is saturated"
         );
 
         fs::write(&release, "").unwrap();
@@ -1837,6 +1951,8 @@ mod tests {
             None,
             &log_dir,
             Duration::from_millis(1),
+            1,
+            1,
             1,
             ProcessGroupRegistry::default(),
             SupervisorJournal::disabled(),

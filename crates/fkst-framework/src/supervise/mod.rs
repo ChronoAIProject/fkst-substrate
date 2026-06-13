@@ -24,6 +24,7 @@ mod raised;
 pub(crate) mod source_runner;
 mod spawner;
 
+use crate::config_registry::{ConfigContext, ConfigKey};
 use crate::process_tree::ProcessGroupRegistry;
 use consumer::spawn_consumer;
 use delivery_router::DeliveryRouter;
@@ -93,7 +94,7 @@ pub async fn supervise(roots: PackageRoots, framework_bin: PathBuf) -> Result<()
         warn!(warning = %warning, "schema validation warning");
     }
     info!("schema validation passed");
-    let config_context = crate::config_registry::ConfigContext::from_host_root(&project_root)?;
+    let config_context = ConfigContext::from_host_root(&project_root)?;
     let rate_pools = crate::rate_pool::RatePoolRegistry::from_config(&config_context)?;
     if !rate_pools.is_empty() {
         let framework_for_shim = std::env::current_exe().unwrap_or_else(|_| framework_bin.clone());
@@ -111,6 +112,10 @@ pub async fn supervise(roots: PackageRoots, framework_bin: PathBuf) -> Result<()
     );
     delivery_watch::set_failure_fact_publisher(router.failure_fact_publisher());
     let codex_permit_slots = cfg.limits.global_codex_processes;
+    let max_in_flight_per_dept =
+        config_context.resolved_positive_usize(ConfigKey::MaxInFlightPerDept)?;
+    let durable_admission_burst_per_dept =
+        config_context.resolved_positive_usize(ConfigKey::DurableAdmissionBurstPerDept)?;
     let process_groups = ProcessGroupRegistry::default();
     let mut handles = vec![];
 
@@ -141,6 +146,8 @@ pub async fn supervise(roots: PackageRoots, framework_bin: PathBuf) -> Result<()
                 delivery_store.clone(),
                 q_cap,
                 codex_permit_slots,
+                max_in_flight_per_dept,
+                durable_admission_burst_per_dept,
                 process_groups.clone(),
                 journal.clone(),
             )
