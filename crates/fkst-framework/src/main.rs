@@ -358,16 +358,18 @@ fn run_pipeline(
     owner_namespace: String,
     event: JsonValue,
 ) -> Result<i32> {
-    crate::process_tree::install_sdk_shutdown_watch();
-    let parent_pid = std::env::var("FKST_SUPERVISOR_PID")
-        .ok()
-        .and_then(|value| value.parse::<u32>().ok());
-    if parent_pid
-        .map(crate::process_tree::parent_changed)
-        .unwrap_or(false)
-    {
-        eprintln!("[framework] supervisor parent lost before pipeline start");
-        return Ok(125);
+    if std::env::var_os(crate::process_tree::SUPERVISED_RUN_ENV).is_some() {
+        crate::process_tree::install_sdk_shutdown_watch();
+        let parent_pid = std::env::var(crate::process_tree::SUPERVISOR_PID_ENV)
+            .ok()
+            .and_then(|value| value.parse::<u32>().ok());
+        if parent_pid
+            .map(crate::process_tree::parent_changed)
+            .unwrap_or(false)
+        {
+            eprintln!("[framework] supervisor parent lost before pipeline start");
+            return Ok(125);
+        }
     }
     let lua = mlua_init::new_lua();
     let raise_buf = RaiseBuffer::new();

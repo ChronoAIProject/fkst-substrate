@@ -10,6 +10,8 @@ use tracing::{info, warn};
 
 const TERMINATION_GRACE: Duration = Duration::from_secs(2);
 const POLL_INTERVAL: Duration = Duration::from_millis(25);
+pub(crate) const SUPERVISOR_PID_ENV: &str = "FKST_SUPERVISOR_PID";
+pub(crate) const SUPERVISED_RUN_ENV: &str = "FKST_SUPERVISED_RUN";
 static SDK_PROCESS_GROUPS: OnceLock<ProcessGroupRegistry> = OnceLock::new();
 static SIGNAL_WATCH_INSTALLED: OnceLock<()> = OnceLock::new();
 static SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
@@ -145,7 +147,10 @@ pub(crate) fn install_sdk_shutdown_watch() {
 }
 
 pub(crate) fn ensure_supervisor_parent_alive() -> mlua::Result<()> {
-    let Some(expected_parent_pid) = std::env::var("FKST_SUPERVISOR_PID")
+    if SIGNAL_WATCH_INSTALLED.get().is_none() {
+        return Ok(());
+    }
+    let Some(expected_parent_pid) = std::env::var(SUPERVISOR_PID_ENV)
         .ok()
         .and_then(|value| value.parse::<u32>().ok())
     else {

@@ -93,9 +93,10 @@ pub async fn spawn_framework(
         codex_permit_slots.to_string(),
     );
     cmd.env(
-        "FKST_SUPERVISOR_PID",
+        crate::process_tree::SUPERVISOR_PID_ENV,
         crate::process_tree::current_pid().to_string(),
     );
+    cmd.env(crate::process_tree::SUPERVISED_RUN_ENV, "1");
     cmd.current_dir(host_root);
 
     // Set a new process group before exec so framework becomes its own group leader.
