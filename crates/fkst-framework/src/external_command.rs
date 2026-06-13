@@ -330,9 +330,7 @@ pub(crate) fn audit_line(
     stderr: &[u8],
 ) -> String {
     format!(
-        "LEVEL=info ENGINE_VER={} PKG_VER={} EVENT=external_command CMD={} EXIT={} TIMED_OUT={} STDOUT_BYTES={} STDERR_BYTES={} STDOUT_EXCERPT={} STDERR_EXCERPT={}",
-        escape_value(&crate::provenance::current_engine_ver()),
-        escape_value(&crate::provenance::current_pkg_ver()),
+        "LEVEL=info EVENT=external_command CMD={} EXIT={} TIMED_OUT={} STDOUT_BYTES={} STDERR_BYTES={} STDOUT_EXCERPT={} STDERR_EXCERPT={}",
         escape_value(rendered),
         exit_code,
         timed_out,
@@ -445,11 +443,9 @@ where
         event.record(&mut visitor);
         write!(
             writer,
-            "TIMESTAMP={} LEVEL={} ENGINE_VER={} PKG_VER={}",
+            "TIMESTAMP={} LEVEL={}",
             rfc3339_utc_now(),
-            event.metadata().level(),
-            escape_value(&crate::provenance::current_engine_ver()),
-            escape_value(&crate::provenance::current_pkg_ver())
+            event.metadata().level()
         )?;
         for (key, value) in visitor.fields {
             if key == "message" {
@@ -559,6 +555,8 @@ mod tests {
     fn audit_line_captures_exit_timeout_and_byte_counts() {
         let line = audit_line("sh -c false", 124, true, b"out", b"err");
         assert!(line.contains("EVENT=external_command"), "{line}");
+        assert!(!line.contains("ENGINE_VER="), "{line}");
+        assert!(!line.contains("PKG_VER="), "{line}");
         assert!(line.contains("EXIT=124"), "{line}");
         assert!(line.contains("TIMED_OUT=true"), "{line}");
         assert!(line.contains("STDOUT_BYTES=3"), "{line}");
@@ -569,6 +567,8 @@ mod tests {
     fn shim_audit_line_omits_captured_excerpts() {
         let line = shim_audit_line("gh issue list", 17, false);
         assert!(line.contains("EVENT=external_command"), "{line}");
+        assert!(line.contains("ENGINE_VER="), "{line}");
+        assert!(line.contains("PKG_VER="), "{line}");
         assert!(line.contains("CMD=gh\\sissue\\slist"), "{line}");
         assert!(line.contains("EXIT=17"), "{line}");
         assert!(!line.contains("STDOUT_EXCERPT"), "{line}");
