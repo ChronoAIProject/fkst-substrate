@@ -112,7 +112,7 @@ impl DeliveryRouter {
                     .ok_or_else(|| anyhow!("reliable delivery store is not open"))?;
                 ensure_payload_within_bound(&envelope.event.payload)?;
                 let record = DeliveryRecord {
-                    delivery_id: derive_delivery_id(&queue, &sub.dept, &source, &envelope),
+                    delivery_id: derive_delivery_id(&queue, &sub.dept, &source, &envelope)?,
                     queue: queue.clone(),
                     dept: sub.dept.clone(),
                     payload: envelope.event.payload.clone(),
@@ -265,27 +265,18 @@ pub(crate) fn derive_delivery_id(
     dept: &str,
     source: &SourceRef,
     envelope: &PublishEnvelope,
-) -> String {
-    let key = if let Some(derived) = envelope.derived.as_ref() {
+) -> Result<String> {
+    let key = if envelope.derived.is_some() {
         if let Some(dedup_key) = payload_dedup_key(&envelope.event.payload) {
             runtime_key([
                 "delivery", "v3", "raised", "queue", queue, "dept", dept, "dedup", &dedup_key,
             ])
         } else {
-            let parent_hash = stable_hex_hash(&derived.parent_delivery_id);
-            runtime_key([
-                "delivery",
-                "v2",
-                "raised",
-                "queue",
+            bail!(
+                "reliable raised delivery to queue `{}` for dept `{}` requires payload.dedup_key",
                 queue,
-                "dept",
-                dept,
-                "parent_hash",
-                &parent_hash,
-                "ordinal",
-                &derived.ordinal.to_string(),
-            ])
+                dept
+            );
         }
     } else {
         runtime_key([
@@ -302,7 +293,7 @@ pub(crate) fn derive_delivery_id(
         ])
     };
     validate_runtime_key(&key).expect("delivery id should be a runtime-safe key");
-    key
+    Ok(key)
 }
 
 fn payload_dedup_key(payload: &JsonValue) -> Option<String> {
@@ -311,111 +302,6 @@ fn payload_dedup_key(payload: &JsonValue) -> Option<String> {
         .and_then(JsonValue::as_str)
         .filter(|value| !value.is_empty())
         .map(str::to_string)
-}
-
-fn stable_hex_hash(value: &str) -> String {
-    let digest = sha256(value.as_bytes());
-    let mut hex = String::with_capacity(32);
-    for byte in digest.iter().take(16) {
-        hex.push_str(&format!("{byte:02x}"));
-    }
-    hex
-}
-
-fn sha256(input: &[u8]) -> [u8; 32] {
-    const H0: [u32; 8] = [
-        0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
-        0x5be0cd19,
-    ];
-    const K: [u32; 64] = [
-        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4,
-        0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe,
-        0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f,
-        0x4a7484aa, 0x5cb0a9dc, 0x76f988da, 0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7,
-        0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc,
-        0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b,
-        0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070, 0x19a4c116,
-        0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
-        0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7,
-        0xc67178f2,
-    ];
-
-    let mut h = H0;
-    let mut message = input.to_vec();
-    let bit_len = (message.len() as u64).wrapping_mul(8);
-    message.push(0x80);
-    while message.len() % 64 != 56 {
-        message.push(0);
-    }
-    message.extend_from_slice(&bit_len.to_be_bytes());
-
-    for chunk in message.chunks_exact(64) {
-        let mut w = [0_u32; 64];
-        for (idx, word) in w.iter_mut().take(16).enumerate() {
-            let offset = idx * 4;
-            *word = u32::from_be_bytes([
-                chunk[offset],
-                chunk[offset + 1],
-                chunk[offset + 2],
-                chunk[offset + 3],
-            ]);
-        }
-        for idx in 16..64 {
-            let s0 =
-                w[idx - 15].rotate_right(7) ^ w[idx - 15].rotate_right(18) ^ (w[idx - 15] >> 3);
-            let s1 = w[idx - 2].rotate_right(17) ^ w[idx - 2].rotate_right(19) ^ (w[idx - 2] >> 10);
-            w[idx] = w[idx - 16]
-                .wrapping_add(s0)
-                .wrapping_add(w[idx - 7])
-                .wrapping_add(s1);
-        }
-
-        let mut a = h[0];
-        let mut b = h[1];
-        let mut c = h[2];
-        let mut d = h[3];
-        let mut e = h[4];
-        let mut f = h[5];
-        let mut g = h[6];
-        let mut hh = h[7];
-
-        for idx in 0..64 {
-            let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
-            let ch = (e & f) ^ ((!e) & g);
-            let temp1 = hh
-                .wrapping_add(s1)
-                .wrapping_add(ch)
-                .wrapping_add(K[idx])
-                .wrapping_add(w[idx]);
-            let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
-            let maj = (a & b) ^ (a & c) ^ (b & c);
-            let temp2 = s0.wrapping_add(maj);
-
-            hh = g;
-            g = f;
-            f = e;
-            e = d.wrapping_add(temp1);
-            d = c;
-            c = b;
-            b = a;
-            a = temp1.wrapping_add(temp2);
-        }
-
-        h[0] = h[0].wrapping_add(a);
-        h[1] = h[1].wrapping_add(b);
-        h[2] = h[2].wrapping_add(c);
-        h[3] = h[3].wrapping_add(d);
-        h[4] = h[4].wrapping_add(e);
-        h[5] = h[5].wrapping_add(f);
-        h[6] = h[6].wrapping_add(g);
-        h[7] = h[7].wrapping_add(hh);
-    }
-
-    let mut out = [0_u8; 32];
-    for (idx, word) in h.iter().enumerate() {
-        out[idx * 4..idx * 4 + 4].copy_from_slice(&word.to_be_bytes());
-    }
-    out
 }
 
 fn runtime_key<'a>(parts: impl IntoIterator<Item = &'a str>) -> String {
@@ -743,13 +629,15 @@ mod tests {
             "worker",
             &source,
             &source_envelope("jobs", serde_json::json!({"n": 1})),
-        );
+        )
+        .unwrap();
         let second = derive_delivery_id(
             "jobs",
             "worker",
             &source,
             &source_envelope("jobs", serde_json::json!({"n": 2})),
-        );
+        )
+        .unwrap();
 
         assert_eq!(first, second);
         assert_eq!(
@@ -777,8 +665,8 @@ mod tests {
             9,
         );
 
-        let first_id = derive_delivery_id("next", "next_worker", &source, &first);
-        let second_id = derive_delivery_id("next", "next_worker", &source, &second);
+        let first_id = derive_delivery_id("next", "next_worker", &source, &first).unwrap();
+        let second_id = derive_delivery_id("next", "next_worker", &source, &second).unwrap();
 
         assert_eq!(
             first_id,
@@ -860,7 +748,7 @@ mod tests {
     }
 
     #[test]
-    fn raised_delivery_id_without_dedup_key_uses_parent_ordinal_queue_and_dept() {
+    fn reliable_raised_delivery_id_without_dedup_key_is_rejected() {
         let source = SourceRef {
             kind: SourceKind::Cron,
             reference: "tick/slot/1000".to_string(),
@@ -872,40 +760,39 @@ mod tests {
             2,
         );
 
-        let id = derive_delivery_id("next", "next_worker", &source, &envelope);
+        let err = derive_delivery_id("next", "next_worker", &source, &envelope).unwrap_err();
+        let message = err.to_string();
 
-        assert_eq!(
-            id,
-            "delivery/v2/raised/queue/next/dept/next__worker/parent__hash/1137428a8a684af06e4ef49a79a0d5e8/ordinal/2"
+        assert!(
+            message.contains(
+                "reliable raised delivery to queue `next` for dept `next_worker` requires payload.dedup_key"
+            ),
+            "{message}"
         );
     }
 
     #[test]
-    fn raised_delivery_id_chain_stays_bounded() {
+    fn reliable_raised_delivery_id_with_empty_dedup_key_is_rejected() {
         let source = SourceRef {
             kind: SourceKind::Cron,
-            reference: "tick".to_string(),
+            reference: "tick/slot/1000".to_string(),
         };
-        let mut parent = derive_delivery_id(
-            "jobs",
-            "worker",
-            &source,
-            &source_envelope("jobs", serde_json::json!({"n": 1})),
+        let envelope = raised_envelope(
+            "next",
+            serde_json::json!({"dedup_key": ""}),
+            "delivery/v1/source/cron/queue/jobs/dept/worker/ref/tick",
+            2,
         );
 
-        for hop in 0..20 {
-            let envelope = raised_envelope("next", serde_json::json!({"n": hop}), &parent, hop);
-            let id = derive_delivery_id("next", "next_worker", &source, &envelope);
+        let err = derive_delivery_id("next", "next_worker", &source, &envelope).unwrap_err();
+        let message = err.to_string();
 
-            assert!(
-                id.len() < 512,
-                "hop {hop} delivery id exceeded bound: {} bytes",
-                id.len()
-            );
-            assert!(id.contains("/parent__hash/"));
-            assert!(!id.contains("/parent/"));
-            parent = id;
-        }
+        assert!(
+            message.contains(
+                "reliable raised delivery to queue `next` for dept `next_worker` requires payload.dedup_key"
+            ),
+            "{message}"
+        );
     }
 
     #[tokio::test]

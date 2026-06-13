@@ -1759,7 +1759,7 @@ mod tests {
             "RAISED: {}\n",
             base64::engine::general_purpose::URL_SAFE.encode(
                 serde_json::to_vec(&serde_json::json!([
-                    {"queue": "next", "payload": {"n": 2}}
+                    {"queue": "next", "payload": {"dedup_key": "replay/next/2", "n": 2}}
                 ]))
                 .unwrap()
             )
@@ -1815,7 +1815,7 @@ mod tests {
             "RAISED: {}\n",
             base64::engine::general_purpose::URL_SAFE.encode(
                 serde_json::to_vec(&serde_json::json!([
-                    {"queue": "next", "payload": {"n": 2}}
+                    {"queue": "next", "payload": {"dedup_key": "replay/next/2", "n": 2}}
                 ]))
                 .unwrap()
             )
@@ -1833,7 +1833,10 @@ mod tests {
             )
             .unwrap();
         assert_eq!(leased.len(), 1);
-        assert_eq!(leased[0].payload, serde_json::json!({"n": 2}));
+        assert_eq!(
+            leased[0].payload,
+            serde_json::json!({"dedup_key": "replay/next/2", "n": 2})
+        );
     }
 
     #[test]
