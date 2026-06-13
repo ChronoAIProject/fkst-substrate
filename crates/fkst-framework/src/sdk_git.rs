@@ -11,11 +11,11 @@ use mlua::{Function, Lua, Result};
 use nix::fcntl::{flock, FlockArg};
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::Output;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::config_registry::{ConfigContext, ConfigKey};
-use crate::external_command::{format_command, MockCommandState};
+use crate::external_command::{format_command, CommandSpec, MockCommandState};
 use crate::rate_pool::RatePoolRegistry;
 use crate::runtime_context;
 
@@ -405,12 +405,6 @@ fn register_list_orphan_worktrees(
     Ok(())
 }
 
-fn git_command(host_root: &Path) -> Command {
-    let mut command = Command::new("git");
-    command.arg("-C").arg(host_root);
-    command
-}
-
 fn run_git_command<'a>(
     host_root: &Path,
     args: impl IntoIterator<Item = &'a str>,
@@ -435,10 +429,20 @@ fn run_git_command<'a>(
             .map_err(mlua::Error::external)?;
     }
 
-    git_command(host_root)
-        .args(rendered_args.iter().skip(2))
-        .output()
-        .map_err(mlua::Error::external)
+    let audited = crate::external_command::run_audited(CommandSpec {
+        program: "git".into(),
+        args: rendered_args,
+        cwd: None,
+        env: Vec::new(),
+        timeout: None,
+        process_group: false,
+    })
+    .map_err(mlua::Error::external)?;
+    Ok(mock_output(
+        String::from_utf8_lossy(&audited.stdout).to_string(),
+        String::from_utf8_lossy(&audited.stderr).to_string(),
+        audited.exit_code,
+    ))
 }
 
 #[cfg(unix)]

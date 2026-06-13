@@ -1,5 +1,7 @@
 // path-based integration tests own behavior coverage while runtime modules keep runtime code.
 
+#[path = "../src/provenance.rs"]
+mod provenance;
 #[path = "../src/runtime_context.rs"]
 mod runtime_context;
 #[path = "../src/sdk_log.rs"]

@@ -20,6 +20,8 @@ mod event_fanout;
 mod failure_fact;
 #[path = "../src/supervise/journal.rs"]
 mod journal;
+#[path = "../src/provenance.rs"]
+mod provenance;
 #[allow(dead_code)]
 #[path = "../src/supervise/source_runner.rs"]
 mod source_runner;

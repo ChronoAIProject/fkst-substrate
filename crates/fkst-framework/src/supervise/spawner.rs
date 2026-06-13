@@ -105,6 +105,18 @@ pub async fn spawn_framework_with_stdout_observer(
         package_root_list(package_roots)
     ));
     log.write_line(&format!("OWNER_NAMESPACE={owner_namespace}"));
+    log.write_line(&format!(
+        "ENGINE_VER={}",
+        crate::provenance::current_engine_ver()
+    ));
+    log.write_line(&format!(
+        "PKG_VER={}",
+        crate::provenance::pkg_ver_for_namespace(owner_namespace)
+    ));
+    log.write_line(&format!(
+        "PKG_VERS={}",
+        crate::provenance::current_pkg_versions_summary()
+    ));
     log.write_line(&format!("DEPT={child_label}"));
 
     let mut cmd = Command::new(binary);

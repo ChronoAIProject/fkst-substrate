@@ -216,6 +216,59 @@ fn generated_shim_consumes_same_bucket_as_cli_acquire() {
 
 #[cfg(unix)]
 #[test]
+fn generated_shim_preserves_streams_exit_and_emits_audit_line() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("rate-pools");
+    let real_dir = tmp.path().join("bin");
+    std::fs::create_dir_all(&real_dir).unwrap();
+    executable(
+        &real_dir.join("gh"),
+        "#!/bin/sh\nprintf 'shim-out\\n'\nprintf 'shim-err\\n' >&2\nexit 17\n",
+    );
+    let registry = RatePoolRegistry::for_test(
+        root.clone(),
+        BTreeMap::from([(
+            "gh".to_string(),
+            RatePoolConfig {
+                burst: 1,
+                refill_per_minute: 1,
+            },
+        )]),
+    );
+    seed_ledger(&root, "gh", 1);
+
+    let generator_path = std::env::join_paths([real_dir.as_path()]).unwrap();
+    let shim_dir =
+        rate_shim::ensure_rate_shims_with_path(&registry, &framework_bin(), &generator_path)
+            .unwrap();
+    let path = std::env::join_paths([shim_dir.as_path(), real_dir.as_path()]).unwrap();
+
+    let shim = Command::new(shim_dir.join("gh"))
+        .env("PATH", path)
+        .env_remove("FKST_RATE_POOL_ROOT")
+        .env_remove("FKST_RATE_POOL_GH")
+        .output()
+        .unwrap();
+
+    assert_exit(&shim, 17);
+    assert_eq!(stdout(&shim), "shim-out\n");
+    let stderr = stderr(&shim);
+    assert!(stderr.contains("shim-err\n"), "stderr={stderr}");
+    assert!(stderr.contains("EVENT=external_command"), "stderr={stderr}");
+    assert!(stderr.contains("EXIT=17"), "stderr={stderr}");
+    assert!(
+        stderr.contains("STDOUT_EXCERPT=shim-out\\n"),
+        "stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("STDERR_EXCERPT=shim-err\\n"),
+        "stderr={stderr}"
+    );
+    assert_eq!(ledger_tokens(&root.join("gh.bucket")), 0);
+}
+
+#[cfg(unix)]
+#[test]
 fn generated_shim_bakes_resolved_config_from_fkst_env_style_registry() {
     let _env = EnvGuard::remove(&["FKST_RATE_POOL_ROOT", "FKST_RATE_POOL_GH"]);
     let tmp = tempfile::tempdir().unwrap();

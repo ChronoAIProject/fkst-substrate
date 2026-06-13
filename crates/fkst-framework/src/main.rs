@@ -28,6 +28,7 @@ mod init_package_repo;
 mod mlua_init;
 mod path_resolver;
 mod process_tree;
+mod provenance;
 mod raise;
 mod rate_pool;
 mod rate_shim;
@@ -71,6 +72,11 @@ enum CliCommand {
     RateAcquire {
         pool: String,
     },
+    RateExec {
+        pool: String,
+        program: PathBuf,
+        args: Vec<String>,
+    },
     Test(TestCli),
     InitPackageRepo(init_package_repo::InitPackageRepoOptions),
     CodexWorker(sdk_codex::CodexWorkerOptions),
@@ -82,7 +88,7 @@ fn parse_args() -> Result<CliCommand> {
     let mut args_iter = args.into_iter();
     let sub = args_iter.next().ok_or_else(|| {
         anyhow::anyhow!(
-            "usage: fkst-framework run <lua> --project-root <path> --package-root <path> [--package-root <path> ...] [--owner-namespace <id>] --event <json> | fkst-framework supervise --project-root <path> --framework-bin <path> [--package-root <path> ...] | fkst-framework conformance --project-root <path> [--package-root <path> ...] | fkst-framework config --project-root <path> [--package-root <path> ...] | fkst-framework boundary-resources | fkst-framework rate-acquire <pool> | fkst-framework test --project-root <path> [--package-root <path> ...] [--report-json <path>] | fkst-framework init-package-repo [--ref <substrate-ref>] [--force] | fkst-framework --self-test"
+            "usage: fkst-framework run <lua> --project-root <path> --package-root <path> [--package-root <path> ...] [--owner-namespace <id>] --event <json> | fkst-framework supervise --project-root <path> --framework-bin <path> [--package-root <path> ...] | fkst-framework conformance --project-root <path> [--package-root <path> ...] | fkst-framework config --project-root <path> [--package-root <path> ...] | fkst-framework boundary-resources | fkst-framework rate-acquire <pool> | fkst-framework rate-exec <pool> -- <program> [args...] | fkst-framework test --project-root <path> [--package-root <path> ...] [--report-json <path>] | fkst-framework init-package-repo [--ref <substrate-ref>] [--force] | fkst-framework --self-test"
         )
     })?;
     if sub == "--self-test" {
@@ -137,6 +143,20 @@ fn parse_args() -> Result<CliCommand> {
             anyhow::bail!("unknown rate-acquire argument: {}", other);
         }
         return Ok(CliCommand::RateAcquire { pool });
+    }
+    if sub == "rate-exec" {
+        let pool = next_iter_value(&mut args_iter, "<pool>")?;
+        let separator = next_iter_value(&mut args_iter, "--")?;
+        if separator != "--" {
+            anyhow::bail!("rate-exec requires -- before program");
+        }
+        let program = PathBuf::from(next_iter_value(&mut args_iter, "<program>")?);
+        let args = args_iter.collect();
+        return Ok(CliCommand::RateExec {
+            pool,
+            program,
+            args,
+        });
     }
     if sub == "test" {
         let rest = args_iter.collect::<Vec<_>>();
@@ -380,6 +400,7 @@ fn run_pipeline(
     let owner_root = roots
         .owner_root_for_namespace(&owner_namespace)
         .ok_or_else(|| anyhow::anyhow!("unknown owner namespace `{owner_namespace}`"))?;
+    provenance::install_run(owner_root, &owner_namespace);
     let require_roots = roots.require_roots_for_owner(owner_root);
     let graph_json_authorized =
         sdk_graph::department_authorized(&roots, owner_root, &lua_path).unwrap_or(false);
@@ -487,6 +508,24 @@ fn run_rate_acquire(pool: &str) -> Result<i32> {
     Ok(0)
 }
 
+fn run_rate_exec(pool: &str, program: PathBuf, args: Vec<String>) -> Result<i32> {
+    let registry = rate_pool::RatePoolRegistry::from_env()
+        .with_context(|| "parse rate pool configuration for rate-exec")?;
+    registry.acquire_for_name(pool)?;
+    let output = external_command::run_audited(external_command::CommandSpec {
+        program,
+        args,
+        cwd: None,
+        env: Vec::new(),
+        timeout: None,
+        process_group: false,
+    })?;
+    use std::io::Write;
+    std::io::stdout().write_all(&output.stdout)?;
+    std::io::stderr().write_all(&output.stderr)?;
+    Ok(output.exit_code)
+}
+
 fn run() -> Result<i32> {
     match parse_args()? {
         CliCommand::Run {
@@ -499,11 +538,13 @@ fn run() -> Result<i32> {
             roots,
             framework_bin,
         } => {
+            provenance::install_supervise(roots.package_roots(), roots.host_root());
             tracing_subscriber::fmt()
                 .with_env_filter(
                     tracing_subscriber::EnvFilter::from_default_env()
                         .add_directive(tracing::Level::INFO.into()),
                 )
+                .event_format(external_command::TracingKeyValueFormatter)
                 .init();
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -516,6 +557,11 @@ fn run() -> Result<i32> {
         CliCommand::Config(options) => run_config_command(options),
         CliCommand::BoundaryResources => run_boundary_resources_command(),
         CliCommand::RateAcquire { pool } => run_rate_acquire(&pool),
+        CliCommand::RateExec {
+            pool,
+            program,
+            args,
+        } => run_rate_exec(&pool, program, args),
         CliCommand::Test(options) => test_runner::run_tests(options.roots, options.report_json),
         CliCommand::InitPackageRepo(options) => init_package_repo::run(options),
         CliCommand::CodexWorker(options) => sdk_codex::run_codex_worker(options),

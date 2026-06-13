@@ -168,8 +168,7 @@ if [ -z \"$real_program\" ]; then\n\
   printf '%s\\n' \"fkst rate shim: real program not found: $program\" >&2\n\
   exit 127\n\
 fi\n\
-PATH=$real_path \"$framework_bin\" rate-acquire \"$program\" || exit $?\n\
-exec \"$real_program\" \"$@\"\n",
+PATH=$real_path \"$framework_bin\" rate-exec \"$program\" -- \"$real_program\" \"$@\"\n",
         shim_dir = shell_single_quote(&shim_dir.to_string_lossy()),
         shim_script = shell_single_quote(&shim_script.to_string_lossy()),
         shim_dir_private = shell_single_quote(&private_var_alias(shim_dir).unwrap_or_default()),
@@ -256,7 +255,7 @@ mod tests {
         executable(
             &framework,
             &format!(
-                "#!/bin/sh\nprintf '%s %s\\n' \"$1\" \"$2\" > {}\n",
+                "#!/bin/sh\nprintf '%s %s\\n' \"$1\" \"$2\" > {}\nexec \"$4\" \"$5\"\n",
                 capture.display()
             ),
         );
@@ -281,9 +280,6 @@ mod tests {
 
         assert_eq!(output.status.code(), Some(0));
         assert_eq!(String::from_utf8_lossy(&output.stdout), "real:ok");
-        assert_eq!(
-            std::fs::read_to_string(capture).unwrap(),
-            "rate-acquire gh\n"
-        );
+        assert_eq!(std::fs::read_to_string(capture).unwrap(), "rate-exec gh\n");
     }
 }

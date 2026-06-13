@@ -40,9 +40,11 @@ pub(crate) fn emit(level: &str, msg: &str) {
 
 fn log_line(level: &str, msg: &str) -> String {
     format!(
-        "TIMESTAMP={} LEVEL={} MSG={}",
+        "TIMESTAMP={} LEVEL={} ENGINE_VER={} PKG_VER={} MSG={}",
         rfc3339_utc_now(),
         level,
+        single_line(&crate::provenance::current_engine_ver()),
+        single_line(&crate::provenance::current_pkg_ver()),
         single_line(msg)
     )
 }
@@ -110,7 +112,16 @@ mod tests {
         let line = log_line("info", "test message");
         assert!(line.starts_with("TIMESTAMP="));
         assert!(line.contains("T"));
-        assert!(line.contains("Z LEVEL=info MSG=test message"));
+        assert!(line.contains("Z LEVEL=info ENGINE_VER="));
+        assert!(line.contains(" PKG_VER="));
+        assert!(line.contains(" MSG=test message"));
+    }
+
+    #[test]
+    fn log_line_has_engine_and_package_provenance() {
+        let line = log_line("info", "test message");
+        assert!(line.contains(" ENGINE_VER="), "{line}");
+        assert!(line.contains(" PKG_VER="), "{line}");
     }
 
     #[test]
