@@ -21,16 +21,10 @@ struct RaisedEntry {
     payload: Value,
 }
 
-/// Parse stdout into a list of (queue, Event) tuples. Returns empty vec if no RAISED line.
-pub fn parse_raised(stdout: &str) -> Vec<Event> {
-    // Find the LAST line starting with "RAISED: " (after any trailing whitespace).
-    let last = stdout
-        .lines()
-        .rev()
-        .find(|line| line.trim_start().starts_with("RAISED: "));
-    let Some(line) = last else {
+pub fn parse_raised_line(line: &str) -> Vec<Event> {
+    if !line.trim_start().starts_with("RAISED: ") {
         return Vec::new();
-    };
+    }
 
     let b64_part = line.trim_start().trim_start_matches("RAISED: ").trim();
     let decoded_bytes = match base64::engine::general_purpose::URL_SAFE.decode(b64_part) {
@@ -51,6 +45,19 @@ pub fn parse_raised(stdout: &str) -> Vec<Event> {
         .into_iter()
         .map(|e| Event::new(e.queue, e.payload))
         .collect()
+}
+
+/// Parse stdout into a list of (queue, Event) tuples. Returns empty vec if no RAISED line.
+pub fn parse_raised(stdout: &str) -> Vec<Event> {
+    // Find the LAST line starting with "RAISED: " (after any trailing whitespace).
+    let last = stdout
+        .lines()
+        .rev()
+        .find(|line| line.trim_start().starts_with("RAISED: "));
+    let Some(line) = last else {
+        return Vec::new();
+    };
+    parse_raised_line(line)
 }
 
 #[cfg(test)]
