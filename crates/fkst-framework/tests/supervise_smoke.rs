@@ -201,12 +201,14 @@ return M
 fn supervise_starts_when_journal_log_dir_cannot_be_created() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();
-    let runtime_root = root.join("runtime-file");
+    let runtime_root = root.join("runtime");
     let fact = root.join("started.txt");
-    fs::write(&runtime_root, "not a directory").unwrap();
+    fs::create_dir_all(&runtime_root).unwrap();
+    fs::write(runtime_root.join("logs"), "not a directory").unwrap();
     fs::create_dir_all(root.join("departments/idle")).unwrap();
     fs::create_dir_all(root.join("raisers")).unwrap();
     write_fkst_env(root);
+    write_persistence_decl(root);
     fs::write(root.join("input.txt"), "ready").unwrap();
     fs::write(
         root.join("raisers/input.lua"),
