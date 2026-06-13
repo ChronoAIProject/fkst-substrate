@@ -35,6 +35,8 @@ const CODEX_WORKER_BIN_ENV: &str = "FKST_CODEX_WORKER_BIN";
 const DEFAULT_CODEX_TIMEOUT_SECONDS: i64 = 3600;
 const DEFAULT_CODEX_LOG_MAX_AGE: Duration = Duration::from_secs(48 * 60 * 60);
 const CODEX_STATUS_RECENT_LIMIT: usize = 50;
+const CODEX_OUTPUT_TAIL_MAX_LINES: usize = 40;
+const CODEX_OUTPUT_TAIL_MAX_BYTES: usize = 4096;
 const CODEX_STATUS_LOG_PREFIX: &str = "CODEX_STATUS:";
 const CODEX_ADOPTION_DIR: &str = "codex-adoption";
 const CODEX_ADOPTION_POLL: Duration = Duration::from_millis(100);
@@ -50,6 +52,8 @@ struct CodexRequest {
     worktree: Option<String>,
     timeout_seconds: i64,
     log_path: PathBuf,
+    output_tail_path: PathBuf,
+    role: Option<String>,
     label: Option<String>,
     proposal_id: Option<String>,
     dedup_key: Option<String>,
@@ -71,17 +75,31 @@ struct CodexAdoptionPaths {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 struct CodexStatusRecord {
     run_id: String,
+    #[serde(default)]
+    role: Option<String>,
+    #[serde(default)]
     label: Option<String>,
+    #[serde(default)]
     dept: Option<String>,
+    #[serde(default)]
     proposal_id: Option<String>,
+    #[serde(default)]
+    dedup_key: Option<String>,
     started_at: String,
     started_at_ms: u64,
+    #[serde(default)]
     ended_at: Option<String>,
+    #[serde(default)]
     ended_at_ms: Option<u64>,
+    #[serde(default)]
     elapsed_ms: Option<u64>,
     status: String,
+    #[serde(default)]
     exit_code: Option<i32>,
+    #[serde(default)]
     permit_slot: Option<usize>,
+    #[serde(default)]
+    output_tail_path: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -347,6 +365,7 @@ fn codex_request_from_opts(opts: Table, runtime_dept: Option<String>) -> CodexRe
     let prompt: String = opts.get("prompt").unwrap_or_default();
     let context: Option<String> = opts.get("context").ok();
     let worktree: Option<String> = opts.get("worktree").ok();
+    let role: Option<String> = opts.get("role").ok();
     let label: Option<String> = opts.get("label").ok();
     let proposal_id: Option<String> = opts.get("proposal_id").ok();
     let dedup_key: Option<String> = opts.get("dedup_key").ok();
@@ -356,6 +375,7 @@ fn codex_request_from_opts(opts: Table, runtime_dept: Option<String>) -> CodexRe
         .filter(|seconds| *seconds > 0)
         .unwrap_or(DEFAULT_CODEX_TIMEOUT_SECONDS);
     let log_path = codex_log_path(worktree.as_deref());
+    let output_tail_path = codex_output_tail_path(&log_path);
     let started_at_ms = unix_duration().as_millis() as u64;
     CodexRequest {
         run_id: codex_run_id(),
@@ -364,6 +384,8 @@ fn codex_request_from_opts(opts: Table, runtime_dept: Option<String>) -> CodexRe
         worktree,
         timeout_seconds,
         log_path,
+        output_tail_path,
+        role,
         label,
         proposal_id,
         dedup_key,
@@ -577,6 +599,11 @@ fn run_mocked_codex_request(
         args,
         request.prompt.clone(),
     )?;
+    write_live_output_tail(
+        Some(&request.output_tail_path),
+        result.stdout.as_bytes(),
+        result.stderr.as_bytes(),
+    );
     write_codex_log(
         &request.log_path,
         &result.stdout,
@@ -685,6 +712,12 @@ fn read_completed_adoption_result(paths: &CodexAdoptionPaths) -> Result<Option<C
     }
     let stdout = read_optional_string(&paths.stdout).map_err(mlua::Error::external)?;
     let stderr = read_optional_string(&paths.stderr).map_err(mlua::Error::external)?;
+    let output_tail_path = codex_output_tail_path(Path::new(&record.log_path));
+    write_live_output_tail(
+        Some(&output_tail_path),
+        stdout.as_bytes(),
+        stderr.as_bytes(),
+    );
     let exit_code = record.exit_code.unwrap_or(-1);
     if let Some(kind) = record.error_kind.as_deref() {
         return Ok(Some(CodexResult::failure(
@@ -851,6 +884,10 @@ fn codex_worker_args(
         args.push("--label".to_string());
         args.push(label.to_string());
     }
+    if let Some(role) = request.role.as_deref() {
+        args.push("--role".to_string());
+        args.push(role.to_string());
+    }
     if let Some(proposal_id) = request.proposal_id.as_deref() {
         args.push("--proposal-id".to_string());
         args.push(proposal_id.to_string());
@@ -952,6 +989,7 @@ pub(crate) struct CodexWorkerOptions {
     timeout_seconds: i64,
     context: Option<String>,
     worktree: Option<String>,
+    role: Option<String>,
     label: Option<String>,
     proposal_id: Option<String>,
     dedup_key: Option<String>,
@@ -973,6 +1011,7 @@ pub(crate) fn parse_worker_args(args: Vec<String>) -> anyhow::Result<CodexWorker
     let timeout_seconds = parser.required_string("--timeout")?.parse::<i64>()?;
     let context = parser.optional_string("--context");
     let worktree = parser.optional_string("--worktree");
+    let role = parser.optional_string("--role");
     let label = parser.optional_string("--label");
     let proposal_id = parser.optional_string("--proposal-id");
     let dedup_key = parser.optional_string("--dedup-key");
@@ -992,6 +1031,7 @@ pub(crate) fn parse_worker_args(args: Vec<String>) -> anyhow::Result<CodexWorker
         timeout_seconds,
         context,
         worktree,
+        role,
         label,
         proposal_id,
         dedup_key,
@@ -1009,6 +1049,8 @@ pub(crate) fn run_codex_worker(options: CodexWorkerOptions) -> anyhow::Result<i3
         worktree: options.worktree.clone(),
         timeout_seconds: options.timeout_seconds,
         log_path: options.log_path.clone(),
+        output_tail_path: codex_output_tail_path(&options.log_path),
+        role: options.role.clone(),
         label: options.label.clone(),
         proposal_id: options.proposal_id.clone(),
         dedup_key: options.dedup_key.clone(),
@@ -1135,9 +1177,11 @@ impl CodexStatusRecord {
     fn from_request(request: &CodexRequest, permit_slot: Option<usize>) -> Self {
         Self {
             run_id: request.run_id.clone(),
+            role: request.role.clone().or_else(|| request.label.clone()),
             label: request.label.clone(),
             dept: request.dept.clone(),
             proposal_id: request.proposal_id.clone(),
+            dedup_key: request.dedup_key.clone(),
             started_at: unix_millis_to_iso8601(request.started_at_ms),
             started_at_ms: request.started_at_ms,
             ended_at: None,
@@ -1146,6 +1190,7 @@ impl CodexStatusRecord {
             status: "running".to_string(),
             exit_code: None,
             permit_slot,
+            output_tail_path: Some(request.output_tail_path.to_string_lossy().into_owned()),
         }
     }
 
@@ -1192,9 +1237,16 @@ fn codex_status(lua: &Lua, host_root: &Path) -> Result<Table> {
 fn codex_status_record_table(lua: &Lua, record: &CodexStatusRecord, now_ms: u64) -> Result<Table> {
     let table = lua.create_table()?;
     table.set("run_id", record.run_id.clone())?;
+    if let Some(role) = record.role.as_ref().or(record.label.as_ref()) {
+        table.set("role", role.as_str())?;
+    }
     set_optional_string(&table, "label", &record.label)?;
     set_optional_string(&table, "dept", &record.dept)?;
     set_optional_string(&table, "proposal_id", &record.proposal_id)?;
+    set_optional_string(&table, "dedup_key", &record.dedup_key)?;
+    if let Some(key) = record.proposal_id.as_ref().or(record.dedup_key.as_ref()) {
+        table.set("proposal_id_or_key", key.as_str())?;
+    }
     table.set("started_at", record.started_at.clone())?;
     table.set("started_at_ms", record.started_at_ms)?;
     set_optional_string(&table, "ended_at", &record.ended_at)?;
@@ -1205,14 +1257,42 @@ fn codex_status_record_table(lua: &Lua, record: &CodexStatusRecord, now_ms: u64)
         .elapsed_ms
         .unwrap_or_else(|| now_ms.saturating_sub(record.started_at_ms));
     table.set("elapsed_ms", elapsed_ms)?;
-    table.set("status", record.status.clone())?;
+    table.set("status", sdk_status(record))?;
     if let Some(exit_code) = record.exit_code {
         table.set("exit_code", exit_code)?;
     }
     if let Some(permit_slot) = record.permit_slot {
         table.set("permit_slot", permit_slot)?;
     }
+    table.set("output_tail", read_codex_output_tail(record))?;
     Ok(table)
+}
+
+fn sdk_status(record: &CodexStatusRecord) -> &'static str {
+    if record.status == "running" {
+        "running"
+    } else if record.exit_code == Some(0) {
+        "done"
+    } else {
+        "failed"
+    }
+}
+
+fn read_codex_output_tail(record: &CodexStatusRecord) -> String {
+    let Some(path) = record.output_tail_path.as_deref() else {
+        return String::new();
+    };
+    match std::fs::read(path) {
+        Ok(bytes) => bounded_output_tail(&bytes),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(err) => {
+            eprintln!(
+                "WARN: codex output tail read failed path={} error={err}",
+                path
+            );
+            String::new()
+        }
+    }
 }
 
 fn set_optional_string(table: &Table, key: &str, value: &Option<String>) -> Result<()> {
@@ -1440,7 +1520,11 @@ fn wait_for_codex_child(
     cmd_line: &str,
     _registration: crate::process_tree::ProcessGroupRegistration,
 ) -> CodexResult {
-    let wait_outcome = wait_codex_with_timeout(child, request.timeout_seconds);
+    let wait_outcome = wait_codex_with_timeout_and_tail(
+        child,
+        request.timeout_seconds,
+        Some(request.output_tail_path.clone()),
+    );
     let stdin_result = join_stdin_writer(stdin_writer);
     match wait_outcome {
         CodexWaitOutcome::Exited {
@@ -1480,8 +1564,11 @@ fn wait_for_codex_child(
     }
 }
 
-// stdout/stderr output is captured but does not extend the wall-clock timeout.
-fn wait_codex_with_timeout(mut child: Child, timeout_seconds: i64) -> CodexWaitOutcome {
+fn wait_codex_with_timeout_and_tail(
+    mut child: Child,
+    timeout_seconds: i64,
+    output_tail_path: Option<PathBuf>,
+) -> CodexWaitOutcome {
     let start = Instant::now();
     let child_pid = child.id();
     let (tx, rx) = mpsc::channel();
@@ -1520,6 +1607,7 @@ fn wait_codex_with_timeout(mut child: Child, timeout_seconds: i64) -> CodexWaitO
                         CodexStream::Stdout => stdout.extend(bytes),
                         CodexStream::Stderr => stderr.extend(bytes),
                     }
+                    write_live_output_tail(output_tail_path.as_deref(), &stdout, &stderr);
                 }
             }
             Ok(CodexEvent::Exited(result)) => break result,
@@ -1544,6 +1632,7 @@ fn wait_codex_with_timeout(mut child: Child, timeout_seconds: i64) -> CodexWaitO
     }
     let _ = waiter.join();
     drain_codex_events(&rx, &mut stdout, &mut stderr);
+    write_live_output_tail(output_tail_path.as_deref(), &stdout, &stderr);
 
     codex_outcome_from_wait(exit, killed_for_timeout, stdout, stderr)
 }
@@ -1633,6 +1722,48 @@ fn drain_codex_events(rx: &Receiver<CodexEvent>, stdout: &mut Vec<u8>, stderr: &
     }
 }
 
+fn write_live_output_tail(path: Option<&Path>, stdout: &[u8], stderr: &[u8]) {
+    let Some(path) = path else {
+        return;
+    };
+    let mut combined = Vec::with_capacity(stdout.len().saturating_add(stderr.len()));
+    combined.extend_from_slice(stdout);
+    combined.extend_from_slice(stderr);
+    let tail = bounded_output_tail(&combined);
+    if let Err(err) = write_atomic(path, tail.as_bytes()) {
+        eprintln!(
+            "WARN: codex output tail write failed path={} error={err}",
+            path.display()
+        );
+    }
+}
+
+fn bounded_output_tail(bytes: &[u8]) -> String {
+    let text = String::from_utf8_lossy(bytes);
+    let mut lines = text
+        .lines()
+        .rev()
+        .take(CODEX_OUTPUT_TAIL_MAX_LINES)
+        .collect::<Vec<_>>();
+    lines.reverse();
+    let mut tail = lines.join("\n");
+    if text.ends_with('\n') && !tail.is_empty() {
+        tail.push('\n');
+    }
+    truncate_tail_utf8(&tail, CODEX_OUTPUT_TAIL_MAX_BYTES)
+}
+
+fn truncate_tail_utf8(value: &str, max_bytes: usize) -> String {
+    if value.len() <= max_bytes {
+        return value.to_string();
+    }
+    let mut start = value.len() - max_bytes;
+    while !value.is_char_boundary(start) {
+        start += 1;
+    }
+    value[start..].to_string()
+}
+
 // positive values become overall timeout caps; invalid values mean unbounded wait.
 fn overall_timeout(timeout_seconds: i64) -> Option<Duration> {
     u64::try_from(timeout_seconds)
@@ -1668,6 +1799,11 @@ fn logged_failure(
     } else {
         format!("{stderr}\n{message}")
     };
+    write_live_output_tail(
+        Some(&request.output_tail_path),
+        stdout.as_bytes(),
+        logged_stderr.as_bytes(),
+    );
     write_codex_log(
         &request.log_path,
         &stdout,
@@ -1749,6 +1885,15 @@ fn codex_log_path(worktree: Option<&str>) -> PathBuf {
     runtime_log_dir()
         .join("codex")
         .join(format!("{basename}-{timestamp}.log"))
+}
+
+fn codex_output_tail_path(log_path: &Path) -> PathBuf {
+    let stem = log_path
+        .file_stem()
+        .and_then(OsStr::to_str)
+        .filter(|stem| !stem.is_empty())
+        .unwrap_or("codex");
+    log_path.with_file_name(format!("{stem}.tail"))
 }
 
 fn prune_codex_logs_for_request(request: &CodexRequest) {
@@ -1878,6 +2023,15 @@ fn remove_codex_log(path: &Path) {
             "WARN: codex log prune remove failed path={} error={err}",
             path.display()
         );
+    }
+    let tail_path = codex_output_tail_path(path);
+    if let Err(err) = std::fs::remove_file(&tail_path) {
+        if err.kind() != std::io::ErrorKind::NotFound {
+            eprintln!(
+                "WARN: codex tail prune remove failed path={} error={err}",
+                tail_path.display()
+            );
+        }
     }
 }
 

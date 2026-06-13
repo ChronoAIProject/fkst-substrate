@@ -208,7 +208,7 @@ fn fixed_surface_does_not_register_await_any_await_or_sleep() {
 
 #[cfg(unix)]
 #[test]
-fn codex_status_reports_running_and_recent_without_output_or_paths() {
+fn codex_status_reports_running_and_recent_with_bounded_output_tail_without_paths() {
     let tmp = tempfile::tempdir().unwrap();
     let bin_dir = tmp.path().join("bin");
     let started_fifo = tmp.path().join("started.fifo");
@@ -221,7 +221,7 @@ fn codex_status_reports_running_and_recent_without_output_or_paths() {
 cat >/dev/null
 printf 'started' > "$STARTED_FIFO"
 read _ < "$RELEASE_FIFO"
-printf 'sensitive output must stay out of codex_status'
+printf 'final output visible through bounded output_tail'
 "#,
     );
 
@@ -238,6 +238,7 @@ printf 'sensitive output must stay out of codex_status'
     let spawn: mlua::Function = lua.globals().get("spawn_codex").unwrap();
     let opts = lua_opts(&lua, "status");
     opts.set("label", "review").unwrap();
+    opts.set("role", "reviewer").unwrap();
     opts.set("proposal_id", "proposal-43").unwrap();
     let handle: AnyUserData = spawn.call(opts).unwrap();
     assert_eq!(read_fifo(&started_fifo), "started");
@@ -248,11 +249,17 @@ printf 'sensitive output must stay out of codex_status'
     assert_eq!(running.raw_len(), 1);
     let active: Table = running.get(1).unwrap();
     assert_eq!(active.get::<String>("status").unwrap(), "running");
+    assert_eq!(active.get::<String>("role").unwrap(), "reviewer");
     assert_eq!(active.get::<String>("label").unwrap(), "review");
     assert_eq!(active.get::<String>("proposal_id").unwrap(), "proposal-43");
+    assert_eq!(
+        active.get::<String>("proposal_id_or_key").unwrap(),
+        "proposal-43"
+    );
     assert_eq!(active.get::<String>("dept").unwrap(), "pkg.reviewer");
     assert!(active.get::<u64>("elapsed_ms").is_ok());
     assert!(active.get::<i64>("exit_code").is_err());
+    assert_eq!(active.get::<String>("output_tail").unwrap(), "");
     assert!(active.get::<String>("output_excerpt").is_err());
     assert!(active.get::<String>("log_path").is_err());
     assert_eq!(table_len(&status, "recent"), 0);
@@ -269,8 +276,12 @@ printf 'sensitive output must stay out of codex_status'
     let recent: Table = status.get("recent").unwrap();
     assert_eq!(recent.raw_len(), 1);
     let completed: Table = recent.get(1).unwrap();
-    assert_eq!(completed.get::<String>("status").unwrap(), "completed");
+    assert_eq!(completed.get::<String>("status").unwrap(), "done");
     assert_eq!(completed.get::<i64>("exit_code").unwrap(), 0);
+    assert_eq!(
+        completed.get::<String>("output_tail").unwrap(),
+        "final output visible through bounded output_tail"
+    );
     assert!(completed.get::<String>("ended_at").unwrap().ends_with('Z'));
     assert!(completed.get::<u64>("ended_at_ms").is_ok());
     assert!(
@@ -322,6 +333,84 @@ printf 'ok'
     assert!(labels.iter().any(|label| label == "job-54"));
     assert!(tmp.path().join("runtime/codex").exists());
     assert!(!tmp.path().join(".fkst/runtime/codex-status").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn codex_status_exposes_bounded_live_output_tail_while_run_is_blocked() {
+    let tmp = tempfile::tempdir().unwrap();
+    let bin_dir = tmp.path().join("bin");
+    let started_fifo = tmp.path().join("started.fifo");
+    let release_fifo = tmp.path().join("release.fifo");
+    make_fifo(&started_fifo);
+    make_fifo(&release_fifo);
+    install_codex_script(
+        &bin_dir,
+        r#"#!/bin/sh
+i=0
+while [ "$i" -lt 60 ]; do
+  i=$((i + 1))
+  printf 'line-%02d\n' "$i"
+done
+printf 'started' > "$STARTED_FIFO"
+read _ < "$RELEASE_FIFO"
+"#,
+    );
+
+    let mut sandbox = ProcessSandbox::new();
+    sandbox.enter_cwd(tmp.path()).runtime_root(".fkst/runtime");
+    sandbox.prepend_path(&bin_dir);
+    sandbox.set_env("STARTED_FIFO", started_fifo.to_string_lossy().into_owned());
+    sandbox.set_env("RELEASE_FIFO", release_fifo.to_string_lossy().into_owned());
+    sandbox.runtime_log_dir(tmp.path().join("runtime"));
+    let (_lock, _guard) = sandbox.enter();
+
+    let lua = Lua::new();
+    register(&lua).unwrap();
+    let spawn: mlua::Function = lua.globals().get("spawn_codex").unwrap();
+    let opts = lua_opts(&lua, "live tail");
+    opts.set("role", "implementer").unwrap();
+    opts.set("dedup_key", "issue-74").unwrap();
+    let handle: AnyUserData = spawn.call(opts).unwrap();
+    assert_eq!(read_fifo(&started_fifo), "started");
+
+    let status_fn: mlua::Function = lua.globals().get("codex_status").unwrap();
+    let mut observed_tail = String::new();
+    let mut observed_role = String::new();
+    let mut observed_key = String::new();
+    let mut observed_log_path_is_hidden = false;
+    for _ in 0..50 {
+        let status: Table = status_fn.call(()).unwrap();
+        let running: Table = status.get("running").unwrap();
+        if running.raw_len() == 1 {
+            let active: Table = running.get(1).unwrap();
+            assert_eq!(active.get::<String>("status").unwrap(), "running");
+            observed_role = active.get::<String>("role").unwrap();
+            observed_key = active.get::<String>("proposal_id_or_key").unwrap();
+            observed_tail = active.get::<String>("output_tail").unwrap();
+            observed_log_path_is_hidden = active.get::<String>("log_path").is_err();
+            if observed_tail.contains("line-60") {
+                break;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    write_fifo(&release_fifo, "go\n");
+    let await_all: mlua::Function = lua.globals().get("await_all").unwrap();
+    let handles = lua.create_sequence_from(vec![handle]).unwrap();
+    let results: Table = await_all.call(handles).unwrap();
+    let result: Table = results.get(1).unwrap();
+    assert_eq!(result.get::<i64>("exit_code").unwrap(), 0);
+
+    assert_eq!(observed_role, "implementer");
+    assert_eq!(observed_key, "issue-74");
+    assert!(!observed_tail.contains("line-20"), "{observed_tail}");
+    assert!(observed_tail.contains("line-21"), "{observed_tail}");
+    assert!(observed_tail.contains("line-60"), "{observed_tail}");
+    assert!(observed_tail.len() <= 4096, "{observed_tail}");
+    assert_eq!(observed_tail.lines().count(), 40);
+    assert!(observed_log_path_is_hidden);
 }
 
 #[test]
@@ -861,8 +950,12 @@ printf 'sensitive output body'
     assert_eq!(item.get::<String>("label").unwrap(), "draft");
     assert_eq!(item.get::<String>("dept").unwrap(), "pkg.writer");
     assert_eq!(item.get::<String>("proposal_id").unwrap(), "proposal-43");
-    assert_eq!(item.get::<String>("status").unwrap(), "completed");
+    assert_eq!(item.get::<String>("status").unwrap(), "done");
     assert_eq!(item.get::<i64>("exit_code").unwrap(), 0);
+    assert_eq!(
+        item.get::<String>("output_tail").unwrap(),
+        "sensitive output body"
+    );
     assert!(item.get::<String>("run_id").unwrap().starts_with("codex-"));
     assert!(item.get::<u64>("started_at_ms").unwrap() > 0);
     assert!(item.get::<u64>("ended_at_ms").unwrap() >= item.get::<u64>("started_at_ms").unwrap());
@@ -940,7 +1033,7 @@ printf 'done'
     assert_eq!(running.raw_len(), 0);
     assert_eq!(recent.raw_len(), 1);
     let completed: Table = recent.get(1).unwrap();
-    assert_eq!(completed.get::<String>("status").unwrap(), "completed");
+    assert_eq!(completed.get::<String>("status").unwrap(), "done");
     assert_eq!(completed.get::<i64>("exit_code").unwrap(), 0);
 }
 
@@ -1061,6 +1154,18 @@ fn spawn_codex_sync_returns_visible_spawn_error() {
     assert!(log_body.contains("codex spawn failed"));
     assert!(log_body.contains("EXIT=-1\n"));
     assert!(log_body.contains("CMD=codex exec --dangerously-bypass-approvals-and-sandbox -\n"));
+
+    let status_fn: mlua::Function = lua.globals().get("codex_status").unwrap();
+    let status: Table = status_fn.call(()).unwrap();
+    let recent: Table = status.get("recent").unwrap();
+    assert_eq!(recent.raw_len(), 1);
+    let failed: Table = recent.get(1).unwrap();
+    assert_eq!(failed.get::<String>("status").unwrap(), "failed");
+    assert_eq!(failed.get::<i64>("exit_code").unwrap(), -1);
+    assert!(failed
+        .get::<String>("output_tail")
+        .unwrap()
+        .contains("codex spawn failed"));
 }
 
 #[cfg(unix)]
