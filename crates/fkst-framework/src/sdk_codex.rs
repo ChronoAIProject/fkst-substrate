@@ -36,7 +36,7 @@ const DEFAULT_CODEX_TIMEOUT_SECONDS: i64 = 3600;
 const DEFAULT_CODEX_LOG_MAX_AGE: Duration = Duration::from_secs(48 * 60 * 60);
 const CODEX_STATUS_RECENT_LIMIT: usize = 50;
 const CODEX_STATUS_LOG_PREFIX: &str = "CODEX_STATUS:";
-const CODEX_ADOPTION_DIR: &str = ".fkst-codex";
+const CODEX_ADOPTION_DIR: &str = "codex-adoption";
 const CODEX_ADOPTION_POLL: Duration = Duration::from_millis(100);
 const CODEX_ADOPTION_TIMEOUT_GRACE: Duration = Duration::from_secs(2);
 static NEXT_PIPELINE_OWNER_ID: AtomicU64 = AtomicU64::new(1);
@@ -600,9 +600,8 @@ fn adoption_paths_for_request(request: &CodexRequest) -> Option<CodexAdoptionPat
     if worktree.trim().is_empty() {
         return None;
     }
-    let worktree_path = PathBuf::from(worktree);
     let key = adoption_key_for_request(request);
-    let dir = worktree_path.join(CODEX_ADOPTION_DIR).join(&key);
+    let dir = adoption_runtime_dir(&request.log_path).join(&key);
     Some(CodexAdoptionPaths {
         key,
         prompt: dir.join("prompt.txt"),
@@ -611,6 +610,14 @@ fn adoption_paths_for_request(request: &CodexRequest) -> Option<CodexAdoptionPat
         status: dir.join("status.json"),
         dir,
     })
+}
+
+fn adoption_runtime_dir(log_path: &Path) -> PathBuf {
+    log_path
+        .parent()
+        .and_then(Path::parent)
+        .map(|runtime| runtime.join(CODEX_ADOPTION_DIR))
+        .unwrap_or_else(|| runtime_log_dir().join(CODEX_ADOPTION_DIR))
 }
 
 fn adoption_key_for_request(request: &CodexRequest) -> String {

@@ -554,7 +554,50 @@ printf 'result-%s' "$count"
         std::fs::read_to_string(capture_dir.join("spawns")).unwrap(),
         "1"
     );
-    assert!(worktree.join(".fkst-codex").exists());
+    assert!(tmp.path().join("runtime/codex-adoption").exists());
+    assert!(!worktree.join(".fkst-codex").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn spawn_codex_sync_uses_runtime_adoption_dir_for_read_only_worktree() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let bin_dir = tmp.path().join("bin");
+    let worktree = tmp.path().join("readonly-wt");
+    std::fs::create_dir_all(&worktree).unwrap();
+    let mut permissions = std::fs::metadata(&worktree).unwrap().permissions();
+    permissions.set_mode(0o555);
+    std::fs::set_permissions(&worktree, permissions).unwrap();
+    install_codex_script(
+        &bin_dir,
+        r#"#!/bin/sh
+cat >/dev/null
+printf 'readonly-ok'
+"#,
+    );
+
+    let mut sandbox = ProcessSandbox::new();
+    sandbox.enter_cwd(tmp.path()).runtime_root(".fkst/runtime");
+    sandbox.prepend_path(&bin_dir);
+    sandbox.set_env(CODEX_WORKER_BIN_ENV, framework_bin());
+    sandbox.runtime_log_dir(tmp.path().join("runtime"));
+    let (_lock, _guard) = sandbox.enter();
+
+    let lua = Lua::new();
+    register(&lua).unwrap();
+    let spawn: mlua::Function = lua.globals().get("spawn_codex_sync").unwrap();
+    let opts = lua_opts(&lua, "read only worktree");
+    opts.set("worktree", worktree.to_string_lossy().into_owned())
+        .unwrap();
+    opts.set("dedup_key", "readonly-dedup").unwrap();
+
+    let result: Table = spawn.call(opts).unwrap();
+    assert_eq!(result.get::<i64>("exit_code").unwrap(), 0);
+    assert_eq!(result.get::<String>("stdout").unwrap(), "readonly-ok");
+    assert!(tmp.path().join("runtime/codex-adoption").exists());
+    assert!(!worktree.join(".fkst-codex").exists());
 }
 
 #[cfg(unix)]
