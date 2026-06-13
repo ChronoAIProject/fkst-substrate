@@ -1157,6 +1157,7 @@ mod tests {
             },
         );
         let cfg = Config {
+            package: BTreeMap::new(),
             queue,
             raiser: BTreeMap::new(),
             department,

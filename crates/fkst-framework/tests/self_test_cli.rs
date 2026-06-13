@@ -155,6 +155,7 @@ end
         .arg("--event")
         .arg(r#"{"name":"ok"}"#)
         .env(PACKAGE_ROOT_ENV, tmp.path())
+        .env_remove("FKST_SUPERVISOR_PID")
         .current_dir(tmp.path())
         .output()
         .unwrap();
@@ -215,6 +216,7 @@ end
         .env(RUNTIME_ROOT_ENV, &runtime_root)
         .env_remove(PACKAGE_ROOT_ENV)
         .env_remove(CODEX_PERMIT_SLOTS_ENV)
+        .env_remove("FKST_SUPERVISOR_PID")
         .current_dir(&cwd)
         .output()
         .unwrap();

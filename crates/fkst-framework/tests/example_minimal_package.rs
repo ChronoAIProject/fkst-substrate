@@ -47,6 +47,7 @@ fn run_department(host: &Path, runtime: &Path, lua: &str, event: &str) -> Output
         .arg("--event")
         .arg(event)
         .current_dir(host)
+        .env_remove("FKST_SUPERVISOR_PID")
         .env("FKST_RUNTIME_ROOT", runtime)
         .output()
         .unwrap()

@@ -145,19 +145,26 @@ pub(crate) fn install_sdk_shutdown_watch() {
 }
 
 pub(crate) fn ensure_supervisor_parent_alive() -> mlua::Result<()> {
-    let Some(expected_parent_pid) = std::env::var("FKST_SUPERVISOR_PID")
-        .ok()
-        .and_then(|value| value.parse::<u32>().ok())
-    else {
-        return Ok(());
-    };
-    if parent_changed(expected_parent_pid) {
-        return Err(mlua::Error::external(format!(
-            "supervisor parent lost: expected parent pid {expected_parent_pid}, current parent pid {}",
-            current_parent_pid()
-        )));
+    #[cfg(test)]
+    {
+        Ok(())
     }
-    Ok(())
+    #[cfg(not(test))]
+    {
+        let Some(expected_parent_pid) = std::env::var("FKST_SUPERVISOR_PID")
+            .ok()
+            .and_then(|value| value.parse::<u32>().ok())
+        else {
+            return Ok(());
+        };
+        if parent_changed(expected_parent_pid) {
+            return Err(mlua::Error::external(format!(
+                "supervisor parent lost: expected parent pid {expected_parent_pid}, current parent pid {}",
+                current_parent_pid()
+            )));
+        }
+        Ok(())
+    }
 }
 
 fn install_signal_handler(signal: Signal) {

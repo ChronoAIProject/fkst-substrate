@@ -194,6 +194,7 @@ fn supervise_survives_launcher_parent_exit() {
     fs::create_dir_all(root.join("raisers")).unwrap();
     fs::create_dir_all(&input_dir).unwrap();
     write_fkst_env(root);
+    write_persistence_decl(root);
     fs::write(
         root.join("departments/recorder/main.lua"),
         format!(
@@ -249,6 +250,7 @@ exit 0
         .current_dir(root)
         .env("FKST_RUNTIME_ROOT", root.join(".fkst/runtime"))
         .env("FKST_DURABLE_ROOT", root.join(".fkst/durable"))
+        .env_remove("FKST_SUPERVISOR_PID")
         .status()
         .unwrap();
     assert!(status.success(), "launcher status={status}");
@@ -259,9 +261,11 @@ exit 0
         .unwrap();
 
     std::thread::sleep(Duration::from_secs(2));
+    let supervise_stdout = fs::read_to_string(root.join("supervise.stdout")).unwrap_or_default();
+    let supervise_stderr = fs::read_to_string(root.join("supervise.stderr")).unwrap_or_default();
     assert!(
         process_exists(pid),
-        "supervise exited after launcher parent exit"
+        "supervise exited after launcher parent exit\nstdout:\n{supervise_stdout}\nstderr:\n{supervise_stderr}"
     );
     fs::write(input_dir.join("after-parent-exit.txt"), "ready").unwrap();
     let body = wait_for_file_containing(&fact, "after-parent-exit.txt", Duration::from_secs(10))
