@@ -554,7 +554,10 @@ printf 'result-%s' "$count"
         std::fs::read_to_string(capture_dir.join("spawns")).unwrap(),
         "1"
     );
-    assert!(tmp.path().join("runtime/codex-adoption").exists());
+    assert!(tmp
+        .path()
+        .join(".fkst/runtime/logs/codex-adoption")
+        .exists());
     assert!(!worktree.join(".fkst-codex").exists());
 }
 
@@ -596,7 +599,10 @@ printf 'readonly-ok'
     let result: Table = spawn.call(opts).unwrap();
     assert_eq!(result.get::<i64>("exit_code").unwrap(), 0);
     assert_eq!(result.get::<String>("stdout").unwrap(), "readonly-ok");
-    assert!(tmp.path().join("runtime/codex-adoption").exists());
+    assert!(tmp
+        .path()
+        .join(".fkst/runtime/logs/codex-adoption")
+        .exists());
     assert!(!worktree.join(".fkst-codex").exists());
 }
 
@@ -659,7 +665,7 @@ printf 'result-%s' "$count"
         "2"
     );
 
-    let adoption_dir = tmp.path().join("runtime/codex-adoption");
+    let adoption_dir = tmp.path().join(".fkst/runtime/logs/codex-adoption");
     let dirs: Vec<_> = std::fs::read_dir(&adoption_dir)
         .unwrap()
         .map(|entry| entry.unwrap().path())
