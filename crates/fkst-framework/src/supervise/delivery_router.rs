@@ -38,13 +38,7 @@ pub(crate) struct PublishEnvelope {
     pub event: Event,
     pub source: Option<SourceRef>,
     pub cron_payload: Option<JsonValue>,
-    pub derived: Option<DerivedDelivery>,
-}
-
-#[derive(Clone, Debug)]
-pub(crate) struct DerivedDelivery {
-    pub parent_delivery_id: String,
-    pub ordinal: usize,
+    pub derived: bool,
 }
 
 impl DeliveryRouter {
@@ -173,7 +167,7 @@ impl DeliveryRouter {
             event,
             source: Some(source),
             cron_payload: None,
-            derived: None,
+            derived: false,
         })
     }
 
@@ -206,7 +200,7 @@ impl DeliveryRouter {
 }
 
 fn publish_reason(envelope: &PublishEnvelope) -> &'static str {
-    if envelope.derived.is_some() {
+    if envelope.derived {
         "raised"
     } else if envelope.cron_payload.is_some() {
         "cron"
@@ -266,7 +260,7 @@ pub(crate) fn derive_delivery_id(
     source: &SourceRef,
     envelope: &PublishEnvelope,
 ) -> Result<String> {
-    let key = if envelope.derived.is_some() {
+    let key = if envelope.derived {
         if let Some(dedup_key) = payload_dedup_key(&envelope.event.payload) {
             runtime_key([
                 "delivery", "v3", "raised", "queue", queue, "dept", dept, "dedup", &dedup_key,
@@ -389,24 +383,16 @@ mod tests {
             event: Event::new(queue, payload),
             source: None,
             cron_payload: None,
-            derived: None,
+            derived: false,
         }
     }
 
-    fn raised_envelope(
-        queue: &str,
-        payload: JsonValue,
-        parent_id: &str,
-        ordinal: usize,
-    ) -> PublishEnvelope {
+    fn raised_envelope(queue: &str, payload: JsonValue) -> PublishEnvelope {
         PublishEnvelope {
             event: Event::new(queue, payload),
             source: None,
             cron_payload: None,
-            derived: Some(DerivedDelivery {
-                parent_delivery_id: parent_id.to_string(),
-                ordinal,
-            }),
+            derived: true,
         }
     }
 
@@ -503,7 +489,7 @@ mod tests {
                 event: Event::new("jobs", serde_json::json!({"n": 1})),
                 source: None,
                 cron_payload: None,
-                derived: None,
+                derived: false,
             })
             .unwrap_err();
 
@@ -522,7 +508,7 @@ mod tests {
                 event: Event::new("jobs", serde_json::json!({"n": 1})),
                 source: None,
                 cron_payload: None,
-                derived: None,
+                derived: false,
             })
             .unwrap();
 
@@ -546,7 +532,7 @@ mod tests {
                     reference: "tick".to_string(),
                 }),
                 cron_payload: Some(serde_json::json!({"raiser": "tick"})),
-                derived: None,
+                derived: false,
             })
             .unwrap();
 
@@ -581,7 +567,7 @@ mod tests {
                     event: Event::new(queue, serde_json::json!({"queue": queue})),
                     source: Some(source.clone()),
                     cron_payload: None,
-                    derived: None,
+                    derived: false,
                 })
                 .unwrap();
         }
@@ -652,18 +638,8 @@ mod tests {
             kind: SourceKind::Cron,
             reference: "tick/slot/1000".to_string(),
         };
-        let first = raised_envelope(
-            "next",
-            serde_json::json!({"dedup_key": "issue/67", "n": 1}),
-            "parent-a",
-            0,
-        );
-        let second = raised_envelope(
-            "next",
-            serde_json::json!({"dedup_key": "issue/67", "n": 1}),
-            "parent-b",
-            9,
-        );
+        let first = raised_envelope("next", serde_json::json!({"dedup_key": "issue/67", "n": 1}));
+        let second = raised_envelope("next", serde_json::json!({"dedup_key": "issue/67", "n": 1}));
 
         let first_id = derive_delivery_id("next", "next_worker", &source, &first).unwrap();
         let second_id = derive_delivery_id("next", "next_worker", &source, &second).unwrap();
@@ -718,16 +694,13 @@ mod tests {
             reference: "tick".to_string(),
         };
 
-        for parent in ["tick-a", "tick-b"] {
+        for _parent in ["tick-a", "tick-b"] {
             router
                 .publish(PublishEnvelope {
                     event: Event::new("next", serde_json::json!({"dedup_key": "issue/67"})),
                     source: Some(source.clone()),
                     cron_payload: None,
-                    derived: Some(DerivedDelivery {
-                        parent_delivery_id: parent.to_string(),
-                        ordinal: 0,
-                    }),
+                    derived: true,
                 })
                 .unwrap();
         }
@@ -753,12 +726,7 @@ mod tests {
             kind: SourceKind::Cron,
             reference: "tick/slot/1000".to_string(),
         };
-        let envelope = raised_envelope(
-            "next",
-            serde_json::json!({"n": 1}),
-            "delivery/v1/source/cron/queue/jobs/dept/worker/ref/tick",
-            2,
-        );
+        let envelope = raised_envelope("next", serde_json::json!({"n": 1}));
 
         let err = derive_delivery_id("next", "next_worker", &source, &envelope).unwrap_err();
         let message = err.to_string();
@@ -777,12 +745,7 @@ mod tests {
             kind: SourceKind::Cron,
             reference: "tick/slot/1000".to_string(),
         };
-        let envelope = raised_envelope(
-            "next",
-            serde_json::json!({"dedup_key": ""}),
-            "delivery/v1/source/cron/queue/jobs/dept/worker/ref/tick",
-            2,
-        );
+        let envelope = raised_envelope("next", serde_json::json!({"dedup_key": ""}));
 
         let err = derive_delivery_id("next", "next_worker", &source, &envelope).unwrap_err();
         let message = err.to_string();
@@ -812,7 +775,7 @@ mod tests {
                     reference: "tick".to_string(),
                 }),
                 cron_payload: None,
-                derived: None,
+                derived: false,
             })
             .unwrap();
 
@@ -836,7 +799,7 @@ mod tests {
                     reference: "tick".to_string(),
                 }),
                 cron_payload: None,
-                derived: None,
+                derived: false,
             })
             .unwrap_err();
 

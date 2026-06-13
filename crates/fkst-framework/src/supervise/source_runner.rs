@@ -46,7 +46,7 @@ pub fn spawn_cron(
                     reference: cron_source_reference(&name, slot),
                 }),
                 cron_payload: Some(cron_payload(&name)),
-                derived: None,
+                derived: false,
             }) {
                 warn!(raiser = %name, error = %e, "delivery publish failed");
             }
@@ -262,7 +262,7 @@ fn emit_abs_path(
             reference: file_source_reference(&path, identity),
         }),
         cron_payload: None,
-        derived: None,
+        derived: false,
     }) {
         warn!(raiser = %name, error = %e, "delivery publish failed");
     }

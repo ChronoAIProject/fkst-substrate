@@ -1,6 +1,6 @@
 //! Per-department consumer task.
 
-use super::delivery_router::{now_unix_millis, DeliveryRouter, DerivedDelivery, PublishEnvelope};
+use super::delivery_router::{now_unix_millis, DeliveryRouter, PublishEnvelope};
 use super::delivery_store::{DeliveryStore, RetryFailure, RetryOutcome};
 use super::delivery_types::{
     DeadRecord, DeliveryRecord, RedrivePolicy, RetryPolicy, SourceKind, SourceRef,
@@ -17,7 +17,6 @@ use fkst_common::config::{DepartmentDecl, RetryDecl};
 use fkst_common::{Event, RuntimeKind};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Duration;
@@ -794,7 +793,7 @@ fn publish_dead_letter_to(router: &DeliveryRouter, dead: &DeadRecord, queue: &st
             reference: format!("dead/{}", dead.delivery_id),
         }),
         cron_payload: None,
-        derived: None,
+        derived: false,
     }) {
         warn!(
             delivery_id = %dead.delivery_id,
@@ -816,17 +815,14 @@ fn publish_raised(
     stdout: &str,
     parent: &DeliveryRecord,
 ) -> anyhow::Result<()> {
-    for (ordinal, mut raised_ev) in parse_raised(stdout).into_iter().enumerate() {
+    for mut raised_ev in parse_raised(stdout) {
         reject_reserved_raised_queue(&raised_ev)?;
         raised_ev.ts = parent.observed_at_ms;
         router.publish(PublishEnvelope {
             event: raised_ev,
             source: parent.source.clone(),
             cron_payload: None,
-            derived: Some(DerivedDelivery {
-                parent_delivery_id: parent.delivery_id.clone(),
-                ordinal,
-            }),
+            derived: true,
         })?;
     }
     Ok(())
@@ -836,20 +832,15 @@ fn publish_raised_events(
     router: &DeliveryRouter,
     events: Vec<Event>,
     parent: &DeliveryRecord,
-    next_ordinal: &AtomicUsize,
 ) -> anyhow::Result<()> {
     for mut raised_ev in events {
         reject_reserved_raised_queue(&raised_ev)?;
         raised_ev.ts = parent.observed_at_ms;
-        let ordinal = next_ordinal.fetch_add(1, Ordering::Relaxed);
         router.publish(PublishEnvelope {
             event: raised_ev,
             source: parent.source.clone(),
             cron_payload: None,
-            derived: Some(DerivedDelivery {
-                parent_delivery_id: parent.delivery_id.clone(),
-                ordinal,
-            }),
+            derived: true,
         })?;
     }
     Ok(())
@@ -858,7 +849,6 @@ fn publish_raised_events(
 struct StreamingRaiseState {
     router: DeliveryRouter,
     parent: DeliveryRecord,
-    next_ordinal: AtomicUsize,
     first_error: Mutex<Option<String>>,
 }
 
@@ -867,7 +857,6 @@ impl StreamingRaiseState {
         Self {
             router,
             parent,
-            next_ordinal: AtomicUsize::new(0),
             first_error: Mutex::new(None),
         }
     }
@@ -879,9 +868,7 @@ impl StreamingRaiseState {
         }
         // A child may fail after an already streamed raise; durable consumers own
         // idempotence, so immediate publication intentionally keeps at-least-once semantics.
-        if let Err(err) =
-            publish_raised_events(&self.router, events, &self.parent, &self.next_ordinal)
-        {
+        if let Err(err) = publish_raised_events(&self.router, events, &self.parent) {
             let mut first_error = self
                 .first_error
                 .lock()
@@ -914,7 +901,7 @@ fn publish_ephemeral_raised(router: &DeliveryRouter, stdout: &str) -> anyhow::Re
             event: raised_ev,
             source: None,
             cron_payload: None,
-            derived: None,
+            derived: false,
         })?;
     }
     Ok(())
