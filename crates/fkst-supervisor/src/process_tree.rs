@@ -5,26 +5,18 @@ use tracing::warn;
 
 const TERMINATION_GRACE: Duration = Duration::from_secs(2);
 const POLL_INTERVAL: Duration = Duration::from_millis(25);
-
 pub async fn terminate_process_group(child: &mut Child, pid: u32, label: &str) {
     let pgid = Pid::from_raw(pid as i32);
-    if let Err(err) = killpg(pgid, Signal::SIGTERM) {
-        if err != Errno::ESRCH {
-            warn!(pid = pid, label = label, error = %err, "process group SIGTERM failed");
-        }
-    }
+    send_group_signal(pgid, Signal::SIGTERM, pid, label);
 
     let deadline = Instant::now() + TERMINATION_GRACE;
-    loop {
+    while Instant::now() < deadline {
         match child.try_wait() {
             Ok(Some(status)) => {
                 warn!(pid = pid, label = label, status = %status, "process group exited after SIGTERM");
                 return;
             }
-            Ok(None) if Instant::now() < deadline => {
-                tokio::time::sleep(POLL_INTERVAL).await;
-            }
-            Ok(None) => break,
+            Ok(None) => tokio::time::sleep(POLL_INTERVAL).await,
             Err(err) => {
                 warn!(pid = pid, label = label, error = %err, "process wait failed during termination");
                 break;
@@ -32,10 +24,29 @@ pub async fn terminate_process_group(child: &mut Child, pid: u32, label: &str) {
         }
     }
 
-    if let Err(err) = killpg(pgid, Signal::SIGKILL) {
-        if err != Errno::ESRCH {
-            warn!(pid = pid, label = label, error = %err, "process group SIGKILL failed");
+    send_group_signal(pgid, Signal::SIGKILL, pid, label);
+    let _ = child.wait().await;
+}
+fn send_group_signal(pgid: Pid, signal: Signal, pid: u32, label: &str) {
+    match killpg(pgid, signal) {
+        Ok(()) => {}
+        Err(err) if group_signal_cleanup_tolerated(err) => {
+            warn!(pid = pid, label = label, signal = ?signal, "process group signal cleanup tolerated");
+        }
+        Err(err) => {
+            warn!(pid = pid, label = label, signal = ?signal, error = %err, "process group signal cleanup failed");
         }
     }
-    let _ = child.wait().await;
+}
+pub(crate) fn group_signal_cleanup_tolerated(err: Errno) -> bool {
+    matches!(err, Errno::EPERM | Errno::ESRCH)
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn group_signal_cleanup_tolerates_eperm_and_esrch() {
+        let tolerated = group_signal_cleanup_tolerated;
+        assert!(tolerated(Errno::EPERM) && tolerated(Errno::ESRCH));
+    }
 }

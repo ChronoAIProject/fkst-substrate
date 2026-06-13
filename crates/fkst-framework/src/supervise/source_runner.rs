@@ -10,7 +10,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::time::Instant;
 use tracing::{info, warn};
 
-/// Spawn a Cron raiser as a tokio task. Fires every `interval` from supervisor start (monotonic).
+/// Spawn a Cron raiser as a tokio task. First fire is start plus deterministic jitter.
 /// Missed ticks during sleep/pause coalesce to one tick.
 ///
 /// `interval_str` formats: `Ns`, `Nm`, or `Nh`, for example "10s", "5m", or "1h".
@@ -23,7 +23,7 @@ pub fn spawn_cron(
     let interval = parse_duration(interval_str)?;
     let handle = tokio::spawn(async move {
         info!(raiser = %name, interval_s = interval.as_secs(), "cron raiser starting");
-        let mut next = Instant::now() + interval;
+        let mut next = Instant::now() + cron_first_fire_jitter(&name, interval);
         loop {
             tokio::time::sleep_until(next).await;
             let payload = cron_payload(&name);
@@ -50,6 +50,24 @@ pub fn spawn_cron(
 
 fn cron_payload(name: &str) -> serde_json::Value {
     serde_json::json!({"raiser": name})
+}
+
+fn cron_first_fire_jitter(name: &str, interval: Duration) -> Duration {
+    let bound = std::cmp::min(interval, Duration::from_secs(30));
+    let bound_ms = bound.as_millis().min(u64::MAX as u128) as u64;
+    if bound_ms == 0 {
+        return Duration::from_millis(0);
+    }
+    Duration::from_millis(deterministic_hash_u64(name.as_bytes()) % bound_ms)
+}
+
+fn deterministic_hash_u64(bytes: &[u8]) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
 }
 
 /// Spawn a file-watch raiser as a tokio task. Emits matching filesystem observations.
@@ -574,6 +592,25 @@ mod tests {
         assert_eq!(cron_source_reference("tick", 1_000), "tick/slot/1000");
         let slot = cron_slot_unix_millis(Duration::from_secs(60));
         assert_eq!(slot % 60_000, 0);
+    }
+
+    #[test]
+    fn cron_first_fire_jitter_is_before_interval() {
+        let interval = Duration::from_secs(600);
+        let jitter = cron_first_fire_jitter("tick", interval);
+
+        assert_eq!(jitter, cron_first_fire_jitter("tick", interval));
+        assert_ne!(jitter, cron_first_fire_jitter("other", interval));
+        assert!(jitter < Duration::from_secs(30));
+        assert!(jitter < interval);
+    }
+
+    #[test]
+    fn cron_first_fire_jitter_is_bounded_by_short_interval() {
+        let interval = Duration::from_secs(5);
+        let jitter = cron_first_fire_jitter("tick", interval);
+
+        assert!(jitter < interval);
     }
 
     #[test]

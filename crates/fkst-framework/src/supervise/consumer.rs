@@ -7,16 +7,18 @@ use super::delivery_types::{
 };
 use super::event_fanout::Fanout;
 use super::failure_fact::{dead_record_payload, delivery_failure_fact, FAILURE_FACT_QUEUE};
-use super::raised::parse_raised;
+use super::raised::{parse_raised, parse_raised_line};
 use super::source_runner::parse_duration;
-use super::spawner::{spawn_framework, SpawnResult};
+use super::spawner::{spawn_framework_with_stdout_observer, SpawnResult, StdoutLineObserver};
 use crate::path_resolver::PackageRoots;
 use crate::process_tree::ProcessGroupRegistry;
 use fkst_common::config::{DepartmentDecl, RetryDecl};
 use fkst_common::{Event, RuntimeKind};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -361,16 +363,17 @@ async fn run_durable_record(
     record: DeliveryRecord,
     args: SpawnArgs,
 ) -> CompletedDelivery {
-    let result = spawn_and_report(dept_name, &args).await;
+    let publish_state = Arc::new(StreamingRaiseState::new(router.clone(), record.clone()));
+    let result = spawn_and_report_with_stdout_observer(
+        dept_name,
+        &args,
+        Some(streaming_raise_observer(publish_state.clone())),
+    )
+    .await;
     let failure = match result {
-        Ok(result) if result.exit_code == 0 => {
-            match publish_raised(router, &result.stdout, &record) {
-                Ok(()) => None,
-                Err(err) => Some(DeliveryFailure::permanent(format!(
-                    "raised publish error: {err}"
-                ))),
-            }
-        }
+        Ok(result) if result.exit_code == 0 => publish_state
+            .first_error()
+            .map(|err| DeliveryFailure::permanent(format!("raised publish error: {err}"))),
         Ok(result) => Some(DeliveryFailure::from_spawn_result(&result)),
         Err(err) => {
             error!(
@@ -605,6 +608,7 @@ fn publish_failure_fact(router: &DeliveryRouter, event: Event) {
     }
 }
 
+#[cfg(test)]
 fn publish_raised(
     router: &DeliveryRouter,
     stdout: &str,
@@ -624,6 +628,81 @@ fn publish_raised(
         })?;
     }
     Ok(())
+}
+
+fn publish_raised_events(
+    router: &DeliveryRouter,
+    events: Vec<Event>,
+    parent: &DeliveryRecord,
+    next_ordinal: &AtomicUsize,
+) -> anyhow::Result<()> {
+    for mut raised_ev in events {
+        reject_reserved_raised_queue(&raised_ev)?;
+        raised_ev.ts = parent.observed_at_ms;
+        let ordinal = next_ordinal.fetch_add(1, Ordering::Relaxed);
+        router.publish(PublishEnvelope {
+            event: raised_ev,
+            source: parent.source.clone(),
+            cron_payload: None,
+            derived: Some(DerivedDelivery {
+                parent_delivery_id: parent.delivery_id.clone(),
+                ordinal,
+            }),
+        })?;
+    }
+    Ok(())
+}
+
+struct StreamingRaiseState {
+    router: DeliveryRouter,
+    parent: DeliveryRecord,
+    next_ordinal: AtomicUsize,
+    first_error: Mutex<Option<String>>,
+}
+
+impl StreamingRaiseState {
+    fn new(router: DeliveryRouter, parent: DeliveryRecord) -> Self {
+        Self {
+            router,
+            parent,
+            next_ordinal: AtomicUsize::new(0),
+            first_error: Mutex::new(None),
+        }
+    }
+
+    fn publish_line(&self, line: &str) {
+        let events = parse_raised_line(line);
+        if events.is_empty() {
+            return;
+        }
+        // A child may fail after an already streamed raise; durable consumers own
+        // idempotence, so immediate publication intentionally keeps at-least-once semantics.
+        if let Err(err) =
+            publish_raised_events(&self.router, events, &self.parent, &self.next_ordinal)
+        {
+            let mut first_error = self
+                .first_error
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if first_error.is_none() {
+                *first_error = Some(err.to_string());
+            }
+        }
+    }
+
+    fn first_error(&self) -> Option<String> {
+        self.first_error
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+}
+
+fn streaming_raise_observer(state: Arc<StreamingRaiseState>) -> StdoutLineObserver {
+    Arc::new(move |line| {
+        state.publish_line(line);
+        Ok(())
+    })
 }
 
 fn publish_ephemeral_raised(router: &DeliveryRouter, stdout: &str) -> anyhow::Result<()> {
@@ -701,7 +780,15 @@ struct SpawnArgs {
 }
 
 async fn spawn_and_report(dept_name: &str, args: &SpawnArgs) -> anyhow::Result<SpawnResult> {
-    let result = spawn_framework(
+    spawn_and_report_with_stdout_observer(dept_name, args, None).await
+}
+
+async fn spawn_and_report_with_stdout_observer(
+    dept_name: &str,
+    args: &SpawnArgs,
+    stdout_observer: Option<StdoutLineObserver>,
+) -> anyhow::Result<SpawnResult> {
+    let result = spawn_framework_with_stdout_observer(
         &args.framework_bin,
         &args.lua_full,
         &args.project_root,
@@ -712,6 +799,7 @@ async fn spawn_and_report(dept_name: &str, args: &SpawnArgs) -> anyhow::Result<S
         dept_name,
         &args.log_dir,
         args.process_groups.clone(),
+        stdout_observer,
     )
     .await?;
 
@@ -790,8 +878,10 @@ mod tests {
     use fkst_common::config::{Config, LimitsDecl, QueueDecl};
     use std::collections::BTreeMap;
     use std::fs;
+    use std::os::unix::fs::PermissionsExt;
     use std::path::Path;
     use tempfile::TempDir;
+    use tokio::time::timeout;
 
     fn package_namespace(root: &Path) -> String {
         root.canonicalize()
@@ -829,6 +919,11 @@ mod tests {
             base: Duration::from_millis(1),
             cap: Duration::from_millis(1),
         }
+    }
+
+    fn write_executable(path: &Path, body: &str) {
+        fs::write(path, format!("#!/bin/sh\n{body}\n")).unwrap();
+        fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
     }
 
     #[test]
@@ -1016,6 +1111,91 @@ mod tests {
             vec![temp.path().canonicalize().unwrap()]
         );
         assert_eq!(args.owner_namespace, owner_namespace);
+    }
+
+    #[tokio::test]
+    async fn durable_raised_line_publishes_before_child_exit() {
+        let temp = TempDir::new().unwrap();
+        let binary = temp.path().join("fkst-framework");
+        let lua = temp.path().join("dept.lua");
+        let log_dir = temp.path().join("logs");
+        fs::write(&lua, "return {}\n").unwrap();
+        let raised = base64::engine::general_purpose::URL_SAFE.encode(
+            serde_json::to_vec(&serde_json::json!([
+                {"queue": "done", "payload": {"n": 2}}
+            ]))
+            .unwrap(),
+        );
+        write_executable(
+            &binary,
+            &format!("printf 'RAISED: {raised}\\n'; sleep 5; exit 0"),
+        );
+
+        let fanout = Fanout::new();
+        let mut rx = fanout.subscribe("done", 8).await;
+        let mut queue = BTreeMap::new();
+        queue.insert(
+            "done".to_string(),
+            QueueDecl {
+                capacity: 8,
+                fanout: false,
+            },
+        );
+        let mut department = BTreeMap::new();
+        department.insert(
+            "observer".to_string(),
+            DepartmentDecl {
+                lua: "departments/observer/main.lua".into(),
+                owner_root: temp.path().into(),
+                owner_namespace: "pkg".to_string(),
+                consumes: vec!["done".to_string()],
+                produces: Vec::new(),
+                ephemeral: vec!["done".to_string()],
+                stall_window: "30s".to_string(),
+                graph_json: false,
+                retry: None,
+            },
+        );
+        let cfg = Config {
+            queue,
+            raiser: BTreeMap::new(),
+            department,
+            limits: LimitsDecl {
+                global_codex_processes: 1,
+            },
+        };
+        let router = DeliveryRouter::new(&cfg, fanout, None);
+        let spawned_router = router.clone();
+        let args = SpawnArgs {
+            framework_bin: binary,
+            lua_full: lua,
+            project_root: temp.path().into(),
+            graph_package_roots: vec![temp.path().into()],
+            event_json: "{}".to_string(),
+            stall_window: Duration::from_secs(30),
+            codex_permit_slots: 1,
+            log_dir,
+            owner_namespace: "pkg".to_string(),
+            process_groups: ProcessGroupRegistry::default(),
+        };
+
+        let started = std::time::Instant::now();
+        let handle = tokio::spawn(async move {
+            run_durable_record("worker", &spawned_router, record("parent"), args).await
+        });
+        let event = timeout(Duration::from_secs(4), rx.recv())
+            .await
+            .expect("streamed raise should publish before child exit")
+            .expect("done subscription should remain open");
+
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "raise was not visible before the child sleep elapsed"
+        );
+        assert_eq!(event.queue, "done");
+        assert_eq!(event.payload, serde_json::json!({"n": 2}));
+        let done = handle.await.unwrap();
+        assert!(done.failure.is_none());
     }
 
     #[test]
