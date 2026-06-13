@@ -323,6 +323,8 @@ supervisor 使用 current-thread tokio runtime，spawn `fkst-framework supervise
 
 supervise 运行在 current-thread tokio runtime 内，但每个 Department event 都会 spawn 一个 framework child process。framework child 是新的 process group leader，并运行到自然退出。Department `M.spec.stall_window` 是可靠投递 lease 与续租窗口，不是 codex kill deadline。
 
+The supervise process boundary follows process-supervision practice: each `fkst-framework run` child has one engine owner that observes exit and reaps it, and that observation is the source for delivery ack or retry. Blocking `wait` and blocking pipe I/O are not allowed on the core async runtime thread; stdout/stderr capture and child exit observation must not starve cron ticks, file-watch ticks, reliable wakes, lease renewal, retry, or dead-letter maintenance. Department spawn admission is bounded before a reliable lease is consumed, so lack of capacity leaves delivery due for a later dispatch pass instead of creating an unobservable leased backlog.
+
 Codex SDK 也把 `codex exec` 放入 process group。`spawn_codex_sync` 与 `spawn_codex` 使用整体 wall-clock `timeout`，默认 3600 秒；只有总运行时间超过 timeout 时才 kill process group，stdout/stderr 输出只被捕获，不延长 timeout。permit 池使用 fcntl lock file，不是内存 semaphore。permit 数来自 registry 的 `codex_permit_slots`：env 或 host `fkst.env` 可覆盖，未设置时默认 `20`。
 
 `with_lock(name, fn)` 是跨 pipeline 互斥 primitive。它把校验后的锁名解析到 `<RT>/locks/<name>` 并打开，获取 exclusive flock，执行 Lua function，释放 file handle。进程死时 lock 自动释放。

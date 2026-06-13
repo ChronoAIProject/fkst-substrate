@@ -58,6 +58,16 @@
 - conformance 读取仓库文件与 Lua graph 来执行上述 check。
 - conformance 不得调度工作、重试 pipeline、调用 GitHub、写隐藏状态、维护队列或承担 workflow engine 职责。
 
+## Supervise process safety
+
+- The governing practice for this problem class is process supervision with explicit ownership, non-blocking async executors, and bounded concurrency with backpressure. A new `supervise` process rule that deviates from those practices requires evidence that the existing practice does not apply to the engine boundary.
+- This invariant applies to the engine-owned Department child boundary in `fkst-framework supervise`: admission, process ownership, pipe capture, exit observation, reaping, and delivery completion. It does not add a host workflow scheduler, Department-specific retry policy, dashboard, durable business inbox, or any new Lua SDK surface.
+- Each `fkst-framework run` child started by `fkst-framework supervise` has exactly one engine owner responsible for observing exit and reaping the process. Child exit observation must feed delivery completion; a delivery must not stay leased or unacked because no owner waited on the child.
+- `supervise` must not run blocking `wait` or blocking pipe I/O on the core async runtime thread. Child stdout/stderr capture and process exit observation must be arranged so cron ticks, file-watch ticks, lease renewal, retry, dead-letter maintenance, and reliable wake handling keep making progress while many Department children are running.
+- Department child spawn must be bounded by engine-owned concurrency/backpressure before reliable delivery lease or equivalent dispatch ownership is consumed. When capacity is unavailable, due deliveries remain due or queued for a later dispatch pass rather than being leased into an unobservable backlog.
+- `M.spec.stall_window` remains a reliable delivery lease and renewal window. It is not a child no-output timeout, not a process kill deadline, and not permission to let unbounded child spawn load starve runtime timers.
+- Acceptance for this invariant is a local engine change that documents and tests: no zombie accumulation under concurrent Department child exits, no core-runtime starvation from child `wait` or pipe I/O, bounded Department spawn admission before lease consumption, and delivery ack/retry decisions tied to the single observed child exit. It is not a new SDK surface, source kind, durable business fact, dashboard, retry policy, or host workflow concept.
+
 ## SDK surface
 
 - 固定 Lua SDK surface 锚点是 `fixed-lua-sdk-surface`；允许 surface 是 `pipeline`、`source`、`raise`、`spawn_codex_sync`、`spawn_codex`、`exec_sync`、`await_all`、`with_lock`、`once`、`cache_set`、`cache_get`、`graph_json`、`t`、`git_log_count`、`git_log_grep`、`count_worktrees`、`list_orphan_worktrees`、`setup_worktree`、`file`、`json.decode`、`log.info`、`log.warn`、`log.error`、`now`。
