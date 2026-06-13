@@ -19,6 +19,7 @@ mod delivery_watch;
 pub mod event_fanout;
 pub(crate) mod failure_fact;
 pub(crate) mod graph_scan;
+mod journal;
 mod raised;
 pub(crate) mod source_runner;
 mod spawner;
@@ -29,6 +30,7 @@ use delivery_router::DeliveryRouter;
 use delivery_store::DeliveryStore;
 use event_fanout::Fanout;
 use failure_fact::schema_validation_failure_fact;
+use journal::SupervisorJournal;
 use source_runner::{spawn_cron, spawn_file_watch};
 
 pub(crate) fn load_host_graph_for_conformance(roots: &PackageRoots) -> Result<Config> {
@@ -37,20 +39,53 @@ pub(crate) fn load_host_graph_for_conformance(roots: &PackageRoots) -> Result<Co
 
 pub async fn supervise(roots: PackageRoots, framework_bin: PathBuf) -> Result<()> {
     let project_root = roots.host_root().to_path_buf();
+    let journal = SupervisorJournal::open();
     info!(
         package_roots = ?roots.package_roots(),
         host_root = %project_root.display(),
         "scanning graph from package roots and host root"
     );
+    journal.event(
+        "startup",
+        [
+            ("host_root", project_root.display().to_string()),
+            ("package_roots", path_list(roots.package_roots())),
+            ("framework_bin", framework_bin.display().to_string()),
+            (
+                "runtime_root",
+                std::env::var(fkst_common::runtime_layout::RUNTIME_ROOT_ENV)
+                    .unwrap_or_else(|_| "unset".into()),
+            ),
+            (
+                "durable_root_set",
+                std::env::var_os(fkst_common::DURABLE_ROOT_ENV)
+                    .is_some()
+                    .to_string(),
+            ),
+            (
+                "package_roots_env_set",
+                std::env::var_os("FKST_PACKAGE_ROOTS").is_some().to_string(),
+            ),
+            (
+                "package_root_env_set",
+                std::env::var_os("FKST_PACKAGE_ROOT").is_some().to_string(),
+            ),
+        ],
+    );
 
     let cfg = graph_scan::load_roots(&roots).map_err(|e| {
         error!(error = %e, "graph scan failed");
+        journal.event("startup_failed", [("reason", format!("graph_scan:{e}"))]);
         e
     })?;
 
     let schema_warnings = validate(&cfg, &project_root).map_err(|e| {
         let message = e.to_string();
         error!(error = %message, "schema validation failed, refusing to start");
+        journal.event(
+            "startup_failed",
+            [("reason", format!("schema_validation:{message}"))],
+        );
         publish_startup_validation_failure(&cfg, &message);
         anyhow::Error::msg(message)
     })?;
@@ -68,7 +103,12 @@ pub async fn supervise(roots: PackageRoots, framework_bin: PathBuf) -> Result<()
 
     let fanout = Fanout::new();
     let delivery_store = delivery_store_for_config(&cfg)?;
-    let router = DeliveryRouter::new(&cfg, fanout.clone(), delivery_store.clone());
+    let router = DeliveryRouter::new(
+        &cfg,
+        fanout.clone(),
+        delivery_store.clone(),
+        Some(journal.clone()),
+    );
     delivery_watch::set_failure_fact_publisher(router.failure_fact_publisher());
     let codex_permit_slots = cfg.limits.global_codex_processes;
     let process_groups = ProcessGroupRegistry::default();
@@ -102,6 +142,7 @@ pub async fn supervise(roots: PackageRoots, framework_bin: PathBuf) -> Result<()
                 q_cap,
                 codex_permit_slots,
                 process_groups.clone(),
+                journal.clone(),
             )
             .await,
         );
@@ -119,6 +160,7 @@ pub async fn supervise(roots: PackageRoots, framework_bin: PathBuf) -> Result<()
                     interval,
                     produces.clone(),
                     router.clone(),
+                    journal.clone(),
                 )?);
             }
             RaiserDecl::FileWatch { glob, produces } => {
@@ -128,6 +170,7 @@ pub async fn supervise(roots: PackageRoots, framework_bin: PathBuf) -> Result<()
                     &project_root,
                     produces.clone(),
                     router.clone(),
+                    journal.clone(),
                 )?);
             }
         }
@@ -139,23 +182,37 @@ pub async fn supervise(roots: PackageRoots, framework_bin: PathBuf) -> Result<()
     tokio::select! {
         _ = sigint.recv() => {
             warn!("event runtime received SIGINT");
+            journal.event("signal_received", [("signal", "SIGINT".to_string())]);
+            journal.event("shutdown_initiated", [("reason", "signal:SIGINT".to_string())]);
         }
         _ = sigterm.recv() => {
             warn!("event runtime received SIGTERM");
+            journal.event("signal_received", [("signal", "SIGTERM".to_string())]);
+            journal.event("shutdown_initiated", [("reason", "signal:SIGTERM".to_string())]);
         }
     }
-    shutdown_runtime(handles, &process_groups).await;
+    shutdown_runtime(handles, &process_groups, &journal).await;
     Ok(())
 }
 
 async fn shutdown_runtime(
     handles: Vec<tokio::task::JoinHandle<()>>,
     process_groups: &ProcessGroupRegistry,
+    journal: &SupervisorJournal,
 ) {
+    journal.event(
+        "teardown_step",
+        [("step", "terminate_process_groups".to_string())],
+    );
     process_groups.terminate_all("department").await;
+    journal.event(
+        "teardown_step",
+        [("step", "abort_runtime_tasks".to_string())],
+    );
     for handle in handles {
         handle.abort();
     }
+    journal.event("teardown_step", [("step", "complete".to_string())]);
 }
 
 fn delivery_store_for_config(cfg: &Config) -> Result<Option<Arc<DeliveryStore>>> {
@@ -181,11 +238,19 @@ fn publish_startup_validation_failure(cfg: &Config, error: &str) {
             None
         }
     };
-    let router = DeliveryRouter::new(cfg, fanout, store);
+    let router = DeliveryRouter::new(cfg, fanout, store, None);
     if let Err(err) = router.publish_failure_fact(fact.clone()) {
         warn!(error = %err, "startup failure fact publish failed");
     }
     error!(queue = %fact.queue, payload = %fact.payload, "engine failure fact");
+}
+
+fn path_list(paths: &[PathBuf]) -> String {
+    paths
+        .iter()
+        .map(|path| path.display().to_string())
+        .collect::<Vec<_>>()
+        .join(";")
 }
 
 #[cfg(test)]
@@ -303,7 +368,12 @@ mod tests {
         });
         registered_rx.await.unwrap();
 
-        shutdown_runtime(vec![handle], &process_groups).await;
+        shutdown_runtime(
+            vec![handle],
+            &process_groups,
+            &SupervisorJournal::disabled(),
+        )
+        .await;
 
         assert!(
             wait_for_child_exit(&mut child, Duration::from_secs(5)),
