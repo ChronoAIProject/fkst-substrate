@@ -9,6 +9,8 @@ mod sdk_codex {
 }
 #[path = "../src/process_tree.rs"]
 mod process_tree;
+#[path = "../src/provenance.rs"]
+mod provenance;
 #[path = "../src/supervise/spawner.rs"]
 mod spawner;
 mod support;
@@ -257,7 +259,7 @@ return M
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(
-        trace_output.contains("supervisor journal disabled"),
+        trace_output.contains("MSG=supervisor journal disabled"),
         "trace_output={trace_output}"
     );
 }
@@ -465,19 +467,20 @@ return M
     let journal = read_single_supervisor_journal(&runtime_root);
     assert!(journal.contains("event=startup "), "journal={journal}");
     assert!(
-        journal.contains("event=raiser_fired name="),
+        journal.contains("event=raiser_fired ")
+            && journal.contains(" name=package-root.standard_input "),
         "journal={journal}"
     );
     assert!(
-        journal.contains("event=dept_child_spawn dept=host.host_worker"),
+        journal.contains("event=dept_child_spawn ") && journal.contains(" dept=host.host_worker "),
         "journal={journal}"
     );
     assert!(
-        journal.contains("event=dept_child_exit dept=host.host_worker"),
+        journal.contains("event=dept_child_exit ") && journal.contains(" dept=host.host_worker "),
         "journal={journal}"
     );
     assert!(
-        journal.contains("event=shutdown_initiated reason=signal:SIGTERM"),
+        journal.contains("event=shutdown_initiated ") && journal.contains(" reason=signal:SIGTERM"),
         "journal={journal}"
     );
 }
@@ -726,6 +729,9 @@ async fn framework_child_log_records_final_metadata_for_exit_modes() {
     assert!(success_log.contains("LUA="));
     assert!(success_log.contains("PACKAGE_ROOTS="));
     assert!(success_log.contains("OWNER_NAMESPACE=pkg"));
+    assert!(success_log.contains("ENGINE_VER="));
+    assert!(success_log.contains("PKG_VER="));
+    assert!(success_log.contains("PKG_VERS="));
     assert!(success_log.contains("DEPT=success"));
     assert!(success_log.contains("EXIT=0\n"));
     assert!(success_log.contains("ELAPSED_MS="));

@@ -4,6 +4,10 @@
 mod config_registry;
 #[path = "../src/external_command.rs"]
 mod external_command;
+#[path = "../src/process_tree.rs"]
+mod process_tree;
+#[path = "../src/provenance.rs"]
+mod provenance;
 #[path = "../src/rate_pool.rs"]
 mod rate_pool;
 #[path = "../src/runtime_context.rs"]
