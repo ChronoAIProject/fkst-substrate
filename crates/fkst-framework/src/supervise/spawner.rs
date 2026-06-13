@@ -20,6 +20,7 @@ use tracing::info;
 static NEXT_FRAMEWORK_CHILD_LOG_ID: AtomicU64 = AtomicU64::new(1);
 
 pub struct SpawnResult {
+    pub pid: u32,
     pub exit_code: i32,
     pub stdout: String,
     pub stderr: String,
@@ -149,7 +150,7 @@ pub async fn spawn_framework_with_stdout_observer(
     info!(pid = pid, lua = %lua_path.display(), "framework spawned");
     let registration = process_groups.register(pid);
 
-    wait_for_framework_child(child, start, log, registration, stdout_observer).await
+    wait_for_framework_child(child, pid, start, log, registration, stdout_observer).await
 }
 
 fn package_root_flags(package_roots: &[PathBuf]) -> String {
@@ -170,6 +171,7 @@ fn package_root_list(package_roots: &[PathBuf]) -> String {
 
 async fn wait_for_framework_child(
     mut child: Child,
+    pid: u32,
     start: Instant,
     mut log: FrameworkChildLog,
     _registration: ProcessGroupRegistration,
@@ -226,7 +228,7 @@ async fn wait_for_framework_child(
         stdout_observer.as_deref(),
     )?;
 
-    spawn_result_from_status(status, output, start, log)
+    spawn_result_from_status(pid, status, output, start, log)
 }
 
 // buffers accumulate incrementally as output events arrive.
@@ -295,6 +297,7 @@ impl StdoutLineBuffer {
 
 // natural exits keep their child status.
 fn spawn_result_from_status(
+    pid: u32,
     status: std::result::Result<std::process::ExitStatus, String>,
     output: FrameworkOutput,
     start: Instant,
@@ -308,6 +311,7 @@ fn spawn_result_from_status(
     log.write_line(&format!("ELAPSED_MS={elapsed_ms}"));
     let log_path = log.path().map(Path::to_path_buf);
     Ok(SpawnResult {
+        pid,
         exit_code,
         stdout,
         stderr,

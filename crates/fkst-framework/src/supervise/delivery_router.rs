@@ -4,6 +4,7 @@ use super::delivery_store::DeliveryStore;
 use super::delivery_types::{DeliveryRecord, SourceKind, SourceRef};
 use super::event_fanout::Fanout;
 use super::failure_fact::{FAILURE_FACT_QUEUE, FAILURE_FACT_SCHEMA};
+use super::journal::SupervisorJournal;
 use anyhow::{anyhow, bail, Context, Result};
 use fkst_common::config::Config;
 use fkst_common::validate_runtime_key;
@@ -23,6 +24,7 @@ pub(crate) struct DeliveryRouter {
     store: Option<Arc<DeliveryStore>>,
     subscriptions: Arc<BTreeMap<String, Vec<Subscription>>>,
     reliable_wakes: Arc<Mutex<BTreeMap<String, mpsc::Sender<()>>>>,
+    journal: SupervisorJournal,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -46,12 +48,18 @@ pub(crate) struct DerivedDelivery {
 }
 
 impl DeliveryRouter {
-    pub(crate) fn new(cfg: &Config, fanout: Fanout, store: Option<Arc<DeliveryStore>>) -> Self {
+    pub(crate) fn new(
+        cfg: &Config,
+        fanout: Fanout,
+        store: Option<Arc<DeliveryStore>>,
+        journal: Option<SupervisorJournal>,
+    ) -> Self {
         Self {
             fanout,
             store,
             subscriptions: Arc::new(subscriptions(cfg)),
             reliable_wakes: Arc::new(Mutex::new(BTreeMap::new())),
+            journal: journal.unwrap_or_else(SupervisorJournal::disabled),
         }
     }
 
@@ -80,6 +88,14 @@ impl DeliveryRouter {
             .subscriptions
             .get(&queue)
             .ok_or_else(|| anyhow!("queue `{}` has no delivery subscriptions", queue))?;
+        self.journal.event(
+            "published",
+            [
+                ("queue", queue.clone()),
+                ("subscriber_count", subscribers.len().to_string()),
+                ("reason", publish_reason(&envelope).to_string()),
+            ],
+        );
         let mut sent_ephemeral = false;
         for sub in subscribers {
             if sub.reliable {
@@ -118,8 +134,26 @@ impl DeliveryRouter {
                 store
                     .enqueue(&record)
                     .with_context(|| format!("enqueue delivery `{}`", record.delivery_id))?;
+                self.journal.event(
+                    "delivered",
+                    [
+                        ("queue", queue.clone()),
+                        ("dept", sub.dept.clone()),
+                        ("delivery_id", record.delivery_id.clone()),
+                        ("reason", "durable_enqueue".to_string()),
+                    ],
+                );
                 self.notify_reliable(&sub.dept);
             } else {
+                self.journal.event(
+                    "delivered",
+                    [
+                        ("queue", queue.clone()),
+                        ("dept", sub.dept.clone()),
+                        ("delivery_id", "ephemeral".to_string()),
+                        ("reason", "ephemeral_fanout".to_string()),
+                    ],
+                );
                 sent_ephemeral = true;
             }
         }
@@ -173,6 +207,18 @@ impl DeliveryRouter {
         if let Err(err) = wake.try_send(()) {
             warn!(dept = %dept, error = %err, "reliable wake notify failed");
         }
+    }
+}
+
+fn publish_reason(envelope: &PublishEnvelope) -> &'static str {
+    if envelope.derived.is_some() {
+        "raised"
+    } else if envelope.cron_payload.is_some() {
+        "cron"
+    } else if envelope.source.is_some() {
+        "source"
+    } else {
+        "ephemeral"
     }
 }
 
@@ -525,7 +571,7 @@ mod tests {
     #[test]
     fn reliable_publish_requires_source_ref() {
         let cfg = config(false);
-        let router = DeliveryRouter::new(&cfg, Fanout::new(), None);
+        let router = DeliveryRouter::new(&cfg, Fanout::new(), None, None);
 
         let err = router
             .publish(PublishEnvelope {
@@ -544,7 +590,7 @@ mod tests {
         let cfg = config(true);
         let fanout = Fanout::new();
         let mut rx = fanout.subscribe("jobs", 8).await;
-        let router = DeliveryRouter::new(&cfg, fanout, None);
+        let router = DeliveryRouter::new(&cfg, fanout, None, None);
 
         router
             .publish(PublishEnvelope {
@@ -565,7 +611,7 @@ mod tests {
         let cfg = config(false);
         let temp = TempDir::new().unwrap();
         let store = Arc::new(DeliveryStore::open(temp.path().join("delivery.redb")).unwrap());
-        let router = DeliveryRouter::new(&cfg, Fanout::new(), Some(store.clone()));
+        let router = DeliveryRouter::new(&cfg, Fanout::new(), Some(store.clone()), None);
 
         router
             .publish(PublishEnvelope {
@@ -598,7 +644,7 @@ mod tests {
         let cfg = namespaced_config();
         let temp = TempDir::new().unwrap();
         let store = Arc::new(DeliveryStore::open(temp.path().join("delivery.redb")).unwrap());
-        let router = DeliveryRouter::new(&cfg, Fanout::new(), Some(store.clone()));
+        let router = DeliveryRouter::new(&cfg, Fanout::new(), Some(store.clone()), None);
         let source = SourceRef {
             kind: SourceKind::Cron,
             reference: "pkg.tick".to_string(),
@@ -716,7 +762,7 @@ mod tests {
         let store = Arc::new(DeliveryStore::open(temp.path().join("delivery.redb")).unwrap());
         let fanout = Fanout::new();
         let mut rx = fanout.subscribe("jobs", 8).await;
-        let router = DeliveryRouter::new(&cfg, fanout, Some(store));
+        let router = DeliveryRouter::new(&cfg, fanout, Some(store), None);
 
         router
             .publish(PublishEnvelope {
@@ -740,7 +786,7 @@ mod tests {
         let cfg = config(false);
         let temp = TempDir::new().unwrap();
         let store = Arc::new(DeliveryStore::open(temp.path().join("delivery.redb")).unwrap());
-        let router = DeliveryRouter::new(&cfg, Fanout::new(), Some(store));
+        let router = DeliveryRouter::new(&cfg, Fanout::new(), Some(store), None);
 
         let err = router
             .publish(PublishEnvelope {
