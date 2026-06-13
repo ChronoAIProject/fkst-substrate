@@ -583,4 +583,47 @@ mod tests {
         );
         assert_eq!(escape_message("a\r\nb"), r"a\r\nb");
     }
+
+    #[test]
+    fn tracing_formatter_omits_process_provenance_fields() {
+        let output = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .event_format(TracingKeyValueFormatter)
+            .with_writer(SharedBuffer(output.clone()))
+            .finish();
+
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info!(event = "startup", "framework started");
+        });
+
+        let line = String::from_utf8(output.lock().unwrap().clone()).unwrap();
+        assert!(line.contains(" event=startup "), "{line}");
+        assert!(!line.contains(" ENGINE_VER="), "{line}");
+        assert!(!line.contains(" PKG_VER="), "{line}");
+        assert!(!line.contains(" PKG_VERS="), "{line}");
+    }
+
+    #[derive(Clone)]
+    struct SharedBuffer(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    struct SharedWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for SharedBuffer {
+        type Writer = SharedWriter;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            SharedWriter(self.0.clone())
+        }
+    }
+
+    impl std::io::Write for SharedWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
 }
