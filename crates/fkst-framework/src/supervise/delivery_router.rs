@@ -788,6 +788,78 @@ mod tests {
     }
 
     #[test]
+    fn reliable_raised_publish_collapses_same_dedup_key_across_parent_ticks() {
+        let mut queue = BTreeMap::new();
+        queue.insert(
+            "next".to_string(),
+            QueueDecl {
+                capacity: 8,
+                fanout: false,
+            },
+        );
+        let mut department = BTreeMap::new();
+        department.insert(
+            "next_worker".to_string(),
+            DepartmentDecl {
+                lua: "departments/next_worker/main.lua".into(),
+                owner_root: std::path::PathBuf::from("."),
+                owner_namespace: "pkg".to_string(),
+                consumes: vec!["next".to_string()],
+                produces: Vec::new(),
+                ephemeral: Vec::new(),
+                stall_window: "30s".to_string(),
+                graph_json: false,
+                retry: None,
+            },
+        );
+        let cfg = Config {
+            queue,
+            raiser: BTreeMap::new(),
+            department,
+            limits: LimitsDecl {
+                global_codex_processes: 1,
+                global_department_child_processes: 16,
+                department_child_processes_per_dept: 4,
+            },
+        };
+        let temp = TempDir::new().unwrap();
+        let store = Arc::new(DeliveryStore::open(temp.path().join("delivery.redb")).unwrap());
+        let router = DeliveryRouter::new(&cfg, Fanout::new(), Some(store.clone()), None);
+        let source = SourceRef {
+            kind: SourceKind::Cron,
+            reference: "tick".to_string(),
+        };
+
+        for parent in ["tick-a", "tick-b"] {
+            router
+                .publish(PublishEnvelope {
+                    event: Event::new("next", serde_json::json!({"dedup_key": "issue/67"})),
+                    source: Some(source.clone()),
+                    cron_payload: None,
+                    derived: Some(DerivedDelivery {
+                        parent_delivery_id: parent.to_string(),
+                        ordinal: 0,
+                    }),
+                })
+                .unwrap();
+        }
+
+        let leased = store
+            .lease_for_dept("next_worker", now_unix_millis(), 8, Duration::from_secs(30))
+            .unwrap();
+
+        assert_eq!(leased.len(), 1);
+        assert_eq!(
+            leased[0].delivery_id,
+            "delivery/v3/raised/queue/next/dept/next__worker/dedup/issue_x2F67"
+        );
+        assert_eq!(
+            leased[0].payload,
+            serde_json::json!({"dedup_key": "issue/67"})
+        );
+    }
+
+    #[test]
     fn raised_delivery_id_without_dedup_key_uses_parent_ordinal_queue_and_dept() {
         let source = SourceRef {
             kind: SourceKind::Cron,

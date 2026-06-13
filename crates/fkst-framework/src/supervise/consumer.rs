@@ -1208,6 +1208,53 @@ mod tests {
         assert_eq!(second_dept.available_permits(), 4);
     }
 
+    #[test]
+    fn dispatch_due_does_not_lease_when_child_spawn_limit_is_exhausted() {
+        let temp = TempDir::new().unwrap();
+        let store = Arc::new(DeliveryStore::open(temp.path().join("delivery.redb")).unwrap());
+        store.enqueue(&record("one")).unwrap();
+        let roots = PackageRoots::resolve(temp.path(), vec![temp.path().to_path_buf()]).unwrap();
+        let decl = DepartmentDecl {
+            lua: "departments/worker/main.lua".into(),
+            owner_root: temp.path().canonicalize().unwrap(),
+            owner_namespace: package_namespace(temp.path()),
+            consumes: vec!["jobs".to_string()],
+            produces: Vec::new(),
+            ephemeral: Vec::new(),
+            stall_window: "30s".to_string(),
+            graph_json: false,
+            retry: None,
+        };
+        let router = router_with_dead_letter(store.clone());
+        let (complete_tx, _complete_rx) = mpsc::channel::<CompletedDelivery>(1);
+        let mut running = BTreeMap::new();
+
+        dispatch_due(
+            "worker",
+            &decl,
+            temp.path(),
+            &roots,
+            &temp.path().join("fkst-framework"),
+            &router,
+            Some(store.clone()),
+            None,
+            &temp.path().join("logs"),
+            Duration::from_secs(30),
+            1,
+            Arc::new(Semaphore::new(0)),
+            Arc::new(Semaphore::new(1)),
+            ProcessGroupRegistry::default(),
+            SupervisorJournal::disabled(),
+            &complete_tx,
+            &mut running,
+        );
+
+        let current = store.get("one").unwrap().unwrap();
+        assert_eq!(current.lease_generation, 0);
+        assert_eq!(current.lease_until_ms, None);
+        assert!(running.is_empty());
+    }
+
     fn router_with_dead_letter(store: Arc<DeliveryStore>) -> DeliveryRouter {
         router_with_dead_letter_and_fanout(store, Fanout::new())
     }
