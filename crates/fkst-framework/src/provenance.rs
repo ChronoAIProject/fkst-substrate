@@ -4,6 +4,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{OnceLock, RwLock};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const HOST_NAMESPACE: &str = "host";
 static STATE: OnceLock<RwLock<ProvenanceState>> = OnceLock::new();
@@ -125,6 +126,19 @@ pub(crate) fn pkg_ver_for_namespace(namespace: &str) -> String {
         .unwrap_or_else(|| current_pkg_ver())
 }
 
+pub(crate) fn emit_code_provenance_line() {
+    eprintln!("{}", code_provenance_line());
+}
+
+fn code_provenance_line() -> String {
+    format!(
+        "TIMESTAMP={} LEVEL=info EVENT=code_provenance ENGINE_VER={} PKG_VERS={}",
+        rfc3339_utc_now(),
+        escape_value(&current_engine_ver()),
+        escape_value(&current_pkg_versions_summary())
+    )
+}
+
 fn install_state(next: ProvenanceState) {
     set_env(&next);
     let mut state = state()
@@ -175,6 +189,53 @@ fn root_namespace(root: &Path) -> String {
         .to_string()
 }
 
+fn escape_value(value: &str) -> String {
+    let mut escaped = String::new();
+    for ch in value.chars() {
+        match ch {
+            '\\' => escaped.push_str("\\\\"),
+            '\n' => escaped.push_str("\\n"),
+            '\r' => escaped.push_str("\\r"),
+            '\t' => escaped.push_str("\\t"),
+            ' ' => escaped.push_str("\\s"),
+            '=' => escaped.push_str("\\="),
+            _ => escaped.push(ch),
+        }
+    }
+    escaped
+}
+
+fn rfc3339_utc_now() -> String {
+    let elapsed = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or(Duration::ZERO);
+    rfc3339_from_unix(elapsed.as_secs())
+}
+
+fn rfc3339_from_unix(secs: u64) -> String {
+    let days = (secs / 86_400) as i64;
+    let seconds_of_day = secs % 86_400;
+    let hour = seconds_of_day / 3_600;
+    let minute = (seconds_of_day % 3_600) / 60;
+    let second = seconds_of_day % 60;
+    let (year, month, day) = civil_from_days(days);
+    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z")
+}
+
+fn civil_from_days(days_since_epoch: i64) -> (i64, u32, u32) {
+    let z = days_since_epoch + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = mp + if mp < 10 { 3 } else { -9 };
+    let year = y + if month <= 2 { 1 } else { 0 };
+    (year, month as u32, day as u32)
+}
+
 fn git_stdout<const N: usize>(root: &Path, args: [&str; N]) -> Option<String> {
     Command::new("git")
         .arg("-C")
@@ -207,5 +268,18 @@ mod tests {
         let parsed = parse_versions_summary("host@abc;pkg@def");
         assert_eq!(parsed.get("host"), Some(&"abc".to_string()));
         assert_eq!(parsed.get("pkg"), Some(&"def".to_string()));
+    }
+
+    #[test]
+    fn code_provenance_line_records_engine_and_package_versions_once() {
+        let line = code_provenance_line();
+        assert!(line.starts_with("TIMESTAMP="), "{line}");
+        assert!(
+            line.contains(" LEVEL=info EVENT=code_provenance "),
+            "{line}"
+        );
+        assert!(line.contains(" ENGINE_VER="), "{line}");
+        assert!(line.contains(" PKG_VERS="), "{line}");
+        assert!(!line.contains(" PKG_VER="), "{line}");
     }
 }

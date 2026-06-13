@@ -401,6 +401,7 @@ fn run_pipeline(
         .owner_root_for_namespace(&owner_namespace)
         .ok_or_else(|| anyhow::anyhow!("unknown owner namespace `{owner_namespace}`"))?;
     provenance::install_run(owner_root, &owner_namespace);
+    provenance::emit_code_provenance_line();
     let require_roots = roots.require_roots_for_owner(owner_root);
     let graph_json_authorized =
         sdk_graph::department_authorized(&roots, owner_root, &lua_path).unwrap_or(false);
@@ -562,6 +563,7 @@ fn run() -> Result<i32> {
             framework_bin,
         } => {
             provenance::install_supervise(roots.package_roots(), roots.host_root());
+            provenance::emit_code_provenance_line();
             tracing_subscriber::fmt()
                 .with_env_filter(
                     tracing_subscriber::EnvFilter::from_default_env()
