@@ -216,14 +216,15 @@ fn generated_shim_consumes_same_bucket_as_cli_acquire() {
 
 #[cfg(unix)]
 #[test]
-fn generated_shim_preserves_streams_exit_and_emits_audit_line() {
+fn generated_shim_preserves_streams_stdin_exit_and_writes_audit_file() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().join("rate-pools");
+    let runtime_root = tmp.path().join("runtime");
     let real_dir = tmp.path().join("bin");
     std::fs::create_dir_all(&real_dir).unwrap();
     executable(
         &real_dir.join("gh"),
-        "#!/bin/sh\nprintf 'shim-out\\n'\nprintf 'shim-err\\n' >&2\nexit 17\n",
+        "#!/bin/sh\nprintf 'shim-out\\n'\nIFS= read -r line\nprintf '%s\\n' \"$line\"\nprintf 'shim-err\\n' >&2\nexit 17\n",
     );
     let registry = RatePoolRegistry::for_test(
         root.clone(),
@@ -243,27 +244,45 @@ fn generated_shim_preserves_streams_exit_and_emits_audit_line() {
             .unwrap();
     let path = std::env::join_paths([shim_dir.as_path(), real_dir.as_path()]).unwrap();
 
-    let shim = Command::new(shim_dir.join("gh"))
+    let mut child = Command::new(shim_dir.join("gh"))
         .env("PATH", path)
+        .env("FKST_RUNTIME_ROOT", &runtime_root)
+        .env("FKST_ENGINE_VER", "engine-test")
+        .env("FKST_PKG_VER", "pkg-test")
+        .env("FKST_PKG_VERS", "host@host-test;pkg@pkg-test")
         .env_remove("FKST_RATE_POOL_ROOT")
         .env_remove("FKST_RATE_POOL_GH")
-        .output()
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
         .unwrap();
+    use std::io::Write;
+    child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(b"from-stdin\n")
+        .unwrap();
+    drop(child.stdin.take());
+    let shim = child.wait_with_output().unwrap();
 
     assert_exit(&shim, 17);
-    assert_eq!(stdout(&shim), "shim-out\n");
+    assert_eq!(stdout(&shim), "shim-out\nfrom-stdin\n");
     let stderr = stderr(&shim);
-    assert!(stderr.contains("shim-err\n"), "stderr={stderr}");
-    assert!(stderr.contains("EVENT=external_command"), "stderr={stderr}");
-    assert!(stderr.contains("EXIT=17"), "stderr={stderr}");
+    assert_eq!(stderr, "shim-err\n");
     assert!(
-        stderr.contains("STDOUT_EXCERPT=shim-out\\n"),
+        !stderr.contains("EVENT=external_command"),
         "stderr={stderr}"
     );
-    assert!(
-        stderr.contains("STDERR_EXCERPT=shim-err\\n"),
-        "stderr={stderr}"
-    );
+    let audit =
+        std::fs::read_to_string(runtime_root.join("logs/external-command-audit.log")).unwrap();
+    assert!(audit.contains("EVENT=external_command"), "audit={audit}");
+    assert!(audit.contains("PKG_VER=pkg-test"), "audit={audit}");
+    assert!(audit.contains("EXIT=17"), "audit={audit}");
+    assert!(audit.contains("TIMED_OUT=false"), "audit={audit}");
+    assert!(!audit.contains("STDOUT_EXCERPT"), "audit={audit}");
+    assert!(!audit.contains("STDERR_EXCERPT"), "audit={audit}");
     assert_eq!(ledger_tokens(&root.join("gh.bucket")), 0);
 }
 

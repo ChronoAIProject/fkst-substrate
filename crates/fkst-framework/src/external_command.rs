@@ -338,18 +338,78 @@ pub(crate) fn audit_line(
         timed_out,
         stdout.len(),
         stderr.len(),
-        escape_value(&excerpt(stdout, AUDIT_EXCERPT_LIMIT)),
-        escape_value(&excerpt(stderr, AUDIT_EXCERPT_LIMIT))
+        escaped_excerpt(stdout, AUDIT_EXCERPT_LIMIT),
+        escaped_excerpt(stderr, AUDIT_EXCERPT_LIMIT)
     )
 }
 
-pub(crate) fn excerpt(bytes: &[u8], limit: usize) -> String {
+fn excerpt(bytes: &[u8], limit: usize) -> String {
     let bounded = if bytes.len() > limit {
         &bytes[..limit]
     } else {
         bytes
     };
     String::from_utf8_lossy(bounded).to_string()
+}
+
+fn escaped_excerpt(bytes: &[u8], limit: usize) -> String {
+    truncate_escaped_field(&escape_value(&excerpt(bytes, limit)), limit)
+}
+
+fn truncate_escaped_field(value: &str, limit: usize) -> String {
+    const MARKER: &str = "...";
+    if value.len() <= limit {
+        return value.to_string();
+    }
+    if limit <= MARKER.len() {
+        return MARKER[..limit].to_string();
+    }
+    let content_limit = limit - MARKER.len();
+    let mut end = 0;
+    for (idx, ch) in value.char_indices() {
+        let next = idx + ch.len_utf8();
+        if next > content_limit {
+            break;
+        }
+        end = next;
+    }
+    format!("{}{}", &value[..end], MARKER)
+}
+
+pub(crate) fn shim_audit_line(rendered: &str, exit_code: i32, timed_out: bool) -> String {
+    format!(
+        "LEVEL=info ENGINE_VER={} PKG_VER={} EVENT=external_command CMD={} EXIT={} TIMED_OUT={}",
+        escape_value(&crate::provenance::current_engine_ver()),
+        escape_value(&crate::provenance::current_pkg_ver()),
+        escape_value(rendered),
+        exit_code,
+        timed_out
+    )
+}
+
+pub(crate) fn append_shim_audit_line(line: &str) {
+    let Some(runtime_root) =
+        std::env::var_os("FKST_RUNTIME_ROOT").filter(|value| !value.is_empty())
+    else {
+        return;
+    };
+    let path = PathBuf::from(runtime_root)
+        .join("logs")
+        .join("external-command-audit.log");
+    let Some(parent) = path.parent() else {
+        return;
+    };
+    if std::fs::create_dir_all(parent).is_err() {
+        return;
+    }
+    use std::io::Write;
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        let _ = writeln!(file, "{line}");
+    }
 }
 
 pub(crate) fn escape_value(value: &str) -> String {
@@ -397,9 +457,13 @@ where
             }
             write!(writer, " {}={}", key, escape_value(&value))?;
         }
-        write!(writer, " MSG={}", escape_value(&visitor.message))?;
+        write!(writer, " MSG={}", escape_message(&visitor.message))?;
         writeln!(writer)
     }
+}
+
+fn escape_message(value: &str) -> String {
+    value.replace('\r', "\\r").replace('\n', "\\n")
 }
 
 fn rfc3339_utc_now() -> String {
@@ -499,5 +563,24 @@ mod tests {
         assert!(line.contains("TIMED_OUT=true"), "{line}");
         assert!(line.contains("STDOUT_BYTES=3"), "{line}");
         assert!(line.contains("STDERR_BYTES=3"), "{line}");
+    }
+
+    #[test]
+    fn shim_audit_line_omits_captured_excerpts() {
+        let line = shim_audit_line("gh issue list", 17, false);
+        assert!(line.contains("EVENT=external_command"), "{line}");
+        assert!(line.contains("CMD=gh\\sissue\\slist"), "{line}");
+        assert!(line.contains("EXIT=17"), "{line}");
+        assert!(!line.contains("STDOUT_EXCERPT"), "{line}");
+        assert!(!line.contains("STDERR_EXCERPT"), "{line}");
+    }
+
+    #[test]
+    fn tracing_message_keeps_spaces_readable() {
+        assert_eq!(
+            escape_message("schema validation passed"),
+            "schema validation passed"
+        );
+        assert_eq!(escape_message("a\r\nb"), r"a\r\nb");
     }
 }

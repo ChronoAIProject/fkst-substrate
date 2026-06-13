@@ -10,17 +10,35 @@ static STATE: OnceLock<RwLock<ProvenanceState>> = OnceLock::new();
 
 #[derive(Clone, Debug)]
 struct ProvenanceState {
-    engine_ver: &'static str,
+    engine_ver: String,
     pkg_versions: BTreeMap<String, String>,
     pkg_ver: String,
 }
 
 impl Default for ProvenanceState {
     fn default() -> Self {
+        Self::from_env()
+    }
+}
+
+impl ProvenanceState {
+    fn from_env() -> Self {
+        let engine_ver = std::env::var("FKST_ENGINE_VER")
+            .ok()
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| engine_version().to_string());
+        let pkg_versions = std::env::var("FKST_PKG_VERS")
+            .ok()
+            .map(|value| parse_versions_summary(&value))
+            .unwrap_or_default();
+        let pkg_ver = std::env::var("FKST_PKG_VER")
+            .ok()
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| summarize_versions(&pkg_versions));
         Self {
-            engine_ver: engine_version(),
-            pkg_versions: BTreeMap::new(),
-            pkg_ver: "unknown".to_string(),
+            engine_ver,
+            pkg_versions,
+            pkg_ver,
         }
     }
 }
@@ -58,7 +76,7 @@ pub(crate) fn install_supervise(package_roots: &[PathBuf], host_root: &Path) {
     versions.insert(HOST_NAMESPACE.to_string(), read_git_version(host_root));
     let pkg_ver = summarize_versions(&versions);
     install_state(ProvenanceState {
-        engine_ver: engine_version(),
+        engine_ver: engine_version().to_string(),
         pkg_versions: versions,
         pkg_ver,
     });
@@ -68,7 +86,7 @@ pub(crate) fn install_run(owner_root: &Path, owner_namespace: &str) {
     let pkg_ver = read_git_version(owner_root);
     let versions = BTreeMap::from([(owner_namespace.to_string(), pkg_ver.clone())]);
     install_state(ProvenanceState {
-        engine_ver: engine_version(),
+        engine_ver: engine_version().to_string(),
         pkg_versions: versions,
         pkg_ver,
     });
@@ -77,7 +95,7 @@ pub(crate) fn install_run(owner_root: &Path, owner_namespace: &str) {
 pub(crate) fn current_engine_ver() -> String {
     state()
         .read()
-        .map(|state| state.engine_ver.to_string())
+        .map(|state| state.engine_ver.clone())
         .unwrap_or_else(|_| "unknown".to_string())
 }
 
@@ -116,7 +134,7 @@ fn install_state(next: ProvenanceState) {
 }
 
 fn set_env(state: &ProvenanceState) {
-    std::env::set_var("FKST_ENGINE_VER", state.engine_ver);
+    std::env::set_var("FKST_ENGINE_VER", &state.engine_ver);
     std::env::set_var("FKST_PKG_VER", &state.pkg_ver);
     std::env::set_var("FKST_PKG_VERS", summarize_versions(&state.pkg_versions));
 }
@@ -134,6 +152,19 @@ fn summarize_versions(versions: &BTreeMap<String, String>) -> String {
         .map(|(namespace, version)| format!("{namespace}@{version}"))
         .collect::<Vec<_>>()
         .join(";")
+}
+
+fn parse_versions_summary(summary: &str) -> BTreeMap<String, String> {
+    summary
+        .split(';')
+        .filter_map(|entry| {
+            let (namespace, version) = entry.split_once('@')?;
+            if namespace.is_empty() || version.is_empty() {
+                return None;
+            }
+            Some((namespace.to_string(), version.to_string()))
+        })
+        .collect()
 }
 
 fn root_namespace(root: &Path) -> String {
@@ -169,5 +200,12 @@ mod tests {
             current_pkg_versions_summary() == "unknown"
                 || current_pkg_versions_summary().contains('@')
         );
+    }
+
+    #[test]
+    fn parses_inherited_package_versions() {
+        let parsed = parse_versions_summary("host@abc;pkg@def");
+        assert_eq!(parsed.get("host"), Some(&"abc".to_string()));
+        assert_eq!(parsed.get("pkg"), Some(&"def".to_string()));
     }
 }

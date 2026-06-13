@@ -512,18 +512,41 @@ fn run_rate_exec(pool: &str, program: PathBuf, args: Vec<String>) -> Result<i32>
     let registry = rate_pool::RatePoolRegistry::from_env()
         .with_context(|| "parse rate pool configuration for rate-exec")?;
     registry.acquire_for_name(pool)?;
-    let output = external_command::run_audited(external_command::CommandSpec {
-        program,
-        args,
-        cwd: None,
-        env: Vec::new(),
-        timeout: None,
-        process_group: false,
-    })?;
-    use std::io::Write;
-    std::io::stdout().write_all(&output.stdout)?;
-    std::io::stderr().write_all(&output.stderr)?;
-    Ok(output.exit_code)
+    let rendered = external_command::format_command(&program.to_string_lossy(), &args);
+    let status = match std::process::Command::new(&program)
+        .args(&args)
+        .stdin(std::process::Stdio::inherit())
+        .stdout(std::process::Stdio::inherit())
+        .stderr(std::process::Stdio::inherit())
+        .status()
+    {
+        Ok(status) => status,
+        Err(_) => {
+            external_command::append_shim_audit_line(&external_command::shim_audit_line(
+                &rendered, 127, false,
+            ));
+            return Ok(127);
+        }
+    };
+    let exit_code = status_exit_code(status);
+    external_command::append_shim_audit_line(&external_command::shim_audit_line(
+        &rendered, exit_code, false,
+    ));
+    Ok(exit_code)
+}
+
+fn status_exit_code(status: std::process::ExitStatus) -> i32 {
+    if let Some(code) = status.code() {
+        return code;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        if let Some(signal) = status.signal() {
+            return 128 + signal;
+        }
+    }
+    -1
 }
 
 fn run() -> Result<i32> {

@@ -259,7 +259,7 @@ return M
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(
-        trace_output.contains("MSG=supervisor\\sjournal\\sdisabled"),
+        trace_output.contains("MSG=supervisor journal disabled"),
         "trace_output={trace_output}"
     );
 }
