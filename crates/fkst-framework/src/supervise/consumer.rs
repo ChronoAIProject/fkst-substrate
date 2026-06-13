@@ -27,6 +27,8 @@ use tracing::{error, info, warn};
 
 const DISPATCH_INTERVAL: Duration = Duration::from_secs(1);
 const DISPATCH_BATCH: usize = 16;
+/// Bounds concurrent durable children per department so restart backlogs drain serially.
+const MAX_DURABLE_IN_FLIGHT_PER_DEPT: usize = 1;
 const REDRIVE_COOLDOWN: Duration = Duration::from_secs(600);
 const REDRIVE_MAX: u64 = 3;
 
@@ -226,6 +228,12 @@ fn on_wake_disconnect(reliable_wake_rx: &mut Option<mpsc::Receiver<()>>) {
     *reliable_wake_rx = None;
 }
 
+fn durable_dispatch_capacity(running_len: usize) -> usize {
+    MAX_DURABLE_IN_FLIGHT_PER_DEPT
+        .saturating_sub(running_len)
+        .min(DISPATCH_BATCH)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn spawn_ephemeral(
     name: &str,
@@ -323,21 +331,20 @@ fn dispatch_due(
         error!(dept = %name, "reliable consumer missing delivery store");
         return;
     };
+    let capacity = durable_dispatch_capacity(running.len());
+    if capacity == 0 {
+        return;
+    }
     let lease = retry_lease(stall_window);
     let excluded = running.keys().cloned().collect();
-    let leased = match store.lease_for_dept_excluding(
-        name,
-        now_unix_millis(),
-        DISPATCH_BATCH,
-        lease,
-        &excluded,
-    ) {
-        Ok(records) => records,
-        Err(err) => {
-            error!(dept = %name, error = %err, "delivery lease failed");
-            return;
-        }
-    };
+    let leased =
+        match store.lease_for_dept_excluding(name, now_unix_millis(), capacity, lease, &excluded) {
+            Ok(records) => records,
+            Err(err) => {
+                error!(dept = %name, error = %err, "delivery lease failed");
+                return;
+            }
+        };
     for record in leased {
         if running.contains_key(&record.delivery_id) {
             continue;
@@ -1105,6 +1112,13 @@ mod tests {
         assert!(reliable_wake_rx.is_none());
     }
 
+    #[test]
+    fn durable_dispatch_capacity_bounds_one_running_delivery() {
+        assert_eq!(durable_dispatch_capacity(0), 1);
+        assert_eq!(durable_dispatch_capacity(1), 0);
+        assert_eq!(durable_dispatch_capacity(8), 0);
+    }
+
     fn router_with_dead_letter(store: Arc<DeliveryStore>) -> DeliveryRouter {
         router_with_dead_letter_and_fanout(store, Fanout::new())
     }
@@ -1350,6 +1364,185 @@ mod tests {
         assert_eq!(event.payload, serde_json::json!({"n": 2}));
         let done = handle.await.unwrap();
         assert!(done.failure.is_none());
+    }
+
+    #[tokio::test]
+    async fn durable_dispatch_drains_one_child_per_dept_under_backlog() {
+        let temp = TempDir::new().unwrap();
+        let store = Arc::new(DeliveryStore::open(temp.path().join("delivery.redb")).unwrap());
+        store.enqueue(&record("one")).unwrap();
+        store.enqueue(&record("two")).unwrap();
+        let started = temp.path().join("started");
+        let release = temp.path().join("release");
+        let binary = temp.path().join("fkst-framework");
+        let lua = temp.path().join("departments/worker/main.lua");
+        let log_dir = temp.path().join("logs");
+        fs::create_dir_all(lua.parent().unwrap()).unwrap();
+        fs::write(&lua, "return {}\n").unwrap();
+        write_executable(
+            &binary,
+            &format!(
+                "printf 'started\\n' >> '{}'\nwhile [ ! -f '{}' ]; do sleep 0.05; done\nexit 0",
+                started.display(),
+                release.display()
+            ),
+        );
+        let roots = PackageRoots::resolve(temp.path(), vec![temp.path().to_path_buf()]).unwrap();
+        let decl = DepartmentDecl {
+            lua: "departments/worker/main.lua".into(),
+            owner_root: temp.path().canonicalize().unwrap(),
+            owner_namespace: package_namespace(temp.path()),
+            consumes: vec!["jobs".to_string()],
+            produces: Vec::new(),
+            ephemeral: Vec::new(),
+            stall_window: "30s".to_string(),
+            graph_json: false,
+            retry: None,
+        };
+        let mut queue = BTreeMap::new();
+        queue.insert(
+            "jobs".to_string(),
+            QueueDecl {
+                capacity: 8,
+                fanout: false,
+            },
+        );
+        let mut department = BTreeMap::new();
+        department.insert("worker".to_string(), decl.clone());
+        let cfg = Config {
+            queue,
+            raiser: BTreeMap::new(),
+            department,
+            limits: LimitsDecl {
+                global_codex_processes: 1,
+            },
+        };
+        let router = DeliveryRouter::new(&cfg, Fanout::new(), Some(store.clone()), None);
+        let (complete_tx, mut complete_rx) = mpsc::channel::<CompletedDelivery>(8);
+        let mut running = BTreeMap::new();
+
+        dispatch_due(
+            "worker",
+            &decl,
+            temp.path(),
+            &roots,
+            &binary,
+            &router,
+            Some(store.clone()),
+            None,
+            &log_dir,
+            Duration::from_secs(30),
+            1,
+            ProcessGroupRegistry::default(),
+            SupervisorJournal::disabled(),
+            &complete_tx,
+            &mut running,
+        );
+        timeout(Duration::from_secs(2), async {
+            loop {
+                if fs::read_to_string(&started)
+                    .map(|text| text.lines().count())
+                    .unwrap_or(0)
+                    == 1
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("first durable child should start");
+        assert_eq!(running.len(), 1);
+
+        dispatch_due(
+            "worker",
+            &decl,
+            temp.path(),
+            &roots,
+            &binary,
+            &router,
+            Some(store.clone()),
+            None,
+            &log_dir,
+            Duration::from_secs(30),
+            1,
+            ProcessGroupRegistry::default(),
+            SupervisorJournal::disabled(),
+            &complete_tx,
+            &mut running,
+        );
+        assert_eq!(
+            fs::read_to_string(&started).unwrap().lines().count(),
+            1,
+            "second due record must not spawn while one durable child is running"
+        );
+
+        fs::write(&release, "").unwrap();
+        let done = timeout(Duration::from_secs(2), complete_rx.recv())
+            .await
+            .expect("first durable child should complete")
+            .expect("completion channel should remain open");
+        running.remove(&done.record.delivery_id);
+        finish_durable_record(
+            "worker",
+            Some(store.as_ref()),
+            &router,
+            None,
+            done,
+            &SupervisorJournal::disabled(),
+        );
+        fs::remove_file(&release).unwrap();
+
+        dispatch_due(
+            "worker",
+            &decl,
+            temp.path(),
+            &roots,
+            &binary,
+            &router,
+            Some(store.clone()),
+            None,
+            &log_dir,
+            Duration::from_secs(30),
+            1,
+            ProcessGroupRegistry::default(),
+            SupervisorJournal::disabled(),
+            &complete_tx,
+            &mut running,
+        );
+        timeout(Duration::from_secs(2), async {
+            loop {
+                if fs::read_to_string(&started)
+                    .map(|text| text.lines().count())
+                    .unwrap_or(0)
+                    == 2
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("second durable child should start after the first completes");
+        assert_eq!(running.len(), 1);
+
+        fs::write(&release, "").unwrap();
+        let done = timeout(Duration::from_secs(2), complete_rx.recv())
+            .await
+            .expect("second durable child should complete")
+            .expect("completion channel should remain open");
+        running.remove(&done.record.delivery_id);
+        finish_durable_record(
+            "worker",
+            Some(store.as_ref()),
+            &router,
+            None,
+            done,
+            &SupervisorJournal::disabled(),
+        );
+
+        assert!(store.get("one").unwrap().is_none());
+        assert!(store.get("two").unwrap().is_none());
     }
 
     #[test]
