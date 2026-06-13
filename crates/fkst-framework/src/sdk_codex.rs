@@ -106,6 +106,16 @@ struct CodexStatusRecord {
 struct CodexAdoptionRecord {
     key: String,
     run_id: String,
+    #[serde(default)]
+    role: Option<String>,
+    #[serde(default)]
+    label: Option<String>,
+    #[serde(default)]
+    dept: Option<String>,
+    #[serde(default)]
+    proposal_id: Option<String>,
+    #[serde(default)]
+    dedup_key: Option<String>,
     status: String,
     started_at_ms: u64,
     ended_at_ms: Option<u64>,
@@ -804,6 +814,11 @@ fn start_adoption_worker(
     let record = CodexAdoptionRecord {
         key: paths.key.clone(),
         run_id: request.run_id.clone(),
+        role: request.role.clone(),
+        label: request.label.clone(),
+        dept: request.dept.clone(),
+        proposal_id: request.proposal_id.clone(),
+        dedup_key: request.dedup_key.clone(),
         status: "running".to_string(),
         started_at_ms: request.started_at_ms,
         ended_at_ms: None,
@@ -1064,6 +1079,11 @@ pub(crate) fn run_codex_worker(options: CodexWorkerOptions) -> anyhow::Result<i3
     let mut adoption = CodexAdoptionRecord {
         key: options.key,
         run_id: options.run_id,
+        role: options.role.clone(),
+        label: options.label.clone(),
+        dept: options.dept.clone(),
+        proposal_id: options.proposal_id.clone(),
+        dedup_key: options.dedup_key.clone(),
         status: "running".to_string(),
         started_at_ms: options.started_at_ms,
         ended_at_ms: None,
@@ -1330,7 +1350,40 @@ fn append_codex_status_log(log_path: &Path, record: &CodexStatusRecord) -> anyho
 fn read_codex_status_records(host_root: &Path) -> anyhow::Result<Vec<CodexStatusRecord>> {
     let _ = host_root;
     let log_dir = runtime_log_dir().join("codex");
-    let entries = match std::fs::read_dir(&log_dir) {
+    let mut records = Vec::new();
+    match std::fs::read_dir(&log_dir) {
+        Ok(entries) => {
+            for entry in entries {
+                let entry = entry?;
+                let path = entry.path();
+                if path.extension().and_then(OsStr::to_str) != Some("log") {
+                    continue;
+                }
+                let body = std::fs::read_to_string(&path)?;
+                for line in body.lines() {
+                    let Some(json) = line.strip_prefix(CODEX_STATUS_LOG_PREFIX) else {
+                        continue;
+                    };
+                    match serde_json::from_str::<CodexStatusRecord>(json) {
+                        Ok(record) => records.push(record),
+                        Err(err) => eprintln!(
+                            "WARN: codex status log line skipped path={} error={err}",
+                            path.display()
+                        ),
+                    }
+                }
+            }
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => return Err(err.into()),
+    }
+    records.extend(read_adoption_status_records()?);
+    Ok(latest_codex_status_records(records))
+}
+
+fn read_adoption_status_records() -> anyhow::Result<Vec<CodexStatusRecord>> {
+    let adoption_dir = runtime_log_dir().join(CODEX_ADOPTION_DIR);
+    let entries = match std::fs::read_dir(&adoption_dir) {
         Ok(entries) => entries,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(err) => return Err(err.into()),
@@ -1338,25 +1391,59 @@ fn read_codex_status_records(host_root: &Path) -> anyhow::Result<Vec<CodexStatus
     let mut records = Vec::new();
     for entry in entries {
         let entry = entry?;
-        let path = entry.path();
-        if path.extension().and_then(OsStr::to_str) != Some("log") {
-            continue;
-        }
-        let body = std::fs::read_to_string(&path)?;
-        for line in body.lines() {
-            let Some(json) = line.strip_prefix(CODEX_STATUS_LOG_PREFIX) else {
+        let status_path = entry.path().join("status.json");
+        match read_adoption_record(&status_path) {
+            Ok(Some(record)) => records.push(codex_status_record_from_adoption(record)),
+            Ok(None) => {}
+            Err(err) => {
+                eprintln!(
+                    "WARN: codex adoption status skipped path={} error={err}",
+                    status_path.display()
+                );
                 continue;
-            };
-            match serde_json::from_str::<CodexStatusRecord>(json) {
-                Ok(record) => records.push(record),
-                Err(err) => eprintln!(
-                    "WARN: codex status log line skipped path={} error={err}",
-                    path.display()
-                ),
             }
         }
     }
-    Ok(latest_codex_status_records(records))
+    Ok(records)
+}
+
+fn codex_status_record_from_adoption(record: CodexAdoptionRecord) -> CodexStatusRecord {
+    let ended_at_ms = record.ended_at_ms;
+    let exit_code = adoption_status_exit_code(&record);
+    let status = if record.status == "running" && adoption_worker_alive(&record) {
+        "running".to_string()
+    } else {
+        "completed".to_string()
+    };
+    CodexStatusRecord {
+        run_id: record.run_id,
+        role: record.role,
+        label: record.label,
+        dept: record.dept,
+        proposal_id: record.proposal_id,
+        dedup_key: record.dedup_key.or(Some(record.key)),
+        started_at: unix_millis_to_iso8601(record.started_at_ms),
+        started_at_ms: record.started_at_ms,
+        ended_at: ended_at_ms.map(unix_millis_to_iso8601),
+        ended_at_ms,
+        elapsed_ms: ended_at_ms.map(|ended| ended.saturating_sub(record.started_at_ms)),
+        status,
+        exit_code,
+        permit_slot: None,
+        output_tail_path: Some(
+            codex_output_tail_path(Path::new(&record.log_path))
+                .to_string_lossy()
+                .into_owned(),
+        ),
+    }
+}
+
+fn adoption_status_exit_code(record: &CodexAdoptionRecord) -> Option<i32> {
+    if record.status == "running" && adoption_worker_alive(record) {
+        None
+    } else {
+        Some(record.exit_code.unwrap_or(-1))
+    }
 }
 
 fn latest_codex_status_records(records: Vec<CodexStatusRecord>) -> Vec<CodexStatusRecord> {

@@ -912,6 +912,105 @@ printf 'adopted-%s' "$count"
 
 #[cfg(unix)]
 #[test]
+fn codex_status_reads_running_adoption_record_without_status_log() {
+    let tmp = tempfile::tempdir().unwrap();
+    let bin_dir = tmp.path().join("bin");
+    let worktree = tmp.path().join("wt");
+    let started_fifo = tmp.path().join("started.fifo");
+    let release_fifo = tmp.path().join("release.fifo");
+    std::fs::create_dir_all(&worktree).unwrap();
+    make_fifo(&started_fifo);
+    make_fifo(&release_fifo);
+    install_codex_script(
+        &bin_dir,
+        r#"#!/bin/sh
+cat >/dev/null
+printf 'adoption-live-tail\n'
+printf 'started' > "$STARTED_FIFO"
+read _ < "$RELEASE_FIFO"
+printf 'adoption-done'
+"#,
+    );
+
+    let mut sandbox = ProcessSandbox::new();
+    sandbox.enter_cwd(tmp.path()).runtime_root(".fkst/runtime");
+    sandbox.prepend_path(&bin_dir);
+    sandbox.set_env("STARTED_FIFO", started_fifo.to_string_lossy().into_owned());
+    sandbox.set_env("RELEASE_FIFO", release_fifo.to_string_lossy().into_owned());
+    sandbox.set_env(CODEX_WORKER_BIN_ENV, framework_bin());
+    sandbox.runtime_log_dir(tmp.path().join("runtime"));
+    let (_lock, _guard) = sandbox.enter();
+
+    let worktree_arg = worktree.to_string_lossy().into_owned();
+    let (result_tx, result_rx) = std::sync::mpsc::channel();
+    let worker_thread = std::thread::spawn({
+        let worktree_arg = worktree_arg.clone();
+        move || {
+            let lua = Lua::new();
+            register_with_dept(&lua, Some("pkg.implementer".to_string())).unwrap();
+            let spawn: mlua::Function = lua.globals().get("spawn_codex_sync").unwrap();
+            let opts = lua_opts(&lua, "adoption status");
+            opts.set("worktree", worktree_arg).unwrap();
+            opts.set("role", "implementer").unwrap();
+            opts.set("proposal_id", "issue-74").unwrap();
+            let result: Table = spawn.call(opts).unwrap();
+            result_tx
+                .send(result.get::<String>("stdout").unwrap())
+                .unwrap();
+        }
+    });
+    assert_eq!(read_fifo(&started_fifo), "started");
+
+    let log_dir = tmp.path().join("runtime/codex");
+    for entry in std::fs::read_dir(&log_dir).unwrap() {
+        let path = entry.unwrap().path();
+        if path.extension().and_then(|ext| ext.to_str()) == Some("log") {
+            std::fs::remove_file(path).unwrap();
+        }
+    }
+
+    let lua = Lua::new();
+    register(&lua).unwrap();
+    let status_fn: mlua::Function = lua.globals().get("codex_status").unwrap();
+    let mut active: Option<Table> = None;
+    for _ in 0..50 {
+        let status: Table = status_fn.call(()).unwrap();
+        let running: Table = status.get("running").unwrap();
+        if running.raw_len() == 1 {
+            let item: Table = running.get(1).unwrap();
+            if item.get::<String>("output_tail").unwrap() == "adoption-live-tail\n" {
+                active = Some(item);
+                break;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let active = active.expect("running adoption status with live output tail");
+    assert_eq!(active.get::<String>("status").unwrap(), "running");
+    assert_eq!(active.get::<String>("role").unwrap(), "implementer");
+    assert_eq!(active.get::<String>("proposal_id").unwrap(), "issue-74");
+    assert_eq!(
+        active.get::<String>("proposal_id_or_key").unwrap(),
+        "issue-74"
+    );
+    assert_eq!(active.get::<String>("dept").unwrap(), "pkg.implementer");
+    assert_eq!(
+        active.get::<String>("output_tail").unwrap(),
+        "adoption-live-tail\n"
+    );
+    assert!(active.get::<i64>("exit_code").is_err());
+    assert!(active.get::<String>("log_path").is_err());
+
+    write_fifo(&release_fifo, "go\n");
+    assert_eq!(
+        recv_result(&result_rx, "adopted status result"),
+        "adoption-live-tail\nadoption-done"
+    );
+    worker_thread.join().unwrap();
+}
+
+#[cfg(unix)]
+#[test]
 fn spawn_codex_sync_records_minimal_completed_status() {
     let tmp = tempfile::tempdir().unwrap();
     let bin_dir = tmp.path().join("bin");
