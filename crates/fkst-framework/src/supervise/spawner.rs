@@ -9,6 +9,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::{Child, Command};
@@ -19,12 +20,15 @@ use tracing::info;
 static NEXT_FRAMEWORK_CHILD_LOG_ID: AtomicU64 = AtomicU64::new(1);
 
 pub struct SpawnResult {
+    pub pid: u32,
     pub exit_code: i32,
     pub stdout: String,
     pub stderr: String,
     pub elapsed_ms: u128,
     pub log_path: Option<PathBuf>,
 }
+
+pub type StdoutLineObserver = Arc<dyn Fn(&str) -> Result<()> + Send + Sync + 'static>;
 
 // each stream is tagged so captured output preserves stdout/stderr boundaries.
 #[derive(Clone, Copy)]
@@ -52,6 +56,36 @@ pub async fn spawn_framework(
     child_label: &str,
     log_dir: &Path,
     process_groups: ProcessGroupRegistry,
+) -> Result<SpawnResult> {
+    spawn_framework_with_stdout_observer(
+        binary,
+        lua_path,
+        host_root,
+        package_roots,
+        owner_namespace,
+        event_json,
+        codex_permit_slots,
+        child_label,
+        log_dir,
+        process_groups,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn spawn_framework_with_stdout_observer(
+    binary: &Path,
+    lua_path: &Path,
+    host_root: &Path,
+    package_roots: &[PathBuf],
+    owner_namespace: &str,
+    event_json: &str,
+    codex_permit_slots: usize,
+    child_label: &str,
+    log_dir: &Path,
+    process_groups: ProcessGroupRegistry,
+    stdout_observer: Option<StdoutLineObserver>,
 ) -> Result<SpawnResult> {
     let start = std::time::Instant::now();
     let cmd_line = format!(
@@ -116,7 +150,7 @@ pub async fn spawn_framework(
     info!(pid = pid, lua = %lua_path.display(), "framework spawned");
     let registration = process_groups.register(pid);
 
-    wait_for_framework_child(child, start, log, registration).await
+    wait_for_framework_child(child, pid, start, log, registration, stdout_observer).await
 }
 
 fn package_root_flags(package_roots: &[PathBuf]) -> String {
@@ -137,9 +171,11 @@ fn package_root_list(package_roots: &[PathBuf]) -> String {
 
 async fn wait_for_framework_child(
     mut child: Child,
+    pid: u32,
     start: Instant,
     mut log: FrameworkChildLog,
     _registration: ProcessGroupRegistration,
+    stdout_observer: Option<StdoutLineObserver>,
 ) -> Result<SpawnResult> {
     let (tx, mut rx) = mpsc::unbounded_channel();
     let mut readers = Vec::new();
@@ -163,11 +199,15 @@ async fn wait_for_framework_child(
     });
 
     let mut output = FrameworkOutput::default();
+    let mut line_buffer = StdoutLineBuffer::default();
     let status = loop {
         match rx.recv().await {
             Some(FrameworkEvent::Output(stream, bytes)) => {
                 if !bytes.is_empty() {
                     log.write_chunk(stream, &bytes);
+                    if matches!(stream, FrameworkStream::Stdout) {
+                        line_buffer.push(&bytes, stdout_observer.as_deref())?;
+                    }
                     output.push(stream, bytes);
                 }
             }
@@ -180,9 +220,15 @@ async fn wait_for_framework_child(
         let _ = reader.await;
     }
     let _ = waiter.await;
-    drain_framework_events(&mut rx, &mut output, &mut log);
+    drain_framework_events(
+        &mut rx,
+        &mut output,
+        &mut log,
+        &mut line_buffer,
+        stdout_observer.as_deref(),
+    )?;
 
-    spawn_result_from_status(status, output, start, log)
+    spawn_result_from_status(pid, status, output, start, log)
 }
 
 // buffers accumulate incrementally as output events arrive.
@@ -206,17 +252,52 @@ fn drain_framework_events(
     rx: &mut mpsc::UnboundedReceiver<FrameworkEvent>,
     output: &mut FrameworkOutput,
     log: &mut FrameworkChildLog,
-) {
+    line_buffer: &mut StdoutLineBuffer,
+    stdout_observer: Option<&(dyn Fn(&str) -> Result<()> + Send + Sync)>,
+) -> Result<()> {
     while let Ok(event) = rx.try_recv() {
         if let FrameworkEvent::Output(stream, bytes) = event {
             log.write_chunk(stream, &bytes);
+            if matches!(stream, FrameworkStream::Stdout) {
+                line_buffer.push(&bytes, stdout_observer)?;
+            }
             output.push(stream, bytes);
         }
+    }
+    Ok(())
+}
+
+#[derive(Default)]
+struct StdoutLineBuffer {
+    pending: Vec<u8>,
+}
+
+impl StdoutLineBuffer {
+    fn push(
+        &mut self,
+        bytes: &[u8],
+        observer: Option<&(dyn Fn(&str) -> Result<()> + Send + Sync)>,
+    ) -> Result<()> {
+        self.pending.extend_from_slice(bytes);
+        while let Some(newline) = self.pending.iter().position(|byte| *byte == b'\n') {
+            let mut line = self.pending.drain(..=newline).collect::<Vec<_>>();
+            if line.ends_with(b"\n") {
+                line.pop();
+            }
+            if line.ends_with(b"\r") {
+                line.pop();
+            }
+            if let Some(observer) = observer {
+                observer(&String::from_utf8_lossy(&line))?;
+            }
+        }
+        Ok(())
     }
 }
 
 // natural exits keep their child status.
 fn spawn_result_from_status(
+    pid: u32,
     status: std::result::Result<std::process::ExitStatus, String>,
     output: FrameworkOutput,
     start: Instant,
@@ -230,6 +311,7 @@ fn spawn_result_from_status(
     log.write_line(&format!("ELAPSED_MS={elapsed_ms}"));
     let log_path = log.path().map(Path::to_path_buf);
     Ok(SpawnResult {
+        pid,
         exit_code,
         stdout,
         stderr,

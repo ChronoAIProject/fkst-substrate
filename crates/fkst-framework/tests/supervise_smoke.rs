@@ -98,6 +98,25 @@ fn wait_for_process_exit(pid: i32, timeout: Duration) -> bool {
     }
 }
 
+fn process_exists(pid: i32) -> bool {
+    nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None).is_ok()
+}
+
+fn read_single_supervisor_journal(runtime_root: &Path) -> String {
+    let entries = fs::read_dir(runtime_root.join("logs"))
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("supervisor-") && name.ends_with(".log"))
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(entries.len(), 1, "journal files={entries:?}");
+    fs::read_to_string(&entries[0]).unwrap()
+}
+
 #[test]
 fn supervise_dispatches_file_watch_event_to_department() {
     let tmp = tempfile::tempdir().unwrap();
@@ -169,11 +188,194 @@ return M
 }
 
 #[test]
+fn supervise_starts_when_journal_log_dir_cannot_be_created() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let runtime_root = root.join("runtime-file");
+    let fact = root.join("started.txt");
+    fs::write(&runtime_root, "not a directory").unwrap();
+    fs::create_dir_all(root.join("departments/idle")).unwrap();
+    fs::create_dir_all(root.join("raisers")).unwrap();
+    write_fkst_env(root);
+    fs::write(root.join("input.txt"), "ready").unwrap();
+    fs::write(
+        root.join("raisers/input.lua"),
+        format!(
+            r#"return {{ type = "file_watch", glob = {}, produces = "idle" }}"#,
+            lua_string(&root.join("input.txt"))
+        ),
+    )
+    .unwrap();
+    fs::write(
+        root.join("departments/idle/main.lua"),
+        format!(
+            r#"
+local M = {{}}
+M.spec = {{ consumes = {{"idle"}}, ephemeral = {{"idle"}}, stall_window = "5s" }}
+function pipeline(event)
+  local f = assert(io.open({}, "w"))
+  f:write("started")
+  f:close()
+end
+return M
+"#,
+            lua_string(&fact)
+        ),
+    )
+    .unwrap();
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_fkst-framework"))
+        .current_dir(root)
+        .arg("supervise")
+        .arg("--project-root")
+        .arg(root)
+        .arg("--package-root")
+        .arg(root)
+        .arg("--framework-bin")
+        .arg(env!("CARGO_BIN_EXE_fkst-framework"))
+        .env("FKST_RUNTIME_ROOT", &runtime_root)
+        .env("FKST_DURABLE_ROOT", root.join(".fkst/durable"))
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    wait_for_file_containing(&fact, "started", Duration::from_secs(10)).unwrap_or_else(|| {
+        let _ = child.kill();
+        panic!("timed out waiting for {}", fact.display());
+    });
+    nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(child.id() as i32),
+        nix::sys::signal::Signal::SIGTERM,
+    )
+    .unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(output.status.success(), "status={}", output.status);
+    let trace_output = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        trace_output.contains("supervisor journal disabled"),
+        "trace_output={trace_output}"
+    );
+}
+
+#[test]
+fn supervise_survives_launcher_parent_exit() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let input_dir = root.join("input");
+    let fact = root.join("seen.txt");
+    let supervise_pid = root.join("supervise.pid");
+    let launcher = root.join("launch-supervise.sh");
+    fs::create_dir_all(root.join("departments/recorder")).unwrap();
+    fs::create_dir_all(root.join("raisers")).unwrap();
+    fs::create_dir_all(&input_dir).unwrap();
+    write_fkst_env(root);
+    fs::write(
+        root.join("departments/recorder/main.lua"),
+        format!(
+            r#"
+local M = {{}}
+M.spec = {{
+  consumes = {{ "files" }},
+  ephemeral = {{ "files" }},
+  stall_window = "5s",
+}}
+function pipeline(event)
+  local f = assert(io.open({}, "w"))
+  f:write(event.payload.path or "")
+  f:close()
+end
+return M
+"#,
+            lua_string(&fact)
+        ),
+    )
+    .unwrap();
+    fs::write(
+        root.join("raisers/files.lua"),
+        format!(
+            r#"return {{ type = "file_watch", glob = {}, produces = "files" }}"#,
+            lua_string(&input_dir.join("*.txt"))
+        ),
+    )
+    .unwrap();
+    write_executable(
+        &launcher,
+        &format!(
+            r#"#!/bin/sh
+"{}" supervise \
+  --project-root "{}" \
+  --package-root "{}" \
+  --framework-bin "{}" \
+  > "{}" 2> "{}" &
+printf '%s\n' "$!" > "{}"
+exit 0
+"#,
+            env!("CARGO_BIN_EXE_fkst-framework"),
+            root.display(),
+            root.display(),
+            env!("CARGO_BIN_EXE_fkst-framework"),
+            root.join("supervise.stdout").display(),
+            root.join("supervise.stderr").display(),
+            supervise_pid.display()
+        ),
+    );
+
+    let status = Command::new(&launcher)
+        .current_dir(root)
+        .env("FKST_RUNTIME_ROOT", root.join(".fkst/runtime"))
+        .env("FKST_DURABLE_ROOT", root.join(".fkst/durable"))
+        .status()
+        .unwrap();
+    assert!(status.success(), "launcher status={status}");
+    let pid: i32 = wait_for_file_containing(&supervise_pid, "\n", Duration::from_secs(5))
+        .unwrap_or_else(|| panic!("timed out waiting for {}", supervise_pid.display()))
+        .trim()
+        .parse()
+        .unwrap();
+
+    std::thread::sleep(Duration::from_secs(2));
+    assert!(
+        process_exists(pid),
+        "supervise exited after launcher parent exit"
+    );
+    fs::write(input_dir.join("after-parent-exit.txt"), "ready").unwrap();
+    let body = wait_for_file_containing(&fact, "after-parent-exit.txt", Duration::from_secs(10))
+        .unwrap_or_else(|| {
+            let _ = nix::sys::signal::kill(
+                nix::unistd::Pid::from_raw(pid),
+                nix::sys::signal::Signal::SIGTERM,
+            );
+            panic!("timed out waiting for {}", fact.display());
+        });
+    assert!(body.contains("after-parent-exit.txt"), "body={body}");
+    assert!(
+        process_exists(pid),
+        "supervise exited before explicit signal"
+    );
+
+    nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(pid),
+        nix::sys::signal::Signal::SIGTERM,
+    )
+    .unwrap();
+    assert!(
+        wait_for_process_exit(pid, Duration::from_secs(5)),
+        "supervise process survived cleanup SIGTERM"
+    );
+}
+
+#[test]
 fn supervise_env_package_root_reaches_child_framework() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();
     let package = root.join("package-root");
     let host = root.join("host-root");
+    let runtime_root = host.join(".fkst/runtime");
     let fact = host.join("package-root-fact.txt");
     write_graph_defaults(&package);
     fs::create_dir_all(package.join("fkst")).unwrap();
@@ -227,7 +429,7 @@ return M
         .arg("--framework-bin")
         .arg(env!("CARGO_BIN_EXE_fkst-framework"))
         .env("FKST_PACKAGE_ROOT", &package)
-        .env("FKST_RUNTIME_ROOT", host.join(".fkst/runtime"))
+        .env("FKST_RUNTIME_ROOT", &runtime_root)
         .env("FKST_DURABLE_ROOT", host.join(".fkst/durable"))
         .spawn()
         .unwrap();
@@ -259,6 +461,24 @@ return M
     assert!(
         body.contains(&format!("event_path={}", input_path.display())),
         "body={body}"
+    );
+    let journal = read_single_supervisor_journal(&runtime_root);
+    assert!(journal.contains("event=startup "), "journal={journal}");
+    assert!(
+        journal.contains("event=raiser_fired name="),
+        "journal={journal}"
+    );
+    assert!(
+        journal.contains("event=dept_child_spawn dept=host.host_worker"),
+        "journal={journal}"
+    );
+    assert!(
+        journal.contains("event=dept_child_exit dept=host.host_worker"),
+        "journal={journal}"
+    );
+    assert!(
+        journal.contains("event=shutdown_initiated reason=signal:SIGTERM"),
+        "journal={journal}"
     );
 }
 

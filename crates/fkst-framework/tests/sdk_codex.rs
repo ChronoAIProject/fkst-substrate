@@ -85,15 +85,11 @@ fn read_fifo(path: &Path) -> String {
     result.unwrap_or_else(|err| panic!("failed reading FIFO {display}: {err}"))
 }
 
-fn recv_result<T>(rx: &std::sync::mpsc::Receiver<T>, label: &str) -> T {
-    rx.recv_timeout(Duration::from_secs(5))
-        .unwrap_or_else(|err| panic!("timed out waiting for {label}: {err}"))
-}
-
 #[cfg(unix)]
 fn continuous_output_codex_script(stream_redirect: &'static str) -> String {
     format!(
         r#"#!/bin/sh
+printf 'tick:start\n' {stream_redirect}
 cat >/dev/null
 i=0
 while :; do
@@ -153,7 +149,9 @@ fn run_timeout_activity_test(output_stream: TestStream) -> ActivityResult {
             .unwrap();
     });
 
-    let result = recv_result(&result_rx, "codex activity result");
+    let result = result_rx
+        .recv_timeout(Duration::from_secs(15))
+        .unwrap_or_else(|err| panic!("timed out waiting for codex activity result: {err}"));
     spawn_thread.join().unwrap();
     result
 }

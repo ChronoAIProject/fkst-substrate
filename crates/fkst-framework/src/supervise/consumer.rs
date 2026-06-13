@@ -7,16 +7,19 @@ use super::delivery_types::{
 };
 use super::event_fanout::Fanout;
 use super::failure_fact::{dead_record_payload, delivery_failure_fact, FAILURE_FACT_QUEUE};
-use super::raised::parse_raised;
+use super::journal::{optional_path, SupervisorJournal};
+use super::raised::{parse_raised, parse_raised_line};
 use super::source_runner::parse_duration;
-use super::spawner::{spawn_framework, SpawnResult};
+use super::spawner::{spawn_framework_with_stdout_observer, SpawnResult, StdoutLineObserver};
 use crate::path_resolver::PackageRoots;
 use crate::process_tree::ProcessGroupRegistry;
 use fkst_common::config::{DepartmentDecl, RetryDecl};
 use fkst_common::{Event, RuntimeKind};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -40,6 +43,7 @@ pub async fn spawn_consumer(
     queue_capacity: usize,
     codex_permit_slots: usize,
     process_groups: ProcessGroupRegistry,
+    journal: SupervisorJournal,
 ) -> JoinHandle<()> {
     let reliable_queues: Vec<String> = decl
         .consumes
@@ -137,6 +141,7 @@ pub async fn spawn_consumer(
                             stall_window,
                             codex_permit_slots,
                             process_groups.clone(),
+                            journal.clone(),
                         );
                     }
                 }
@@ -158,6 +163,7 @@ pub async fn spawn_consumer(
                         stall_window,
                         codex_permit_slots,
                         process_groups.clone(),
+                        journal.clone(),
                         &complete_tx,
                         &mut running,
                     );
@@ -178,6 +184,7 @@ pub async fn spawn_consumer(
                         stall_window,
                         codex_permit_slots,
                         process_groups.clone(),
+                        journal.clone(),
                         &complete_tx,
                         &mut running,
                     );
@@ -185,7 +192,7 @@ pub async fn spawn_consumer(
                 maybe_done = complete_rx.recv(), if !running.is_empty() => {
                     if let Some(done) = maybe_done {
                         running.remove(&done.record.delivery_id);
-                        finish_durable_record(&name, store.as_deref(), &router, retry_policy.as_ref(), done);
+                        finish_durable_record(&name, store.as_deref(), &router, retry_policy.as_ref(), done, &journal);
                     }
                 }
             }
@@ -232,6 +239,7 @@ fn spawn_ephemeral(
     stall_window: Duration,
     codex_permit_slots: usize,
     process_groups: ProcessGroupRegistry,
+    journal: SupervisorJournal,
 ) {
     let args = match spawn_args(
         decl,
@@ -247,13 +255,24 @@ fn spawn_ephemeral(
         Ok(args) => args,
         Err(err) => {
             error!(dept = %name, error = %err, "build spawn args failed");
+            journal.event(
+                "dept_child_exit",
+                [
+                    ("dept", name.to_string()),
+                    ("pid", "none".to_string()),
+                    ("exit_code", "none".to_string()),
+                    ("elapsed_ms", "0".to_string()),
+                    ("log_path", "none".to_string()),
+                    ("reason", format!("build_spawn_args:{err}")),
+                ],
+            );
             return;
         }
     };
     let dept_name = name.to_string();
     let router = router.clone();
     tokio::spawn(async move {
-        match spawn_and_report(&dept_name, &args).await {
+        match spawn_and_report(&dept_name, &args, &journal).await {
             Ok(result) => {
                 if let Err(err) = publish_ephemeral_raised(&router, &result.stdout) {
                     error!(dept = %dept_name, error = %err, "publish raised failed");
@@ -265,6 +284,17 @@ fn spawn_ephemeral(
                     log_dir = %args.log_dir.display(),
                     error = %err,
                     "framework spawn error"
+                );
+                journal.event(
+                    "dept_child_exit",
+                    [
+                        ("dept", dept_name),
+                        ("pid", "none".to_string()),
+                        ("exit_code", "none".to_string()),
+                        ("elapsed_ms", "0".to_string()),
+                        ("log_path", optional_path(None)),
+                        ("reason", format!("spawn_error:{err}")),
+                    ],
                 );
             }
         }
@@ -285,6 +315,7 @@ fn dispatch_due(
     stall_window: Duration,
     codex_permit_slots: usize,
     process_groups: ProcessGroupRegistry,
+    journal: SupervisorJournal,
     complete_tx: &mpsc::Sender<CompletedDelivery>,
     running: &mut BTreeMap<String, RunningDelivery>,
 ) {
@@ -330,6 +361,7 @@ fn dispatch_due(
                     retry_policy,
                     &record,
                     DeliveryFailure::permanent(format!("build spawn args: {err}")),
+                    &journal,
                 );
                 continue;
             }
@@ -339,8 +371,9 @@ fn dispatch_due(
         let complete_tx = complete_tx.clone();
         let running_record = record.clone();
         let delivery_id = record.delivery_id.clone();
+        let journal = journal.clone();
         let handle = tokio::spawn(async move {
-            let result = run_durable_record(&dept_name, &router, record, args).await;
+            let result = run_durable_record(&dept_name, &router, record, args, &journal).await;
             if complete_tx.send(result).await.is_err() {
                 warn!(dept = %dept_name, delivery_id = %delivery_id, "delivery completion receiver closed");
             }
@@ -360,17 +393,20 @@ async fn run_durable_record(
     router: &DeliveryRouter,
     record: DeliveryRecord,
     args: SpawnArgs,
+    journal: &SupervisorJournal,
 ) -> CompletedDelivery {
-    let result = spawn_and_report(dept_name, &args).await;
+    let publish_state = Arc::new(StreamingRaiseState::new(router.clone(), record.clone()));
+    let result = spawn_and_report_with_stdout_observer(
+        dept_name,
+        &args,
+        Some(streaming_raise_observer(publish_state.clone())),
+        journal,
+    )
+    .await;
     let failure = match result {
-        Ok(result) if result.exit_code == 0 => {
-            match publish_raised(router, &result.stdout, &record) {
-                Ok(()) => None,
-                Err(err) => Some(DeliveryFailure::permanent(format!(
-                    "raised publish error: {err}"
-                ))),
-            }
-        }
+        Ok(result) if result.exit_code == 0 => publish_state
+            .first_error()
+            .map(|err| DeliveryFailure::permanent(format!("raised publish error: {err}"))),
         Ok(result) => Some(DeliveryFailure::from_spawn_result(&result)),
         Err(err) => {
             error!(
@@ -378,6 +414,17 @@ async fn run_durable_record(
                 log_dir = %args.log_dir.display(),
                 error = %err,
                 "framework spawn error"
+            );
+            journal.event(
+                "dept_child_exit",
+                [
+                    ("dept", dept_name.to_string()),
+                    ("pid", "none".to_string()),
+                    ("exit_code", "none".to_string()),
+                    ("elapsed_ms", "0".to_string()),
+                    ("log_path", optional_path(None)),
+                    ("reason", format!("spawn_error:{err}")),
+                ],
             );
             Some(DeliveryFailure::permanent(format!("spawn error: {err}")))
         }
@@ -392,18 +439,27 @@ fn finish_durable_record(
     router: &DeliveryRouter,
     retry_policy: Option<&RetryPolicy>,
     done: CompletedDelivery,
+    journal: &SupervisorJournal,
 ) {
     let Some(store) = store else {
         error!(dept = %dept_name, "reliable consumer missing delivery store");
         return;
     };
     if let Some(error) = done.failure {
-        retry_record(store, router, retry_policy, &done.record, error);
+        retry_record(store, router, retry_policy, &done.record, error, journal);
         return;
     }
 
     match store.ack(&done.record.delivery_id, done.record.lease_generation) {
         Ok(true) => {
+            journal.event(
+                "acked",
+                [
+                    ("dept", dept_name.to_string()),
+                    ("delivery_id", done.record.delivery_id.clone()),
+                    ("reason", "completed".to_string()),
+                ],
+            );
             info!(
                 dept = %dept_name,
                 delivery_id = %done.record.delivery_id,
@@ -412,6 +468,14 @@ fn finish_durable_record(
             );
         }
         Ok(false) => {
+            journal.event(
+                "acked",
+                [
+                    ("dept", dept_name.to_string()),
+                    ("delivery_id", done.record.delivery_id.clone()),
+                    ("reason", "stale_or_missing".to_string()),
+                ],
+            );
             warn!(
                 dept = %dept_name,
                 delivery_id = %done.record.delivery_id,
@@ -420,6 +484,14 @@ fn finish_durable_record(
             );
         }
         Err(err) => {
+            journal.event(
+                "acked",
+                [
+                    ("dept", dept_name.to_string()),
+                    ("delivery_id", done.record.delivery_id.clone()),
+                    ("reason", format!("failed:{err}")),
+                ],
+            );
             error!(
                 dept = %dept_name,
                 delivery_id = %done.record.delivery_id,
@@ -479,6 +551,7 @@ fn retry_record(
     retry_policy: Option<&RetryPolicy>,
     record: &DeliveryRecord,
     failure: DeliveryFailure,
+    journal: &SupervisorJournal,
 ) {
     let Some(policy) = retry_policy else {
         if let Err(err) = store.ack(&record.delivery_id, record.lease_generation) {
@@ -489,6 +562,14 @@ fn retry_record(
                 "delivery drop ack failed"
             );
         }
+        journal.event(
+            "acked",
+            [
+                ("dept", record.dept.clone()),
+                ("delivery_id", record.delivery_id.clone()),
+                ("reason", "dropped_no_retry_policy".to_string()),
+            ],
+        );
         return;
     };
     let failure_message = failure.message.clone();
@@ -502,9 +583,26 @@ fn retry_record(
         policy,
         now_unix_millis(),
     ) {
-        Ok(RetryOutcome::DeadPendingRedrive) => {}
+        Ok(RetryOutcome::DeadPendingRedrive) => {
+            journal.event(
+                "dead_lettered",
+                [
+                    ("dept", record.dept.clone()),
+                    ("delivery_id", record.delivery_id.clone()),
+                    ("reason", "dead_pending_redrive".to_string()),
+                ],
+            );
+        }
         Ok(RetryOutcome::PermanentDead) => match store.get_dead(&record.delivery_id) {
             Ok(Some(dead)) => {
+                journal.event(
+                    "dead_lettered",
+                    [
+                        ("dept", record.dept.clone()),
+                        ("delivery_id", record.delivery_id.clone()),
+                        ("reason", "permanent_dead".to_string()),
+                    ],
+                );
                 publish_failure_fact(router, delivery_failure_fact(record, &failure_message));
                 publish_permanent_dead_letter(router, &dead);
             }
@@ -518,8 +616,35 @@ fn retry_record(
                 "permanent dead delivery lookup failed"
             ),
         },
-        Ok(RetryOutcome::Scheduled | RetryOutcome::Stale | RetryOutcome::Missing) => {}
+        Ok(RetryOutcome::Scheduled) => {
+            journal.event(
+                "retried",
+                [
+                    ("dept", record.dept.clone()),
+                    ("delivery_id", record.delivery_id.clone()),
+                    ("reason", failure_message),
+                ],
+            );
+        }
+        Ok(RetryOutcome::Stale | RetryOutcome::Missing) => {
+            journal.event(
+                "retried",
+                [
+                    ("dept", record.dept.clone()),
+                    ("delivery_id", record.delivery_id.clone()),
+                    ("reason", "stale_or_missing".to_string()),
+                ],
+            );
+        }
         Err(err) => {
+            journal.event(
+                "retried",
+                [
+                    ("dept", record.dept.clone()),
+                    ("delivery_id", record.delivery_id.clone()),
+                    ("reason", format!("failed:{err}")),
+                ],
+            );
             error!(
                 delivery_id = %record.delivery_id,
                 generation = record.lease_generation,
@@ -605,6 +730,7 @@ fn publish_failure_fact(router: &DeliveryRouter, event: Event) {
     }
 }
 
+#[cfg(test)]
 fn publish_raised(
     router: &DeliveryRouter,
     stdout: &str,
@@ -624,6 +750,81 @@ fn publish_raised(
         })?;
     }
     Ok(())
+}
+
+fn publish_raised_events(
+    router: &DeliveryRouter,
+    events: Vec<Event>,
+    parent: &DeliveryRecord,
+    next_ordinal: &AtomicUsize,
+) -> anyhow::Result<()> {
+    for mut raised_ev in events {
+        reject_reserved_raised_queue(&raised_ev)?;
+        raised_ev.ts = parent.observed_at_ms;
+        let ordinal = next_ordinal.fetch_add(1, Ordering::Relaxed);
+        router.publish(PublishEnvelope {
+            event: raised_ev,
+            source: parent.source.clone(),
+            cron_payload: None,
+            derived: Some(DerivedDelivery {
+                parent_delivery_id: parent.delivery_id.clone(),
+                ordinal,
+            }),
+        })?;
+    }
+    Ok(())
+}
+
+struct StreamingRaiseState {
+    router: DeliveryRouter,
+    parent: DeliveryRecord,
+    next_ordinal: AtomicUsize,
+    first_error: Mutex<Option<String>>,
+}
+
+impl StreamingRaiseState {
+    fn new(router: DeliveryRouter, parent: DeliveryRecord) -> Self {
+        Self {
+            router,
+            parent,
+            next_ordinal: AtomicUsize::new(0),
+            first_error: Mutex::new(None),
+        }
+    }
+
+    fn publish_line(&self, line: &str) {
+        let events = parse_raised_line(line);
+        if events.is_empty() {
+            return;
+        }
+        // A child may fail after an already streamed raise; durable consumers own
+        // idempotence, so immediate publication intentionally keeps at-least-once semantics.
+        if let Err(err) =
+            publish_raised_events(&self.router, events, &self.parent, &self.next_ordinal)
+        {
+            let mut first_error = self
+                .first_error
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if first_error.is_none() {
+                *first_error = Some(err.to_string());
+            }
+        }
+    }
+
+    fn first_error(&self) -> Option<String> {
+        self.first_error
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+}
+
+fn streaming_raise_observer(state: Arc<StreamingRaiseState>) -> StdoutLineObserver {
+    Arc::new(move |line| {
+        state.publish_line(line);
+        Ok(())
+    })
 }
 
 fn publish_ephemeral_raised(router: &DeliveryRouter, stdout: &str) -> anyhow::Result<()> {
@@ -700,8 +901,21 @@ struct SpawnArgs {
     process_groups: ProcessGroupRegistry,
 }
 
-async fn spawn_and_report(dept_name: &str, args: &SpawnArgs) -> anyhow::Result<SpawnResult> {
-    let result = spawn_framework(
+async fn spawn_and_report(
+    dept_name: &str,
+    args: &SpawnArgs,
+    journal: &SupervisorJournal,
+) -> anyhow::Result<SpawnResult> {
+    spawn_and_report_with_stdout_observer(dept_name, args, None, journal).await
+}
+
+async fn spawn_and_report_with_stdout_observer(
+    dept_name: &str,
+    args: &SpawnArgs,
+    stdout_observer: Option<StdoutLineObserver>,
+    journal: &SupervisorJournal,
+) -> anyhow::Result<SpawnResult> {
+    let result = spawn_framework_with_stdout_observer(
         &args.framework_bin,
         &args.lua_full,
         &args.project_root,
@@ -712,9 +926,32 @@ async fn spawn_and_report(dept_name: &str, args: &SpawnArgs) -> anyhow::Result<S
         dept_name,
         &args.log_dir,
         args.process_groups.clone(),
+        stdout_observer,
     )
     .await?;
 
+    journal.event(
+        "dept_child_spawn",
+        [
+            ("dept", dept_name.to_string()),
+            ("pid", result.pid.to_string()),
+            ("exit_code", "pending".to_string()),
+            ("elapsed_ms", "0".to_string()),
+            ("log_path", optional_path(result.log_path.as_deref())),
+            ("reason", "spawn_framework_run".to_string()),
+        ],
+    );
+    journal.event(
+        "dept_child_exit",
+        [
+            ("dept", dept_name.to_string()),
+            ("pid", result.pid.to_string()),
+            ("exit_code", result.exit_code.to_string()),
+            ("elapsed_ms", result.elapsed_ms.to_string()),
+            ("log_path", optional_path(result.log_path.as_deref())),
+            ("reason", "natural_exit".to_string()),
+        ],
+    );
     if result.exit_code != 0 {
         warn!(dept = %dept_name, exit = result.exit_code,
               stall_window_ms = args.stall_window.as_millis(),
@@ -790,8 +1027,10 @@ mod tests {
     use fkst_common::config::{Config, LimitsDecl, QueueDecl};
     use std::collections::BTreeMap;
     use std::fs;
+    use std::os::unix::fs::PermissionsExt;
     use std::path::Path;
     use tempfile::TempDir;
+    use tokio::time::timeout;
 
     fn package_namespace(root: &Path) -> String {
         root.canonicalize()
@@ -829,6 +1068,11 @@ mod tests {
             base: Duration::from_millis(1),
             cap: Duration::from_millis(1),
         }
+    }
+
+    fn write_executable(path: &Path, body: &str) {
+        fs::write(path, format!("#!/bin/sh\n{body}\n")).unwrap();
+        fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
     }
 
     #[test]
@@ -900,7 +1144,7 @@ mod tests {
                 global_codex_processes: 1,
             },
         };
-        DeliveryRouter::new(&cfg, fanout, Some(store))
+        DeliveryRouter::new(&cfg, fanout, Some(store), None)
     }
 
     fn router_with_failure_fact_and_fanout(fanout: Fanout) -> DeliveryRouter {
@@ -935,7 +1179,7 @@ mod tests {
                 global_codex_processes: 1,
             },
         };
-        DeliveryRouter::new(&cfg, fanout, None)
+        DeliveryRouter::new(&cfg, fanout, None, None)
     }
 
     #[test]
@@ -1014,6 +1258,98 @@ mod tests {
             vec![temp.path().canonicalize().unwrap()]
         );
         assert_eq!(args.owner_namespace, owner_namespace);
+    }
+
+    #[tokio::test]
+    async fn durable_raised_line_publishes_before_child_exit() {
+        let temp = TempDir::new().unwrap();
+        let binary = temp.path().join("fkst-framework");
+        let lua = temp.path().join("dept.lua");
+        let log_dir = temp.path().join("logs");
+        fs::write(&lua, "return {}\n").unwrap();
+        let raised = base64::engine::general_purpose::URL_SAFE.encode(
+            serde_json::to_vec(&serde_json::json!([
+                {"queue": "done", "payload": {"n": 2}}
+            ]))
+            .unwrap(),
+        );
+        write_executable(
+            &binary,
+            &format!("printf 'RAISED: {raised}\\n'; sleep 5; exit 0"),
+        );
+
+        let fanout = Fanout::new();
+        let mut rx = fanout.subscribe("done", 8).await;
+        let mut queue = BTreeMap::new();
+        queue.insert(
+            "done".to_string(),
+            QueueDecl {
+                capacity: 8,
+                fanout: false,
+            },
+        );
+        let mut department = BTreeMap::new();
+        department.insert(
+            "observer".to_string(),
+            DepartmentDecl {
+                lua: "departments/observer/main.lua".into(),
+                owner_root: temp.path().into(),
+                owner_namespace: "pkg".to_string(),
+                consumes: vec!["done".to_string()],
+                produces: Vec::new(),
+                ephemeral: vec!["done".to_string()],
+                stall_window: "30s".to_string(),
+                graph_json: false,
+                retry: None,
+            },
+        );
+        let cfg = Config {
+            queue,
+            raiser: BTreeMap::new(),
+            department,
+            limits: LimitsDecl {
+                global_codex_processes: 1,
+            },
+        };
+        let router = DeliveryRouter::new(&cfg, fanout, None, None);
+        let spawned_router = router.clone();
+        let args = SpawnArgs {
+            framework_bin: binary,
+            lua_full: lua,
+            project_root: temp.path().into(),
+            graph_package_roots: vec![temp.path().into()],
+            event_json: "{}".to_string(),
+            stall_window: Duration::from_secs(30),
+            codex_permit_slots: 1,
+            log_dir,
+            owner_namespace: "pkg".to_string(),
+            process_groups: ProcessGroupRegistry::default(),
+        };
+
+        let started = std::time::Instant::now();
+        let handle = tokio::spawn(async move {
+            run_durable_record(
+                "worker",
+                &spawned_router,
+                record("parent"),
+                args,
+                &SupervisorJournal::disabled(),
+            )
+            .await
+        });
+        let event = timeout(Duration::from_secs(4), rx.recv())
+            .await
+            .expect("streamed raise should publish before child exit")
+            .expect("done subscription should remain open");
+
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "raise was not visible before the child sleep elapsed"
+        );
+        assert_eq!(event.queue, "done");
+        assert_eq!(event.payload, serde_json::json!({"n": 2}));
+        let done = handle.await.unwrap();
+        assert!(done.failure.is_none());
     }
 
     #[test]
@@ -1106,6 +1442,7 @@ mod tests {
             Some(&policy(1)),
             &leased,
             DeliveryFailure::permanent("failure"),
+            &SupervisorJournal::disabled(),
         );
 
         assert!(store.get("one").unwrap().is_none());
@@ -1131,6 +1468,7 @@ mod tests {
             Some(&policy(1)),
             &leased,
             DeliveryFailure::permanent("exit=7 stderr=bad"),
+            &SupervisorJournal::disabled(),
         );
 
         let event = rx.recv().await.unwrap();
@@ -1199,6 +1537,7 @@ mod tests {
             .remove(0);
         let router = router_with_dead_letter(store.clone());
         let failure = DeliveryFailure::from_spawn_result(&SpawnResult {
+            pid: 123,
             exit_code: 124,
             stdout: String::new(),
             stderr: "codex timed out".to_string(),
@@ -1206,7 +1545,14 @@ mod tests {
             log_path: None,
         });
 
-        retry_record(&store, &router, Some(&policy(1)), &leased, failure);
+        retry_record(
+            &store,
+            &router,
+            Some(&policy(1)),
+            &leased,
+            failure,
+            &SupervisorJournal::disabled(),
+        );
 
         assert!(store.get("one").unwrap().is_none());
         let dead = store.get_dead("one").unwrap().unwrap();
@@ -1250,7 +1596,7 @@ mod tests {
         };
         let temp = TempDir::new().unwrap();
         let store = Arc::new(DeliveryStore::open(temp.path().join("delivery.redb")).unwrap());
-        let router = DeliveryRouter::new(&cfg, Fanout::new(), Some(store));
+        let router = DeliveryRouter::new(&cfg, Fanout::new(), Some(store), None);
         let stdout = format!(
             "RAISED: {}\n",
             base64::engine::general_purpose::URL_SAFE.encode(
@@ -1303,7 +1649,7 @@ mod tests {
         };
         let temp = TempDir::new().unwrap();
         let store = Arc::new(DeliveryStore::open(temp.path().join("delivery.redb")).unwrap());
-        let router = DeliveryRouter::new(&cfg, Fanout::new(), Some(store.clone()));
+        let router = DeliveryRouter::new(&cfg, Fanout::new(), Some(store.clone()), None);
         let parent = record("parent");
         let stdout = format!(
             "RAISED: {}\n",
