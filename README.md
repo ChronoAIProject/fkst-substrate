@@ -20,11 +20,13 @@ target/debug/fkst-framework test \
 
 引擎操作配置由 `crates/fkst-framework/src/config_registry.rs` 中的静态 typed registry 声明。读取优先级固定为 process env → host `fkst.env` → operational 默认；HostFact 缺失 fail-closed。registry 只读，没有 set/apply/watch、YAML/DSL/manifest/plugin 或 per-key `tunables/*.txt` 兼容层。
 
-9 个 knob:
+11 个 knob:
 
 - Operational: `FKST_QUEUE_CAPACITY` 默认 `16`
 - Operational: `FKST_DEPARTMENT_DEFAULT_STALL_WINDOW` 默认 `30s`，作为 Department delivery lease window
 - Operational: `FKST_CODEX_PERMIT_SLOTS` 默认 `20`
+- Operational: `FKST_MAX_IN_FLIGHT_PER_DEPT` 默认 `16`
+- Operational: `FKST_DURABLE_ADMISSION_BURST_PER_DEPT` 默认 `1`
 - Operational: `FKST_RATE_POOL_ROOT` 默认 `~/.fkst/rate-pools`
 - Operational: `FKST_RETRY_DEFAULT_MAX_ATTEMPTS` 默认 `5`
 - Operational: `FKST_RETRY_DEFAULT_BASE` 默认 `60s`
