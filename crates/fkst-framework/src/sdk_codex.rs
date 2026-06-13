@@ -659,6 +659,11 @@ fn adoption_request_hash(request: &CodexRequest) -> String {
         &mut hash,
         request.dedup_key.as_deref().unwrap_or("").as_bytes(),
     );
+    feed(&mut hash, b"\0worktree\0");
+    feed(
+        &mut hash,
+        request.worktree.as_deref().unwrap_or("").as_bytes(),
+    );
     feed(&mut hash, b"\0prompt\0");
     feed(&mut hash, request.prompt.as_bytes());
     feed(&mut hash, b"\0context\0");
