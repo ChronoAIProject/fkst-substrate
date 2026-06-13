@@ -27,7 +27,18 @@ use tracing::{error, info, warn};
 
 const DISPATCH_INTERVAL: Duration = Duration::from_secs(1);
 const DISPATCH_BATCH: usize = 16;
-/// Bounds concurrent durable children per department so restart backlogs drain serially.
+/// Bounds concurrent durable children per department as backpressure: accumulated durable backlog
+/// such as cron-tick or level-signal deliveries that piled up behind a lagging consumer drains
+/// serially instead of thundering-herd on restart.
+///
+/// Cross-department fairness is preserved because each department owns its consumer, `running` map,
+/// and `lease_for_dept_excluding` lease path; one department's backlog never blocks another.
+///
+/// A slow durable child only delays its own department's next dispatch until it exits naturally, so
+/// the backlog still drains. A genuinely deadlocked child blocks only that department. That is the
+/// least-bad option under the deliberate no-kill, renew-until-natural-exit policy that keeps long
+/// codex children alive; a never-exiting child is an application bug in the package, not something
+/// to fix by killing it here.
 const MAX_DURABLE_IN_FLIGHT_PER_DEPT: usize = 1;
 const REDRIVE_COOLDOWN: Duration = Duration::from_secs(600);
 const REDRIVE_MAX: u64 = 3;
@@ -1082,6 +1093,70 @@ mod tests {
         fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
     }
 
+    fn durable_decl(root: &Path, dept: &str, stall_window: &str) -> DepartmentDecl {
+        DepartmentDecl {
+            lua: format!("departments/{dept}/main.lua").into(),
+            owner_root: root.canonicalize().unwrap(),
+            owner_namespace: package_namespace(root),
+            consumes: vec!["jobs".to_string()],
+            produces: Vec::new(),
+            ephemeral: Vec::new(),
+            stall_window: stall_window.to_string(),
+            graph_json: false,
+            retry: None,
+        }
+    }
+
+    fn durable_router(
+        store: Arc<DeliveryStore>,
+        departments: &[(&str, DepartmentDecl)],
+    ) -> DeliveryRouter {
+        let mut queue = BTreeMap::new();
+        queue.insert(
+            "jobs".to_string(),
+            QueueDecl {
+                capacity: 8,
+                fanout: false,
+            },
+        );
+        let department = departments
+            .iter()
+            .map(|(name, decl)| ((*name).to_string(), decl.clone()))
+            .collect();
+        let cfg = Config {
+            queue,
+            raiser: BTreeMap::new(),
+            department,
+            limits: LimitsDecl {
+                global_codex_processes: 1,
+            },
+        };
+        DeliveryRouter::new(&cfg, Fanout::new(), Some(store), None)
+    }
+
+    fn record_for_dept(id: &str, dept: &str) -> DeliveryRecord {
+        let mut record = record(id);
+        record.dept = dept.to_string();
+        record
+    }
+
+    async fn wait_for_started_count(path: &Path, count: usize) {
+        timeout(Duration::from_secs(5), async {
+            loop {
+                if fs::read_to_string(path)
+                    .map(|text| text.lines().count())
+                    .unwrap_or(0)
+                    >= count
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("durable child should reach the expected start count");
+    }
+
     #[test]
     fn ephemeral_disconnect_disables_arm_when_reliable_queues_remain() {
         let mut ephemeral_open = true;
@@ -1525,6 +1600,250 @@ mod tests {
         .await
         .expect("second durable child should start after the first completes");
         assert_eq!(running.len(), 1);
+
+        fs::write(&release, "").unwrap();
+        let done = timeout(Duration::from_secs(2), complete_rx.recv())
+            .await
+            .expect("second durable child should complete")
+            .expect("completion channel should remain open");
+        running.remove(&done.record.delivery_id);
+        finish_durable_record(
+            "worker",
+            Some(store.as_ref()),
+            &router,
+            None,
+            done,
+            &SupervisorJournal::disabled(),
+        );
+
+        assert!(store.get("one").unwrap().is_none());
+        assert!(store.get("two").unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn durable_dispatch_cap_is_per_department_not_global() {
+        let temp = TempDir::new().unwrap();
+        let store = Arc::new(DeliveryStore::open(temp.path().join("delivery.redb")).unwrap());
+        store
+            .enqueue(&record_for_dept("dept-a-one", "dept_a"))
+            .unwrap();
+        store
+            .enqueue(&record_for_dept("dept-b-one", "dept_b"))
+            .unwrap();
+        let started = temp.path().join("started");
+        let release = temp.path().join("release");
+        let binary = temp.path().join("fkst-framework");
+        let log_dir = temp.path().join("logs");
+        fs::create_dir_all(temp.path().join("departments/dept_a")).unwrap();
+        fs::create_dir_all(temp.path().join("departments/dept_b")).unwrap();
+        fs::write(
+            temp.path().join("departments/dept_a/main.lua"),
+            "return {}\n",
+        )
+        .unwrap();
+        fs::write(
+            temp.path().join("departments/dept_b/main.lua"),
+            "return {}\n",
+        )
+        .unwrap();
+        write_executable(
+            &binary,
+            &format!(
+                "printf 'started\\n' >> '{}'\nwhile [ ! -f '{}' ]; do sleep 0.05; done\nexit 0",
+                started.display(),
+                release.display()
+            ),
+        );
+        let roots = PackageRoots::resolve(temp.path(), vec![temp.path().to_path_buf()]).unwrap();
+        let decl_a = durable_decl(temp.path(), "dept_a", "30s");
+        let decl_b = durable_decl(temp.path(), "dept_b", "30s");
+        let router = durable_router(
+            store.clone(),
+            &[("dept_a", decl_a.clone()), ("dept_b", decl_b.clone())],
+        );
+        let (complete_tx, mut complete_rx) = mpsc::channel::<CompletedDelivery>(8);
+        let mut running_a = BTreeMap::new();
+        let mut running_b = BTreeMap::new();
+
+        dispatch_due(
+            "dept_a",
+            &decl_a,
+            temp.path(),
+            &roots,
+            &binary,
+            &router,
+            Some(store.clone()),
+            None,
+            &log_dir,
+            Duration::from_secs(30),
+            1,
+            ProcessGroupRegistry::default(),
+            SupervisorJournal::disabled(),
+            &complete_tx,
+            &mut running_a,
+        );
+        wait_for_started_count(&started, 1).await;
+        assert_eq!(running_a.len(), 1);
+
+        dispatch_due(
+            "dept_b",
+            &decl_b,
+            temp.path(),
+            &roots,
+            &binary,
+            &router,
+            Some(store.clone()),
+            None,
+            &log_dir,
+            Duration::from_secs(30),
+            1,
+            ProcessGroupRegistry::default(),
+            SupervisorJournal::disabled(),
+            &complete_tx,
+            &mut running_b,
+        );
+        wait_for_started_count(&started, 2).await;
+        assert_eq!(running_b.len(), 1);
+
+        fs::write(&release, "").unwrap();
+        for _ in 0..2 {
+            let done = timeout(Duration::from_secs(2), complete_rx.recv())
+                .await
+                .expect("durable child should complete")
+                .expect("completion channel should remain open");
+            let dept = done.record.dept.clone();
+            if dept == "dept_a" {
+                running_a.remove(&done.record.delivery_id);
+            } else {
+                running_b.remove(&done.record.delivery_id);
+            }
+            finish_durable_record(
+                &dept,
+                Some(store.as_ref()),
+                &router,
+                None,
+                done,
+                &SupervisorJournal::disabled(),
+            );
+        }
+
+        assert!(store.get("dept-a-one").unwrap().is_none());
+        assert!(store.get("dept-b-one").unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn durable_dispatch_does_not_duplicate_same_dept_while_running() {
+        let temp = TempDir::new().unwrap();
+        let store = Arc::new(DeliveryStore::open(temp.path().join("delivery.redb")).unwrap());
+        store.enqueue(&record("one")).unwrap();
+        store.enqueue(&record("two")).unwrap();
+        let started = temp.path().join("started");
+        let release = temp.path().join("release");
+        let binary = temp.path().join("fkst-framework");
+        let lua = temp.path().join("departments/worker/main.lua");
+        let log_dir = temp.path().join("logs");
+        fs::create_dir_all(lua.parent().unwrap()).unwrap();
+        fs::write(&lua, "return {}\n").unwrap();
+        write_executable(
+            &binary,
+            &format!(
+                "printf 'started\\n' >> '{}'\nwhile [ ! -f '{}' ]; do sleep 0.05; done\nexit 0",
+                started.display(),
+                release.display()
+            ),
+        );
+        let roots = PackageRoots::resolve(temp.path(), vec![temp.path().to_path_buf()]).unwrap();
+        let decl = durable_decl(temp.path(), "worker", "1ms");
+        let router = durable_router(store.clone(), &[("worker", decl.clone())]);
+        let (complete_tx, mut complete_rx) = mpsc::channel::<CompletedDelivery>(8);
+        let mut running = BTreeMap::new();
+
+        dispatch_due(
+            "worker",
+            &decl,
+            temp.path(),
+            &roots,
+            &binary,
+            &router,
+            Some(store.clone()),
+            None,
+            &log_dir,
+            Duration::from_millis(1),
+            1,
+            ProcessGroupRegistry::default(),
+            SupervisorJournal::disabled(),
+            &complete_tx,
+            &mut running,
+        );
+        wait_for_started_count(&started, 1).await;
+        assert_eq!(running.len(), 1);
+        assert_eq!(durable_dispatch_capacity(running.len()), 0);
+
+        // The capacity gate is the same-department at-least-once guard while the child is still
+        // tracked in `running`; renewal can extend the lease, but expired or second due records
+        // cannot be leased until this department's slot is freed.
+        renew_running(
+            "worker",
+            Some(store.as_ref()),
+            Duration::from_millis(1),
+            &running,
+        );
+        dispatch_due(
+            "worker",
+            &decl,
+            temp.path(),
+            &roots,
+            &binary,
+            &router,
+            Some(store.clone()),
+            None,
+            &log_dir,
+            Duration::from_millis(1),
+            1,
+            ProcessGroupRegistry::default(),
+            SupervisorJournal::disabled(),
+            &complete_tx,
+            &mut running,
+        );
+        assert_eq!(
+            fs::read_to_string(&started).unwrap().lines().count(),
+            1,
+            "second due record must not dispatch while this department has a running child"
+        );
+
+        fs::write(&release, "").unwrap();
+        let done = timeout(Duration::from_secs(2), complete_rx.recv())
+            .await
+            .expect("first durable child should complete")
+            .expect("completion channel should remain open");
+        running.remove(&done.record.delivery_id);
+        finish_durable_record(
+            "worker",
+            Some(store.as_ref()),
+            &router,
+            None,
+            done,
+            &SupervisorJournal::disabled(),
+        );
+
+        dispatch_due(
+            "worker",
+            &decl,
+            temp.path(),
+            &roots,
+            &binary,
+            &router,
+            Some(store.clone()),
+            None,
+            &log_dir,
+            Duration::from_millis(1),
+            1,
+            ProcessGroupRegistry::default(),
+            SupervisorJournal::disabled(),
+            &complete_tx,
+            &mut running,
+        );
+        wait_for_started_count(&started, 2).await;
 
         fs::write(&release, "").unwrap();
         let done = timeout(Duration::from_secs(2), complete_rx.recv())
