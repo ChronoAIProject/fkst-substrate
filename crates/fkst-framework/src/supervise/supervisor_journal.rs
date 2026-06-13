@@ -393,4 +393,44 @@ mod tests {
         assert!(keep.exists());
         assert!(current.exists());
     }
+
+    #[test]
+    fn prunes_old_supervisor_logs_by_size_without_removing_current() {
+        let temp = TempDir::new().unwrap();
+        let dir = temp.path().join("supervisor");
+        std::fs::create_dir_all(&dir).unwrap();
+        let oldest = dir.join("oldest.log");
+        let newest = dir.join("newest.log");
+        let current = dir.join("current.log");
+        std::fs::write(&oldest, "11111").unwrap();
+        std::fs::write(&newest, "22222").unwrap();
+        std::fs::write(&current, "33333").unwrap();
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(10_000);
+        set_file_mtime(
+            &oldest,
+            FileTime::from_system_time(now - Duration::from_secs(200)),
+        )
+        .unwrap();
+        set_file_mtime(
+            &newest,
+            FileTime::from_system_time(now - Duration::from_secs(20)),
+        )
+        .unwrap();
+        set_file_mtime(&current, FileTime::from_system_time(now)).unwrap();
+
+        prune_supervisor_logs_result(
+            &dir,
+            &current,
+            RetentionPolicy {
+                max_age: None,
+                max_bytes: Some(6),
+            },
+            now,
+        )
+        .unwrap();
+
+        assert!(!oldest.exists());
+        assert!(newest.exists());
+        assert!(current.exists());
+    }
 }

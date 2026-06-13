@@ -40,6 +40,24 @@ pub(crate) fn load_host_graph_for_conformance(roots: &PackageRoots) -> Result<Co
 
 pub async fn supervise(roots: PackageRoots, framework_bin: PathBuf) -> Result<()> {
     let project_root = roots.host_root().to_path_buf();
+    let layout = crate::runtime_context::layout_from_host_root(&project_root)?;
+    let journal = SupervisorJournal::open(&layout.runtime_dir(RuntimeKind::Logs));
+    journal.event(
+        "startup_begin",
+        &[
+            ("host_root", project_root.display().to_string()),
+            (
+                "package_roots",
+                roots
+                    .package_roots()
+                    .iter()
+                    .map(|root| root.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(";"),
+            ),
+            ("framework_bin", framework_bin.display().to_string()),
+        ],
+    );
     info!(
         package_roots = ?roots.package_roots(),
         host_root = %project_root.display(),
@@ -48,12 +66,26 @@ pub async fn supervise(roots: PackageRoots, framework_bin: PathBuf) -> Result<()
 
     let cfg = graph_scan::load_roots(&roots).map_err(|e| {
         error!(error = %e, "graph scan failed");
+        journal.event(
+            "startup_failed",
+            &[
+                ("stage", "graph_scan".to_string()),
+                ("error", e.to_string()),
+            ],
+        );
         e
     })?;
 
     let schema_warnings = validate(&cfg, &project_root).map_err(|e| {
         let message = e.to_string();
         error!(error = %message, "schema validation failed, refusing to start");
+        journal.event(
+            "startup_failed",
+            &[
+                ("stage", "schema_validation".to_string()),
+                ("error", message.clone()),
+            ],
+        );
         publish_startup_validation_failure(&cfg, &message);
         anyhow::Error::msg(message)
     })?;
@@ -61,17 +93,39 @@ pub async fn supervise(roots: PackageRoots, framework_bin: PathBuf) -> Result<()
         warn!(warning = %warning, "schema validation warning");
     }
     info!("schema validation passed");
-    let config_context = crate::config_registry::ConfigContext::from_host_root(&project_root)?;
-    let rate_pools = crate::rate_pool::RatePoolRegistry::from_config(&config_context)?;
+    let config_context = crate::config_registry::ConfigContext::from_host_root(&project_root)
+        .map_err(|e| {
+            journal.event(
+                "startup_failed",
+                &[
+                    ("stage", "config_context".to_string()),
+                    ("error", e.to_string()),
+                ],
+            );
+            e
+        })?;
+    let rate_pools =
+        crate::rate_pool::RatePoolRegistry::from_config(&config_context).map_err(|e| {
+            journal.event(
+                "startup_failed",
+                &[("stage", "rate_pool".to_string()), ("error", e.to_string())],
+            );
+            e
+        })?;
     if !rate_pools.is_empty() {
         let framework_for_shim = std::env::current_exe().unwrap_or_else(|_| framework_bin.clone());
-        let shim_dir = crate::rate_shim::ensure_rate_shims(&rate_pools, &framework_for_shim)?;
+        let shim_dir = crate::rate_shim::ensure_rate_shims(&rate_pools, &framework_for_shim)
+            .map_err(|e| {
+                journal.event(
+                    "startup_failed",
+                    &[("stage", "rate_shim".to_string()), ("error", e.to_string())],
+                );
+                e
+            })?;
         info!(shim_dir = %shim_dir.display(), "rate pool shims ensured");
     }
 
     let fanout = Fanout::new();
-    let layout = crate::runtime_context::layout_from_host_root(&project_root)?;
-    let journal = SupervisorJournal::open(&layout.runtime_dir(RuntimeKind::Logs));
     journal.event(
         "startup",
         &[
@@ -90,7 +144,16 @@ pub async fn supervise(roots: PackageRoots, framework_bin: PathBuf) -> Result<()
             ("queues", cfg.queue.len().to_string()),
         ],
     );
-    let delivery_store = delivery_store_for_config(&cfg)?;
+    let delivery_store = delivery_store_for_config(&cfg).map_err(|e| {
+        journal.event(
+            "startup_failed",
+            &[
+                ("stage", "delivery_store".to_string()),
+                ("error", e.to_string()),
+            ],
+        );
+        e
+    })?;
     let router = DeliveryRouter::new(
         &cfg,
         fanout.clone(),

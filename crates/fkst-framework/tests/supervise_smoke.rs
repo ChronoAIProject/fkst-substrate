@@ -87,6 +87,36 @@ fn wait_for_file_containing(path: &Path, needle: &str, timeout: Duration) -> Opt
     }
 }
 
+fn wait_for_supervisor_journal_containing(
+    runtime_root: &Path,
+    needle: &str,
+    timeout: Duration,
+) -> Option<(PathBuf, String)> {
+    let deadline = Instant::now() + timeout;
+    let journal_dir = runtime_root.join("logs/supervisor");
+    loop {
+        if let Ok(entries) = fs::read_dir(&journal_dir) {
+            let mut paths = entries
+                .flatten()
+                .map(|entry| entry.path())
+                .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("log"))
+                .collect::<Vec<_>>();
+            paths.sort();
+            for path in paths {
+                if let Ok(body) = fs::read_to_string(&path) {
+                    if body.contains(needle) {
+                        return Some((path, body));
+                    }
+                }
+            }
+        }
+        if Instant::now() >= deadline {
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
 fn wait_for_process_exit(pid: i32, timeout: Duration) -> bool {
     let deadline = Instant::now() + timeout;
     loop {
@@ -102,6 +132,110 @@ fn wait_for_process_exit(pid: i32, timeout: Duration) -> bool {
 
 fn process_exists(pid: i32) -> bool {
     nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None).is_ok()
+}
+
+#[test]
+fn supervise_writes_generation_journal_for_ephemeral_delivery() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let runtime_root = root.join(".fkst/runtime");
+    fs::create_dir_all(root.join("departments/recorder")).unwrap();
+    fs::create_dir_all(root.join("raisers")).unwrap();
+    fs::write(root.join("input.txt"), "ready").unwrap();
+    write_fkst_env(root);
+    fs::write(
+        root.join("departments/recorder/main.lua"),
+        r#"
+local M = {}
+M.spec = {
+  consumes = { "files" },
+  ephemeral = { "files" },
+  stall_window = "5s",
+}
+function pipeline(event)
+end
+return M
+"#,
+    )
+    .unwrap();
+    fs::write(
+        root.join("raisers/files.lua"),
+        format!(
+            r#"return {{ type = "file_watch", glob = {}, produces = "files" }}"#,
+            lua_string(&root.join("input.txt"))
+        ),
+    )
+    .unwrap();
+
+    let fake = root.join("fkst-framework");
+    write_executable(
+        &fake,
+        &format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" > {}\nexit 0\n",
+            root.join("seen.txt").display()
+        ),
+    );
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_fkst-framework"))
+        .current_dir(root)
+        .arg("supervise")
+        .arg("--project-root")
+        .arg(root)
+        .arg("--package-root")
+        .arg(root)
+        .arg("--framework-bin")
+        .arg(&fake)
+        .env("FKST_RUNTIME_ROOT", &runtime_root)
+        .env("FKST_DURABLE_ROOT", root.join(".fkst/durable"))
+        .spawn()
+        .unwrap();
+
+    wait_for_file_containing(&root.join("seen.txt"), "run", Duration::from_secs(10))
+        .unwrap_or_else(|| {
+            let _ = child.kill();
+            panic!("timed out waiting for child run");
+        });
+    let (journal_path, body) = wait_for_supervisor_journal_containing(
+        &runtime_root,
+        "event=\"exit\"",
+        Duration::from_secs(10),
+    )
+    .unwrap_or_else(|| {
+        let _ = child.kill();
+        panic!("timed out waiting for supervisor journal exit");
+    });
+    assert!(
+        journal_path.starts_with(runtime_root.join("logs/supervisor")),
+        "journal_path={}",
+        journal_path.display()
+    );
+    for needle in [
+        "event=\"startup_begin\"",
+        "event=\"startup\"",
+        "event=\"raiser_fire\" kind=\"file_watch\"",
+        "event=\"publish\" queue=\"files\"",
+        "event=\"deliver\" mode=\"ephemeral\" queue=\"files\" dept=\"recorder\"",
+        "event=\"spawn\" dept=\"recorder\"",
+        "event=\"exit\" dept=\"recorder\"",
+        "exit_code=\"0\"",
+    ] {
+        assert!(body.contains(needle), "missing {needle} in {body}");
+    }
+
+    nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(child.id() as i32),
+        nix::sys::signal::Signal::SIGTERM,
+    )
+    .unwrap();
+    let status = child.wait().unwrap();
+    assert!(status.success(), "status={status}");
+    let (_, body) = wait_for_supervisor_journal_containing(
+        &runtime_root,
+        "event=\"shutdown\" reason=\"signal\" signal=\"SIGTERM\"",
+        Duration::from_secs(5),
+    )
+    .expect("shutdown reason should be journaled");
+    assert!(body.contains("event=\"signal\" signal=\"SIGTERM\""));
 }
 
 #[test]
