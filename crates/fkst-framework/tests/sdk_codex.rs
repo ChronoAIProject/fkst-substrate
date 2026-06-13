@@ -20,7 +20,7 @@ mod runtime_context;
 mod sdk_codex;
 mod support;
 
-use mlua::{AnyUserData, Lua, Table};
+use mlua::{AnyUserData, Function, Lua, Table};
 use nix::fcntl::{flock, FlockArg};
 use sdk_codex::{
     acquire_permit, ensure_pool, CodexResult, CodexTaskHandle, CODEX_PERMIT_SLOTS_ENV,
@@ -187,6 +187,14 @@ fn table_len(table: &Table, key: &str) -> usize {
         .count()
 }
 
+fn codex_runs_fn(lua: &Lua) -> Function {
+    lua.globals()
+        .get::<Table>("fkst")
+        .unwrap()
+        .get("codex_runs")
+        .unwrap()
+}
+
 #[test]
 fn fixed_surface_does_not_register_await_any_await_or_sleep() {
     let lua = Lua::new();
@@ -196,7 +204,9 @@ fn fixed_surface_does_not_register_await_any_await_or_sleep() {
         r#"
         assert(type(spawn_codex) == "function")
         assert(type(await_all) == "function")
-        assert(type(codex_status) == "function")
+        assert(type(fkst) == "table")
+        assert(type(fkst.codex_runs) == "function")
+        assert(codex_status == nil)
         assert(await_any == nil)
         assert(await == nil)
         assert(sleep == nil)
@@ -208,7 +218,7 @@ fn fixed_surface_does_not_register_await_any_await_or_sleep() {
 
 #[cfg(unix)]
 #[test]
-fn codex_status_reports_running_and_recent_with_bounded_output_tail_without_paths() {
+fn codex_runs_reports_running_and_recent_with_bounded_output_tail_without_paths() {
     let tmp = tempfile::tempdir().unwrap();
     let bin_dir = tmp.path().join("bin");
     let started_fifo = tmp.path().join("started.fifo");
@@ -243,7 +253,7 @@ printf 'final output visible through bounded output_tail'
     let handle: AnyUserData = spawn.call(opts).unwrap();
     assert_eq!(read_fifo(&started_fifo), "started");
 
-    let status_fn: mlua::Function = lua.globals().get("codex_status").unwrap();
+    let status_fn: mlua::Function = codex_runs_fn(&lua);
     let status: Table = status_fn.call(()).unwrap();
     let running: Table = status.get("running").unwrap();
     assert_eq!(running.raw_len(), 1);
@@ -293,7 +303,7 @@ printf 'final output visible through bounded output_tail'
 
 #[cfg(unix)]
 #[test]
-fn codex_status_recent_is_bounded_to_last_fifty_completions() {
+fn codex_runs_recent_is_bounded_to_last_fifty_completions() {
     let tmp = tempfile::tempdir().unwrap();
     let bin_dir = tmp.path().join("bin");
     install_codex_script(
@@ -320,7 +330,7 @@ printf 'ok'
         assert_eq!(result.get::<i64>("exit_code").unwrap(), 0);
     }
 
-    let status_fn: mlua::Function = lua.globals().get("codex_status").unwrap();
+    let status_fn: mlua::Function = codex_runs_fn(&lua);
     let status: Table = status_fn.call(()).unwrap();
     assert_eq!(table_len(&status, "running"), 0);
     let recent: Table = status.get("recent").unwrap();
@@ -337,7 +347,7 @@ printf 'ok'
 
 #[cfg(unix)]
 #[test]
-fn codex_status_exposes_bounded_live_output_tail_while_run_is_blocked() {
+fn codex_runs_exposes_bounded_live_output_tail_while_run_is_blocked() {
     let tmp = tempfile::tempdir().unwrap();
     let bin_dir = tmp.path().join("bin");
     let started_fifo = tmp.path().join("started.fifo");
@@ -374,7 +384,7 @@ read _ < "$RELEASE_FIFO"
     let handle: AnyUserData = spawn.call(opts).unwrap();
     assert_eq!(read_fifo(&started_fifo), "started");
 
-    let status_fn: mlua::Function = lua.globals().get("codex_status").unwrap();
+    let status_fn: mlua::Function = codex_runs_fn(&lua);
     let mut observed_tail = String::new();
     let mut observed_role = String::new();
     let mut observed_key = String::new();
@@ -912,7 +922,7 @@ printf 'adopted-%s' "$count"
 
 #[cfg(unix)]
 #[test]
-fn codex_status_reads_running_adoption_record_without_status_log() {
+fn codex_runs_reads_running_adoption_record_without_status_log() {
     let tmp = tempfile::tempdir().unwrap();
     let bin_dir = tmp.path().join("bin");
     let worktree = tmp.path().join("wt");
@@ -971,7 +981,7 @@ printf 'adoption-done'
 
     let lua = Lua::new();
     register(&lua).unwrap();
-    let status_fn: mlua::Function = lua.globals().get("codex_status").unwrap();
+    let status_fn: mlua::Function = codex_runs_fn(&lua);
     let mut active: Option<Table> = None;
     for _ in 0..50 {
         let status: Table = status_fn.call(()).unwrap();
@@ -1038,7 +1048,7 @@ printf 'sensitive output body'
     let result: Table = spawn.call(opts).unwrap();
     assert_eq!(result.get::<i64>("exit_code").unwrap(), 0);
 
-    let status_fn: mlua::Function = lua.globals().get("codex_status").unwrap();
+    let status_fn: mlua::Function = codex_runs_fn(&lua);
     let status: Table = status_fn.call(()).unwrap();
     let running: Table = status.get("running").unwrap();
     let recent: Table = status.get("recent").unwrap();
@@ -1104,7 +1114,7 @@ printf 'done'
     let handle: AnyUserData = spawn.call(opts).unwrap();
     assert_eq!(read_fifo(&started_fifo), "started");
 
-    let status_fn: mlua::Function = lua.globals().get("codex_status").unwrap();
+    let status_fn: mlua::Function = codex_runs_fn(&lua);
     let status: Table = status_fn.call(()).unwrap();
     let running: Table = status.get("running").unwrap();
     let recent: Table = status.get("recent").unwrap();
@@ -1138,7 +1148,7 @@ printf 'done'
 
 #[cfg(unix)]
 #[test]
-fn codex_status_retains_last_fifty_completed_runs() {
+fn codex_runs_retains_last_fifty_completed_runs() {
     let tmp = tempfile::tempdir().unwrap();
     let bin_dir = tmp.path().join("bin");
     install_codex_script(
@@ -1165,7 +1175,7 @@ printf 'ok'
         assert_eq!(result.get::<i64>("exit_code").unwrap(), 0);
     }
 
-    let status_fn: mlua::Function = lua.globals().get("codex_status").unwrap();
+    let status_fn: mlua::Function = codex_runs_fn(&lua);
     let status: Table = status_fn.call(()).unwrap();
     let recent: Table = status.get("recent").unwrap();
     assert_eq!(recent.raw_len(), 50);
@@ -1254,7 +1264,7 @@ fn spawn_codex_sync_returns_visible_spawn_error() {
     assert!(log_body.contains("EXIT=-1\n"));
     assert!(log_body.contains("CMD=codex exec --dangerously-bypass-approvals-and-sandbox -\n"));
 
-    let status_fn: mlua::Function = lua.globals().get("codex_status").unwrap();
+    let status_fn: mlua::Function = codex_runs_fn(&lua);
     let status: Table = status_fn.call(()).unwrap();
     let recent: Table = status.get("recent").unwrap();
     assert_eq!(recent.raw_len(), 1);

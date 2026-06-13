@@ -363,10 +363,20 @@ pub(crate) fn register_with_runner(
         "await_all",
         lua.create_function(move |lua, handles: Table| await_all(lua, handles, owner_id))?,
     )?;
-    lua.globals().set("codex_status", {
+    let fkst = match lua.globals().get::<mlua::Value>("fkst")? {
+        mlua::Value::Table(table) => table,
+        mlua::Value::Nil => lua.create_table()?,
+        _ => {
+            return Err(mlua::Error::RuntimeError(
+                "global fkst is not a table".to_string(),
+            ))
+        }
+    };
+    fkst.set("codex_runs", {
         let host_root = Arc::clone(&host_root);
         lua.create_function(move |lua, ()| codex_status(lua, &host_root))?
     })?;
+    lua.globals().set("fkst", fkst)?;
     Ok(())
 }
 
