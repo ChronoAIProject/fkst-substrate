@@ -44,6 +44,7 @@ fn run_conformance(host: &Path, runtime: &Path) -> Output {
         .arg("--package-root")
         .arg(host)
         .current_dir(host)
+        .env_remove("FKST_SUPERVISOR_PID")
         .env("FKST_RUNTIME_ROOT", runtime)
         .output()
         .unwrap()
@@ -61,6 +62,7 @@ fn run_department(host: &Path, runtime: &Path, lua: &str, event: &str) -> Comman
         .arg("--event")
         .arg(event)
         .current_dir(host)
+        .env_remove("FKST_SUPERVISOR_PID")
         .env("FKST_RUNTIME_ROOT", runtime);
     command
 }
@@ -73,6 +75,7 @@ fn run_lua_tests(host: &Path, runtime: &Path) -> Output {
         .arg("--package-root")
         .arg(host)
         .current_dir(host)
+        .env_remove("FKST_SUPERVISOR_PID")
         .env("FKST_RUNTIME_ROOT", runtime)
         .output()
         .unwrap()

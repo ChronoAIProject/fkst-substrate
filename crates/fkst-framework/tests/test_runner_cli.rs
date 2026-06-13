@@ -7,6 +7,12 @@ fn framework_bin() -> &'static str {
     env!("CARGO_BIN_EXE_fkst-framework")
 }
 
+fn framework_command() -> Command {
+    let mut command = Command::new(framework_bin());
+    command.env_remove("FKST_SUPERVISOR_PID");
+    command
+}
+
 fn repo_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
@@ -35,7 +41,7 @@ fn copy_codex_package(host: &Path) {
 }
 
 fn run_lua_tests(host: &Path, package: &Path) -> Output {
-    Command::new(framework_bin())
+    framework_command()
         .arg("test")
         .arg("--project-root")
         .arg(host)
@@ -48,7 +54,7 @@ fn run_lua_tests(host: &Path, package: &Path) -> Output {
 }
 
 fn run_lua_tests_with_packages(host: &Path, packages: &[&Path]) -> Output {
-    let mut cmd = Command::new(framework_bin());
+    let mut cmd = framework_command();
     cmd.arg("test").arg("--project-root").arg(host);
     for package in packages {
         cmd.arg("--package-root").arg(package);
@@ -60,7 +66,7 @@ fn run_lua_tests_with_packages(host: &Path, packages: &[&Path]) -> Output {
 }
 
 fn run_lua_tests_with_report(host: &Path, package: &Path, report: &Path) -> Output {
-    Command::new(framework_bin())
+    framework_command()
         .arg("test")
         .arg("--project-root")
         .arg(host)
@@ -79,7 +85,7 @@ fn run_lua_tests_with_packages_and_report(
     packages: &[&Path],
     report: &Path,
 ) -> Output {
-    let mut cmd = Command::new(framework_bin());
+    let mut cmd = framework_command();
     cmd.arg("test").arg("--project-root").arg(host);
     for package in packages {
         cmd.arg("--package-root").arg(package);
@@ -117,7 +123,7 @@ fn raised_entries(output: &Output) -> serde_json::Value {
 }
 
 fn run_command(host: &Path, lua: &Path) -> Command {
-    let mut cmd = Command::new(framework_bin());
+    let mut cmd = framework_command();
     cmd.arg("run")
         .arg(lua)
         .arg("--project-root")
@@ -1493,7 +1499,7 @@ end
     )
     .unwrap();
 
-    let output = Command::new(framework_bin())
+    let output = framework_command()
         .arg("run")
         .arg(&probe)
         .arg("--project-root")
@@ -1535,7 +1541,7 @@ end
     )
     .unwrap();
 
-    let output = Command::new(framework_bin())
+    let output = framework_command()
         .arg("run")
         .arg(&probe)
         .arg("--project-root")
@@ -1578,7 +1584,7 @@ end
     )
     .unwrap();
 
-    let auth = Command::new(framework_bin())
+    let auth = framework_command()
         .arg("run")
         .arg(&probe)
         .arg("--project-root")
@@ -1605,7 +1611,7 @@ end
     assert_eq!(raises[0]["payload"]["exit_code"], 1);
     assert_eq!(raises[0]["payload"]["error_class"], "auth-degraded");
 
-    let throttle = Command::new(framework_bin())
+    let throttle = framework_command()
         .arg("run")
         .arg(&probe)
         .arg("--project-root")

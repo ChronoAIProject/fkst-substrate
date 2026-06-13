@@ -10,6 +10,7 @@ use nix::fcntl::{flock, FlockArg};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::ffi::OsStr;
+use std::fmt::Write as FmtWrite;
 use std::io::{Read, Write};
 use std::os::fd::AsRawFd;
 #[cfg(unix)]
@@ -51,6 +52,7 @@ struct CodexRequest {
     log_path: PathBuf,
     label: Option<String>,
     proposal_id: Option<String>,
+    dedup_key: Option<String>,
     dept: Option<String>,
     started_at_ms: u64,
     adoption_status_path: Option<PathBuf>,
@@ -347,6 +349,7 @@ fn codex_request_from_opts(opts: Table, runtime_dept: Option<String>) -> CodexRe
     let worktree: Option<String> = opts.get("worktree").ok();
     let label: Option<String> = opts.get("label").ok();
     let proposal_id: Option<String> = opts.get("proposal_id").ok();
+    let dedup_key: Option<String> = opts.get("dedup_key").ok();
     let dept: Option<String> = opts.get("dept").ok().or(runtime_dept);
     let timeout: Option<i64> = opts.get("timeout").ok();
     let timeout_seconds = timeout
@@ -363,6 +366,7 @@ fn codex_request_from_opts(opts: Table, runtime_dept: Option<String>) -> CodexRe
         log_path,
         label,
         proposal_id,
+        dedup_key,
         dept,
         started_at_ms,
         adoption_status_path: None,
@@ -597,7 +601,7 @@ fn adoption_paths_for_request(request: &CodexRequest) -> Option<CodexAdoptionPat
         return None;
     }
     let worktree_path = PathBuf::from(worktree);
-    let key = adoption_key_for_worktree(&worktree_path);
+    let key = adoption_key_for_request(request);
     let dir = worktree_path.join(CODEX_ADOPTION_DIR).join(&key);
     Some(CodexAdoptionPaths {
         key,
@@ -609,14 +613,20 @@ fn adoption_paths_for_request(request: &CodexRequest) -> Option<CodexAdoptionPat
     })
 }
 
-fn adoption_key_for_worktree(worktree: &Path) -> String {
-    let basename = worktree
-        .file_name()
-        .and_then(OsStr::to_str)
-        .filter(|name| !name.is_empty())
-        .unwrap_or("worktree");
+fn adoption_key_for_request(request: &CodexRequest) -> String {
+    let identity = request.dedup_key.as_deref().unwrap_or("prompt");
+    let identity = sanitize_adoption_key_segment(identity);
+    let hash = adoption_request_hash(request);
+    if request.dedup_key.is_some() {
+        format!("dedup-{identity}-{hash}")
+    } else {
+        format!("prompt-{hash}")
+    }
+}
+
+fn sanitize_adoption_key_segment(value: &str) -> String {
     let mut key = String::new();
-    for byte in basename.bytes() {
+    for byte in value.bytes().take(80) {
         if byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-') {
             key.push(byte as char);
         } else {
@@ -624,10 +634,34 @@ fn adoption_key_for_worktree(worktree: &Path) -> String {
         }
     }
     if key.is_empty() {
-        "worktree".to_string()
+        "work-unit".to_string()
     } else {
         key
     }
+}
+
+fn adoption_request_hash(request: &CodexRequest) -> String {
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    fn feed(hash: &mut u64, bytes: &[u8]) {
+        for byte in bytes {
+            *hash ^= u64::from(*byte);
+            *hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    }
+    feed(
+        &mut hash,
+        request.dedup_key.as_deref().unwrap_or("").as_bytes(),
+    );
+    feed(&mut hash, b"\0prompt\0");
+    feed(&mut hash, request.prompt.as_bytes());
+    feed(&mut hash, b"\0context\0");
+    feed(
+        &mut hash,
+        request.context.as_deref().unwrap_or("").as_bytes(),
+    );
+    let mut hex = String::with_capacity(16);
+    write!(&mut hex, "{hash:016x}").expect("writing to string should not fail");
+    hex
 }
 
 fn read_completed_adoption_result(paths: &CodexAdoptionPaths) -> Result<Option<CodexResult>> {
@@ -809,6 +843,10 @@ fn codex_worker_args(
         args.push("--proposal-id".to_string());
         args.push(proposal_id.to_string());
     }
+    if let Some(dedup_key) = request.dedup_key.as_deref() {
+        args.push("--dedup-key".to_string());
+        args.push(dedup_key.to_string());
+    }
     if let Some(dept) = request.dept.as_deref() {
         args.push("--dept".to_string());
         args.push(dept.to_string());
@@ -904,6 +942,7 @@ pub(crate) struct CodexWorkerOptions {
     worktree: Option<String>,
     label: Option<String>,
     proposal_id: Option<String>,
+    dedup_key: Option<String>,
     dept: Option<String>,
 }
 
@@ -924,6 +963,7 @@ pub(crate) fn parse_worker_args(args: Vec<String>) -> anyhow::Result<CodexWorker
     let worktree = parser.optional_string("--worktree");
     let label = parser.optional_string("--label");
     let proposal_id = parser.optional_string("--proposal-id");
+    let dedup_key = parser.optional_string("--dedup-key");
     let dept = parser.optional_string("--dept");
     parser.finish()?;
     Ok(CodexWorkerOptions {
@@ -942,6 +982,7 @@ pub(crate) fn parse_worker_args(args: Vec<String>) -> anyhow::Result<CodexWorker
         worktree,
         label,
         proposal_id,
+        dedup_key,
         dept,
     })
 }
@@ -958,6 +999,7 @@ pub(crate) fn run_codex_worker(options: CodexWorkerOptions) -> anyhow::Result<i3
         log_path: options.log_path.clone(),
         label: options.label.clone(),
         proposal_id: options.proposal_id.clone(),
+        dedup_key: options.dedup_key.clone(),
         dept: options.dept.clone(),
         started_at_ms: options.started_at_ms,
         adoption_status_path: Some(options.status_file.clone()),
