@@ -112,12 +112,7 @@ impl DeliveryRouter {
                     .ok_or_else(|| anyhow!("reliable delivery store is not open"))?;
                 ensure_payload_within_bound(&envelope.event.payload)?;
                 let record = DeliveryRecord {
-                    delivery_id: derive_delivery_id(
-                        &queue,
-                        &sub.dept,
-                        &source,
-                        envelope.derived.as_ref(),
-                    ),
+                    delivery_id: derive_delivery_id(&queue, &sub.dept, &source, &envelope),
                     queue: queue.clone(),
                     dept: sub.dept.clone(),
                     payload: envelope.event.payload.clone(),
@@ -269,23 +264,29 @@ pub(crate) fn derive_delivery_id(
     queue: &str,
     dept: &str,
     source: &SourceRef,
-    derived: Option<&DerivedDelivery>,
+    envelope: &PublishEnvelope,
 ) -> String {
-    let key = if let Some(derived) = derived {
-        let parent_hash = stable_hex_hash(&derived.parent_delivery_id);
-        runtime_key([
-            "delivery",
-            "v2",
-            "raised",
-            "queue",
-            queue,
-            "dept",
-            dept,
-            "parent_hash",
-            &parent_hash,
-            "ordinal",
-            &derived.ordinal.to_string(),
-        ])
+    let key = if let Some(derived) = envelope.derived.as_ref() {
+        if let Some(dedup_key) = payload_dedup_key(&envelope.event.payload) {
+            runtime_key([
+                "delivery", "v3", "raised", "queue", queue, "dept", dept, "dedup", &dedup_key,
+            ])
+        } else {
+            let parent_hash = stable_hex_hash(&derived.parent_delivery_id);
+            runtime_key([
+                "delivery",
+                "v2",
+                "raised",
+                "queue",
+                queue,
+                "dept",
+                dept,
+                "parent_hash",
+                &parent_hash,
+                "ordinal",
+                &derived.ordinal.to_string(),
+            ])
+        }
     } else {
         runtime_key([
             "delivery",
@@ -302,6 +303,14 @@ pub(crate) fn derive_delivery_id(
     };
     validate_runtime_key(&key).expect("delivery id should be a runtime-safe key");
     key
+}
+
+fn payload_dedup_key(payload: &JsonValue) -> Option<String> {
+    payload
+        .get("dedup_key")
+        .and_then(JsonValue::as_str)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
 }
 
 fn stable_hex_hash(value: &str) -> String {
@@ -489,6 +498,32 @@ mod tests {
     use std::time::Duration;
     use tempfile::TempDir;
 
+    fn source_envelope(queue: &str, payload: JsonValue) -> PublishEnvelope {
+        PublishEnvelope {
+            event: Event::new(queue, payload),
+            source: None,
+            cron_payload: None,
+            derived: None,
+        }
+    }
+
+    fn raised_envelope(
+        queue: &str,
+        payload: JsonValue,
+        parent_id: &str,
+        ordinal: usize,
+    ) -> PublishEnvelope {
+        PublishEnvelope {
+            event: Event::new(queue, payload),
+            source: None,
+            cron_payload: None,
+            derived: Some(DerivedDelivery {
+                parent_delivery_id: parent_id.to_string(),
+                ordinal,
+            }),
+        }
+    }
+
     fn config(ephemeral: bool) -> Config {
         let mut queue = BTreeMap::new();
         queue.insert(
@@ -523,6 +558,8 @@ mod tests {
             department,
             limits: LimitsDecl {
                 global_codex_processes: 1,
+                global_department_child_processes: 16,
+                department_child_processes_per_dept: 4,
             },
         }
     }
@@ -564,6 +601,8 @@ mod tests {
             department,
             limits: LimitsDecl {
                 global_codex_processes: 1,
+                global_department_child_processes: 16,
+                department_child_processes_per_dept: 4,
             },
         }
     }
@@ -699,8 +738,18 @@ mod tests {
             kind: SourceKind::File,
             reference: "/tmp/input.txt/len/4/mtime/1000".to_string(),
         };
-        let first = derive_delivery_id("jobs", "worker", &source, None);
-        let second = derive_delivery_id("jobs", "worker", &source, None);
+        let first = derive_delivery_id(
+            "jobs",
+            "worker",
+            &source,
+            &source_envelope("jobs", serde_json::json!({"n": 1})),
+        );
+        let second = derive_delivery_id(
+            "jobs",
+            "worker",
+            &source,
+            &source_envelope("jobs", serde_json::json!({"n": 2})),
+        );
 
         assert_eq!(first, second);
         assert_eq!(
@@ -710,18 +759,48 @@ mod tests {
     }
 
     #[test]
-    fn raised_delivery_id_uses_parent_ordinal_queue_and_dept() {
+    fn raised_delivery_id_uses_payload_dedup_key_when_present() {
         let source = SourceRef {
             kind: SourceKind::Cron,
             reference: "tick/slot/1000".to_string(),
         };
-        let derived = DerivedDelivery {
-            parent_delivery_id: "delivery/v1/source/cron/queue/jobs/dept/worker/ref/tick"
-                .to_string(),
-            ordinal: 2,
-        };
+        let first = raised_envelope(
+            "next",
+            serde_json::json!({"dedup_key": "issue/67", "n": 1}),
+            "parent-a",
+            0,
+        );
+        let second = raised_envelope(
+            "next",
+            serde_json::json!({"dedup_key": "issue/67", "n": 1}),
+            "parent-b",
+            9,
+        );
 
-        let id = derive_delivery_id("next", "next_worker", &source, Some(&derived));
+        let first_id = derive_delivery_id("next", "next_worker", &source, &first);
+        let second_id = derive_delivery_id("next", "next_worker", &source, &second);
+
+        assert_eq!(
+            first_id,
+            "delivery/v3/raised/queue/next/dept/next__worker/dedup/issue_x2F67"
+        );
+        assert_eq!(first_id, second_id);
+    }
+
+    #[test]
+    fn raised_delivery_id_without_dedup_key_uses_parent_ordinal_queue_and_dept() {
+        let source = SourceRef {
+            kind: SourceKind::Cron,
+            reference: "tick/slot/1000".to_string(),
+        };
+        let envelope = raised_envelope(
+            "next",
+            serde_json::json!({"n": 1}),
+            "delivery/v1/source/cron/queue/jobs/dept/worker/ref/tick",
+            2,
+        );
+
+        let id = derive_delivery_id("next", "next_worker", &source, &envelope);
 
         assert_eq!(
             id,
@@ -735,14 +814,16 @@ mod tests {
             kind: SourceKind::Cron,
             reference: "tick".to_string(),
         };
-        let mut parent = derive_delivery_id("jobs", "worker", &source, None);
+        let mut parent = derive_delivery_id(
+            "jobs",
+            "worker",
+            &source,
+            &source_envelope("jobs", serde_json::json!({"n": 1})),
+        );
 
         for hop in 0..20 {
-            let derived = DerivedDelivery {
-                parent_delivery_id: parent.clone(),
-                ordinal: hop,
-            };
-            let id = derive_delivery_id("next", "next_worker", &source, Some(&derived));
+            let envelope = raised_envelope("next", serde_json::json!({"n": hop}), &parent, hop);
+            let id = derive_delivery_id("next", "next_worker", &source, &envelope);
 
             assert!(
                 id.len() < 512,

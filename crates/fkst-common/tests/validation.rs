@@ -50,6 +50,8 @@ fn cfg_minimal(lua_file: &Path) -> Config {
         department,
         limits: LimitsDecl {
             global_codex_processes: 1,
+            global_department_child_processes: 16,
+            department_child_processes_per_dept: 4,
         },
     }
 }
@@ -196,6 +198,36 @@ fn global_codex_processes_zero_rejected() {
     let message = e.to_string();
     assert!(
         message.contains("limits.global_codex_processes"),
+        "{message}"
+    );
+    assert!(message.contains("must be > 0"), "{message}");
+}
+
+#[test]
+fn global_department_child_processes_zero_rejected() {
+    let tmp = tempdir().unwrap();
+    let lua = touch(tmp.path(), "d.lua");
+    let mut cfg = cfg_minimal(&lua);
+    cfg.limits.global_department_child_processes = 0;
+    let e = validate(&cfg, tmp.path()).unwrap_err();
+    let message = e.to_string();
+    assert!(
+        message.contains("limits.global_department_child_processes"),
+        "{message}"
+    );
+    assert!(message.contains("must be > 0"), "{message}");
+}
+
+#[test]
+fn department_child_processes_per_dept_zero_rejected() {
+    let tmp = tempdir().unwrap();
+    let lua = touch(tmp.path(), "d.lua");
+    let mut cfg = cfg_minimal(&lua);
+    cfg.limits.department_child_processes_per_dept = 0;
+    let e = validate(&cfg, tmp.path()).unwrap_err();
+    let message = e.to_string();
+    assert!(
+        message.contains("limits.department_child_processes_per_dept"),
         "{message}"
     );
     assert!(message.contains("must be > 0"), "{message}");

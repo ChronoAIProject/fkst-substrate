@@ -325,6 +325,8 @@ mod tests {
             department,
             limits: LimitsDecl {
                 global_codex_processes: 4,
+                global_department_child_processes: 16,
+                department_child_processes_per_dept: 4,
             },
         };
 

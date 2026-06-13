@@ -124,6 +124,8 @@ fn minimal_config(lua_rel: PathBuf, owner_root: &std::path::Path) -> Config {
         department,
         limits: LimitsDecl {
             global_codex_processes: 1,
+            global_department_child_processes: 16,
+            department_child_processes_per_dept: 4,
         },
     }
 }

@@ -63,4 +63,6 @@ pub struct RetryDecl {
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 pub struct LimitsDecl {
     pub global_codex_processes: usize,
+    pub global_department_child_processes: usize,
+    pub department_child_processes_per_dept: usize,
 }

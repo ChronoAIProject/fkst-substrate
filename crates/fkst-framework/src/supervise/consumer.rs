@@ -21,7 +21,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Duration;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinHandle;
 use tracing::{error, info, warn};
 
@@ -42,6 +42,8 @@ pub async fn spawn_consumer(
     store: Option<Arc<DeliveryStore>>,
     queue_capacity: usize,
     codex_permit_slots: usize,
+    global_department_child_processes: Arc<Semaphore>,
+    department_child_processes_per_dept: usize,
     process_groups: ProcessGroupRegistry,
     journal: SupervisorJournal,
 ) -> JoinHandle<()> {
@@ -79,6 +81,8 @@ pub async fn spawn_consumer(
             .expect("validation already accepted retry");
 
         let (ephemeral_tx, mut ephemeral_rx) = mpsc::channel::<Event>(queue_capacity);
+        let department_child_processes =
+            Arc::new(Semaphore::new(department_child_processes_per_dept));
         let mut ephemeral_open = !receivers.is_empty();
         for mut rx in receivers {
             let tx = ephemeral_tx.clone();
@@ -140,6 +144,8 @@ pub async fn spawn_consumer(
                             ev,
                             stall_window,
                             codex_permit_slots,
+                            global_department_child_processes.clone(),
+                            department_child_processes.clone(),
                             process_groups.clone(),
                             journal.clone(),
                         );
@@ -162,6 +168,8 @@ pub async fn spawn_consumer(
                         &framework_child_log_dir,
                         stall_window,
                         codex_permit_slots,
+                        global_department_child_processes.clone(),
+                        department_child_processes.clone(),
                         process_groups.clone(),
                         journal.clone(),
                         &complete_tx,
@@ -183,6 +191,8 @@ pub async fn spawn_consumer(
                         &framework_child_log_dir,
                         stall_window,
                         codex_permit_slots,
+                        global_department_child_processes.clone(),
+                        department_child_processes.clone(),
                         process_groups.clone(),
                         journal.clone(),
                         &complete_tx,
@@ -238,9 +248,29 @@ fn spawn_ephemeral(
     event: Event,
     stall_window: Duration,
     codex_permit_slots: usize,
+    global_department_child_processes: Arc<Semaphore>,
+    department_child_processes: Arc<Semaphore>,
     process_groups: ProcessGroupRegistry,
     journal: SupervisorJournal,
 ) {
+    let Some(permit) = child_spawn_permit(
+        global_department_child_processes,
+        department_child_processes,
+    ) else {
+        warn!(dept = %name, "department child spawn limit reached; dropping ephemeral event");
+        journal.event(
+            "dept_child_exit",
+            [
+                ("dept", name.to_string()),
+                ("pid", "none".to_string()),
+                ("exit_code", "none".to_string()),
+                ("elapsed_ms", "0".to_string()),
+                ("log_path", "none".to_string()),
+                ("reason", "spawn_limited:ephemeral".to_string()),
+            ],
+        );
+        return;
+    };
     let args = match spawn_args(
         decl,
         project_root,
@@ -272,6 +302,7 @@ fn spawn_ephemeral(
     let dept_name = name.to_string();
     let router = router.clone();
     tokio::spawn(async move {
+        let _permit = permit;
         match spawn_and_report(&dept_name, &args, &journal).await {
             Ok(result) => {
                 if let Err(err) = publish_ephemeral_raised(&router, &result.stdout) {
@@ -314,6 +345,8 @@ fn dispatch_due(
     log_dir: &std::path::Path,
     stall_window: Duration,
     codex_permit_slots: usize,
+    global_department_child_processes: Arc<Semaphore>,
+    department_child_processes: Arc<Semaphore>,
     process_groups: ProcessGroupRegistry,
     journal: SupervisorJournal,
     complete_tx: &mpsc::Sender<CompletedDelivery>,
@@ -323,12 +356,20 @@ fn dispatch_due(
         error!(dept = %name, "reliable consumer missing delivery store");
         return;
     };
+    let permits = dispatch_permits(
+        global_department_child_processes,
+        department_child_processes,
+        DISPATCH_BATCH,
+    );
+    if permits.is_empty() {
+        return;
+    }
     let lease = retry_lease(stall_window);
     let excluded = running.keys().cloned().collect();
     let leased = match store.lease_for_dept_excluding(
         name,
         now_unix_millis(),
-        DISPATCH_BATCH,
+        permits.len(),
         lease,
         &excluded,
     ) {
@@ -338,7 +379,7 @@ fn dispatch_due(
             return;
         }
     };
-    for record in leased {
+    for (record, permit) in leased.into_iter().zip(permits) {
         if running.contains_key(&record.delivery_id) {
             continue;
         }
@@ -373,6 +414,7 @@ fn dispatch_due(
         let delivery_id = record.delivery_id.clone();
         let journal = journal.clone();
         let handle = tokio::spawn(async move {
+            let _permit = permit;
             let result = run_durable_record(&dept_name, &router, record, args, &journal).await;
             if complete_tx.send(result).await.is_err() {
                 warn!(dept = %dept_name, delivery_id = %delivery_id, "delivery completion receiver closed");
@@ -386,6 +428,44 @@ fn dispatch_due(
             },
         );
     }
+}
+
+fn dispatch_permits(
+    global_department_child_processes: Arc<Semaphore>,
+    department_child_processes: Arc<Semaphore>,
+    batch_limit: usize,
+) -> Vec<ChildSpawnPermit> {
+    let mut permits = Vec::with_capacity(batch_limit);
+    for _ in 0..batch_limit {
+        match child_spawn_permit(
+            global_department_child_processes.clone(),
+            department_child_processes.clone(),
+        ) {
+            Some(permit) => permits.push(permit),
+            None => break,
+        }
+    }
+    permits
+}
+
+fn child_spawn_permit(
+    global_department_child_processes: Arc<Semaphore>,
+    department_child_processes: Arc<Semaphore>,
+) -> Option<ChildSpawnPermit> {
+    let global = global_department_child_processes.try_acquire_owned().ok()?;
+    let dept = match department_child_processes.try_acquire_owned() {
+        Ok(permit) => permit,
+        Err(_) => return None,
+    };
+    Some(ChildSpawnPermit {
+        _global: global,
+        _dept: dept,
+    })
+}
+
+struct ChildSpawnPermit {
+    _global: OwnedSemaphorePermit,
+    _dept: OwnedSemaphorePermit,
 }
 
 async fn run_durable_record(
@@ -1105,6 +1185,29 @@ mod tests {
         assert!(reliable_wake_rx.is_none());
     }
 
+    #[test]
+    fn dispatch_permits_apply_per_dept_and_global_limits() {
+        let global = Arc::new(Semaphore::new(3));
+        let first_dept = Arc::new(Semaphore::new(2));
+        let second_dept = Arc::new(Semaphore::new(4));
+
+        let first = dispatch_permits(global.clone(), first_dept.clone(), 16);
+        assert_eq!(first.len(), 2);
+        assert_eq!(global.available_permits(), 1);
+        assert_eq!(first_dept.available_permits(), 0);
+
+        let second = dispatch_permits(global.clone(), second_dept.clone(), 16);
+        assert_eq!(second.len(), 1);
+        assert_eq!(global.available_permits(), 0);
+        assert_eq!(second_dept.available_permits(), 3);
+
+        drop(first);
+        drop(second);
+        assert_eq!(global.available_permits(), 3);
+        assert_eq!(first_dept.available_permits(), 2);
+        assert_eq!(second_dept.available_permits(), 4);
+    }
+
     fn router_with_dead_letter(store: Arc<DeliveryStore>) -> DeliveryRouter {
         router_with_dead_letter_and_fanout(store, Fanout::new())
     }
@@ -1142,6 +1245,8 @@ mod tests {
             department,
             limits: LimitsDecl {
                 global_codex_processes: 1,
+                global_department_child_processes: 16,
+                department_child_processes_per_dept: 4,
             },
         };
         DeliveryRouter::new(&cfg, fanout, Some(store), None)
@@ -1177,6 +1282,8 @@ mod tests {
             department,
             limits: LimitsDecl {
                 global_codex_processes: 1,
+                global_department_child_processes: 16,
+                department_child_processes_per_dept: 4,
             },
         };
         DeliveryRouter::new(&cfg, fanout, None, None)
@@ -1309,6 +1416,8 @@ mod tests {
             department,
             limits: LimitsDecl {
                 global_codex_processes: 1,
+                global_department_child_processes: 16,
+                department_child_processes_per_dept: 4,
             },
         };
         let router = DeliveryRouter::new(&cfg, fanout, None, None);
@@ -1592,6 +1701,8 @@ mod tests {
             department,
             limits: LimitsDecl {
                 global_codex_processes: 1,
+                global_department_child_processes: 16,
+                department_child_processes_per_dept: 4,
             },
         };
         let temp = TempDir::new().unwrap();
@@ -1645,6 +1756,8 @@ mod tests {
             department,
             limits: LimitsDecl {
                 global_codex_processes: 1,
+                global_department_child_processes: 16,
+                department_child_processes_per_dept: 4,
             },
         };
         let temp = TempDir::new().unwrap();

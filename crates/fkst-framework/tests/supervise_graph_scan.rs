@@ -28,6 +28,9 @@ const RUNTIME_ROOT_ENV: &str = "FKST_RUNTIME_ROOT";
 const QUEUE_CAPACITY_ENV: &str = "FKST_QUEUE_CAPACITY";
 const DEPARTMENT_DEFAULT_STALL_WINDOW_ENV: &str = "FKST_DEPARTMENT_DEFAULT_STALL_WINDOW";
 const CODEX_PERMIT_SLOTS_ENV: &str = "FKST_CODEX_PERMIT_SLOTS";
+const DEPARTMENT_CHILD_PROCESS_LIMIT_ENV: &str = "FKST_DEPARTMENT_CHILD_PROCESS_LIMIT";
+const DEPARTMENT_CHILD_PROCESS_LIMIT_PER_DEPT_ENV: &str =
+    "FKST_DEPARTMENT_CHILD_PROCESS_LIMIT_PER_DEPT";
 const RETRY_DEFAULT_MAX_ATTEMPTS_ENV: &str = "FKST_RETRY_DEFAULT_MAX_ATTEMPTS";
 const RETRY_DEFAULT_BASE_ENV: &str = "FKST_RETRY_DEFAULT_BASE";
 const RETRY_DEFAULT_CAP_ENV: &str = "FKST_RETRY_DEFAULT_CAP";
@@ -459,6 +462,8 @@ fn host_graph_defaults_use_operational_defaults_when_env_and_fkst_env_are_absent
     let _queue = EnvGuard::unset(QUEUE_CAPACITY_ENV);
     let _stall_window = EnvGuard::unset(DEPARTMENT_DEFAULT_STALL_WINDOW_ENV);
     let _slots = EnvGuard::unset(CODEX_PERMIT_SLOTS_ENV);
+    let _child_limit = EnvGuard::unset(DEPARTMENT_CHILD_PROCESS_LIMIT_ENV);
+    let _child_limit_per_dept = EnvGuard::unset(DEPARTMENT_CHILD_PROCESS_LIMIT_PER_DEPT_ENV);
     let _attempts = EnvGuard::unset(RETRY_DEFAULT_MAX_ATTEMPTS_ENV);
     let _retry_base = EnvGuard::unset(RETRY_DEFAULT_BASE_ENV);
     let _retry_cap = EnvGuard::unset(RETRY_DEFAULT_CAP_ENV);
@@ -524,6 +529,8 @@ return M
     assert_eq!(cfg.queue.get("tick").unwrap().capacity, 11);
     assert_eq!(cfg.department.get("hello").unwrap().stall_window, "44s");
     assert_eq!(cfg.limits.global_codex_processes, 12);
+    assert_eq!(cfg.limits.global_department_child_processes, 16);
+    assert_eq!(cfg.limits.department_child_processes_per_dept, 4);
 }
 
 #[test]
@@ -532,6 +539,8 @@ fn host_graph_defaults_use_env_before_fkst_env() {
     let _queue = EnvGuard::set(QUEUE_CAPACITY_ENV, "31");
     let _stall_window = EnvGuard::set(DEPARTMENT_DEFAULT_STALL_WINDOW_ENV, "66h");
     let _slots = EnvGuard::set(CODEX_PERMIT_SLOTS_ENV, "32");
+    let _child_limit = EnvGuard::set(DEPARTMENT_CHILD_PROCESS_LIMIT_ENV, "9");
+    let _child_limit_per_dept = EnvGuard::set(DEPARTMENT_CHILD_PROCESS_LIMIT_PER_DEPT_ENV, "3");
     let dir = write_repo(
         &[(
             "hello",
@@ -549,7 +558,7 @@ return M
     );
     fs::write(
         dir.path().join("fkst.env"),
-        "FKST_QUEUE_CAPACITY=21\nFKST_DEPARTMENT_DEFAULT_STALL_WINDOW=55m\nFKST_CODEX_PERMIT_SLOTS=22\nFKST_RETRY_DEFAULT_MAX_ATTEMPTS=8\nFKST_RETRY_DEFAULT_BASE=2m\nFKST_RETRY_DEFAULT_CAP=1h\n",
+        "FKST_QUEUE_CAPACITY=21\nFKST_DEPARTMENT_DEFAULT_STALL_WINDOW=55m\nFKST_CODEX_PERMIT_SLOTS=22\nFKST_DEPARTMENT_CHILD_PROCESS_LIMIT=7\nFKST_DEPARTMENT_CHILD_PROCESS_LIMIT_PER_DEPT=2\nFKST_RETRY_DEFAULT_MAX_ATTEMPTS=8\nFKST_RETRY_DEFAULT_BASE=2m\nFKST_RETRY_DEFAULT_CAP=1h\n",
     )
     .unwrap();
 
@@ -558,6 +567,8 @@ return M
     assert_eq!(cfg.queue.get("tick").unwrap().capacity, 31);
     assert_eq!(cfg.department.get("hello").unwrap().stall_window, "66h");
     assert_eq!(cfg.limits.global_codex_processes, 32);
+    assert_eq!(cfg.limits.global_department_child_processes, 9);
+    assert_eq!(cfg.limits.department_child_processes_per_dept, 3);
     let retry = cfg.department.get("hello").unwrap().retry.as_ref().unwrap();
     assert_eq!(retry.max_attempts, 8);
     assert_eq!(retry.base, "2m");

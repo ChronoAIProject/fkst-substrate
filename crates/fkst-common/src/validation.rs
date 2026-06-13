@@ -80,6 +80,16 @@ pub fn validate(cfg: &Config, project_root: &std::path::Path) -> Result<Vec<Stri
             "limits.global_codex_processes must be > 0".to_string(),
         ));
     }
+    if cfg.limits.global_department_child_processes == 0 {
+        return Err(FkstError::Schema(
+            "limits.global_department_child_processes must be > 0".to_string(),
+        ));
+    }
+    if cfg.limits.department_child_processes_per_dept == 0 {
+        return Err(FkstError::Schema(
+            "limits.department_child_processes_per_dept must be > 0".to_string(),
+        ));
+    }
 
     // Build set of declared queue names.
     let queues: std::collections::HashSet<&String> = cfg.queue.keys().collect();
@@ -387,6 +397,8 @@ mod tests {
             department: Default::default(),
             limits: LimitsDecl {
                 global_codex_processes: 1,
+                global_department_child_processes: 16,
+                department_child_processes_per_dept: 4,
             },
         };
         cfg.queue.insert(

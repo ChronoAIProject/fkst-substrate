@@ -62,6 +62,8 @@ struct HostGraphDefaults {
     queue_capacity: usize,
     department_default_stall_window: String,
     codex_permit_slots: usize,
+    department_child_process_limit: usize,
+    department_child_process_limit_per_dept: usize,
     retry: RetryDecl,
 }
 
@@ -76,6 +78,14 @@ impl HostGraphDefaults {
                 ConfigKey::DepartmentDefaultStallWindow,
             )?,
             codex_permit_slots: resolve_usize(&config, ConfigKey::CodexPermitSlots)?,
+            department_child_process_limit: resolve_usize(
+                &config,
+                ConfigKey::DepartmentChildProcessLimit,
+            )?,
+            department_child_process_limit_per_dept: resolve_usize(
+                &config,
+                ConfigKey::DepartmentChildProcessLimitPerDept,
+            )?,
             retry: resolve_retry_defaults(&config)?,
         })
     }
@@ -159,6 +169,8 @@ pub fn load_roots(roots: &PackageRoots) -> Result<Config> {
         department: departments,
         limits: LimitsDecl {
             global_codex_processes: defaults.codex_permit_slots,
+            global_department_child_processes: defaults.department_child_process_limit,
+            department_child_processes_per_dept: defaults.department_child_process_limit_per_dept,
         },
     })
 }

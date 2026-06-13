@@ -4,6 +4,7 @@ use fkst_common::validation::validate;
 use fkst_common::DurableLayout;
 use std::path::PathBuf;
 use std::sync::Arc;
+use tokio::sync::Semaphore;
 use tracing::{error, info, warn};
 
 use crate::path_resolver::PackageRoots;
@@ -111,6 +112,9 @@ pub async fn supervise(roots: PackageRoots, framework_bin: PathBuf) -> Result<()
     );
     delivery_watch::set_failure_fact_publisher(router.failure_fact_publisher());
     let codex_permit_slots = cfg.limits.global_codex_processes;
+    let global_department_child_processes =
+        Arc::new(Semaphore::new(cfg.limits.global_department_child_processes));
+    let department_child_processes_per_dept = cfg.limits.department_child_processes_per_dept;
     let process_groups = ProcessGroupRegistry::default();
     let mut handles = vec![];
 
@@ -141,6 +145,8 @@ pub async fn supervise(roots: PackageRoots, framework_bin: PathBuf) -> Result<()
                 delivery_store.clone(),
                 q_cap,
                 codex_permit_slots,
+                global_department_child_processes.clone(),
+                department_child_processes_per_dept,
                 process_groups.clone(),
                 journal.clone(),
             )
@@ -300,6 +306,8 @@ mod tests {
             department,
             limits: LimitsDecl {
                 global_codex_processes: 1,
+                global_department_child_processes: 16,
+                department_child_processes_per_dept: 4,
             },
         }
     }

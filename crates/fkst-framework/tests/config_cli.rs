@@ -8,6 +8,8 @@ const CONFIG_ENVS: &[&str] = &[
     "FKST_QUEUE_CAPACITY",
     "FKST_DEPARTMENT_DEFAULT_STALL_WINDOW",
     "FKST_CODEX_PERMIT_SLOTS",
+    "FKST_DEPARTMENT_CHILD_PROCESS_LIMIT",
+    "FKST_DEPARTMENT_CHILD_PROCESS_LIMIT_PER_DEPT",
     "FKST_RATE_POOL_ROOT",
     "FKST_RATE_POOL_GH",
     "FKST_RETRY_DEFAULT_MAX_ATTEMPTS",
@@ -52,7 +54,7 @@ fn config_reads_host_fkst_env_from_project_root_when_cwd_differs() {
     let cwd = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
     std::fs::write(
         host.path().join("fkst.env"),
-        "FKST_QUEUE_CAPACITY=31\nFKST_DEPARTMENT_DEFAULT_STALL_WINDOW=7m\nFKST_CODEX_PERMIT_SLOTS=9\nFKST_CANDIDATE_PREFIX=host-rc\nFKST_CANDIDATE_FROM_SEP=__from__\n",
+        "FKST_QUEUE_CAPACITY=31\nFKST_DEPARTMENT_DEFAULT_STALL_WINDOW=7m\nFKST_CODEX_PERMIT_SLOTS=9\nFKST_DEPARTMENT_CHILD_PROCESS_LIMIT=6\nFKST_DEPARTMENT_CHILD_PROCESS_LIMIT_PER_DEPT=2\nFKST_CANDIDATE_PREFIX=host-rc\nFKST_CANDIDATE_FROM_SEP=__from__\n",
     )
     .unwrap();
 
@@ -66,9 +68,16 @@ fn config_reads_host_fkst_env_from_project_root_when_cwd_differs() {
 
     assert_exit(&output, 0);
     let out = stdout(&output);
-    assert_eq!(out.lines().count(), 9, "{out}");
+    assert_eq!(out.lines().count(), 11, "{out}");
     assert!(out.contains("name=queue_capacity"), "{out}");
     assert!(out.contains("resolved=31 source=fkst.env"), "{out}");
+    assert!(out.contains("name=department_child_process_limit"), "{out}");
+    assert!(out.contains("resolved=6 source=fkst.env"), "{out}");
+    assert!(
+        out.contains("name=department_child_process_limit_per_dept"),
+        "{out}"
+    );
+    assert!(out.contains("resolved=2 source=fkst.env"), "{out}");
     assert!(out.contains("name=retry_default_max_attempts"), "{out}");
     assert!(out.contains("name=rate_pool_root"), "{out}");
     assert!(out.contains("resolved=5 source=default"), "{out}");
