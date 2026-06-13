@@ -924,6 +924,7 @@ async fn spawn_and_report_with_stdout_observer(
         "exit",
         &[
             ("dept", dept_name.to_string()),
+            ("pid", result.pid.to_string()),
             ("exit_code", result.exit_code.to_string()),
             ("elapsed_ms", result.elapsed_ms.to_string()),
             (
@@ -1515,6 +1516,7 @@ mod tests {
             .remove(0);
         let router = router_with_dead_letter(store.clone());
         let failure = DeliveryFailure::from_spawn_result(&SpawnResult {
+            pid: 42,
             exit_code: 124,
             stdout: String::new(),
             stderr: "codex timed out".to_string(),

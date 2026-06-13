@@ -204,7 +204,7 @@ queue 是包内命名空间。多 graph-root 组合时，裸 queue 名按 owner 
 | `Worktrees` | `<RT>/worktrees` | 隔离 worktree | `sdk_git::setup_worktree`(`git worktree add`) | `count_worktrees` / `list_orphan_worktrees` |
 | `CodexPermits` | `<RT>/codex-permits` | `permit-*` fcntl codex 并发池 | `sdk_codex`(建池 + flock 占位) | `spawn_codex` 抢 permit |
 | `Locks` | `<RT>/locks` | fcntl 锁文件 | `sdk_git::with_lock` | 同 — 跨 pipeline 互斥 |
-| `Logs` | `<RT>/logs` | 过程日志 | `supervise::spawner`(framework-child;dept `log.*` 经 stderr 捕获于此) | 人手 / 调试,非 file_watch 输入 |
+| `Logs` | `<RT>/logs` | 过程日志 | `supervise::supervisor_journal` 与 `supervise::spawner`(framework-child;dept `log.*` 经 stderr 捕获于此) | 人手 / 调试,非 file_watch 输入 |
 | `Marks` | `<RT>/marks` | per-key success marker | `sdk_mark::once` | `once` |
 | `Cache` | `<RT>/cache` | best-effort scratch KV | `sdk_cache::cache_set` | `sdk_cache::cache_get` |
 
@@ -213,6 +213,7 @@ queue 是包内命名空间。多 graph-root 组合时，裸 queue 名按 owner 
 - `RuntimeLayout` 只提供固定 runtime dir 解析，framework 先把相对 runtime root 锚到 `<HOST>` 再建路径。
 - `with_lock`、`once` 与 `cache` 共用 runtime key 合约：key / name 必须是非空相对 filesystem path，`/` 表示目录；每个 segment 非空、匹配 `[A-Za-z0-9._-]+`，且不是 `.` 或 `..`；禁止 leading / trailing `/`、`//`、反斜杠、NUL 与绝对路径。校验后的 key 直接 join 到 `<RT>/{locks,marks,cache}/<key>`，形成可人工浏览的目录树，不做 byte hex 编码。`locks/once/` 是 `once` 内部锁的保留子目录，不属于 `with_lock` 用户锁命名空间。
 - `file_watch` 只接受 host-root 相对或绝对 glob；不支持 runtime scheme。
+- supervisor journal 落在 `<RT>/logs/supervisor/supervisor-<start-ts>.log`，每个 `fkst-framework supervise` generation 一份，记录 `startup`、`signal`、`shutdown`、`raiser_fire`、`publish`、`deliver`、`lease`、`ack`、`retry`、`dead_letter`、`redrive`、`spawn`、`spawn_error`、`exit` 等 engine-owned lifecycle 与 delivery 事件。格式是一行一个 `key="value"` event；它是可 grep 的 process-trace scratch，不是事实源。打开新 generation log 前会用与 codex log 相同的 `FKST_CODEX_LOG_MAX_AGE` / `FKST_CODEX_LOG_MAX_BYTES` policy best-effort 修剪旧 supervisor `.log` 文件；当前 generation log 永远豁免，删除或扫描失败只写 warning。
 - codex log **不属** `RuntimeKind`/`<RT>`:`sdk_codex` 把它落到 `FKST_RUNTIME_LOG_DIR` 或平台默认目录(如 `~/Library/Logs/fkst`)下的 `codex/`。它与 `<RT>/logs` 同属 process-trace scratch(可 grep、非事实源),但落点不同,`supervise` 也不给 framework child 注入 `FKST_RUNTIME_LOG_DIR`。每次 `spawn_codex_sync` / `spawn_codex` 会在写入本次 log 前 best-effort 修剪同一个 `codex/` 目录中的旧 `.log` 文件：`FKST_CODEX_LOG_MAX_AGE` 默认 `48h`，`0` 或空值表示关闭年龄修剪；`FKST_CODEX_LOG_MAX_BYTES` 为空或 `0` 表示不启用容量上限，启用时优先删除最旧 log；当前请求的 log path 永远豁免，删除或扫描失败只写 warning。
 - engine **不写** runtime 持久状态；accepted-state / rollback 是外部 release pipeline 的事实，见 §13。
 
@@ -243,7 +244,7 @@ Fanout::send(raised.queue, raised_event)
 
 Department 收到的标准事件是 `Event{queue,payload,ts}`，其中 `ts` 是 Unix 毫秒。
 
-`consumer.rs` 为每个 Department 的每个 consumed queue 建 receiver，再汇入该 Department 的 inbox。每个事件 spawn 一个 framework child，不是在 supervisor 进程内直接调用 Lua。framework child 的 stdout/stderr 会写到 `<RT>/logs/framework-child/` 下的具名 log；dept 的 `log.*` 以结构化行写 stderr，并由这个具名 log 捕获。RAISED 解析不依赖 log 文件，而是解析 captured stdout。
+`consumer.rs` 为每个 Department 的每个 consumed queue 建 receiver，再汇入该 Department 的 inbox。每个事件 spawn 一个 framework child，不是在 supervisor 进程内直接调用 Lua。framework child 的 stdout/stderr 会写到 `<RT>/logs/framework-child/` 下的具名 log；supervise 自身的 delivery / spawn / shutdown journal 会写到 `<RT>/logs/supervisor/` 下的 per-generation log。dept 的 `log.*` 以结构化行写 stderr，并由 framework-child 具名 log 捕获。RAISED 解析不依赖 log 文件，而是解析 captured stdout。
 
 `raise` 不落盘。它通过 `LuaSerdeExt` 的 `lua.from_value` 将 Lua payload 转为 JSON 后进入 stdout `RAISED:` 协议。bare Lua empty table 没有数组 / 对象意图标记，序列化为 JSON object `{}`；由 `json.decode("[]")` 构造的 array-tagged empty table 会保持为 JSON array `[]`。需要可能为空的数组字段时，package 必须显式构造 array-tagged table；engine 不根据字段名或 schema 推断空表形态。
 
