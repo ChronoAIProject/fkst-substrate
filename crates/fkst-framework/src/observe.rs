@@ -3,6 +3,9 @@ use crate::supervise::delivery_store::{
 };
 use anyhow::{Context, Result};
 use fkst_common::DurableLayout;
+use serde::{Deserialize, Serialize};
+use std::io::{BufReader, Read, Write};
+use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -53,23 +56,95 @@ pub(crate) fn parse_args(args: &[String]) -> Result<ObserveOptions> {
 }
 
 pub(crate) fn run(options: ObserveOptions) -> Result<i32> {
-    let layout = DurableLayout::new(options.durable_root)?;
+    let layout = DurableLayout::new(&options.durable_root)?;
     let database = layout.delivery_db_path();
-    let store = DeliveryStore::open_existing(&database)?;
-    let snapshot = store.observe_snapshot(
-        layout.durable_root(),
-        &database,
-        &DeliveryObserveOptions {
-            now_ms: now_ms(),
-            limit: options.limit,
-        },
-    )?;
+    let snapshot = match request_live_snapshot(&layout, options.limit)? {
+        Some(snapshot) => Ok(snapshot),
+        None => {
+            let store = DeliveryStore::open_existing(&database)?;
+            store.observe_snapshot(
+                layout.durable_root(),
+                &database,
+                &DeliveryObserveOptions {
+                    now_ms: now_ms(),
+                    limit: options.limit,
+                },
+            )
+        }
+    }?;
     if options.json {
         println!("{}", serde_json::to_string_pretty(&snapshot)?);
     } else {
         print_human(&snapshot);
     }
     Ok(0)
+}
+
+pub(crate) fn socket_path(layout: &DurableLayout) -> PathBuf {
+    layout.observe_socket_path()
+}
+
+pub(crate) fn request_live_snapshot(
+    layout: &DurableLayout,
+    limit: usize,
+) -> Result<Option<DeliveryObserveSnapshot>> {
+    let path = socket_path(layout);
+    if !path.exists() {
+        return Ok(None);
+    }
+    let mut stream = match UnixStream::connect(&path) {
+        Ok(stream) => stream,
+        Err(err) if is_absent_socket_error(&err) => return Ok(None),
+        Err(err) => {
+            return Err(err)
+                .with_context(|| format!("connect live observe socket `{}`", path.display()))
+        }
+    };
+    let request = ObserveSocketRequest {
+        limit,
+        now_ms: now_ms(),
+    };
+    serde_json::to_writer(&mut stream, &request)?;
+    stream.write_all(b"\n")?;
+    stream.flush()?;
+
+    let mut response = String::new();
+    BufReader::new(stream).read_to_string(&mut response)?;
+    if response.trim().is_empty() {
+        anyhow::bail!("live observe socket returned an empty response");
+    }
+    let response: ObserveSocketResponse = serde_json::from_str(&response).with_context(|| {
+        format!(
+            "decode live observe socket response from `{}`",
+            path.display()
+        )
+    })?;
+    match response {
+        ObserveSocketResponse::Ok { snapshot } => Ok(Some(snapshot)),
+        ObserveSocketResponse::Err { error } => {
+            anyhow::bail!("live observe socket failed: {error}")
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub(crate) struct ObserveSocketRequest {
+    pub(crate) limit: usize,
+    pub(crate) now_ms: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub(crate) enum ObserveSocketResponse {
+    Ok { snapshot: DeliveryObserveSnapshot },
+    Err { error: String },
+}
+
+fn is_absent_socket_error(err: &std::io::Error) -> bool {
+    matches!(
+        err.kind(),
+        std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+    )
 }
 
 fn print_human(snapshot: &DeliveryObserveSnapshot) {

@@ -14,7 +14,7 @@ use super::delivery_types::{DeadRecord, DeliveryRecord, RedrivePolicy, RetryPoli
 use super::delivery_watch::StoreOpWatch;
 use anyhow::{bail, Context, Result};
 use redb::{Database, ReadableTable, TableDefinition};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
@@ -61,7 +61,7 @@ pub(crate) struct DeliveryObserveOptions {
     pub(crate) limit: usize,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub(crate) struct DeliveryObserveSnapshot {
     pub(crate) schema_version: u32,
     pub(crate) generated_at_ms: u64,
@@ -73,27 +73,27 @@ pub(crate) struct DeliveryObserveSnapshot {
     pub(crate) dead_letters: Vec<DeadLetterObserveEntry>,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub(crate) struct DeliveryObserveSource {
     pub(crate) durable_root: String,
     pub(crate) database: String,
-    pub(crate) read_semantics: &'static str,
-    pub(crate) history_semantics: &'static str,
+    pub(crate) read_semantics: String,
+    pub(crate) history_semantics: String,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub(crate) struct DeliveryObserveLimits {
     pub(crate) max_deliveries: usize,
     pub(crate) max_dead_letters: usize,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
 pub(crate) struct DeliveryObserveTruncated {
     pub(crate) deliveries: bool,
     pub(crate) dead_letters: bool,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub(crate) struct QueueObserveState {
     pub(crate) queue: String,
     pub(crate) depth: usize,
@@ -103,7 +103,7 @@ pub(crate) struct QueueObserveState {
     pub(crate) oldest_pending_age_ms: Option<u64>,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub(crate) struct DeliveryObserveEntry {
     pub(crate) delivery_id: String,
     pub(crate) queue: String,
@@ -121,7 +121,7 @@ pub(crate) struct DeliveryObserveEntry {
     pub(crate) last_error_excerpt: Option<String>,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub(crate) struct DeadLetterObserveEntry {
     pub(crate) delivery_id: String,
     pub(crate) queue: String,
@@ -138,7 +138,7 @@ pub(crate) struct DeadLetterObserveEntry {
     pub(crate) error_excerpt: Option<String>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub(crate) enum DeliveryObserveStatus {
     Pending,
@@ -146,7 +146,7 @@ pub(crate) enum DeliveryObserveStatus {
     Retrying,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub(crate) struct PayloadObserveSummary {
     pub(crate) schema: Option<String>,
     pub(crate) dedup_key: Option<String>,
@@ -648,9 +648,11 @@ impl DeliveryStore {
                 durable_root: durable_root.display().to_string(),
                 database: database.display().to_string(),
                 read_semantics:
-                    "single read transaction over the last committed redb snapshot after opening the database",
+                    "single read transaction over the owner redb handle for live supervise snapshots or over an offline database open"
+                        .to_string(),
                 history_semantics:
-                    "delivery queue snapshot only; acked deliveries are removed and historical timelines require a journal",
+                    "delivery queue snapshot only; acked deliveries are removed and historical timelines require a journal"
+                        .to_string(),
             },
             limits: DeliveryObserveLimits {
                 max_deliveries: options.limit,

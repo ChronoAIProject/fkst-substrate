@@ -20,6 +20,7 @@ pub mod event_fanout;
 pub(crate) mod failure_fact;
 pub(crate) mod graph_scan;
 mod journal;
+mod observe_server;
 mod raised;
 pub(crate) mod source_runner;
 mod spawner;
@@ -32,6 +33,7 @@ use delivery_store::DeliveryStore;
 use event_fanout::Fanout;
 use failure_fact::schema_validation_failure_fact;
 use journal::SupervisorJournal;
+use observe_server::ObserveEndpoint;
 use source_runner::{spawn_cron, spawn_file_watch};
 
 pub(crate) fn load_host_graph_for_conformance(roots: &PackageRoots) -> Result<Config> {
@@ -103,7 +105,8 @@ pub async fn supervise(roots: PackageRoots, framework_bin: PathBuf) -> Result<()
     }
 
     let fanout = Fanout::new();
-    let delivery_store = delivery_store_for_config(&cfg)?;
+    let delivery = delivery_store_for_config(&cfg)?;
+    let delivery_store = delivery.store.clone();
     let router = DeliveryRouter::new(
         &cfg,
         fanout.clone(),
@@ -118,6 +121,12 @@ pub async fn supervise(roots: PackageRoots, framework_bin: PathBuf) -> Result<()
         config_context.resolved_positive_usize(ConfigKey::DurableAdmissionBurstPerDept)?;
     let process_groups = ProcessGroupRegistry::default();
     let mut handles = vec![];
+    if let Some(store) = delivery.store.as_ref() {
+        handles.push(observe_server::spawn_observe_server(
+            delivery.observe_endpoint.clone(),
+            store.clone(),
+        )?);
+    }
 
     let mut departments = cfg.department.iter().collect::<Vec<_>>();
     departments.sort_by(|(left, _), (right, _)| left.cmp(right));
@@ -222,24 +231,35 @@ async fn shutdown_runtime(
     journal.event("teardown_step", [("step", "complete".to_string())]);
 }
 
-fn delivery_store_for_config(cfg: &Config) -> Result<Option<Arc<DeliveryStore>>> {
+#[derive(Clone)]
+struct DeliveryStoreHandle {
+    store: Option<Arc<DeliveryStore>>,
+    observe_endpoint: ObserveEndpoint,
+}
+
+fn delivery_store_for_config(cfg: &Config) -> Result<DeliveryStoreHandle> {
     if !DeliveryRouter::has_reliable_subscriptions(cfg) {
-        return Ok(None);
+        return Ok(DeliveryStoreHandle {
+            store: None,
+            observe_endpoint: ObserveEndpoint::default(),
+        });
     }
     let durable = DurableLayout::from_env().map_err(|e| {
         error!(error = %e, "durable layout required for reliable subscriptions");
         e
     })?;
-    Ok(Some(Arc::new(DeliveryStore::open(
-        durable.delivery_db_path(),
-    )?)))
+    let database = durable.delivery_db_path();
+    Ok(DeliveryStoreHandle {
+        store: Some(Arc::new(DeliveryStore::open(&database)?)),
+        observe_endpoint: observe_server::endpoint_for_layout(&durable),
+    })
 }
 
 fn publish_startup_validation_failure(cfg: &Config, error: &str) {
     let fact = schema_validation_failure_fact(error);
     let fanout = Fanout::new();
     let store = match delivery_store_for_config(cfg) {
-        Ok(store) => store,
+        Ok(handle) => handle.store,
         Err(err) => {
             warn!(error = %err, "startup failure fact store unavailable");
             None
@@ -351,7 +371,10 @@ mod tests {
         let _lock = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
         let _guard = EnvGuard::unset();
 
-        assert!(delivery_store_for_config(&config(true)).unwrap().is_none());
+        assert!(delivery_store_for_config(&config(true))
+            .unwrap()
+            .store
+            .is_none());
     }
 
     #[tokio::test]
