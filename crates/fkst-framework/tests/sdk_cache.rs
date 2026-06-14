@@ -39,7 +39,7 @@ fn register_for_host_with_clock(lua: &Lua, host_root: &Path, now: Arc<AtomicU64>
 }
 
 fn cache_path(runtime: &Path, key: &str) -> std::path::PathBuf {
-    runtime.join("cache").join(key)
+    runtime.join("cache").join(key).join("=value")
 }
 
 fn assert_cache_file_value(path: &Path, expected: &str) {
@@ -115,9 +115,43 @@ fn cache_set_then_get_uses_readable_hierarchical_path() {
 
     let path = runtime
         .path()
-        .join("cache/github-proxy/issue/owner/repo/42");
+        .join("cache/github-proxy/issue/owner/repo/42/=value");
     assert_eq!(value, "payload");
     assert_cache_file_value(&path, "payload");
+}
+
+#[test]
+fn cache_allows_prefix_extended_keys() {
+    let lua = Lua::new();
+    let host = tempdir().unwrap();
+    let runtime = tempdir().unwrap();
+    register_for_host(&lua, host.path());
+
+    let (first, second): (String, String) = in_sandbox(
+        host.path(),
+        |sandbox| {
+            sandbox.runtime_root(runtime.path());
+        },
+        || {
+            lua.load(
+                r#"
+                cache_set("a/b/c", "first")
+                cache_set("a/b/c/d", "second")
+                return cache_get("a/b/c"), cache_get("a/b/c/d")
+                "#,
+            )
+            .eval()
+            .unwrap()
+        },
+    );
+
+    assert_eq!(first, "first");
+    assert_eq!(second, "second");
+    let first_path = cache_path(runtime.path(), "a/b/c");
+    let second_path = cache_path(runtime.path(), "a/b/c/d");
+    assert_ne!(first_path, second_path);
+    assert_cache_file_value(&first_path, "first");
+    assert_cache_file_value(&second_path, "second");
 }
 
 #[test]

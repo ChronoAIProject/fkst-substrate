@@ -11,5 +11,8 @@ pub use config::Config;
 pub use durable_layout::{DurableLayout, DURABLE_ROOT_ENV};
 pub use error::FkstError;
 pub use event::Event;
-pub use runtime_layout::{RuntimeKind, RuntimeLayout};
+pub use runtime_layout::{
+    runtime_key_file, RuntimeKind, RuntimeLayout, RUNTIME_LOCK_LEAF, RUNTIME_MARK_LEAF,
+    RUNTIME_VALUE_LEAF,
+};
 pub use validation::validate_runtime_key;

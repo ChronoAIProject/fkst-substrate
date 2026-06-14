@@ -4,6 +4,9 @@ use anyhow::{anyhow, Result};
 use std::path::{Component, Path, PathBuf};
 
 pub const RUNTIME_ROOT_ENV: &str = "FKST_RUNTIME_ROOT";
+pub const RUNTIME_LOCK_LEAF: &str = "=lock";
+pub const RUNTIME_MARK_LEAF: &str = "=mark";
+pub const RUNTIME_VALUE_LEAF: &str = "=value";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 // runtime path categories are explicit and bounded before path construction.
@@ -60,6 +63,10 @@ impl RuntimeLayout {
     pub fn runtime_dir(&self, kind: RuntimeKind) -> PathBuf {
         self.root.join(kind.dir_name())
     }
+}
+
+pub fn runtime_key_file(base: &Path, key: &str, leaf: &str) -> PathBuf {
+    base.join(key).join(leaf)
 }
 
 fn reject_traversal(path: &Path) -> Result<()> {

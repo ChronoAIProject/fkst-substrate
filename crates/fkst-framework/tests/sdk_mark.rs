@@ -60,7 +60,7 @@ fn once_runs_first_time_and_writes_marker() {
     let marker = std::fs::read_to_string(
         runtime
             .path()
-            .join("marks/github-proxy/issue/owner/repo/42"),
+            .join("marks/github-proxy/issue/owner/repo/42/=mark"),
     )
     .unwrap();
     assert!(
@@ -70,8 +70,43 @@ fn once_runs_first_time_and_writes_marker() {
     assert!(marker.ends_with("Z\n"), "{marker}");
     assert!(runtime
         .path()
-        .join("locks/once/github-proxy/issue/owner/repo/42")
+        .join("locks/once/github-proxy/issue/owner/repo/42/=lock")
         .exists());
+}
+
+#[test]
+fn once_allows_prefix_extended_keys() {
+    let lua = Lua::new();
+    let host = tempdir().unwrap();
+    let runtime = tempdir().unwrap();
+    register_for_host(&lua, host.path());
+
+    let (first, second, count): (bool, bool, i64) = in_sandbox(
+        host.path(),
+        |sandbox| {
+            sandbox.runtime_root(runtime.path());
+        },
+        || {
+            lua.load(
+                r#"
+                local count = 0
+                local first = once("a/b/c", function() count = count + 1 end)
+                local second = once("a/b/c/d", function() count = count + 10 end)
+                return first, second, count
+                "#,
+            )
+            .eval()
+            .unwrap()
+        },
+    );
+
+    assert!(first);
+    assert!(second);
+    assert_eq!(count, 11);
+    assert!(runtime.path().join("locks/once/a/b/c/=lock").exists());
+    assert!(runtime.path().join("locks/once/a/b/c/d/=lock").exists());
+    assert!(runtime.path().join("marks/a/b/c/=mark").exists());
+    assert!(runtime.path().join("marks/a/b/c/d/=mark").exists());
 }
 
 #[test]
@@ -133,7 +168,7 @@ fn once_error_does_not_write_marker_and_subsequent_call_retries() {
     assert!(err.to_string().contains("intentional once failure"));
     assert!(!runtime
         .path()
-        .join("marks/github-proxy/issue/owner/repo/42")
+        .join("marks/github-proxy/issue/owner/repo/42/=mark")
         .exists());
 
     let (ran, count): (bool, i64) = in_sandbox(
@@ -159,7 +194,7 @@ fn once_error_does_not_write_marker_and_subsequent_call_retries() {
     let marker = std::fs::read_to_string(
         runtime
             .path()
-            .join("marks/github-proxy/issue/owner/repo/42"),
+            .join("marks/github-proxy/issue/owner/repo/42/=mark"),
     )
     .unwrap();
     assert!(

@@ -6,7 +6,9 @@
 //! - count_worktrees()          -- count linked worktrees excluding main checkout
 //! - list_orphan_worktrees(pfx) -- list <runtime>/worktrees/<pfx>* linked worktree paths
 
-use fkst_common::{validate_runtime_key, RuntimeKind, RuntimeLayout};
+use fkst_common::{
+    runtime_key_file, validate_runtime_key, RuntimeKind, RuntimeLayout, RUNTIME_LOCK_LEAF,
+};
 use mlua::{Function, Lua, Result};
 use nix::fcntl::{flock, FlockArg};
 use std::os::fd::AsRawFd;
@@ -64,10 +66,15 @@ fn register_with_lock(lua: &Lua, host_root: PathBuf) -> Result<()> {
                     "with_lock name '{name}' uses reserved lock namespace 'once'"
                 )));
             }
+            if name == "cache" || name.starts_with("cache/") {
+                return Err(mlua::Error::external(anyhow::anyhow!(
+                    "with_lock name '{name}' uses reserved lock namespace 'cache'"
+                )));
+            }
             let layout = runtime_context::layout_from_host_root(&host_root)
                 .map_err(mlua::Error::external)?;
             let locks = layout.runtime_dir(RuntimeKind::Locks);
-            let path = locks.join(name);
+            let path = runtime_key_file(&locks, name, RUNTIME_LOCK_LEAF);
             let parent = path.parent().ok_or_else(|| {
                 mlua::Error::external(anyhow::anyhow!(
                     "with_lock target '{}' has no parent",

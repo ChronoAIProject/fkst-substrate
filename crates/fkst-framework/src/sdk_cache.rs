@@ -1,6 +1,8 @@
 //! SDK: best-effort host-local scratch key-value cache.
 
-use fkst_common::{validate_runtime_key, RuntimeKind};
+use fkst_common::{
+    runtime_key_file, validate_runtime_key, RuntimeKind, RUNTIME_LOCK_LEAF, RUNTIME_VALUE_LEAF,
+};
 use mlua::{Lua, Result};
 use nix::fcntl::{flock, FlockArg};
 use std::fs::{File, OpenOptions};
@@ -71,7 +73,11 @@ fn cache_set(
     let _lock = acquire_cache_lock(host_root, key)?;
     let layout =
         runtime_context::layout_from_host_root(host_root).map_err(mlua::Error::external)?;
-    let target = layout.runtime_dir(RuntimeKind::Cache).join(key);
+    let target = runtime_key_file(
+        &layout.runtime_dir(RuntimeKind::Cache),
+        key,
+        RUNTIME_VALUE_LEAF,
+    );
     let parent = target.parent().ok_or_else(|| {
         mlua::Error::external(anyhow::anyhow!(
             "cache target '{}' has no parent",
@@ -104,7 +110,11 @@ fn cache_get(host_root: &Path, key: String, clock: &Clock) -> Result<Option<Vec<
     let _lock = acquire_cache_lock(host_root, key)?;
     let layout =
         runtime_context::layout_from_host_root(host_root).map_err(mlua::Error::external)?;
-    let target = layout.runtime_dir(RuntimeKind::Cache).join(key);
+    let target = runtime_key_file(
+        &layout.runtime_dir(RuntimeKind::Cache),
+        key,
+        RUNTIME_VALUE_LEAF,
+    );
     match std::fs::read(&target) {
         Ok(raw) => match decode_entry(&raw) {
             Some((Some(expires_at), _)) if clock() >= expires_at => {
@@ -123,17 +133,19 @@ fn cache_expire(host_root: &Path, key: String) -> Result<()> {
     let _lock = acquire_cache_lock(host_root, key)?;
     let layout =
         runtime_context::layout_from_host_root(host_root).map_err(mlua::Error::external)?;
-    let target = layout.runtime_dir(RuntimeKind::Cache).join(key);
+    let target = runtime_key_file(
+        &layout.runtime_dir(RuntimeKind::Cache),
+        key,
+        RUNTIME_VALUE_LEAF,
+    );
     remove_cache_file(&target)
 }
 
 fn acquire_cache_lock(host_root: &Path, key: &str) -> Result<File> {
     let layout =
         runtime_context::layout_from_host_root(host_root).map_err(mlua::Error::external)?;
-    let path = layout
-        .runtime_dir(RuntimeKind::Locks)
-        .join("cache")
-        .join(key);
+    let cache_locks = layout.runtime_dir(RuntimeKind::Locks).join("cache");
+    let path = runtime_key_file(&cache_locks, key, RUNTIME_LOCK_LEAF);
     let parent = path.parent().ok_or_else(|| {
         mlua::Error::external(anyhow::anyhow!(
             "cache lock target '{}' has no parent",
