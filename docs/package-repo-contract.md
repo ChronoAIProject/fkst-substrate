@@ -46,7 +46,8 @@ await_all(handles)
 with_lock(name, fn)
 once(key, fn)
 cache_get(key)
-cache_set(key, value)
+cache_set(key, value[, ttl_seconds])
+cache_expire(key)
 truncate_utf8(s, max_bytes)
 graph_json()
 t(key[, vars])
@@ -167,7 +168,7 @@ Event { queue, payload, ts }
 
 ## 5. Runtime key contract
 
-`once(key, fn)`、`cache_get(key)`、`cache_set(key, value)` 与 `with_lock(name, fn)` 使用同一 runtime key 合约。key / name 必须是可读的相对 filesystem path，不是 hex 编码。
+`once(key, fn)`、`cache_get(key)`、`cache_set(key, value[, ttl_seconds])`、`cache_expire(key)` 与 `with_lock(name, fn)` 使用同一 runtime key 合约。key / name 必须是可读的相对 filesystem path，不是 hex 编码。
 
 规则：非空；相对路径；允许 `/` 表示目录；每个 segment 非空、最长 255 bytes、只含 `[A-Za-z0-9._-]`，且不能是全点 segment；禁止 leading `/`、trailing `/`、`//`、反斜杠、NUL 和绝对路径。校验后的 key 直接 join 到 `<RT>/locks`、`<RT>/marks` 或 `<RT>/cache`。
 

@@ -65,7 +65,7 @@ pub(crate) static BOUNDARY_RESOURCE_REGISTRY: &[BoundaryResourceEntry] = &[
     BoundaryResourceEntry {
         id: "runtime.filesystem",
         resource_type: "storage",
-        adapters: "RuntimeLayout,file,with_lock,once,cache_set,cache_get,setup_worktree",
+        adapters: "RuntimeLayout,file,with_lock,once,cache_set,cache_get,cache_expire,setup_worktree",
         grant: "RuntimeLayout path mediation and runtime-key validation",
         meter: "host filesystem inspection under declared runtime directories",
         budget: "host filesystem posture; RuntimeLayout confines engine scratch",
