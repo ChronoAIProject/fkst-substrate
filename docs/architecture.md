@@ -199,7 +199,7 @@ queue 是包内命名空间。多 graph-root 组合时，裸 queue 名按 owner 
 
 ## 6. Runtime I/O 与落点
 
-`RuntimeKind` 固定 6 类。它们都是 runtime scratch 落点；`Marks` 只承载 `once` success marker，`Cache` 只承载 `cache_get` / `cache_set` 的 best-effort scratch KV。marker 和 cache 可以跨 tick 保留以减少重复执行或重复计算，但它们和 locks / permits 一样不是 durable 真相、不是 package 状态层、业务 schema、accepted-state 或 rollback state。可靠 delivery 状态不在 `<RT>`，而在 `FKST_DURABLE_ROOT` 下的 redb delivery store。`<RT>` 表示引擎 runtime root，相对值会锚到 `<HOST>`。
+`RuntimeKind` 固定 6 类。它们都是 runtime scratch 落点；`Marks` 只承载 `once` success marker，`Cache` 只承载 `cache_get` / `cache_set` / `cache_expire` 的 best-effort scratch KV。marker 和 cache 可以跨 tick 保留以减少重复执行或重复计算，但它们和 locks / permits 一样不是 durable 真相、不是 package 状态层、业务 schema、accepted-state 或 rollback state。可靠 delivery 状态不在 `<RT>`，而在 `FKST_DURABLE_ROOT` 下的 redb delivery store。`<RT>` 表示引擎 runtime root，相对值会锚到 `<HOST>`。
 
 | RuntimeKind | 落点 | 用途 | 写入者(engine) | 读取者 |
 |---|---|---|---|---|
@@ -208,12 +208,12 @@ queue 是包内命名空间。多 graph-root 组合时，裸 queue 名按 owner 
 | `Locks` | `<RT>/locks` | fcntl 锁文件 | `sdk_git::with_lock` | 同 — 跨 pipeline 互斥 |
 | `Logs` | `<RT>/logs` | 过程日志 | `supervise::spawner`(framework-child;dept `log.*` 经 stderr 捕获于此) | 人手 / 调试,非 file_watch 输入 |
 | `Marks` | `<RT>/marks` | per-key success marker | `sdk_mark::once` | `once` |
-| `Cache` | `<RT>/cache` | best-effort scratch KV | `sdk_cache::cache_set` | `sdk_cache::cache_get` |
+| `Cache` | `<RT>/cache` | best-effort scratch KV with optional ttl | `sdk_cache::cache_set` / `sdk_cache::cache_expire` | `sdk_cache::cache_get` |
 
 说明:
 - **engine 自己只写 scratch 结构事实**(worktree / permit / lock / log / mark / cache)。package 不访问 `<RT>`，也不把 `<RT>` 当 inbox、完成态或业务 schema 数据库。
 - `RuntimeLayout` 只提供固定 runtime dir 解析，framework 先把相对 runtime root 锚到 `<HOST>` 再建路径。
-- `with_lock`、`once` 与 `cache` 共用 runtime key 合约：key / name 必须是非空相对 filesystem path，`/` 表示目录；每个 segment 非空、匹配 `[A-Za-z0-9._-]+`，且不是 `.` 或 `..`；禁止 leading / trailing `/`、`//`、反斜杠、NUL 与绝对路径。校验后的 key 直接 join 到 `<RT>/{locks,marks,cache}/<key>`，形成可人工浏览的目录树，不做 byte hex 编码。`locks/once/` 是 `once` 内部锁的保留子目录，不属于 `with_lock` 用户锁命名空间。
+- `with_lock`、`once` 与 `cache` 共用 runtime key 合约：key / name 必须是非空相对 filesystem path，`/` 表示目录；每个 segment 非空、最长 255 bytes、匹配 `[A-Za-z0-9._-]+`，且不是全点 segment（如 `.` / `..` / `...`）；禁止 leading / trailing `/`、`//`、反斜杠、NUL 与绝对路径。校验后的 key 直接 join 到 `<RT>/{locks,marks,cache}/<key>`，形成可人工浏览的目录树，不做 byte hex 编码。`locks/once/` 是 `once` 内部锁的保留子目录，不属于 `with_lock` 用户锁命名空间。
 - `file_watch` 只接受 host-root 相对或绝对 glob；不支持 runtime scheme。
 - codex log **不属** `RuntimeKind`/`<RT>`:`sdk_codex` 把它落到 `FKST_RUNTIME_LOG_DIR` 或平台默认目录(如 `~/Library/Logs/fkst`)下的 `codex/`。它与 `<RT>/logs` 同属 process-trace scratch(可 grep、非事实源),但落点不同,`supervise` 也不给 framework child 注入 `FKST_RUNTIME_LOG_DIR`。每次 `spawn_codex_sync` / `spawn_codex` 会在写入本次 log 前 best-effort 修剪同一个 `codex/` 目录中的旧 `.log` 文件：`FKST_CODEX_LOG_MAX_AGE` 默认 `48h`，`0` 或空值表示关闭年龄修剪；`FKST_CODEX_LOG_MAX_BYTES` 为空或 `0` 表示不启用容量上限，启用时优先删除最旧 log；当前请求的 log path 永远豁免，删除或扫描失败只写 warning。
 - `spawn_codex_sync` 带 `worktree` 时会把 prompt、stdout、stderr 与 completion status 落到 writable runtime-scratch dir `<runtime-log-root>/codex-adoption/<key>/`，`key` 由可选 `dedup_key`、`worktree` 与 prompt/context identity 派生，并通过一次性 detached `fkst-framework __codex-worker` 执行真实 `codex exec`。同一 work unit 的重投递先检查该 handoff：completed 则读取结果，running 则等待同一 worker 完成，不再次 spawn `codex`；不同 worktree 即使使用相同 `dedup_key`、prompt 和 context 也不互相 adopt，同一 worktree 下不同 `dedup_key` 或 prompt/context 也不互相 adopt。该目录属于 RuntimeLayout scratch 之外的 process-trace scratch，用于 supervisor generation 间 adoption；它不写入 worktree，不承载 package business schema、accepted-state 或 rollback state。无 `worktree` 的 `spawn_codex_sync` 保持 pipe/wait 语义。
@@ -281,8 +281,9 @@ engine 维护 durable 在途 delivery state，但它不是实体业务真相、a
 | `exec_sync(cmd|opts)` | `sdk_basic.rs`，运行 `/bin/sh -c`，可选 cwd/env/timeout |
 | `with_lock(name, fn)` | `sdk_git.rs`，fcntl exclusive flock |
 | `once(key, fn)` | `sdk_mark.rs`，locked per-key marker，成功后写入 scratch marker |
-| `cache_set(key, value)` | `sdk_cache.rs`，best-effort scratch KV 原子覆盖写 |
-| `cache_get(key)` | `sdk_cache.rs`，best-effort scratch KV 读取，缺失返回 nil |
+| `cache_set(key, value[, ttl_seconds])` | `sdk_cache.rs`，best-effort scratch KV 原子覆盖写，支持可选 expiry metadata |
+| `cache_get(key)` | `sdk_cache.rs`，best-effort scratch KV 读取，缺失 / 过期 / malformed / unreadable 返回 nil |
+| `cache_expire(key)` | `sdk_cache.rs`，best-effort scratch KV 显式删除，缺失视为成功 |
 | `graph_json()` | `sdk_graph.rs`，只读 composed graph JSON snapshot |
 | `git_log_count(grep, since)` | `sdk_git.rs`，调用 `git log --grep --since --oneline` |
 | `git_log_grep(grep, since)` | `sdk_git.rs`，调用 `git log --format=%H` |
@@ -335,7 +336,7 @@ Codex SDK 也把 `codex exec` 放入 process group。`spawn_codex_sync` 与 `spa
 
 `once` 决策通过 engine log 观察：`once decision=skip-marked key=...` 与 `once decision=ran-marked key=...` 提供可 grep trail。marker 内容只含人工提示（`key`、`marked_at`），不被解析；LIVE lock holder 用 `lsof <RT>/locks/once/<key>` 查看。
 
-`cache_set(key, value)` / `cache_get(key)` 是 best-effort scratch KV primitive。它们把校验后的 key 作为相对路径读写 `<RT>/cache/<key>`；`cache_set` 用 temp file + rename 原子覆盖写入 string value，`cache_get` 命中返回 string，缺失返回 nil。cache 是 host-local scratch，不是 durable state；runtime root 被清空或换 host 后，`cache_get` 返回 nil，调用者必须从 durable source 重新推导。cache 操作内部不加锁，last-writer-wins；需要 read-compare-write 原子性时由调用者外层使用 `with_lock`。
+`cache_set(key, value[, ttl_seconds])` / `cache_get(key)` / `cache_expire(key)` 是 best-effort scratch KV primitive。它们把校验后的 key 作为相对路径读写 `<RT>/cache/<key>`；`cache_set` 用 temp file + rename 原子覆盖写入带 expiry metadata 的 byte-exact string value，`ttl_seconds` 缺省或 nil 表示不过期，正数表示按 wall-clock deadline 过期；`cache_get` 命中返回 string，缺失、过期、malformed 或 unreadable 时返回 nil，过期文件会 best-effort lazy evict；`cache_expire` 显式删除 key，缺失视为成功。`cache_set`、`cache_get` 与 `cache_expire` 都使用 per-key flock 串行化单个 key 的文件操作。cache 是 host-local scratch，不是 durable state；runtime root 被清空或换 host 后，`cache_get` 返回 nil，调用者必须从 durable source 重新推导；需要 read-compare-write 原子性时由调用者外层使用 `with_lock`。
 
 ## 12. Git 与 Worktree Primitives
 
