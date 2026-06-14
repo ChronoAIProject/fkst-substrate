@@ -28,7 +28,7 @@ use sdk_codex::{
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 use support::process_sandbox::ProcessSandbox;
 
 const DEFAULT_CODEX_PERMIT_SLOTS: usize = 20;
@@ -389,7 +389,8 @@ read _ < "$RELEASE_FIFO"
     let mut observed_role = String::new();
     let mut observed_key = String::new();
     let mut observed_log_path_is_hidden = false;
-    for _ in 0..50 {
+    let wait_started = Instant::now();
+    while wait_started.elapsed() < Duration::from_secs(10) {
         let status: Table = status_fn.call(()).unwrap();
         let running: Table = status.get("running").unwrap();
         if running.raw_len() == 1 {
@@ -399,7 +400,10 @@ read _ < "$RELEASE_FIFO"
             observed_key = active.get::<String>("proposal_id_or_key").unwrap();
             observed_tail = active.get::<String>("output_tail").unwrap();
             observed_log_path_is_hidden = active.get::<String>("log_path").is_err();
-            if observed_tail.contains("line-60") {
+            if observed_tail.contains("line-60")
+                && !observed_tail.contains("line-20")
+                && observed_tail.lines().count() == 40
+            {
                 break;
             }
         }

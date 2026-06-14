@@ -430,7 +430,8 @@ fn run_department(
 ) -> mlua::Result<Table> {
     let opts = DeptRunOptions::from_lua(opts)?;
     let lua_path = resolve_department_path(owner_root, &path);
-    let event_json: serde_json::Value = lua.from_value(event)?;
+    let mut event_json: serde_json::Value = lua.from_value(event)?;
+    normalize_run_department_event_queue(&mut event_json, roots, owner_namespace)?;
     let _guard = DeptRunEnvGuard::apply(opts)?;
     let require_roots = roots.require_roots_for_owner(owner_root);
     let graph_json_authorized =
@@ -485,6 +486,30 @@ fn run_department(
     }
     result.set("raises", raises)?;
     Ok(result)
+}
+
+fn normalize_run_department_event_queue(
+    event_json: &mut serde_json::Value,
+    roots: &PackageRoots,
+    owner_namespace: &str,
+) -> mlua::Result<()> {
+    let Some(event) = event_json.as_object_mut() else {
+        return Ok(());
+    };
+    let Some(queue) = event.get_mut("queue") else {
+        return Ok(());
+    };
+    let Some(raw_queue) = queue.as_str() else {
+        return Err(mlua::Error::runtime(
+            "run_department event.queue must be a string",
+        ));
+    };
+    let resolved = roots
+        .name_resolver()
+        .resolve(owner_namespace, raw_queue)
+        .map_err(mlua::Error::external)?;
+    *queue = serde_json::Value::String(resolved);
+    Ok(())
 }
 
 fn declared_qualified_produces<'a>(

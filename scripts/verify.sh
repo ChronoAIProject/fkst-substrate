@@ -3,6 +3,8 @@
 # so local and CI verification stay identical. Run from the repo root.
 set -euo pipefail
 
+unset FKST_SUPERVISOR_PID
+
 # Tier I audit gate: supervisor must stay readable in one sitting.
 loc=$(find crates/fkst-supervisor/src -name '*.rs' -exec cat {} + | wc -l)
 [ "$loc" -le 150 ] || { echo "supervisor exceeds 150 LOC audit gate: $loc" >&2; exit 1; }

@@ -717,6 +717,126 @@ return {
 }
 
 #[test]
+fn run_department_normalizes_bare_event_queue_for_composed_package_owner() {
+    let host = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
+    let package = tempfile::Builder::new()
+        .prefix("github-devloop")
+        .tempdir()
+        .unwrap();
+
+    let package_namespace = namespace(package.path());
+    fs::create_dir_all(package.path().join("departments/probe")).unwrap();
+    fs::write(
+        package.path().join("departments/probe/main.lua"),
+        format!(
+            r#"
+function pipeline(event)
+  if event.queue == "{package_namespace}.devloop_merge_queue_tick" then
+    raise("seen", {{ queue = event.queue }})
+  end
+end
+"#
+        ),
+    )
+    .unwrap();
+    fs::create_dir_all(package.path().join("tests")).unwrap();
+    fs::write(
+        package.path().join("tests/run_department_queue_test.lua"),
+        format!(
+            r#"
+local t = fkst.test
+return {{
+  test_bare_queue_is_delivered_with_production_namespace = function()
+    local result = fkst.test.run_department("departments/probe/main.lua", {{
+      queue = "devloop_merge_queue_tick",
+      payload = {{}},
+    }})
+    t.eq(result.exit_code, 0)
+    t.eq(#result.raises, 1)
+    t.eq(result.raises[1].payload.queue, "{package_namespace}.devloop_merge_queue_tick")
+  end,
+}}
+"#
+        ),
+    )
+    .unwrap();
+
+    let output = run_lua_tests_with_packages(host.path(), &[package.path()]);
+
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}",
+        stdout(&output),
+        stderr(&output)
+    );
+    let out = stdout(&output);
+    assert!(
+        out.contains(
+            "PASS tests/run_department_queue_test.lua::test_bare_queue_is_delivered_with_production_namespace"
+        ),
+        "stdout: {out}"
+    );
+    assert!(out.contains("1 passed, 0 failed"), "stdout: {out}");
+}
+
+#[test]
+fn run_department_keeps_legacy_flat_bare_event_queue() {
+    let package = tempfile::Builder::new()
+        .prefix("github-devloop")
+        .tempdir()
+        .unwrap();
+
+    fs::create_dir_all(package.path().join("departments/probe")).unwrap();
+    fs::write(
+        package.path().join("departments/probe/main.lua"),
+        r#"
+function pipeline(event)
+  if event.queue == "devloop_merge_queue_tick" then
+    raise("seen", { queue = event.queue })
+  end
+end
+"#,
+    )
+    .unwrap();
+    fs::create_dir_all(package.path().join("tests")).unwrap();
+    fs::write(
+        package.path().join("tests/run_department_queue_test.lua"),
+        r#"
+local t = fkst.test
+return {
+  test_bare_queue_stays_bare_in_legacy_flat = function()
+    local result = fkst.test.run_department("departments/probe/main.lua", {
+      queue = "devloop_merge_queue_tick",
+      payload = {},
+    })
+    t.eq(result.exit_code, 0)
+    t.eq(#result.raises, 1)
+    t.eq(result.raises[1].payload.queue, "devloop_merge_queue_tick")
+  end,
+}
+"#,
+    )
+    .unwrap();
+
+    let output = run_lua_tests(package.path(), package.path());
+
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}",
+        stdout(&output),
+        stderr(&output)
+    );
+    let out = stdout(&output);
+    assert!(
+        out.contains(
+            "PASS tests/run_department_queue_test.lua::test_bare_queue_stays_bare_in_legacy_flat"
+        ),
+        "stdout: {out}"
+    );
+    assert!(out.contains("1 passed, 0 failed"), "stdout: {out}");
+}
+
+#[test]
 fn run_department_records_declared_cross_package_raise_without_delivery() {
     let host = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
     let package = tempfile::Builder::new()
