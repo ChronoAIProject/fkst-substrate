@@ -174,9 +174,40 @@ fn with_lock_runs_fn() {
     assert_eq!(n, 42);
     assert!(runtime
         .path()
-        .join("locks/github-proxy/issue/owner/repo/42")
+        .join("locks/github-proxy/issue/owner/repo/42/=lock")
         .exists());
     assert!(!host.path().join("worker-req-001").exists());
+}
+
+#[test]
+fn with_lock_allows_prefix_extended_keys() {
+    let lua = Lua::new();
+    let host = tempdir().unwrap();
+    register_for_host(&lua, host.path());
+    let runtime = tempdir().unwrap();
+
+    let value: i64 = in_sandbox(
+        host.path(),
+        |sandbox| {
+            sandbox.runtime_root(runtime.path());
+        },
+        || {
+            lua.load(
+                r#"
+                local count = 0
+                with_lock("a/b/c", function() count = count + 1 end)
+                with_lock("a/b/c/d", function() count = count + 10 end)
+                return count
+                "#,
+            )
+            .eval()
+            .unwrap()
+        },
+    );
+
+    assert_eq!(value, 11);
+    assert!(runtime.path().join("locks/a/b/c/=lock").exists());
+    assert!(runtime.path().join("locks/a/b/c/d/=lock").exists());
 }
 
 #[test]
@@ -248,6 +279,33 @@ fn with_lock_rejects_once_reserved_namespace() {
         );
 
         assert_lua_error_contains(err, &["reserved lock namespace", "once"]);
+    }
+}
+
+#[test]
+fn with_lock_rejects_cache_reserved_namespace() {
+    // The cache primitive owns <RT>/locks/cache/<key>/=lock for its per-key lock.
+    // with_lock must reserve the 'cache' namespace so a user lock key like
+    // "cache/a" can never alias the cache's internal lock for key "a".
+    let lua = Lua::new();
+    let host = tempdir().unwrap();
+    register_for_host(&lua, host.path());
+    let runtime = tempdir().unwrap();
+
+    for name in ["cache", "cache/a"] {
+        let err = in_sandbox(
+            host.path(),
+            |sandbox| {
+                sandbox.runtime_root(runtime.path());
+            },
+            || {
+                lua.load(format!(r#"return with_lock("{name}", function() end)"#))
+                    .eval::<()>()
+                    .unwrap_err()
+            },
+        );
+
+        assert_lua_error_contains(err, &["reserved lock namespace", "cache"]);
     }
 }
 

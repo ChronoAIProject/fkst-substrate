@@ -170,9 +170,9 @@ Event { queue, payload, ts }
 
 `once(key, fn)`、`cache_get(key)`、`cache_set(key, value[, ttl_seconds])`、`cache_expire(key)` 与 `with_lock(name, fn)` 使用同一 runtime key 合约。key / name 必须是可读的相对 filesystem path，不是 hex 编码。
 
-规则：非空；相对路径；允许 `/` 表示目录；每个 segment 非空、最长 255 bytes、只含 `[A-Za-z0-9._-]`，且不能是全点 segment；禁止 leading `/`、trailing `/`、`//`、反斜杠、NUL 和绝对路径。校验后的 key 直接 join 到 `<RT>/locks`、`<RT>/marks` 或 `<RT>/cache`。
+规则：非空；相对路径；允许 `/` 表示目录；每个 segment 非空、最长 255 bytes、只含 `[A-Za-z0-9._-]`，且不能是全点 segment；禁止 leading `/`、trailing `/`、`//`、反斜杠、NUL 和绝对路径。校验后的 key 保持为 `<RT>/{locks,marks,cache}/<key>/` 目录路径，engine 在该目录下写 reserved leaf file（`=lock` / `=mark` / `=value`）；`=` 不在合法 key segment 字符集内，因此不会与有效 key 冲突。
 
-`once` 使用 `<RT>/locks/once/<key>` 作为内部锁，并在成功执行后写 `<RT>/marks/<key>`；marker 是 scratch，不是 durable truth。`cache` 是 best-effort scratch KV；需要 read-compare-write 原子性时，package 应外层使用 `with_lock`。
+`with_lock` 使用 `<RT>/locks/<name>/=lock`；`once` 使用 `<RT>/locks/once/<key>/=lock` 作为内部锁，并在成功执行后写 `<RT>/marks/<key>/=mark`；`cache` 读写 `<RT>/cache/<key>/=value`。marker 和 cache 都是 scratch，不是 durable truth；需要 read-compare-write 原子性时，package 应外层使用 `with_lock`。
 
 ## 6. Fact-source doctrine
 

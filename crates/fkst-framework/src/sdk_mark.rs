@@ -1,6 +1,8 @@
 //! SDK: `once(key, fn) -> boolean` best-effort per-key debounce marker.
 
-use fkst_common::{validate_runtime_key, RuntimeKind};
+use fkst_common::{
+    runtime_key_file, validate_runtime_key, RuntimeKind, RUNTIME_LOCK_LEAF, RUNTIME_MARK_LEAF,
+};
 use mlua::{Function, Lua, Result};
 use nix::fcntl::{flock, FlockArg};
 use std::os::fd::AsRawFd;
@@ -21,10 +23,8 @@ fn once(host_root: &Path, key: String, f: Function) -> Result<bool> {
     let key = validate_runtime_key(&key).map_err(mlua::Error::external)?;
     let layout =
         runtime_context::layout_from_host_root(host_root).map_err(mlua::Error::external)?;
-    let lock_path = layout
-        .runtime_dir(RuntimeKind::Locks)
-        .join("once")
-        .join(key);
+    let once_locks = layout.runtime_dir(RuntimeKind::Locks).join("once");
+    let lock_path = runtime_key_file(&once_locks, key, RUNTIME_LOCK_LEAF);
     let lock_parent = lock_path.parent().ok_or_else(|| {
         mlua::Error::external(anyhow::anyhow!(
             "once lock target '{}' has no parent",
@@ -42,7 +42,11 @@ fn once(host_root: &Path, key: String, f: Function) -> Result<bool> {
 
     flock(lock_file.as_raw_fd(), FlockArg::LockExclusive).map_err(mlua::Error::external)?;
 
-    let marker = layout.runtime_dir(RuntimeKind::Marks).join(key);
+    let marker = runtime_key_file(
+        &layout.runtime_dir(RuntimeKind::Marks),
+        key,
+        RUNTIME_MARK_LEAF,
+    );
     if marker.exists() {
         sdk_log::info(&format!("once decision=skip-marked key={key}"));
         drop(lock_file);
