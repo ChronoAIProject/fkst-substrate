@@ -6,6 +6,8 @@ mod config_registry;
 mod graph_scan;
 #[path = "../src/path_resolver.rs"]
 mod path_resolver;
+#[path = "../src/provenance.rs"]
+mod provenance;
 #[path = "../src/rate_pool.rs"]
 mod rate_pool;
 #[path = "../src/sdk_i18n.rs"]

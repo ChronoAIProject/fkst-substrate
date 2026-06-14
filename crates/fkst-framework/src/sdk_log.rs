@@ -111,6 +111,14 @@ mod tests {
         assert!(line.starts_with("TIMESTAMP="));
         assert!(line.contains("T"));
         assert!(line.contains("Z LEVEL=info MSG=test message"));
+        assert!(line.contains(" MSG=test message"));
+    }
+
+    #[test]
+    fn log_line_omits_engine_and_package_provenance() {
+        let line = log_line("info", "test message");
+        assert!(!line.contains(" ENGINE_VER="), "{line}");
+        assert!(!line.contains(" PKG_VER="), "{line}");
     }
 
     #[test]

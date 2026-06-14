@@ -95,6 +95,12 @@ pub(crate) fn optional_path(path: Option<&Path>) -> String {
 
 fn format_line<'a>(event: &str, fields: impl IntoIterator<Item = (&'a str, String)>) -> String {
     let mut line = format!("event={}", escape_value(event));
+    line.push_str(" engine_ver=");
+    line.push_str(&escape_value(&crate::provenance::current_engine_ver()));
+    line.push_str(" pkg_versions=");
+    line.push_str(&escape_value(
+        &crate::provenance::current_pkg_versions_summary(),
+    ));
     for (key, value) in fields {
         line.push(' ');
         line.push_str(key);
@@ -144,7 +150,11 @@ mod tests {
 
         assert_eq!(
             line,
-            "event=dept\\schild\\sexit dept=worker\\sone reason=exit\\=0\\nok\\tpath\\\\tail\n"
+            format!(
+                "event=dept\\schild\\sexit engine_ver={} pkg_versions={} dept=worker\\sone reason=exit\\=0\\nok\\tpath\\\\tail\n",
+                escape_value(&crate::provenance::current_engine_ver()),
+                escape_value(&crate::provenance::current_pkg_versions_summary())
+            )
         );
     }
 }

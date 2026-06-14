@@ -4,13 +4,11 @@
 //! `env`, and `timeout`.
 
 use mlua::{Lua, Result, Table, Value};
-use std::io::Read;
-use std::process::{Command, Stdio};
-use std::thread::JoinHandle;
-use std::time::{Duration, Instant};
+use std::path::PathBuf;
+use std::time::Duration;
 
 use crate::config_registry::ConfigContext;
-use crate::external_command::MockCommandState;
+use crate::external_command::{CommandSpec, MockCommandState};
 use crate::rate_pool::RatePoolRegistry;
 
 struct ExecOptions {
@@ -110,39 +108,6 @@ fn parse_exec_options(arg: Value) -> Result<ExecOptions> {
     }
 }
 
-fn build_command(opts: &ExecOptions) -> Command {
-    let mut command = Command::new("/bin/sh");
-    command.arg("-c").arg(&opts.cmd);
-    if let Some(cwd) = &opts.cwd {
-        command.current_dir(cwd);
-    }
-    for (key, value) in &opts.env {
-        command.env(key, value);
-    }
-    command
-}
-
-#[cfg(unix)]
-fn make_process_group_leader(command: &mut Command) {
-    use std::os::unix::process::CommandExt;
-
-    command.process_group(0);
-}
-
-#[cfg(not(unix))]
-fn make_process_group_leader(_command: &mut Command) {}
-
-#[cfg(unix)]
-fn kill_process_group(child_pid: u32) {
-    use nix::sys::signal::{killpg, Signal};
-    use nix::unistd::Pid;
-
-    let _ = killpg(Pid::from_raw(child_pid as i32), Signal::SIGKILL);
-}
-
-#[cfg(not(unix))]
-fn kill_process_group(_child_pid: u32) {}
-
 fn run_exec_sync(
     opts: ExecOptions,
     runner: Option<&MockCommandState>,
@@ -168,110 +133,34 @@ fn run_exec_sync(
         .acquire_for_command_text(&opts.cmd)
         .map_err(mlua::Error::external)?;
 
-    match opts.timeout {
-        Some(timeout) => run_exec_sync_with_timeout(&opts, timeout),
-        None => {
-            let out = build_command(&opts)
-                .output()
-                .map_err(mlua::Error::external)?;
-            let stdout = String::from_utf8_lossy(&out.stdout).to_string();
-            let stderr = String::from_utf8_lossy(&out.stderr).to_string();
-            let exit_code = out.status.code().unwrap_or(-1);
-            Ok(ExecResult {
-                stdout: stdout.clone(),
-                stderr: stderr.clone(),
-                exit_code,
-                timed_out: None,
-                error_class: crate::boundary_resource::classify_process_output(
-                    exit_code, &stdout, &stderr,
-                )
-                .map(|class| class.label().to_string()),
-            })
-        }
-    }
-}
-
-fn run_exec_sync_with_timeout(opts: &ExecOptions, timeout: Duration) -> Result<ExecResult> {
-    let mut command = build_command(opts);
-    make_process_group_leader(&mut command);
-    let mut child = command
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(mlua::Error::external)?;
-    let child_pid = child.id();
-    let _registration = crate::process_tree::sdk_process_groups().register(child_pid);
-    let stdout_reader = child
-        .stdout
-        .take()
-        .map(read_pipe_in_thread)
-        .ok_or_else(|| mlua::Error::external("failed to capture stdout"))?;
-    let stderr_reader = child
-        .stderr
-        .take()
-        .map(read_pipe_in_thread)
-        .ok_or_else(|| mlua::Error::external("failed to capture stderr"))?;
-
-    let start = Instant::now();
-    loop {
-        if let Some(status) = child.try_wait().map_err(mlua::Error::external)? {
-            let stdout = join_pipe_reader(stdout_reader)?;
-            let stderr = join_pipe_reader(stderr_reader)?;
-            let stdout = String::from_utf8_lossy(&stdout).to_string();
-            let stderr = String::from_utf8_lossy(&stderr).to_string();
-            let exit_code = status.code().unwrap_or(-1);
-            return Ok(ExecResult {
-                stdout: stdout.clone(),
-                stderr: stderr.clone(),
-                exit_code,
-                timed_out: Some(false),
-                error_class: crate::boundary_resource::classify_process_output(
-                    exit_code, &stdout, &stderr,
-                )
-                .map(|class| class.label().to_string()),
-            });
-        }
-
-        if start.elapsed() >= timeout {
-            kill_process_group(child_pid);
-            let _ = child.wait();
-            let stdout = join_pipe_reader(stdout_reader)?;
-            let stderr = join_pipe_reader(stderr_reader)?;
-            let stdout = String::from_utf8_lossy(&stdout).to_string();
-            let stderr = String::from_utf8_lossy(&stderr).to_string();
-            return Ok(ExecResult {
-                stdout,
-                stderr,
-                exit_code: 124,
-                timed_out: Some(true),
-                error_class: Some(
-                    crate::boundary_resource::BoundaryErrorClass::ProviderUnavailable
-                        .label()
-                        .to_string(),
-                ),
-            });
-        }
-
-        std::thread::sleep(Duration::from_millis(10));
-    }
-}
-
-fn read_pipe_in_thread<R>(mut pipe: R) -> JoinHandle<std::io::Result<Vec<u8>>>
-where
-    R: Read + Send + 'static,
-{
-    std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        pipe.read_to_end(&mut buf)?;
-        Ok(buf)
+    let timeout = opts.timeout;
+    let output = crate::external_command::run_audited(CommandSpec {
+        program: PathBuf::from("/bin/sh"),
+        args: vec!["-c".to_string(), opts.cmd],
+        cwd: opts.cwd.map(PathBuf::from),
+        env: opts.env,
+        timeout,
+        process_group: timeout.is_some(),
     })
-}
-
-fn join_pipe_reader(reader: JoinHandle<std::io::Result<Vec<u8>>>) -> Result<Vec<u8>> {
-    reader
-        .join()
-        .map_err(|_| mlua::Error::external("pipe reader thread panicked"))?
-        .map_err(mlua::Error::external)
+    .map_err(mlua::Error::external)?;
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    Ok(ExecResult {
+        stdout: stdout.clone(),
+        stderr: stderr.clone(),
+        exit_code: output.exit_code,
+        timed_out: timeout.map(|_| output.timed_out),
+        error_class: if output.timed_out {
+            Some(
+                crate::boundary_resource::BoundaryErrorClass::ProviderUnavailable
+                    .label()
+                    .to_string(),
+            )
+        } else {
+            crate::boundary_resource::classify_process_output(output.exit_code, &stdout, &stderr)
+                .map(|class| class.label().to_string())
+        },
+    })
 }
 
 #[cfg(test)]
@@ -492,6 +381,50 @@ mod tests {
 
         assert_eq!(out.stdout, "[]\n");
         assert!(!dir.path().join("gh.bucket").exists());
+    }
+
+    #[test]
+    fn exec_sync_gh_emits_one_external_command_audit_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let lines = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured = lines.clone();
+        let _sink = crate::external_command::install_audit_sink_for_test(std::sync::Arc::new(
+            move |line| captured.lock().unwrap().push(line.to_string()),
+        ));
+        let bin = dir.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        let gh = bin.join("gh");
+        std::fs::write(&gh, "#!/bin/sh\nprintf '[]\\n'\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&gh).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&gh, perms).unwrap();
+        }
+        let rate_pools = registry(dir.path(), "none");
+        let out = run_exec_sync(
+            ExecOptions {
+                cmd: "gh issue list".to_string(),
+                cwd: None,
+                env: vec![("PATH".to_string(), bin.to_string_lossy().into_owned())],
+                timeout: None,
+            },
+            None,
+            &rate_pools,
+        )
+        .unwrap();
+
+        assert_eq!(out.stdout, "[]\n");
+        let lines = lines.lock().unwrap();
+        assert_eq!(
+            lines
+                .iter()
+                .filter(|line| line.contains("EVENT=external_command"))
+                .count(),
+            1,
+            "{lines:?}"
+        );
     }
 
     #[test]
