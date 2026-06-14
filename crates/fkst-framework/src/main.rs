@@ -7,6 +7,7 @@
 //! CLI: `fkst-framework conformance --project-root <path>`
 //! CLI: `fkst-framework test --project-root <path> [--package-root <path> ...] [--report-json <path>]`
 //! CLI: `fkst-framework init-package-repo [--ref <substrate-ref>] [--force]`
+//! CLI: `fkst-framework observe --durable-root <path> [--json] [--limit <n>]`
 //! CLI: `fkst-framework --self-test`
 //! Exit codes:
 //!   0 = pipeline ok
@@ -26,6 +27,7 @@ mod external_command;
 mod host_conformance;
 mod init_package_repo;
 mod mlua_init;
+mod observe;
 mod path_resolver;
 mod process_tree;
 mod provenance;
@@ -79,6 +81,7 @@ enum CliCommand {
     },
     Test(TestCli),
     InitPackageRepo(init_package_repo::InitPackageRepoOptions),
+    Observe(observe::ObserveOptions),
     CodexWorker(sdk_codex::CodexWorkerOptions),
     SelfTest,
 }
@@ -88,7 +91,7 @@ fn parse_args() -> Result<CliCommand> {
     let mut args_iter = args.into_iter();
     let sub = args_iter.next().ok_or_else(|| {
         anyhow::anyhow!(
-            "usage: fkst-framework run <lua> --project-root <path> --package-root <path> [--package-root <path> ...] [--owner-namespace <id>] --event <json> | fkst-framework supervise --project-root <path> --framework-bin <path> [--package-root <path> ...] | fkst-framework conformance --project-root <path> [--package-root <path> ...] | fkst-framework config --project-root <path> [--package-root <path> ...] | fkst-framework boundary-resources | fkst-framework rate-acquire <pool> | fkst-framework rate-exec <pool> -- <program> [args...] | fkst-framework test --project-root <path> [--package-root <path> ...] [--report-json <path>] | fkst-framework init-package-repo [--ref <substrate-ref>] [--force] | fkst-framework --self-test"
+            "usage: fkst-framework run <lua> --project-root <path> --package-root <path> [--package-root <path> ...] [--owner-namespace <id>] --event <json> | fkst-framework supervise --project-root <path> --framework-bin <path> [--package-root <path> ...] | fkst-framework conformance --project-root <path> [--package-root <path> ...] | fkst-framework config --project-root <path> [--package-root <path> ...] | fkst-framework boundary-resources | fkst-framework rate-acquire <pool> | fkst-framework rate-exec <pool> -- <program> [args...] | fkst-framework test --project-root <path> [--package-root <path> ...] [--report-json <path>] | fkst-framework init-package-repo [--ref <substrate-ref>] [--force] | fkst-framework observe --durable-root <path> [--json] [--limit <n>] | fkst-framework --self-test"
         )
     })?;
     if sub == "--self-test" {
@@ -167,6 +170,10 @@ fn parse_args() -> Result<CliCommand> {
         return Ok(CliCommand::InitPackageRepo(parse_init_package_repo_args(
             &rest,
         )?));
+    }
+    if sub == "observe" {
+        let rest = args_iter.collect::<Vec<_>>();
+        return Ok(CliCommand::Observe(observe::parse_args(&rest)?));
     }
     if sub == "run" {
         let lua_path: PathBuf = args_iter
@@ -589,6 +596,7 @@ fn run() -> Result<i32> {
         } => run_rate_exec(&pool, program, args),
         CliCommand::Test(options) => test_runner::run_tests(options.roots, options.report_json),
         CliCommand::InitPackageRepo(options) => init_package_repo::run(options),
+        CliCommand::Observe(options) => observe::run(options),
         CliCommand::CodexWorker(options) => sdk_codex::run_codex_worker(options),
         CliCommand::SelfTest => match self_test::run() {
             Ok(()) => Ok(0),

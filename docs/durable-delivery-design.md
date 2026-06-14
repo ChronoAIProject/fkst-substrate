@@ -81,6 +81,14 @@ DeliveryEnvelope {
 
 引擎可持有 **durable 在途 delivery 状态**（仅用于 at-least-once / lease / retry / DLQ）；它**不是**实体业务真相、不是 accepted release state、不是 rollback state。外部源 + git + 明确 host filesystem fact 仍是实体内容真相。队列记录是**触发器 + 投递账本**，消费时 Department 回源 derive。`FKST_RUNTIME_ROOT` 是 scratch；`FKST_DURABLE_ROOT` 是 operator 管理的一等持久边界。
 
+## Read-only observation
+
+`fkst-framework observe --durable-root <path> [--json] [--limit <n>]` is the read-only CQRS snapshot projection for the durable delivery store. It opens `<DURABLE>/delivery.redb`, reads `delivery_by_id` and `dead_by_id` in one read transaction, and emits per-queue depth / pending / in-flight / retrying / oldest pending age, the current live delivery list, and the DLQ list. `--json` is the stable scripting interface; human output is only for local inspection.
+
+The projection never emits full payload bodies. It emits only payload `schema`, `dedup_key`, serialized byte count, and SHA-256 digest. For a permanent DLQ tombstone, the store no longer retains the original delivery payload, so the payload summary is the null-value digest. This command does not provide a per-`source_ref` historical timeline: the current store deletes deliveries on `ack`, and the DLQ only keeps compact tombstones. Historical timelines, acked deliveries, and lease/ack transition history require an engine-owned journal/read model instead of inference from mutable queue tables.
+
+`redb` 的事务模型提供 MVCC read snapshots inside an opened database handle, but `redb 2.6.3` opens the database file with an exclusive process lock. Therefore this CLI is read-only after open and does not mutate tables, but it cannot safely open the same database file while a live `supervise` process already holds the `redb` handle; in that case it fails closed with the underlying `DatabaseAlreadyOpen` error instead of reading a partial file or bypassing the store contract. A future live-read command needs an engine-owned observer endpoint or journal/read-model handoff from the process that owns the database handle.
+
 ## 实现落点
 
 1. redb API 使用 `delivery_by_id`、`ready_by_dept_due`、`leased_by_dept_until`、`dead_by_id` 和 `meta` 表，所有状态迁移在写事务内完成。
