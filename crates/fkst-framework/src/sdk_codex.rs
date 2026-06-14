@@ -1394,12 +1394,14 @@ fn read_codex_status_records(host_root: &Path) -> anyhow::Result<Vec<CodexStatus
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
         Err(err) => return Err(err.into()),
     }
-    records.extend(read_adoption_status_records()?);
+    records.extend(read_adoption_status_records(host_root)?);
     Ok(latest_codex_status_records(records))
 }
 
-fn read_adoption_status_records() -> anyhow::Result<Vec<CodexStatusRecord>> {
-    let adoption_dir = runtime_log_dir().join(CODEX_ADOPTION_DIR);
+fn read_adoption_status_records(host_root: &Path) -> anyhow::Result<Vec<CodexStatusRecord>> {
+    let adoption_dir = runtime_context::layout_from_host_root(host_root)?
+        .runtime_dir(RuntimeKind::Logs)
+        .join(CODEX_ADOPTION_DIR);
     let entries = match std::fs::read_dir(&adoption_dir) {
         Ok(entries) => entries,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),

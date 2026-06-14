@@ -389,7 +389,7 @@ read _ < "$RELEASE_FIFO"
     let mut observed_role = String::new();
     let mut observed_key = String::new();
     let mut observed_log_path_is_hidden = false;
-    for _ in 0..50 {
+    for _ in 0..250 {
         let status: Table = status_fn.call(()).unwrap();
         let running: Table = status.get("running").unwrap();
         if running.raw_len() == 1 {
@@ -1014,6 +1014,11 @@ printf 'adoption-done'
         active.get::<String>("output_tail").unwrap(),
         "adoption-live-tail\n"
     );
+    assert!(tmp
+        .path()
+        .join(".fkst/runtime/logs/codex-adoption")
+        .exists());
+    assert!(!tmp.path().join("runtime/codex-adoption").exists());
     assert!(active.get::<i64>("exit_code").is_err());
     assert!(active.get::<String>("log_path").is_err());
 
