@@ -716,10 +716,15 @@ fn normalize_run_department_event_queue(
     let Some(raw_queue) = event.get("queue").and_then(JsonValue::as_str) else {
         return Ok(event);
     };
+    let dead_letter_queue = roots
+        .name_resolver()
+        .resolve(owner_namespace, "dead_letter")
+        .context("resolve production dead_letter queue")?;
     let resolver = roots
         .name_resolver()
         .with_recorded_only_queues(qualified_consumes)
-        .add_recorded_only_queue(crate::supervise::failure_fact::FAILURE_FACT_QUEUE);
+        .add_recorded_only_queue(crate::supervise::failure_fact::FAILURE_FACT_QUEUE)
+        .add_recorded_only_queue(dead_letter_queue);
     let resolved = resolver
         .resolve(owner_namespace, raw_queue)
         .with_context(|| format!("resolve test event.queue `{raw_queue}`"))?;

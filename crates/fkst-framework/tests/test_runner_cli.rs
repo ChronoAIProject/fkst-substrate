@@ -929,6 +929,76 @@ return {{
 }
 
 #[test]
+fn run_department_preserves_dead_letter_queue_event() {
+    let host = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
+    let package = tempfile::Builder::new()
+        .prefix("github-devloop")
+        .tempdir()
+        .unwrap();
+    let owner_namespace = namespace(package.path());
+    let dead_letter_queue = format!("{owner_namespace}.dead_letter");
+
+    fs::create_dir_all(package.path().join("departments/probe")).unwrap();
+    fs::write(
+        package.path().join("departments/probe/main.lua"),
+        format!(
+            r#"
+local M = {{}}
+M.spec = {{
+  consumes = {{ "dead_letter" }},
+  ephemeral = {{ "dead_letter" }},
+  produces = {{ "seen" }},
+}}
+function pipeline(event)
+  assert(event.queue == "{dead_letter_queue}", "got " .. tostring(event.queue))
+  raise("seen", {{ queue = event.queue }})
+end
+return M
+"#
+        ),
+    )
+    .unwrap();
+    fs::create_dir_all(package.path().join("tests")).unwrap();
+    fs::write(
+        package.path().join("tests/dead_letter_event_queue_test.lua"),
+        format!(
+            r#"
+local t = fkst.test
+return {{
+  test_run_department_preserves_dead_letter_queue = function()
+    local result = fkst.test.run_department(
+      "departments/probe/main.lua",
+      {{ queue = "{dead_letter_queue}", payload = {{}}, ts = 1 }}
+    )
+    t.eq(result.exit_code, 0)
+    t.eq(result.raises[1].queue, "{owner_namespace}.seen")
+    t.eq(result.raises[1].payload.queue, "{dead_letter_queue}")
+  end,
+}}
+"#
+        ),
+    )
+    .unwrap();
+
+    let output = run_lua_tests_with_packages(host.path(), &[package.path()]);
+
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}",
+        stdout(&output),
+        stderr(&output)
+    );
+    let out = stdout(&output);
+    assert!(
+        out.contains(
+            "PASS tests/dead_letter_event_queue_test.lua::test_run_department_preserves_dead_letter_queue"
+        ),
+        "stdout: {out}"
+    );
+    assert!(out.contains("1 passed, 0 failed"), "stdout: {out}");
+}
+
+#[test]
 fn run_department_legacy_flat_event_queue_stays_flat() {
     let package = tempfile::Builder::new()
         .prefix("github-devloop")
