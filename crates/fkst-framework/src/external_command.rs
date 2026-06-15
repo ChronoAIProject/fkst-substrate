@@ -1,5 +1,5 @@
-use anyhow::Result;
-use std::io::Read;
+use anyhow::{Context, Result};
+use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
@@ -135,8 +135,24 @@ pub(crate) struct CommandSpec {
     pub(crate) args: Vec<String>,
     pub(crate) cwd: Option<PathBuf>,
     pub(crate) env: Vec<(String, String)>,
+    pub(crate) stdin: CommandStdin,
     pub(crate) timeout: Option<Duration>,
     pub(crate) process_group: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum CommandStdin {
+    Null,
+    #[allow(dead_code)]
+    Bytes(Vec<u8>),
+    #[allow(dead_code)]
+    Inherit,
+}
+
+impl CommandStdin {
+    pub(crate) fn is_empty_input(&self) -> bool {
+        matches!(self, Self::Null)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -161,7 +177,20 @@ fn run_audited_inner(spec: &CommandSpec) -> Result<AuditedOutput> {
     match spec.timeout {
         Some(timeout) => run_audited_with_timeout(spec, timeout),
         None => {
-            let output = build_command(spec).output()?;
+            let output = match &spec.stdin {
+                CommandStdin::Bytes(stdin) => {
+                    let mut command = build_command(spec);
+                    let mut child = command.spawn()?;
+                    let mut child_stdin = child
+                        .stdin
+                        .take()
+                        .context("failed to capture command stdin")?;
+                    child_stdin.write_all(stdin)?;
+                    drop(child_stdin);
+                    child.wait_with_output()?
+                }
+                CommandStdin::Null | CommandStdin::Inherit => build_command(spec).output()?,
+            };
             Ok(AuditedOutput {
                 stdout: output.stdout,
                 stderr: output.stderr,
@@ -191,10 +220,21 @@ fn run_audited_with_timeout(spec: &CommandSpec, timeout: Duration) -> Result<Aud
         .take()
         .map(read_pipe_in_thread)
         .ok_or_else(|| anyhow::anyhow!("failed to capture stderr"))?;
+    let stdin_writer = match &spec.stdin {
+        CommandStdin::Bytes(stdin) => Some(write_pipe_in_thread(
+            child
+                .stdin
+                .take()
+                .context("failed to capture command stdin")?,
+            stdin.clone(),
+        )),
+        CommandStdin::Null | CommandStdin::Inherit => None,
+    };
 
     let start = Instant::now();
     loop {
         if let Some(status) = child.try_wait()? {
+            join_stdin_writer(stdin_writer)?;
             return Ok(AuditedOutput {
                 stdout: join_pipe_reader(stdout_reader)?,
                 stderr: join_pipe_reader(stderr_reader)?,
@@ -210,6 +250,7 @@ fn run_audited_with_timeout(spec: &CommandSpec, timeout: Duration) -> Result<Aud
                 let _ = child.kill();
             }
             let _ = child.wait();
+            join_stdin_writer(stdin_writer)?;
             return Ok(AuditedOutput {
                 stdout: join_pipe_reader(stdout_reader)?,
                 stderr: join_pipe_reader(stderr_reader)?,
@@ -230,6 +271,17 @@ fn build_command(spec: &CommandSpec) -> Command {
     }
     for (key, value) in &spec.env {
         command.env(key, value);
+    }
+    match &spec.stdin {
+        CommandStdin::Null => {
+            command.stdin(Stdio::null());
+        }
+        CommandStdin::Bytes(_) => {
+            command.stdin(Stdio::piped());
+        }
+        CommandStdin::Inherit => {
+            command.stdin(Stdio::inherit());
+        }
     }
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
     if spec.process_group {
@@ -270,11 +322,31 @@ where
     })
 }
 
+fn write_pipe_in_thread<W>(mut pipe: W, bytes: Vec<u8>) -> JoinHandle<std::io::Result<()>>
+where
+    W: Write + Send + 'static,
+{
+    std::thread::spawn(move || {
+        pipe.write_all(&bytes)?;
+        drop(pipe);
+        Ok(())
+    })
+}
+
 fn join_pipe_reader(reader: JoinHandle<std::io::Result<Vec<u8>>>) -> Result<Vec<u8>> {
     reader
         .join()
         .map_err(|_| anyhow::anyhow!("pipe reader thread panicked"))?
         .map_err(Into::into)
+}
+
+fn join_stdin_writer(writer: Option<JoinHandle<std::io::Result<()>>>) -> Result<()> {
+    if let Some(writer) = writer {
+        writer
+            .join()
+            .map_err(|_| anyhow::anyhow!("stdin writer thread panicked"))??;
+    }
+    Ok(())
 }
 
 fn emit_audit_line(rendered: &str, output: &AuditedOutput) {

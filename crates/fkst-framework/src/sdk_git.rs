@@ -441,6 +441,7 @@ fn run_git_command<'a>(
         args: rendered_args,
         cwd: None,
         env: Vec::new(),
+        stdin: crate::external_command::CommandStdin::Null,
         timeout: None,
         process_group: false,
     })

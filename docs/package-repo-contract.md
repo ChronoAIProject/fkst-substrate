@@ -123,6 +123,24 @@ fkst.test.command_calls()
 
 `fkst.test` 不存在于 `run`、`supervise`、`--self-test` 或 conformance production Lua state。`mock_command` 劫持 test mode 中的 `exec_sync`、codex SDK 与 git SDK 外部命令调用；未 mock 的外部命令 fail closed。
 
+### 2.3 `exec_sync` read coalescing
+
+`exec_sync(cmd_or_opts)` is force-fresh by default. A package may opt in only for external commands it knows are read-safe:
+
+```lua
+local result = exec_sync({
+  cmd = "gh issue list --json number,title,updatedAt",
+  read_coalesce = {
+    key = "github/issues/owner-repo/open",
+    ttl_seconds = 30,
+  },
+})
+```
+
+`read_coalesce.key` uses the runtime key contract in §5. `ttl_seconds` must be a positive finite number and is clamped by the engine to at most 300 seconds. The engine fingerprints all result-affecting inputs it controls: the caller key, resolved `/bin/sh -c` command/argv, exact execution cwd, sorted effective environment, and timeout. Coalescing is only allowed for stdin-less commands; if a future command path carries stdin bytes or inherits stdin, the engine bypasses read coalescing and runs fresh. A fresh success cache hit returns `{stdout, stderr, exit_code, timed_out?, error_class?}` before named rate-pool acquisition and before spawning the command. On miss, the engine takes a per-fingerprint flock under `<RT>/locks`, rechecks, then acquires any matching rate-pool token and executes the command. Only `exit_code == 0` is cached; non-zero exits re-run on the next call.
+
+This is a bounded thundering-herd suppression primitive, not automatic command classification. Never use it for writes or read commands whose caller requires force-fresh data; omit `read_coalesce` for those calls. In `fkst-framework test`, mocked `exec_sync` bypasses read coalescing entirely, so `fkst.test.command_calls()` still records each mocked call.
+
 ## 3. Event model
 
 事件流是：

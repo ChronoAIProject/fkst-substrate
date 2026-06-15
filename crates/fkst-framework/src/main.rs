@@ -32,6 +32,7 @@ mod provenance;
 mod raise;
 mod rate_pool;
 mod rate_shim;
+mod read_coalesce;
 mod runtime_context;
 mod sdk_basic;
 mod sdk_cache;
