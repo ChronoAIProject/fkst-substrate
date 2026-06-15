@@ -604,6 +604,7 @@ local allowed = {
   mock_command = true,
   raises = true,
   run_department = true,
+  with_command_cassette = true,
 }
 
 return {
@@ -1533,6 +1534,88 @@ return {
     );
     let out = stdout(&output);
     assert!(out.contains("14 passed, 0 failed"), "stdout: {out}");
+}
+
+#[test]
+fn test_runner_records_and_replays_external_command_cassettes() {
+    let host = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
+    fs::create_dir_all(host.path().join("tests/cassettes")).unwrap();
+    fs::write(
+        host.path().join("tests/vcr_command_test.lua"),
+        r#"
+local t = fkst.test
+
+return {
+  test_01_record_writes_sanitized_cassette = function()
+    t.with_command_cassette({
+      path = "tests/cassettes/command.json",
+      mode = "record",
+      redact = {
+        { value = "secret-token", replacement = "<TOKEN>" },
+      },
+    }, function()
+      local result = exec_sync("printf secret-token")
+      t.eq(result.stdout, "secret-token")
+      t.eq(result.exit_code, 0)
+    end)
+    local calls = t.command_calls()
+    t.eq(#calls, 1)
+    t.eq(calls[1].rendered, "printf secret-token")
+  end,
+
+  test_02_replay_returns_cassette_without_live_command = function()
+    t.with_command_cassette({
+      path = "tests/cassettes/command.json",
+      mode = "replay",
+      redact = {
+        { value = "secret-token", replacement = "<TOKEN>" },
+      },
+    }, function()
+      local result = exec_sync("printf secret-token")
+      t.eq(result.stdout, "<TOKEN>")
+      t.eq(result.exit_code, 0)
+    end)
+    local calls = t.command_calls()
+    t.eq(#calls, 1)
+    t.eq(calls[1].stdout, "<TOKEN>")
+  end,
+
+  test_03_replay_mismatch_fails_closed = function()
+    local ok, err = pcall(function()
+      t.with_command_cassette({
+        path = "tests/cassettes/command.json",
+        mode = "replay",
+      }, function()
+        exec_sync("printf different")
+      end)
+    end)
+    t.eq(ok, false)
+    t.is_true(string.find(tostring(err), "VCR replay mismatch", 1, true) ~= nil)
+  end,
+}
+"#,
+    )
+    .unwrap();
+
+    let output = run_lua_tests(host.path(), host.path());
+
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}",
+        stdout(&output),
+        stderr(&output)
+    );
+    let out = stdout(&output);
+    assert!(out.contains("3 passed, 0 failed"), "stdout: {out}");
+    let cassette = fs::read_to_string(host.path().join("tests/cassettes/command.json")).unwrap();
+    let value: serde_json::Value = serde_json::from_str(&cassette).unwrap();
+    assert_eq!(value["schema"], "fkst.test.command-cassette.v1");
+    assert_eq!(value["entries"][0]["rendered"], "printf <TOKEN>");
+    assert_eq!(value["entries"][0]["stdout"], "<TOKEN>");
+    assert!(
+        !cassette.contains("secret-token"),
+        "cassette leaked secret: {cassette}"
+    );
 }
 
 #[test]

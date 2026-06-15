@@ -24,7 +24,9 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::config_registry::{ConfigContext, ConfigKey};
-use crate::external_command::{format_command, MockCommandState};
+use crate::external_command::{
+    format_command, MockCommandInvocation, MockCommandPlan, MockCommandResult, MockCommandState,
+};
 use crate::runtime_context;
 
 pub(crate) const CODEX_PERMIT_SLOTS_ENV: &str = "FKST_CODEX_PERMIT_SLOTS";
@@ -613,12 +615,33 @@ fn run_mocked_codex_request(
     write_codex_status(&request.log_path, &status);
     let args = command_args_for_request(&request);
     let cmd_line = format_command("codex", &args);
-    let result = runner.execute(
-        cmd_line.clone(),
-        "codex".to_string(),
+    let invocation = MockCommandInvocation {
+        rendered: cmd_line.clone(),
+        program: "codex".to_string(),
         args,
-        request.prompt.clone(),
-    )?;
+        stdin: request.prompt.clone(),
+        cwd: request.worktree.clone(),
+        env: Vec::new(),
+    };
+    let result = match runner.prepare(invocation.clone())? {
+        MockCommandPlan::Return(result) => result,
+        MockCommandPlan::Record => {
+            let result = run_real_codex_for_cassette(&request, &cmd_line);
+            runner.record(
+                invocation,
+                MockCommandResult {
+                    stdout: result.stdout.clone(),
+                    stderr: result.stderr.clone(),
+                    exit_code: result.exit_code,
+                },
+            )?;
+            MockCommandResult {
+                stdout: result.stdout,
+                stderr: result.stderr,
+                exit_code: result.exit_code,
+            }
+        }
+    };
     write_live_output_tail(
         Some(&request.output_tail_path),
         result.stdout.as_bytes(),
@@ -640,6 +663,97 @@ fn run_mocked_codex_request(
         result.exit_code,
         request.log_path.to_string_lossy().into_owned(),
     ))
+}
+
+fn run_real_codex_for_cassette(request: &CodexRequest, cmd_line: &str) -> MockCommandResult {
+    let mut cmd = Command::new("codex");
+    cmd.args(command_args_for_request(request));
+    if let Some(worktree) = request.worktree.as_deref() {
+        cmd.current_dir(worktree);
+    }
+    cmd.stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = match cmd.spawn() {
+        Ok(child) => child,
+        Err(err) => {
+            return MockCommandResult {
+                stdout: String::new(),
+                stderr: format!("codex spawn failed: {err}"),
+                exit_code: -1,
+            };
+        }
+    };
+    let prompt = request.prompt.clone();
+    let stdin = child.stdin.take();
+    let stdin_writer = stdin.map(|mut stdin| {
+        std::thread::spawn(move || {
+            let _ = stdin.write_all(prompt.as_bytes());
+        })
+    });
+    let output = match wait_for_codex_child_for_cassette(child, stdin_writer, request, cmd_line) {
+        Ok(output) => output,
+        Err(err) => {
+            return MockCommandResult {
+                stdout: String::new(),
+                stderr: err.to_string(),
+                exit_code: -1,
+            };
+        }
+    };
+    MockCommandResult {
+        stdout: String::from_utf8_lossy(&output.stdout).to_string(),
+        stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+        exit_code: output.status.code().unwrap_or(-1),
+    }
+}
+
+fn wait_for_codex_child_for_cassette(
+    mut child: Child,
+    stdin_writer: Option<JoinHandle<()>>,
+    request: &CodexRequest,
+    _cmd_line: &str,
+) -> std::io::Result<std::process::Output> {
+    let start = Instant::now();
+    loop {
+        if child.try_wait()?.is_some() {
+            if let Some(stdin_writer) = stdin_writer {
+                let _ = stdin_writer.join();
+            }
+            return child.wait_with_output();
+        }
+        if start.elapsed() >= Duration::from_secs(request.timeout_seconds.max(0) as u64) {
+            let _ = child.kill();
+            if let Some(stdin_writer) = stdin_writer {
+                let _ = stdin_writer.join();
+            }
+            let mut output = child.wait_with_output()?;
+            output.status = timeout_exit_status();
+            return Ok(output);
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[cfg(unix)]
+fn timeout_exit_status() -> ExitStatus {
+    use std::os::unix::process::ExitStatusExt;
+    ExitStatus::from_raw(124 << 8)
+}
+
+#[cfg(not(unix))]
+fn timeout_exit_status() -> ExitStatus {
+    Command::new("sh")
+        .arg("-c")
+        .arg("exit 124")
+        .status()
+        .unwrap_or_else(|_| {
+            Command::new("cmd")
+                .arg("/C")
+                .arg("exit 124")
+                .status()
+                .unwrap()
+        })
 }
 
 fn adoption_paths_for_request(request: &CodexRequest) -> Option<CodexAdoptionPaths> {
