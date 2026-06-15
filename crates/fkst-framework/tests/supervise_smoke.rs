@@ -2,6 +2,7 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
 mod sdk_codex {
@@ -17,6 +18,15 @@ mod support;
 
 use spawner::{spawn_framework, SpawnResult};
 use support::process_sandbox::ProcessSandbox;
+
+static SUPERVISE_SMOKE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+fn supervise_smoke_lock() -> MutexGuard<'static, ()> {
+    SUPERVISE_SMOKE_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap()
+}
 
 fn write_executable(path: &std::path::Path, body: &str) {
     fs::write(path, body).unwrap();
@@ -121,6 +131,7 @@ fn read_single_supervisor_journal(runtime_root: &Path) -> String {
 
 #[test]
 fn supervise_dispatches_file_watch_event_to_department() {
+    let _lock = supervise_smoke_lock();
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();
     fs::create_dir_all(root.join("departments/recorder")).unwrap();
@@ -191,6 +202,7 @@ return M
 
 #[test]
 fn supervise_starts_when_journal_log_dir_cannot_be_created() {
+    let _lock = supervise_smoke_lock();
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();
     let runtime_root = root.join("runtime-file");
@@ -266,6 +278,7 @@ return M
 
 #[test]
 fn supervise_survives_launcher_parent_exit() {
+    let _lock = supervise_smoke_lock();
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();
     let input_dir = root.join("input");
@@ -373,6 +386,7 @@ exit 0
 
 #[test]
 fn supervise_env_package_root_reaches_child_framework() {
+    let _lock = supervise_smoke_lock();
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();
     let package = root.join("package-root");
@@ -487,6 +501,7 @@ return M
 
 #[test]
 fn supervise_sigterm_terminates_department_process_tree() {
+    let _lock = supervise_smoke_lock();
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();
     let ready = root.join("ready.txt");
@@ -581,6 +596,7 @@ return M
 
 #[test]
 fn supervise_delivers_cross_package_raise_from_composed_child() {
+    let _lock = supervise_smoke_lock();
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path();
     let host = root.join("host");

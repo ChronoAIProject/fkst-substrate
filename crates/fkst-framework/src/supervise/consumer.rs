@@ -173,7 +173,7 @@ pub async fn spawn_consumer(
                     );
                 }
                 _ = tick.tick(), if !reliable_queues.is_empty() => {
-                    renew_running(&name, store.as_deref(), stall_window, &running);
+                    renew_running(&name, store.as_deref(), stall_window, &mut running);
                     maintain_dead_letters(&name, store.as_deref(), &router);
                     dispatch_due(
                         &name,
@@ -399,6 +399,7 @@ fn dispatch_due(
         running.insert(
             running_record.delivery_id.clone(),
             RunningDelivery {
+                next_renew_at_ms: next_renew_at_ms(now_unix_millis(), stall_window),
                 record: running_record,
                 handle,
             },
@@ -525,42 +526,70 @@ fn renew_running(
     dept_name: &str,
     store: Option<&DeliveryStore>,
     stall_window: Duration,
-    running: &BTreeMap<String, RunningDelivery>,
+    running: &mut BTreeMap<String, RunningDelivery>,
 ) {
     let Some(store) = store else {
         error!(dept = %dept_name, "reliable consumer missing delivery store");
         return;
     };
-    let lease_until = now_unix_millis().saturating_add(duration_millis(retry_lease(stall_window)));
-    for running_delivery in running.values() {
+    let now = now_unix_millis();
+    let lease_until = now.saturating_add(duration_millis(retry_lease(stall_window)));
+    let renewals = running
+        .values()
+        .filter(|running_delivery| {
+            !running_delivery.handle.is_finished() && running_delivery.next_renew_at_ms <= now
+        })
+        .map(|running_delivery| {
+            (
+                running_delivery.record.delivery_id.clone(),
+                running_delivery.record.lease_generation,
+            )
+        })
+        .collect::<Vec<_>>();
+    if renewals.is_empty() {
+        return;
+    }
+    let renewed = match store.renew_leases(&renewals, lease_until) {
+        Ok(renewed) => renewed,
+        Err(err) => {
+            error!(
+                dept = %dept_name,
+                error = %err,
+                "delivery lease renewal failed"
+            );
+            return;
+        }
+    };
+    let next_renew = next_renew_at_ms(now, stall_window);
+    for (delivery_id, lease_generation) in renewals {
+        let Some(running_delivery) = running.get_mut(&delivery_id) else {
+            continue;
+        };
         if running_delivery.handle.is_finished() {
             continue;
         }
-        match store.renew_lease(
-            &running_delivery.record.delivery_id,
-            running_delivery.record.lease_generation,
-            lease_until,
-        ) {
-            Ok(true) => {}
-            Ok(false) => {
-                warn!(
-                    dept = %dept_name,
-                    delivery_id = %running_delivery.record.delivery_id,
-                    generation = running_delivery.record.lease_generation,
-                    "delivery lease renewal stale or missing"
-                );
-            }
-            Err(err) => {
-                error!(
-                    dept = %dept_name,
-                    delivery_id = %running_delivery.record.delivery_id,
-                    generation = running_delivery.record.lease_generation,
-                    error = %err,
-                    "delivery lease renewal failed"
-                );
-            }
+        if let Some(record) = renewed.get(&delivery_id) {
+            running_delivery.record.lease_until_ms = record.lease_until_ms;
+            running_delivery.record.lease_generation = record.lease_generation;
+            running_delivery.next_renew_at_ms = next_renew;
+        } else {
+            warn!(
+                dept = %dept_name,
+                delivery_id = %delivery_id,
+                generation = lease_generation,
+                "delivery lease renewal stale or missing"
+            );
         }
     }
+}
+
+fn next_renew_at_ms(now_ms: u64, stall_window: Duration) -> u64 {
+    now_ms.saturating_add(duration_millis(renew_interval(stall_window)))
+}
+
+fn renew_interval(stall_window: Duration) -> Duration {
+    let half_lease = retry_lease(stall_window) / 2;
+    half_lease.max(Duration::from_secs(1))
 }
 
 fn retry_record(
@@ -998,6 +1027,7 @@ fn duration_millis(duration: Duration) -> u64 {
 }
 
 struct RunningDelivery {
+    next_renew_at_ms: u64,
     record: DeliveryRecord,
     handle: JoinHandle<()>,
 }
@@ -1212,6 +1242,39 @@ mod tests {
     fn durable_dispatch_capacity_clamps_to_burst_and_dispatch_batch() {
         assert_eq!(durable_dispatch_capacity(0, 16, 8), 8);
         assert_eq!(durable_dispatch_capacity(0, 64, 32), DISPATCH_BATCH);
+    }
+
+    #[test]
+    fn renew_interval_is_before_retry_lease() {
+        let stall_window = Duration::from_secs(30);
+
+        let interval = renew_interval(stall_window);
+
+        assert!(interval >= Duration::from_secs(1));
+        assert!(interval < retry_lease(stall_window));
+    }
+
+    #[test]
+    fn dispatch_renew_deadline_is_before_stored_lease_expiry() {
+        for stall_window in [
+            Duration::ZERO,
+            Duration::from_millis(1),
+            Duration::from_secs(1),
+            Duration::from_secs(30),
+        ] {
+            let temp = TempDir::new().unwrap();
+            let store = DeliveryStore::open(temp.path().join("delivery.redb")).unwrap();
+            store.enqueue(&record("one")).unwrap();
+            let now_ms = 1_000;
+            let leased = store
+                .lease_for_dept("worker", now_ms, 1, retry_lease(stall_window))
+                .unwrap();
+            let stored = store.get("one").unwrap().unwrap();
+            let next_renew_at_ms = next_renew_at_ms(now_ms, stall_window);
+
+            assert_eq!(leased.len(), 1);
+            assert!(next_renew_at_ms < stored.lease_until_ms.unwrap());
+        }
     }
 
     fn router_with_dead_letter(store: Arc<DeliveryStore>) -> DeliveryRouter {
@@ -1899,7 +1962,7 @@ mod tests {
             "worker",
             Some(store.as_ref()),
             Duration::from_millis(1),
-            &running,
+            &mut running,
         );
         dispatch_due(
             "worker",
@@ -1979,6 +2042,67 @@ mod tests {
 
         assert!(store.get("one").unwrap().is_none());
         assert!(store.get("two").unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn renew_running_skips_ticks_until_deadline_then_batches() {
+        let temp = TempDir::new().unwrap();
+        let store = DeliveryStore::open(temp.path().join("delivery.redb")).unwrap();
+        store.enqueue(&record("one")).unwrap();
+        store.enqueue(&record("two")).unwrap();
+        let leased = store
+            .lease_for_dept("worker", now_unix_millis(), 2, Duration::from_secs(30))
+            .unwrap();
+        let first_until = leased[0].lease_until_ms.unwrap();
+        let mut running = BTreeMap::new();
+        for mut record in leased {
+            record.dept = "worker".to_string();
+            let handle = tokio::spawn(async {
+                std::future::pending::<()>().await;
+            });
+            running.insert(
+                record.delivery_id.clone(),
+                RunningDelivery {
+                    next_renew_at_ms: u64::MAX,
+                    record,
+                    handle,
+                },
+            );
+        }
+
+        renew_running(
+            "worker",
+            Some(&store),
+            Duration::from_secs(30),
+            &mut running,
+        );
+        assert_eq!(
+            store.get("one").unwrap().unwrap().lease_until_ms,
+            Some(first_until)
+        );
+
+        for running_delivery in running.values_mut() {
+            running_delivery.next_renew_at_ms = 0;
+        }
+        renew_running(
+            "worker",
+            Some(&store),
+            Duration::from_secs(30),
+            &mut running,
+        );
+
+        let one = store.get("one").unwrap().unwrap();
+        let two = store.get("two").unwrap().unwrap();
+        assert!(one.lease_until_ms.unwrap() > first_until);
+        assert_eq!(one.lease_until_ms, two.lease_until_ms);
+        assert_eq!(one.lease_generation, 1);
+        assert_eq!(two.lease_generation, 1);
+        assert!(running
+            .values()
+            .all(|delivery| delivery.next_renew_at_ms > 0));
+        for delivery in running.into_values() {
+            delivery.handle.abort();
+        }
     }
 
     #[test]
