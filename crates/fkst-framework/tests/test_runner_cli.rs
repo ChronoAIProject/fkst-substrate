@@ -717,6 +717,282 @@ return {
 }
 
 #[test]
+fn run_department_delivers_namespaced_queue_for_bare_same_package_event() {
+    let host = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
+    let package = tempfile::Builder::new()
+        .prefix("github-devloop")
+        .tempdir()
+        .unwrap();
+    let owner_namespace = namespace(package.path());
+
+    fs::create_dir_all(package.path().join("departments/probe")).unwrap();
+    fs::write(
+        package.path().join("departments/probe/main.lua"),
+        format!(
+            r#"
+local M = {{}}
+M.spec = {{
+  consumes = {{ "tick" }},
+  produces = {{ "seen" }},
+}}
+function pipeline(event)
+  assert(event.queue == "{owner_namespace}.tick", "got " .. tostring(event.queue))
+  raise("seen", {{ queue = event.queue }})
+end
+return M
+"#
+        ),
+    )
+    .unwrap();
+    fs::create_dir_all(package.path().join("tests")).unwrap();
+    fs::write(
+        package.path().join("tests/namespaced_event_queue_test.lua"),
+        format!(
+            r#"
+local t = fkst.test
+return {{
+  test_run_department_delivers_namespaced_queue = function()
+    local result = fkst.test.run_department(
+      "departments/probe/main.lua",
+      {{ queue = "tick", payload = {{}}, ts = 1 }}
+    )
+    t.eq(result.exit_code, 0)
+    t.eq(result.raises[1].queue, "{owner_namespace}.seen")
+    t.eq(result.raises[1].payload.queue, "{owner_namespace}.tick")
+  end,
+}}
+"#
+        ),
+    )
+    .unwrap();
+
+    let output = run_lua_tests_with_packages(host.path(), &[package.path()]);
+
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}",
+        stdout(&output),
+        stderr(&output)
+    );
+    let out = stdout(&output);
+    assert!(
+        out.contains(
+            "PASS tests/namespaced_event_queue_test.lua::test_run_department_delivers_namespaced_queue"
+        ),
+        "stdout: {out}"
+    );
+    assert!(out.contains("1 passed, 0 failed"), "stdout: {out}");
+}
+
+#[test]
+fn run_department_preserves_cross_package_consumed_queue_event() {
+    let host = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
+    let package = tempfile::Builder::new()
+        .prefix("github-devloop")
+        .tempdir()
+        .unwrap();
+    let other = tempfile::Builder::new()
+        .prefix("consensus")
+        .tempdir()
+        .unwrap();
+    let owner_namespace = namespace(package.path());
+    let other_namespace = namespace(other.path());
+
+    fs::create_dir_all(package.path().join("departments/probe")).unwrap();
+    fs::write(
+        package.path().join("departments/probe/main.lua"),
+        format!(
+            r#"
+local M = {{}}
+M.spec = {{
+  consumes = {{ "{other_namespace}.tick" }},
+  produces = {{ "seen" }},
+}}
+function pipeline(event)
+  assert(event.queue == "{other_namespace}.tick", "got " .. tostring(event.queue))
+  raise("seen", {{ queue = event.queue }})
+end
+return M
+"#
+        ),
+    )
+    .unwrap();
+    fs::create_dir_all(package.path().join("tests")).unwrap();
+    fs::write(
+        package
+            .path()
+            .join("tests/cross_package_event_queue_test.lua"),
+        format!(
+            r#"
+local t = fkst.test
+return {{
+  test_run_department_preserves_cross_package_queue = function()
+    local result = fkst.test.run_department(
+      "departments/probe/main.lua",
+      {{ queue = "{other_namespace}.tick", payload = {{}}, ts = 1 }}
+    )
+    t.eq(result.exit_code, 0)
+    t.eq(result.raises[1].queue, "{owner_namespace}.seen")
+    t.eq(result.raises[1].payload.queue, "{other_namespace}.tick")
+  end,
+}}
+"#
+        ),
+    )
+    .unwrap();
+
+    let output = run_lua_tests_with_packages(host.path(), &[package.path(), other.path()]);
+
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}",
+        stdout(&output),
+        stderr(&output)
+    );
+    let out = stdout(&output);
+    assert!(
+        out.contains(
+            "PASS tests/cross_package_event_queue_test.lua::test_run_department_preserves_cross_package_queue"
+        ),
+        "stdout: {out}"
+    );
+    assert!(out.contains("1 passed, 0 failed"), "stdout: {out}");
+}
+
+#[test]
+fn run_department_preserves_engine_failure_fact_queue_event() {
+    let host = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
+    let package = tempfile::Builder::new()
+        .prefix("github-devloop")
+        .tempdir()
+        .unwrap();
+    let owner_namespace = namespace(package.path());
+
+    fs::create_dir_all(package.path().join("departments/probe")).unwrap();
+    fs::write(
+        package.path().join("departments/probe/main.lua"),
+        r#"
+local M = {}
+M.spec = {
+  consumes = { "fkst.failure_fact" },
+  ephemeral = { "fkst.failure_fact" },
+  produces = { "seen" },
+}
+function pipeline(event)
+  assert(event.queue == "fkst.failure_fact", "got " .. tostring(event.queue))
+  raise("seen", { queue = event.queue })
+end
+return M
+"#,
+    )
+    .unwrap();
+    fs::create_dir_all(package.path().join("tests")).unwrap();
+    fs::write(
+        package
+            .path()
+            .join("tests/failure_fact_event_queue_test.lua"),
+        format!(
+            r#"
+local t = fkst.test
+return {{
+  test_run_department_preserves_failure_fact_queue = function()
+    local result = fkst.test.run_department(
+      "departments/probe/main.lua",
+      {{ queue = "fkst.failure_fact", payload = {{}}, ts = 1 }}
+    )
+    t.eq(result.exit_code, 0)
+    t.eq(result.raises[1].queue, "{owner_namespace}.seen")
+    t.eq(result.raises[1].payload.queue, "fkst.failure_fact")
+  end,
+}}
+"#
+        ),
+    )
+    .unwrap();
+
+    let output = run_lua_tests_with_packages(host.path(), &[package.path()]);
+
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}",
+        stdout(&output),
+        stderr(&output)
+    );
+    let out = stdout(&output);
+    assert!(
+        out.contains(
+            "PASS tests/failure_fact_event_queue_test.lua::test_run_department_preserves_failure_fact_queue"
+        ),
+        "stdout: {out}"
+    );
+    assert!(out.contains("1 passed, 0 failed"), "stdout: {out}");
+}
+
+#[test]
+fn run_department_legacy_flat_event_queue_stays_flat() {
+    let package = tempfile::Builder::new()
+        .prefix("github-devloop")
+        .tempdir()
+        .unwrap();
+
+    fs::create_dir_all(package.path().join("departments/probe")).unwrap();
+    fs::write(
+        package.path().join("departments/probe/main.lua"),
+        r#"
+local M = {}
+M.spec = {
+  consumes = { "tick" },
+  produces = { "seen" },
+}
+function pipeline(event)
+  assert(event.queue == "tick", "got " .. tostring(event.queue))
+  raise("seen", { queue = event.queue })
+end
+return M
+"#,
+    )
+    .unwrap();
+    fs::create_dir_all(package.path().join("tests")).unwrap();
+    fs::write(
+        package
+            .path()
+            .join("tests/legacy_flat_event_queue_test.lua"),
+        r#"
+local t = fkst.test
+return {
+  test_run_department_keeps_legacy_flat_queue = function()
+    local result = fkst.test.run_department(
+      "departments/probe/main.lua",
+      { queue = "tick", payload = {}, ts = 1 }
+    )
+    t.eq(result.exit_code, 0)
+    t.eq(result.raises[1].queue, "seen")
+    t.eq(result.raises[1].payload.queue, "tick")
+  end,
+}
+"#,
+    )
+    .unwrap();
+
+    let output = run_lua_tests(package.path(), package.path());
+
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}",
+        stdout(&output),
+        stderr(&output)
+    );
+    let out = stdout(&output);
+    assert!(
+        out.contains(
+            "PASS tests/legacy_flat_event_queue_test.lua::test_run_department_keeps_legacy_flat_queue"
+        ),
+        "stdout: {out}"
+    );
+    assert!(out.contains("1 passed, 0 failed"), "stdout: {out}");
+}
+
+#[test]
 fn run_department_records_declared_cross_package_raise_without_delivery() {
     let host = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
     let package = tempfile::Builder::new()
