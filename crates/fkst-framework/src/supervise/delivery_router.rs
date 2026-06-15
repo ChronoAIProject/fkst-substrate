@@ -111,13 +111,23 @@ impl DeliveryRouter {
                     .as_ref()
                     .ok_or_else(|| anyhow!("reliable delivery store is not open"))?;
                 ensure_payload_within_bound(&envelope.event.payload)?;
+                let raised_dedup_key = envelope
+                    .event
+                    .payload
+                    .get("dedup_key")
+                    .and_then(JsonValue::as_str)
+                    .filter(|key| !key.is_empty());
+                let raised_source_ref = payload_source_ref(&envelope.event.payload);
+                let delivery_identity = derive_delivery_identity(
+                    &queue,
+                    &sub.dept,
+                    Some(&source),
+                    envelope.derived.as_ref(),
+                    raised_dedup_key,
+                    raised_source_ref.as_ref(),
+                );
                 let record = DeliveryRecord {
-                    delivery_id: derive_delivery_id(
-                        &queue,
-                        &sub.dept,
-                        &source,
-                        envelope.derived.as_ref(),
-                    ),
+                    delivery_id: delivery_identity.delivery_id,
                     queue: queue.clone(),
                     dept: sub.dept.clone(),
                     payload: envelope.event.payload.clone(),
@@ -126,6 +136,7 @@ impl DeliveryRouter {
                     observed_at_ms: envelope.event.ts,
                     attempt: 0,
                     redrive_count: 0,
+                    collapse_by_dedup_id: delivery_identity.collapse_by_dedup_id,
                     lease_generation: 0,
                     lease_until_ms: None,
                     not_before_ms: now_unix_millis(),
@@ -268,25 +279,84 @@ fn subscriptions(cfg: &Config) -> BTreeMap<String, Vec<Subscription>> {
 pub(crate) fn derive_delivery_id(
     queue: &str,
     dept: &str,
-    source: &SourceRef,
+    source: Option<&SourceRef>,
     derived: Option<&DerivedDelivery>,
+    raised_dedup_key: Option<&str>,
+    raised_source_ref: Option<&SourceRef>,
 ) -> String {
+    derive_delivery_identity(
+        queue,
+        dept,
+        source,
+        derived,
+        raised_dedup_key,
+        raised_source_ref,
+    )
+    .delivery_id
+}
+
+struct DeliveryIdentity {
+    delivery_id: String,
+    collapse_by_dedup_id: bool,
+}
+
+fn derive_delivery_identity(
+    queue: &str,
+    dept: &str,
+    source: Option<&SourceRef>,
+    derived: Option<&DerivedDelivery>,
+    raised_dedup_key: Option<&str>,
+    raised_source_ref: Option<&SourceRef>,
+) -> DeliveryIdentity {
+    let mut collapse_by_dedup_id = false;
     let key = if let Some(derived) = derived {
-        let parent_hash = stable_hex_hash(&derived.parent_delivery_id);
-        runtime_key([
-            "delivery",
-            "v2",
-            "raised",
-            "queue",
-            queue,
-            "dept",
-            dept,
-            "parent_hash",
-            &parent_hash,
-            "ordinal",
-            &derived.ordinal.to_string(),
-        ])
+        if let Some(dedup_key) = raised_dedup_key.filter(|key| !key.is_empty()) {
+            collapse_by_dedup_id = true;
+            // dedup_key is an engine-visible raised payload control field like source_ref;
+            // durable collapse depends on producers keeping it stable per logical signal.
+            runtime_key_v3([
+                RuntimeKeyPart::Raw("delivery"),
+                RuntimeKeyPart::Raw("v3"),
+                RuntimeKeyPart::Raw("raised"),
+                RuntimeKeyPart::Raw("queue"),
+                RuntimeKeyPart::Raw(queue),
+                RuntimeKeyPart::Raw("dept"),
+                RuntimeKeyPart::Raw(dept),
+                RuntimeKeyPart::Raw("dedup"),
+                RuntimeKeyPart::Escaped(dedup_key),
+            ])
+        } else if let Some(source_ref) = raised_source_ref.or(source) {
+            runtime_key_v3([
+                RuntimeKeyPart::Raw("delivery"),
+                RuntimeKeyPart::Raw("v3"),
+                RuntimeKeyPart::Raw("raised-src"),
+                RuntimeKeyPart::Raw("queue"),
+                RuntimeKeyPart::Raw(queue),
+                RuntimeKeyPart::Raw("dept"),
+                RuntimeKeyPart::Raw(dept),
+                RuntimeKeyPart::Raw("kind"),
+                RuntimeKeyPart::Raw(source_kind_key(&source_ref.kind)),
+                RuntimeKeyPart::Raw("ref"),
+                RuntimeKeyPart::Escaped(&source_ref.reference),
+            ])
+        } else {
+            let parent_hash = stable_hex_hash(&derived.parent_delivery_id);
+            runtime_key([
+                "delivery",
+                "v2",
+                "raised",
+                "queue",
+                queue,
+                "dept",
+                dept,
+                "parent_hash",
+                &parent_hash,
+                "ordinal",
+                &derived.ordinal.to_string(),
+            ])
+        }
     } else {
+        let source = source.expect("source delivery id requires source_ref");
         runtime_key([
             "delivery",
             "v1",
@@ -301,7 +371,34 @@ pub(crate) fn derive_delivery_id(
         ])
     };
     validate_runtime_key(&key).expect("delivery id should be a runtime-safe key");
-    key
+    DeliveryIdentity {
+        delivery_id: key,
+        collapse_by_dedup_id,
+    }
+}
+
+fn payload_source_ref(payload: &JsonValue) -> Option<SourceRef> {
+    let source = payload.get("source_ref")?;
+    let kind = source.get("kind").and_then(JsonValue::as_str)?;
+    let reference = source
+        .get("reference")
+        .and_then(JsonValue::as_str)
+        .filter(|reference| !reference.is_empty())?;
+    let kind = payload_source_kind(kind)?;
+    Some(SourceRef {
+        kind,
+        reference: reference.to_string(),
+    })
+}
+
+fn payload_source_kind(kind: &str) -> Option<SourceKind> {
+    match kind {
+        "file" | "file_watch" => Some(SourceKind::File),
+        "cron" => Some(SourceKind::Cron),
+        "git" => Some(SourceKind::Git),
+        "external" => Some(SourceKind::External),
+        _ => None,
+    }
 }
 
 fn stable_hex_hash(value: &str) -> String {
@@ -452,6 +549,46 @@ fn encode_runtime_key_part(part: &str) -> String {
     }
 }
 
+enum RuntimeKeyPart<'a> {
+    Raw(&'a str),
+    Escaped(&'a str),
+}
+
+fn runtime_key_v3<'a>(parts: impl IntoIterator<Item = RuntimeKeyPart<'a>>) -> String {
+    let mut segments = Vec::new();
+    for part in parts {
+        match part {
+            RuntimeKeyPart::Raw(part) => segments.push(part.to_string()),
+            RuntimeKeyPart::Escaped(part) => segments.extend(runtime_key_part_segments_v3(part)),
+        }
+    }
+    segments.join("/")
+}
+
+fn runtime_key_part_segments_v3(part: &str) -> Vec<String> {
+    let encoded = encode_runtime_key_part_v3(part);
+    encoded
+        .as_bytes()
+        .chunks(DELIVERY_ID_PART_CHUNK_BYTES)
+        .map(|chunk| std::str::from_utf8(chunk).expect("runtime key part should be ASCII"))
+        .map(str::to_string)
+        .collect()
+}
+
+fn encode_runtime_key_part_v3(part: &str) -> String {
+    if part.is_empty() {
+        return "_".to_string();
+    }
+    let mut encoded = String::new();
+    for byte in part.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' => encoded.push(byte as char),
+            _ => encoded.push_str(&format!("_{byte:02X}_")),
+        }
+    }
+    encoded
+}
+
 fn source_kind_key(kind: &SourceKind) -> &'static str {
     match kind {
         SourceKind::File => "file_watch",
@@ -565,6 +702,13 @@ mod tests {
             limits: LimitsDecl {
                 global_codex_processes: 1,
             },
+        }
+    }
+
+    fn cron_source(reference: &str) -> SourceRef {
+        SourceRef {
+            kind: SourceKind::Cron,
+            reference: reference.to_string(),
         }
     }
 
@@ -699,8 +843,8 @@ mod tests {
             kind: SourceKind::File,
             reference: "/tmp/input.txt/len/4/mtime/1000".to_string(),
         };
-        let first = derive_delivery_id("jobs", "worker", &source, None);
-        let second = derive_delivery_id("jobs", "worker", &source, None);
+        let first = derive_delivery_id("jobs", "worker", Some(&source), None, None, None);
+        let second = derive_delivery_id("jobs", "worker", Some(&source), None, None, None);
 
         assert_eq!(first, second);
         assert_eq!(
@@ -710,18 +854,248 @@ mod tests {
     }
 
     #[test]
-    fn raised_delivery_id_uses_parent_ordinal_queue_and_dept() {
-        let source = SourceRef {
-            kind: SourceKind::Cron,
-            reference: "tick/slot/1000".to_string(),
+    fn raised_delivery_id_collapses_same_dedup_key_across_parents() {
+        let first_parent = DerivedDelivery {
+            parent_delivery_id: "delivery/v1/source/cron/queue/jobs/dept/worker/ref/tick-1"
+                .to_string(),
+            ordinal: 0,
         };
+        let second_parent = DerivedDelivery {
+            parent_delivery_id: "delivery/v1/source/cron/queue/jobs/dept/worker/ref/tick-2"
+                .to_string(),
+            ordinal: 7,
+        };
+
+        let first = derive_delivery_id(
+            "next",
+            "next_worker",
+            Some(&cron_source("tick/slot/1000")),
+            Some(&first_parent),
+            Some("issue/512/proposal/abc"),
+            None,
+        );
+        let second = derive_delivery_id(
+            "next",
+            "next_worker",
+            Some(&cron_source("tick/slot/2000")),
+            Some(&second_parent),
+            Some("issue/512/proposal/abc"),
+            None,
+        );
+
+        assert_eq!(first, second);
+        assert_eq!(
+            first,
+            "delivery/v3/raised/queue/next/dept/next_worker/dedup/issue_2F_512_2F_proposal_2F_abc"
+        );
+    }
+
+    #[test]
+    fn raised_delivery_id_keeps_distinct_dedup_keys_for_same_source() {
+        let source = cron_source("issue/512");
+        let derived = DerivedDelivery {
+            parent_delivery_id: "delivery/v1/source/cron/queue/jobs/dept/worker/ref/tick"
+                .to_string(),
+            ordinal: 0,
+        };
+
+        let first = derive_delivery_id(
+            "comments",
+            "comment_worker",
+            Some(&source),
+            Some(&derived),
+            Some("proposal-a/comment/approve/v1"),
+            None,
+        );
+        let second = derive_delivery_id(
+            "comments",
+            "comment_worker",
+            Some(&source),
+            Some(&derived),
+            Some("proposal-b/comment/approve/v1"),
+            None,
+        );
+
+        assert_ne!(first, second);
+    }
+
+    #[test]
+    fn raised_delivery_id_dedup_key_wins_over_own_source_ref() {
+        let parent_source = cron_source("parent/tick");
+        let own_source = SourceRef {
+            kind: SourceKind::External,
+            reference: "child/entity:512".to_string(),
+        };
+        let derived = DerivedDelivery {
+            parent_delivery_id: "delivery/v1/source/cron/queue/jobs/dept/worker/ref/tick"
+                .to_string(),
+            ordinal: 1,
+        };
+
+        let id = derive_delivery_id(
+            "next",
+            "next_worker",
+            Some(&parent_source),
+            Some(&derived),
+            Some("issue-512"),
+            Some(&own_source),
+        );
+
+        assert_eq!(
+            id,
+            "delivery/v3/raised/queue/next/dept/next_worker/dedup/issue-512"
+        );
+        assert!(!id.contains("child"));
+    }
+
+    #[test]
+    fn reliable_raised_dedup_key_collapses_across_parent_source_and_ts() {
+        let cfg = config(false);
+        let temp = TempDir::new().unwrap();
+        let store = Arc::new(DeliveryStore::open(temp.path().join("delivery.redb")).unwrap());
+        let router = DeliveryRouter::new(&cfg, Fanout::new(), Some(store.clone()), None);
+        let first_parent = DerivedDelivery {
+            parent_delivery_id: "delivery/v1/source/cron/queue/source/dept/producer/ref/tick-1"
+                .to_string(),
+            ordinal: 0,
+        };
+        let second_parent = DerivedDelivery {
+            parent_delivery_id: "delivery/v1/source/cron/queue/source/dept/producer/ref/tick-2"
+                .to_string(),
+            ordinal: 4,
+        };
+        let mut first_event = Event::new(
+            "jobs",
+            serde_json::json!({
+                "entity": "issue-512",
+                "dedup_key": "issue-512/proposal-a"
+            }),
+        );
+        first_event.ts = 1_000;
+        let mut second_event = Event::new(
+            "jobs",
+            serde_json::json!({
+                "entity": "issue-512",
+                "dedup_key": "issue-512/proposal-a",
+                "minor": "later"
+            }),
+        );
+        second_event.ts = 2_000;
+
+        router
+            .publish(PublishEnvelope {
+                event: first_event,
+                source: Some(cron_source("tick/slot/1000")),
+                cron_payload: None,
+                derived: Some(first_parent),
+            })
+            .unwrap();
+        router
+            .publish(PublishEnvelope {
+                event: second_event,
+                source: Some(cron_source("tick/slot/2000")),
+                cron_payload: None,
+                derived: Some(second_parent),
+            })
+            .unwrap();
+
+        let leased = store
+            .lease_for_dept("worker", now_unix_millis(), 8, Duration::from_secs(30))
+            .unwrap();
+
+        assert_eq!(leased.len(), 1);
+        assert_eq!(
+            leased[0].delivery_id,
+            "delivery/v3/raised/queue/jobs/dept/worker/dedup/issue-512_2F_proposal-a"
+        );
+        assert_eq!(
+            leased[0].source.as_ref().unwrap().reference,
+            "tick/slot/1000"
+        );
+        assert_eq!(leased[0].observed_at_ms, 1_000);
+        assert_eq!(
+            leased[0].payload,
+            serde_json::json!({"entity": "issue-512", "dedup_key": "issue-512/proposal-a"})
+        );
+    }
+
+    #[test]
+    fn reliable_raised_same_entity_with_different_dedup_keys_stores_two_records() {
+        let cfg = config(false);
+        let temp = TempDir::new().unwrap();
+        let store = Arc::new(DeliveryStore::open(temp.path().join("delivery.redb")).unwrap());
+        let router = DeliveryRouter::new(&cfg, Fanout::new(), Some(store.clone()), None);
+        let source = cron_source("tick/slot/1000");
+
+        for (ordinal, dedup_key) in ["issue-512/proposal-a", "issue-512/proposal-b"]
+            .into_iter()
+            .enumerate()
+        {
+            router
+                .publish(PublishEnvelope {
+                    event: Event::new(
+                        "jobs",
+                        serde_json::json!({
+                            "entity": "issue-512",
+                            "dedup_key": dedup_key
+                        }),
+                    ),
+                    source: Some(source.clone()),
+                    cron_payload: None,
+                    derived: Some(DerivedDelivery {
+                        parent_delivery_id:
+                            "delivery/v1/source/cron/queue/source/dept/producer/ref/tick"
+                                .to_string(),
+                        ordinal,
+                    }),
+                })
+                .unwrap();
+        }
+
+        let leased = store
+            .lease_for_dept("worker", now_unix_millis(), 8, Duration::from_secs(30))
+            .unwrap();
+
+        assert_eq!(leased.len(), 2);
+    }
+
+    #[test]
+    fn raised_delivery_id_falls_back_to_own_source_ref_without_dedup_key() {
+        let parent_source = cron_source("parent/tick");
+        let own_source = SourceRef {
+            kind: SourceKind::External,
+            reference: "child/entity:512".to_string(),
+        };
+        let derived = DerivedDelivery {
+            parent_delivery_id: "delivery/v1/source/cron/queue/jobs/dept/worker/ref/tick"
+                .to_string(),
+            ordinal: 1,
+        };
+
+        let id = derive_delivery_id(
+            "next",
+            "next_worker",
+            Some(&parent_source),
+            Some(&derived),
+            None,
+            Some(&own_source),
+        );
+
+        assert_eq!(
+            id,
+            "delivery/v3/raised-src/queue/next/dept/next_worker/kind/external/ref/child_2F_entity_3A_512"
+        );
+    }
+
+    #[test]
+    fn raised_delivery_id_last_resort_uses_parent_ordinal_queue_and_dept() {
         let derived = DerivedDelivery {
             parent_delivery_id: "delivery/v1/source/cron/queue/jobs/dept/worker/ref/tick"
                 .to_string(),
             ordinal: 2,
         };
 
-        let id = derive_delivery_id("next", "next_worker", &source, Some(&derived));
+        let id = derive_delivery_id("next", "next_worker", None, Some(&derived), None, None);
 
         assert_eq!(
             id,
@@ -730,19 +1104,70 @@ mod tests {
     }
 
     #[test]
-    fn raised_delivery_id_chain_stays_bounded() {
-        let source = SourceRef {
-            kind: SourceKind::Cron,
-            reference: "tick".to_string(),
+    fn raised_delivery_id_escaping_is_injective_and_runtime_safe() {
+        let source = cron_source("tick");
+        let derived = DerivedDelivery {
+            parent_delivery_id: "delivery/v1/source/cron/queue/jobs/dept/worker/ref/tick"
+                .to_string(),
+            ordinal: 0,
         };
-        let mut parent = derive_delivery_id("jobs", "worker", &source, None);
+
+        let slash = derive_delivery_id(
+            "next",
+            "next_worker",
+            Some(&source),
+            Some(&derived),
+            Some("a/b"),
+            None,
+        );
+        let colon = derive_delivery_id(
+            "next",
+            "next_worker",
+            Some(&source),
+            Some(&derived),
+            Some("a:b"),
+            None,
+        );
+
+        assert_ne!(slash, colon);
+        assert!(slash.ends_with("/dedup/a_2F_b"));
+        assert!(colon.ends_with("/dedup/a_3A_b"));
+        validate_runtime_key(&slash).unwrap();
+        validate_runtime_key(&colon).unwrap();
+
+        let only_dots = derive_delivery_id(
+            "next",
+            "next_worker",
+            Some(&source),
+            Some(&derived),
+            Some("..."),
+            None,
+        );
+        let long_dot_tail = derive_delivery_id(
+            "next",
+            "next_worker",
+            Some(&source),
+            Some(&derived),
+            Some(&format!("a{}", ".".repeat(220))),
+            None,
+        );
+
+        assert!(only_dots.ends_with("/dedup/_2E__2E__2E_"));
+        validate_runtime_key(&only_dots).unwrap();
+        validate_runtime_key(&long_dot_tail).unwrap();
+    }
+
+    #[test]
+    fn raised_delivery_id_chain_stays_bounded() {
+        let source = cron_source("tick");
+        let mut parent = derive_delivery_id("jobs", "worker", Some(&source), None, None, None);
 
         for hop in 0..20 {
             let derived = DerivedDelivery {
                 parent_delivery_id: parent.clone(),
                 ordinal: hop,
             };
-            let id = derive_delivery_id("next", "next_worker", &source, Some(&derived));
+            let id = derive_delivery_id("next", "next_worker", None, Some(&derived), None, None);
 
             assert!(
                 id.len() < 512,

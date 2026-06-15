@@ -239,6 +239,7 @@ mod tests {
             observed_at_ms: 10,
             attempt: 2,
             redrive_count: 0,
+            collapse_by_dedup_id: false,
             lease_generation: 1,
             lease_until_ms: Some(20),
             not_before_ms: 0,
