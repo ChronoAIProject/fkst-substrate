@@ -589,6 +589,57 @@ fn test_runner_runs_minimal_package_sanity_tests() {
 }
 
 #[test]
+fn test_runner_exposes_only_the_explicit_hermetic_test_surface() {
+    let host = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
+    fs::create_dir_all(host.path().join("tests")).unwrap();
+    fs::write(
+        host.path().join("tests/fkst_test_surface_test.lua"),
+        r#"
+local t = fkst.test
+local allowed = {
+  command_calls = true,
+  eq = true,
+  is_nil = true,
+  is_true = true,
+  mock_command = true,
+  raises = true,
+  run_department = true,
+}
+
+return {
+  test_fkst_test_surface_is_explicit = function()
+    for name, _ in pairs(t) do
+      t.is_true(allowed[name], "unexpected fkst.test helper: " .. tostring(name))
+    end
+    for name, _ in pairs(allowed) do
+      t.is_true(type(t[name]) == "function", "missing fkst.test helper: " .. name)
+    end
+    t.is_nil(t.use_cassette)
+    t.is_nil(t.record_command)
+    t.is_nil(t.replay_command)
+  end,
+}
+"#,
+    )
+    .unwrap();
+
+    let output = run_lua_tests(host.path(), host.path());
+
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}",
+        stdout(&output),
+        stderr(&output)
+    );
+    let out = stdout(&output);
+    assert!(
+        out.contains("PASS tests/fkst_test_surface_test.lua::test_fkst_test_surface_is_explicit"),
+        "stdout: {out}"
+    );
+    assert!(out.contains("1 passed, 0 failed"), "stdout: {out}");
+}
+
+#[test]
 fn test_runner_isolates_each_test_file_to_its_owner_root() {
     let host = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
     let package_a = tempfile::Builder::new().prefix("repo").tempdir().unwrap();

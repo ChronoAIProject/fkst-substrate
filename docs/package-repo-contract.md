@@ -123,6 +123,8 @@ fkst.test.command_calls()
 
 `fkst.test` 不存在于 `run`、`supervise`、`--self-test` 或 conformance production Lua state。`mock_command` 劫持 test mode 中的 `exec_sync`、codex SDK 与 git SDK 外部命令调用；未 mock 的外部命令 fail closed。
 
+`fkst.test` deliberately does not provide VCR-style record/replay helpers. The established contract-testing practice for external commands requires a self-contained cassette contract before such a surface exists: explicit command boundary, cassette format and versioning, redaction rules, deterministic replay semantics, refresh or live-revalidation policy, and evidence that narrower contract tests or sandboxed fake CLIs cannot catch the target failure class. Without that proof, package tests must use `mock_command` plus `command_calls()` or a package-owned fake CLI.
+
 ### 2.3 `exec_sync` read coalescing
 
 `exec_sync(cmd_or_opts)` is force-fresh by default. A package may opt in only for external commands it knows are read-safe:

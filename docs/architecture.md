@@ -120,6 +120,8 @@ runner 不全树递归，不扫描 `raisers/` 或 `fkst/`。每个测试文件�
 
 `fkst.test.mock_command(pattern, result)` 与 `fkst.test.command_calls()` 只在 test mode 注册。mock runner 劫持 `exec_sync`、codex SDK 与 git SDK 的外部命令调用；渲染命令行按前缀或子串匹配，mock 按注册顺序一次性消费，未 mock 的外部命令 fail closed 且不启动真实进程。`command_calls()` 返回每次调用的 rendered、program、args、stdin、stdout、stderr 与 exit_code。`run_department` 创建的 fresh Lua state 与测试文件共享同一个 mock state；每个 test function 开始前清空 mocks 与 calls。`setup_worktree` 在 test mode 也经过同一 git mock runner，但 mock 不模拟 worktree filesystem 副作用。
 
+VCR-style record/replay is not part of `fkst.test`. Adding it would expand the external-command test boundary and therefore requires a complete cassette contract first: command boundary, schema/versioning, redaction, deterministic replay, refresh/live-revalidation rules, and proof that `mock_command`, `command_calls()` or sandboxed fake CLIs cannot catch the relevant API-contract failure.
+
 ## 4. Package Root 与 Host Root
 
 `PackageRoots::resolve` 产生 package roots input set 和一个 host root：
