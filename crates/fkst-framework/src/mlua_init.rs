@@ -3,7 +3,10 @@
 use anyhow::{Context, Result};
 use mlua::{Lua, LuaSerdeExt, Value as LuaValue};
 use serde_json::Value as JsonValue;
-use std::path::Path;
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+use std::time::SystemTime;
 
 use crate::config_registry::ConfigContext;
 use crate::external_command::MockCommandState;
@@ -92,11 +95,103 @@ pub(crate) fn set_package_roots_path<'a>(
     package_roots: impl IntoIterator<Item = &'a Path>,
 ) -> mlua::Result<()> {
     let roots_path = package_roots_path(package_roots);
+    set_package_path_string(lua, &roots_path)
+}
+
+pub(crate) fn set_package_path_string(lua: &Lua, roots_path: &str) -> mlua::Result<()> {
     lua.load(format!(
         "package.path = {:?}; package.cpath = \"\"",
         roots_path
     ))
     .exec()
+}
+
+#[derive(Clone, Default)]
+pub(crate) struct LuaChunkCache {
+    chunks: Arc<Mutex<BTreeMap<CachedChunkKey, Vec<u8>>>>,
+}
+
+impl LuaChunkCache {
+    pub(crate) fn load_cached_chunk(&self, lua: &Lua, path: &Path) -> Result<()> {
+        let bytecode = self.bytecode_for(path)?;
+        lua.load(bytecode.as_slice())
+            .set_name(path.to_string_lossy())
+            .exec()
+            .with_context(|| format!("exec {}", path.display()))
+    }
+
+    pub(crate) fn eval_cached_chunk(&self, lua: &Lua, path: &Path) -> Result<LuaValue> {
+        let bytecode = self.bytecode_for(path)?;
+        lua.load(bytecode.as_slice())
+            .set_name(path.to_string_lossy())
+            .eval()
+            .with_context(|| format!("eval {}", path.display()))
+    }
+
+    fn bytecode_for(&self, path: &Path) -> Result<Vec<u8>> {
+        let src =
+            std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
+        let key = CachedChunkKey::for_path(path, src.as_bytes())?;
+        if let Some(bytecode) = self
+            .chunks
+            .lock()
+            .map_err(|_| anyhow::anyhow!("lua chunk cache lock poisoned"))?
+            .get(&key)
+            .cloned()
+        {
+            return Ok(bytecode);
+        }
+        let lua = new_lua();
+        let function = lua
+            .load(&src)
+            .set_name(path.to_string_lossy())
+            .into_function()
+            .with_context(|| format!("compile {}", path.display()))?;
+        let bytecode = function.dump(true);
+        self.chunks
+            .lock()
+            .map_err(|_| anyhow::anyhow!("lua chunk cache lock poisoned"))?
+            .insert(key, bytecode.clone());
+        Ok(bytecode)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn chunk_count(&self) -> usize {
+        self.chunks.lock().map(|chunks| chunks.len()).unwrap_or(0)
+    }
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct CachedChunkKey {
+    path: PathBuf,
+    len: u64,
+    mtime: Option<SystemTime>,
+    content_hash: String,
+}
+
+impl CachedChunkKey {
+    fn for_path(path: &Path, source: &[u8]) -> Result<Self> {
+        let canonical = path
+            .canonicalize()
+            .with_context(|| format!("canonicalize {}", path.display()))?;
+        let metadata = std::fs::metadata(&canonical)
+            .with_context(|| format!("stat {}", canonical.display()))?;
+        Ok(Self {
+            path: canonical,
+            len: metadata.len(),
+            mtime: metadata.modified().ok(),
+            content_hash: content_hash(source),
+        })
+    }
+}
+
+fn content_hash(source: &[u8]) -> String {
+    let mut hash = 0xcbf29ce484222325_u64;
+    for byte in source {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("{hash:016x}")
 }
 
 /// Load the lua file at `path`, execute its top-level chunk, then call `pipeline(event)`.
@@ -128,13 +223,25 @@ pub fn run_dept_with_require_roots<'a>(
         .join(";");
     set_package_roots_path(lua, package_roots.iter().copied())
         .with_context(|| format!("set package.path for {}", roots_label))?;
+    run_dept_with_package_path_and_chunk_cache(lua, lua_path, event, None)
+}
 
-    let src = std::fs::read_to_string(lua_path)
-        .with_context(|| format!("read {}", lua_path.display()))?;
-    let chunk = lua.load(&src).set_name(lua_path.to_string_lossy());
-    chunk
-        .exec()
-        .with_context(|| format!("exec {}", lua_path.display()))?;
+pub(crate) fn run_dept_with_package_path_and_chunk_cache(
+    lua: &Lua,
+    lua_path: &Path,
+    event: &JsonValue,
+    cache: Option<&LuaChunkCache>,
+) -> Result<()> {
+    if let Some(cache) = cache {
+        cache.load_cached_chunk(lua, lua_path)?;
+    } else {
+        let src = std::fs::read_to_string(lua_path)
+            .with_context(|| format!("read {}", lua_path.display()))?;
+        let chunk = lua.load(&src).set_name(lua_path.to_string_lossy());
+        chunk
+            .exec()
+            .with_context(|| format!("exec {}", lua_path.display()))?;
+    }
 
     let pipeline: mlua::Function = lua
         .globals()
@@ -154,12 +261,18 @@ pub fn run_dept_with_require_roots<'a>(
 mod tests {
     use super::*;
     use std::io::Write;
+    use std::time::{Duration, UNIX_EPOCH};
     use tempfile::{NamedTempFile, TempDir};
 
     fn write_lua(s: &str) -> NamedTempFile {
         let mut f = NamedTempFile::new().unwrap();
         f.write_all(s.as_bytes()).unwrap();
         f
+    }
+
+    fn force_mtime(path: &Path, millis_since_epoch: u64) {
+        let time = UNIX_EPOCH + Duration::from_millis(millis_since_epoch);
+        filetime::set_file_mtime(path, filetime::FileTime::from_system_time(time)).unwrap();
     }
 
     #[test]
@@ -205,6 +318,31 @@ mod tests {
         let err = run_dept_with_package_root(&lua, f.path(), &serde_json::json!({}), package_root)
             .unwrap_err();
         assert!(format!("{}", err).contains("exec"));
+    }
+
+    #[test]
+    fn cached_chunk_key_uses_content_hash_when_len_and_mtime_match() {
+        let dir = TempDir::new().unwrap();
+        let main = dir.path().join("main.lua");
+        let first = "value = 'first'\n";
+        let second = "value = 'fresh'\n";
+        assert_eq!(first.len(), second.len());
+        std::fs::write(&main, first).unwrap();
+        force_mtime(&main, 1_000);
+        let cache = LuaChunkCache::default();
+
+        let lua = new_lua();
+        cache.load_cached_chunk(&lua, &main).unwrap();
+        let value: String = lua.globals().get("value").unwrap();
+        assert_eq!(value, "first");
+
+        std::fs::write(&main, second).unwrap();
+        force_mtime(&main, 1_000);
+        cache.load_cached_chunk(&lua, &main).unwrap();
+        let value: String = lua.globals().get("value").unwrap();
+
+        assert_eq!(value, "fresh");
+        assert_eq!(cache.chunk_count(), 2);
     }
 
     #[test]
