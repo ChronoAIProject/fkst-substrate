@@ -58,7 +58,7 @@ framework 不写持久状态文件。`RuntimeLayout` 把 `FKST_RUNTIME_ROOT` 下
 
 单次 `fkst-framework run` 使用一个 Lua state。Lua handler 内没有共享内存并发；跨 pipeline 的真实并发来自 OS 进程。
 
-`spawn_codex_sync`、`spawn_codex`、`await_all`、`exec_sync`、`with_lock`、`setup_worktree` 等 SDK 调用把阻塞、进程、文件锁或 worktree 操作显式暴露。不要在 framework 内引入按 Department 命名的 scheduler、业务 semaphore、retry policy 或 rate limiter。
+`spawn_codex_sync`、`spawn_codex`、`await_all`、`exec_sync`、`with_lock`、`setup_worktree` 等 SDK 调用把阻塞、进程、文件锁或 worktree 操作显式暴露。`exec_sync` 的 `read_coalesce` 只是 caller 显式声明 read-safe 后的 external read 去重，不是 scheduler、retry policy 或自动读写分类。不要在 framework 内引入按 Department 命名的 scheduler、业务 semaphore、retry policy 或 rate limiter。
 
 Codex 全局上限由 `<RT>/codex-permits/permit-*` 的 fcntl permit 池强制。拿不到 permit 就阻塞在文件锁上；进程退出或崩溃时 fd 关闭，permit 自动释放。这个机制是引擎层唯一 codex 并发权威。
 
@@ -92,6 +92,8 @@ framework 看得见的概念只有 `event`、`source`、`queue`、`pipeline`、`
 
 SDK 命名可以直接写 `codex`。不要做通用 LLM provider 抽象；别的模型或 CLI 可以由 package/host 用 `exec_sync` 组合。
 
+`exec_sync({ cmd = "...", read_coalesce = { key = "...", ttl_seconds = n } })` 是 opt-in external-read coalescing；省略 `read_coalesce` 就是 force-fresh。key 使用 runtime key 合约，`ttl_seconds` 必须是正有限数并夹到最多 300 秒。fingerprint 包含 caller key、解析后的 `/bin/sh -c` 命令/argv、与执行一致的原始 cwd（不做 canonical 化，避免 symlink TOCTTOU 错配）、排序后的有效环境和 timeout；带 stdin 输入的命令不参与 coalescing。fresh success hit 在 rate-pool token acquisition 与真实命令执行前返回缓存的 `{stdout, stderr, exit_code}`；miss 路径拿 per-fingerprint flock、double-check、再拿 rate token 并执行；`get` 只读不改（过期返回 miss，不删），leader 用 temp+rename 原子发布。只缓存 `exit_code == 0`；非零退出不缓存。engine 不从命令文本推断 read-safe，写命令不得使用该选项。
+
 ## Fanout / 队列
 
 队列物理实现是显式 `Vec<mpsc::Sender<Event>>`。禁止换成 `tokio::sync::broadcast`；broadcast 的 lag 语义和本引擎的 per-consumer drop-on-full 语义不一致。
@@ -108,7 +110,7 @@ Department execution 由 supervise spawn `fkst-framework run <lua> --project-roo
 
 Codex 调用固定为 `codex exec --dangerously-bypass-approvals-and-sandbox [-C worktree] [--context context] -`。prompt 写入 stdin；stdin EOF 是调用边界。`spawn_codex_sync({ prompt = ..., timeout = 3600 })` 与 `spawn_codex` 使用整体 wall-clock timeout，stdout/stderr 输出只被捕获，不延长 timeout；stdout、stderr、exit_code、cmd、done time、timeout 必须写入 codex log。`spawn_codex` 返回的 handle 只能由同一 pipeline 的 `await_all` 消费，不能跨 pipeline 复用。
 
-`fkst-framework test` 注册 test-mode-only `fkst.test.mock_command(pattern, result)` 与 `fkst.test.command_calls()`，和 `run_department` 并列。test mode 劫持 `exec_sync`、codex SDK 与 git SDK 的外部命令调用，按渲染命令行前缀或子串匹配 mock，按注册顺序一次性消费；未 mock 的外部命令 fail closed，不启动真实进程。production `run`、`supervise`、`--self-test` 与 conformance 不注册 mock state。`setup_worktree` 在 test mode 通过同一 git mock runner fail closed，但不模拟 worktree 副作用。
+`fkst-framework test` 注册 test-mode-only `fkst.test.mock_command(pattern, result)` 与 `fkst.test.command_calls()`，和 `run_department` 并列。test mode 劫持 `exec_sync`、codex SDK 与 git SDK 的外部命令调用，按渲染命令行前缀或子串匹配 mock，按注册顺序一次性消费；未 mock 的外部命令 fail closed，不启动真实进程。mocked `exec_sync` bypasses read coalescing，`command_calls()` 保持逐调用确定性。production `run`、`supervise`、`--self-test` 与 conformance 不注册 mock state。`setup_worktree` 在 test mode 通过同一 git mock runner fail closed，但不模拟 worktree 副作用。
 
 ## 单 repo 单实例
 

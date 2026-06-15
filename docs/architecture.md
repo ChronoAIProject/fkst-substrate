@@ -278,7 +278,7 @@ engine 维护 durable 在途 delivery state，但它不是实体业务真相、a
 | `spawn_codex_sync(opts)` | `sdk_codex.rs`，同步 `codex exec` |
 | `spawn_codex(opts)` | `sdk_codex.rs`，返回 pipeline-local handle |
 | `await_all(handles)` | `sdk_codex.rs`，join handles，防跨 pipeline/重复消费 |
-| `exec_sync(cmd|opts)` | `sdk_basic.rs`，运行 `/bin/sh -c`，可选 cwd/env/timeout |
+| `exec_sync(cmd|opts)` | `sdk_basic.rs`，运行 `/bin/sh -c`，可选 cwd/env/timeout/read_coalesce |
 | `with_lock(name, fn)` | `sdk_git.rs`，fcntl exclusive flock |
 | `once(key, fn)` | `sdk_mark.rs`，locked per-key marker，成功后写入 scratch marker |
 | `cache_set(key, value[, ttl_seconds])` | `sdk_cache.rs`，best-effort scratch KV 原子覆盖写，支持可选 expiry metadata |
