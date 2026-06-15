@@ -90,6 +90,12 @@ impl DeliveryStore {
         {
             let mut delivery = write.open_table(DELIVERY_BY_ID)?;
             if let Some(current) = read_delivery_table(&delivery, record.delivery_id.as_str())? {
+                if current.collapse_by_dedup_id || record.collapse_by_dedup_id {
+                    // Keep terminal or leased existing state intact; liveness repair is outside enqueue.
+                    drop(delivery);
+                    write.commit()?;
+                    return Ok(());
+                }
                 if same_delivery_content(&current, record) {
                     drop(delivery);
                     write.commit()?;
@@ -597,6 +603,7 @@ fn duration_millis(duration: Duration) -> u64 {
 
 #[cfg(test)]
 mod tests {
+    use super::super::delivery_types::{SourceKind, SourceRef};
     use super::*;
     use tempfile::TempDir;
 
@@ -615,6 +622,7 @@ mod tests {
             observed_at_ms: 10,
             attempt: 0,
             redrive_count: 0,
+            collapse_by_dedup_id: false,
             lease_generation: 0,
             lease_until_ms: None,
             not_before_ms,
@@ -706,6 +714,29 @@ mod tests {
             .to_string()
             .contains("conflicting duplicate delivery_id"));
         assert_eq!(current.queue, "input");
+        assert_eq!(current.not_before_ms, 100);
+        assert_eq!(store.ready_index_len().unwrap(), 1);
+    }
+
+    #[test]
+    fn duplicate_enqueue_dedup_keyed_record_keeps_existing_record() {
+        let temp = TempDir::new().unwrap();
+        let store = store(&temp);
+        let mut original = record("one", 100);
+        original.collapse_by_dedup_id = true;
+        let mut duplicate = record("one", 50);
+        duplicate.payload = serde_json::json!({"n": 2});
+        duplicate.source = Some(SourceRef {
+            kind: SourceKind::Cron,
+            reference: "later-tick".to_string(),
+        });
+
+        store.enqueue(&original).unwrap();
+        store.enqueue(&duplicate).unwrap();
+        let current = store.get("one").unwrap().unwrap();
+
+        assert_eq!(current.payload, serde_json::json!({"n": 1}));
+        assert_eq!(current.source, original.source);
         assert_eq!(current.not_before_ms, 100);
         assert_eq!(store.ready_index_len().unwrap(), 1);
     }

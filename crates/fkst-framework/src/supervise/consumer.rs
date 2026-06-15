@@ -1073,6 +1073,7 @@ mod tests {
             observed_at_ms: now_unix_millis(),
             attempt: 0,
             redrive_count: 0,
+            collapse_by_dedup_id: false,
             lease_generation: 0,
             lease_until_ms: None,
             not_before_ms: 0,
