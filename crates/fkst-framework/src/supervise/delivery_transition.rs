@@ -16,14 +16,14 @@ pub(crate) fn lease_key(
     ready: &mut redb::Table<'_, &str, ()>,
     lease_index: &mut redb::Table<'_, &str, ()>,
     from_expired_lease: bool,
-) -> Result<Option<DeliveryRecord>> {
+) -> Result<LeaseKeyOutcome> {
     let DueIndexKey {
         key: index_key,
         due_ms: indexed_at,
         delivery_id,
     } = key;
     if excluded.contains(&delivery_id) {
-        return Ok(None);
+        return Ok(LeaseKeyOutcome::unchanged());
     }
     let Some(mut record) = read_delivery_table(delivery, &delivery_id)? else {
         if from_expired_lease {
@@ -31,20 +31,20 @@ pub(crate) fn lease_key(
         } else {
             ready.remove(index_key.as_str())?;
         }
-        return Ok(None);
+        return Ok(LeaseKeyOutcome::mutated(None));
     };
     if dept.is_some_and(|wanted| record.dept != wanted) {
-        return Ok(None);
+        return Ok(LeaseKeyOutcome::unchanged());
     }
     if from_expired_lease {
         lease_index.remove(index_key.as_str())?;
         if record.lease_until_ms != Some(indexed_at) {
-            return Ok(None);
+            return Ok(LeaseKeyOutcome::mutated(None));
         }
     } else {
         ready.remove(index_key.as_str())?;
         if record.lease_until_ms.is_some() {
-            return Ok(None);
+            return Ok(LeaseKeyOutcome::mutated(None));
         }
     }
     if record.not_before_ms > now_ms && !from_expired_lease {
@@ -52,7 +52,7 @@ pub(crate) fn lease_key(
             make_index_key(&record.dept, record.not_before_ms, delivery_id.as_str()).as_str(),
             &(),
         )?;
-        return Ok(None);
+        return Ok(LeaseKeyOutcome::mutated(None));
     }
     if let Some(old_lease_until) = record.lease_until_ms {
         lease_index
@@ -66,7 +66,28 @@ pub(crate) fn lease_key(
         make_index_key(&record.dept, lease_until, delivery_id.as_str()).as_str(),
         &(),
     )?;
-    Ok(Some(record))
+    Ok(LeaseKeyOutcome::mutated(Some(record)))
+}
+
+pub(crate) struct LeaseKeyOutcome {
+    pub(crate) record: Option<DeliveryRecord>,
+    pub(crate) mutated: bool,
+}
+
+impl LeaseKeyOutcome {
+    fn unchanged() -> Self {
+        Self {
+            record: None,
+            mutated: false,
+        }
+    }
+
+    fn mutated(record: Option<DeliveryRecord>) -> Self {
+        Self {
+            record,
+            mutated: true,
+        }
+    }
 }
 
 pub(crate) fn rebuild_due_indexes(
