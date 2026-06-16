@@ -17,6 +17,7 @@ mod sdk_git;
 mod support;
 
 use config_registry::ConfigContext;
+use external_command::{CommandCassetteMode, CommandCassetteOptions, MockCommandState};
 use mlua::Lua;
 use sdk_git::{parse_worktree_paths, register};
 use std::path::Path;
@@ -345,6 +346,48 @@ fn git_log_count_consumes_git_rate_pool_token() {
         .eval()
         .unwrap();
     drop(guard);
+
+    assert_eq!(count, 1);
+    let ledger = std::fs::read_to_string(pool_root.path().join("git.bucket")).unwrap();
+    assert!(ledger.contains("tokens=0\n"), "{ledger}");
+}
+
+#[test]
+fn git_cassette_record_mode_consumes_git_rate_pool_token() {
+    let repo = repo_with_commit("git cassette rate pool token");
+    let pool_root = tempdir().unwrap();
+    seed_pool_token(pool_root.path(), "git");
+    let runner = MockCommandState::new();
+    runner
+        .start_cassette(CommandCassetteOptions {
+            path: repo.path().join("cassette.json"),
+            mode: CommandCassetteMode::Record,
+            redactions: Vec::new(),
+        })
+        .unwrap();
+    let mut sandbox = ProcessSandbox::new();
+    sandbox
+        .enter_cwd(repo.path())
+        .set_env(
+            "FKST_RATE_POOL_ROOT",
+            pool_root.path().as_os_str().to_owned(),
+        )
+        .set_env("FKST_RATE_POOL_GIT", "1,1");
+    let (_lock, guard) = sandbox.enter();
+    let lua = Lua::new();
+    sdk_git::register_with_runner(
+        &lua,
+        repo.path(),
+        ConfigContext::from_host_root(repo.path()).unwrap(),
+        Some(runner.clone()),
+    )
+    .unwrap();
+    let count: i64 = lua
+        .load(r#"return git_log_count("git cassette rate pool token", "1970-01-01T00:00:00Z")"#)
+        .eval()
+        .unwrap();
+    drop(guard);
+    runner.finish_cassette().unwrap();
 
     assert_eq!(count, 1);
     let ledger = std::fs::read_to_string(pool_root.path().join("git.bucket")).unwrap();
