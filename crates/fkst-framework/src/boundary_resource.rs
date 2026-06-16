@@ -54,6 +54,15 @@ pub(crate) static BOUNDARY_RESOURCE_REGISTRY: &[BoundaryResourceEntry] = &[
         errors: "quota-exhausted,auth-degraded,provider-unavailable,provider-throttle",
     },
     BoundaryResourceEntry {
+        id: "argv.process",
+        resource_type: "subprocess",
+        adapters: "exec_argv",
+        grant: "exec_argv adapter (direct program argv, no shell) plus optional argv[1] program rate pool",
+        meter: "optional rate-pool ledger; test-mode command_calls",
+        budget: "optional FKST_RATE_POOL_<PROGRAM> and per-call timeout",
+        errors: "quota-exhausted,auth-degraded,provider-unavailable,provider-throttle",
+    },
+    BoundaryResourceEntry {
         id: "git.process",
         resource_type: "external-source",
         adapters: "git_log_count,git_log_grep,count_worktrees,list_orphan_worktrees,setup_worktree",
@@ -180,6 +189,7 @@ mod tests {
             .collect::<std::collections::BTreeSet<_>>();
         assert!(ids.contains("codex.process"));
         assert!(ids.contains("shell.process"));
+        assert!(ids.contains("argv.process"));
         assert!(ids.contains("git.process"));
         assert!(ids.contains("runtime.filesystem"));
         assert!(ids.contains("wall-clock"));

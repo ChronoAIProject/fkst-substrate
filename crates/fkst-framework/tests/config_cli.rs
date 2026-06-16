@@ -119,7 +119,7 @@ fn boundary_resources_lists_mediated_resource_registry() {
 
     assert_exit(&output, 0);
     let out = stdout(&output);
-    assert_eq!(out.lines().count(), 5, "{out}");
+    assert_eq!(out.lines().count(), 6, "{out}");
     assert!(out.contains("id=codex.process"), "{out}");
     assert!(
         out.contains("adapters=spawn_codex_sync,spawn_codex"),
@@ -127,6 +127,8 @@ fn boundary_resources_lists_mediated_resource_registry() {
     );
     assert!(out.contains("budget=FKST_CODEX_PERMIT_SLOTS"), "{out}");
     assert!(out.contains("id=shell.process"), "{out}");
+    assert!(out.contains("id=argv.process"), "{out}");
+    assert!(out.contains("adapters=exec_argv"), "{out}");
     assert!(
         out.contains("errors=quota-exhausted,auth-degraded"),
         "{out}"

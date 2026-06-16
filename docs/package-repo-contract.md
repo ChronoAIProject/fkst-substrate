@@ -42,6 +42,7 @@ spawn_codex_sync(opts)
 spawn_codex(opts)
 fkst.codex_runs()
 exec_sync(cmd_or_opts)
+exec_argv(opts)
 await_all(handles)
 with_lock(name, fn)
 once(key, fn)
@@ -67,6 +68,8 @@ now()
 ```
 
 `pipeline(event)` 与 `source` 是 package-side 约定，不是普通 SDK global。Rust 注册的 runtime primitive 来自 `mlua_init.rs` 调用的 `sdk_*` 模块与 `raise.rs`。`json` 只有 `json.decode`，没有 `json.encode`、`json.array` 或 schema 推断；需要空数组时用 `json.decode("[]")` 形成 array-tagged table。Pure data utilities are not automatically Rust primitives; §2.2 defines the decision order.
+
+`exec_sync` and `exec_argv` are two distinct subprocess capabilities, not two ways to run the same thing. `exec_sync(cmd_or_opts)` lowers a command string to `/bin/sh -c` and is the genuine-shell primitive (env expansion, redirection, `&&`, builtins); its rate pool derives from the first shell word. `exec_argv({argv = {program, args...}, cwd?, env?, timeout?, read_coalesce?})` runs the program directly via `argv` with no shell — no Lua-side quoting, no shell injection — and is the egress that `gh`/`git` adapters (`std.github`/`std.git`) must use; its rate pool derives from `argv[1]`'s program basename. `exec_argv` rejects a `cmd` string and a `rate_pool` field. Both share the same mock/cassette/read-coalescing/rate/audit machinery and return `{stdout, stderr, exit_code, timed_out?, error_class?}`.
 
 `t(key[, vars])` implements key-based localization using the current owner root only. It reads `locales/<locale>.lua`, where `<locale>` comes from `FKST_OUTPUT_LANG`, and falls back to `locales/en.lua` when the requested locale or key is missing. `vars` is an optional table of scalar values interpolated into `{name}` placeholders. Catalogs are plain flat Lua tables with stable string keys and literal UTF-8 string values; they are package content, not engine policy.
 
