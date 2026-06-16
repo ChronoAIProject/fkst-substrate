@@ -21,13 +21,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::time::Duration;
 
-const SCHEMA_VERSION: &str = "8";
+const SCHEMA_VERSION: &str = "9";
 const TERMINAL_DEAD_RETENTION_MS: u64 = 24 * 60 * 60 * 1_000;
 const TERMINAL_DEAD_COMPACTION_LIMIT: usize = 1_024;
-const TERMINAL_SUPPRESSION_FILTER_BITS: usize = 262_144;
-const TERMINAL_SUPPRESSION_FILTER_BYTES: usize = TERMINAL_SUPPRESSION_FILTER_BITS / 8;
-const TERMINAL_SUPPRESSION_FILTER_HASHES: u64 = 7;
-const TERMINAL_SUPPRESSION_FILTER_KEY: &str = "v1";
+const TERMINAL_SUPPRESSION_SLOTS: u64 = 16_777_216;
 
 const DELIVERY_BY_ID: TableDefinition<&str, &[u8]> = TableDefinition::new("delivery_by_id");
 const DEAD_BY_ID: TableDefinition<&str, &[u8]> = TableDefinition::new("dead_by_id");
@@ -35,8 +32,8 @@ const TERMINAL_DEAD_BY_TIME: TableDefinition<&str, ()> =
     TableDefinition::new("terminal_dead_by_time");
 const TERMINAL_SUPPRESSED_BY_ID: TableDefinition<&str, ()> =
     TableDefinition::new("terminal_suppressed_by_id");
-const TERMINAL_SUPPRESSION_FILTER: TableDefinition<&str, &[u8]> =
-    TableDefinition::new("terminal_suppression_filter");
+const TERMINAL_SUPPRESSION_BY_SLOT: TableDefinition<&str, &str> =
+    TableDefinition::new("terminal_suppression_by_slot");
 const META: TableDefinition<&str, &str> = TableDefinition::new("meta");
 const OLD_READY_BY_DUE: TableDefinition<(u64, &str), ()> = TableDefinition::new("ready_by_due");
 const OLD_LEASED_BY_UNTIL: TableDefinition<(u64, &str), ()> =
@@ -95,7 +92,7 @@ impl DeliveryStore {
             }
             write.open_table(DEAD_BY_ID)?;
             write.open_table(TERMINAL_DEAD_BY_TIME)?;
-            write.open_table(TERMINAL_SUPPRESSION_FILTER)?;
+            write.open_table(TERMINAL_SUPPRESSION_BY_SLOT)?;
             if current_version.as_deref() != Some(SCHEMA_VERSION) {
                 delete_old_global_indexes(&write)?;
                 rebuild_due_indexes(&write, DELIVERY_BY_ID)?;
@@ -106,6 +103,7 @@ impl DeliveryStore {
                 rebuild_terminal_dead_tables(&write)?;
                 import_legacy_terminal_suppressed_ids(&write)?;
                 drop_legacy_terminal_suppressed_table(&write)?;
+                drop_legacy_terminal_suppression_filter(&write)?;
             }
             let mut meta = write.open_table(META)?;
             meta.insert("schema_version", SCHEMA_VERSION)?;
@@ -700,23 +698,17 @@ impl DeliveryStore {
     }
 
     #[cfg(test)]
-    fn terminal_suppression_filter_len(&self) -> Result<usize> {
+    fn terminal_suppression_slot_len(&self) -> Result<usize> {
         let read = self.db.begin_read()?;
-        let filter = read.open_table(TERMINAL_SUPPRESSION_FILTER)?;
-        let Some(bits) = filter.get(TERMINAL_SUPPRESSION_FILTER_KEY)? else {
-            return Ok(0);
-        };
-        Ok(bits.value().len())
+        let suppression = read.open_table(TERMINAL_SUPPRESSION_BY_SLOT)?;
+        count_suppression_slots(&suppression)
     }
 
     #[cfg(test)]
     fn terminal_suppresses(&self, delivery_id: &str) -> Result<bool> {
         let read = self.db.begin_read()?;
-        let filter = read.open_table(TERMINAL_SUPPRESSION_FILTER)?;
-        let Some(bits) = filter.get(TERMINAL_SUPPRESSION_FILTER_KEY)? else {
-            return Ok(false);
-        };
-        bloom_contains(bits.value(), delivery_id)
+        let suppression = read.open_table(TERMINAL_SUPPRESSION_BY_SLOT)?;
+        terminal_delivery_is_suppressed_in_table(&suppression, delivery_id)
     }
 
     #[cfg(test)]
@@ -860,15 +852,26 @@ fn is_terminal_dead_record(record: &DeadRecord) -> bool {
 }
 
 fn suppress_terminal_delivery(write: &redb::WriteTransaction, delivery_id: &str) -> Result<()> {
-    let mut filter = write.open_table(TERMINAL_SUPPRESSION_FILTER)?;
-    let mut bits = match filter.get(TERMINAL_SUPPRESSION_FILTER_KEY)? {
-        Some(current) if current.value().len() == TERMINAL_SUPPRESSION_FILTER_BYTES => {
-            current.value().to_vec()
+    let mut suppression = write.open_table(TERMINAL_SUPPRESSION_BY_SLOT)?;
+    suppress_terminal_delivery_in_table(&mut suppression, delivery_id)
+}
+
+fn suppress_terminal_delivery_in_table(
+    suppression: &mut redb::Table<'_, &str, &str>,
+    delivery_id: &str,
+) -> Result<()> {
+    let slot = terminal_suppression_slot_key(delivery_id);
+    if let Some(current) = suppression.get(slot.as_str())? {
+        let current = current.value();
+        if current == delivery_id {
+            return Ok(());
         }
-        _ => vec![0; TERMINAL_SUPPRESSION_FILTER_BYTES],
-    };
-    bloom_insert(&mut bits, delivery_id);
-    filter.insert(TERMINAL_SUPPRESSION_FILTER_KEY, bits.as_slice())?;
+        bail!(
+            "terminal suppression slot exhausted for delivery_id: {}",
+            delivery_id
+        );
+    }
+    suppression.insert(slot.as_str(), delivery_id)?;
     Ok(())
 }
 
@@ -876,37 +879,30 @@ fn terminal_delivery_is_suppressed(
     write: &redb::WriteTransaction,
     delivery_id: &str,
 ) -> Result<bool> {
-    let filter = write.open_table(TERMINAL_SUPPRESSION_FILTER)?;
-    let Some(bits) = filter.get(TERMINAL_SUPPRESSION_FILTER_KEY)? else {
+    let suppression = write.open_table(TERMINAL_SUPPRESSION_BY_SLOT)?;
+    terminal_delivery_is_suppressed_in_table(&suppression, delivery_id)
+}
+
+fn terminal_delivery_is_suppressed_in_table<T>(table: &T, delivery_id: &str) -> Result<bool>
+where
+    T: ReadableTable<&'static str, &'static str>,
+{
+    let slot = terminal_suppression_slot_key(delivery_id);
+    let Some(current) = table.get(slot.as_str())? else {
         return Ok(false);
     };
-    bloom_contains(bits.value(), delivery_id)
+    Ok(current.value() == delivery_id)
 }
 
-fn bloom_insert(bits: &mut [u8], delivery_id: &str) {
-    for bit in bloom_bits(delivery_id) {
-        bits[bit / 8] |= 1 << (bit % 8);
-    }
+fn terminal_suppression_slot_key(delivery_id: &str) -> String {
+    format!(
+        "{:05x}",
+        terminal_suppression_hash(delivery_id) % TERMINAL_SUPPRESSION_SLOTS
+    )
 }
 
-fn bloom_contains(bits: &[u8], delivery_id: &str) -> Result<bool> {
-    if bits.len() != TERMINAL_SUPPRESSION_FILTER_BYTES {
-        return Ok(false);
-    }
-    Ok(bloom_bits(delivery_id)
-        .into_iter()
-        .all(|bit| bits[bit / 8] & (1 << (bit % 8)) != 0))
-}
-
-fn bloom_bits(delivery_id: &str) -> [usize; TERMINAL_SUPPRESSION_FILTER_HASHES as usize] {
-    let first = fnv1a64(0xcbf29ce484222325, delivery_id.as_bytes());
-    let second = fnv1a64(0x84222325cbf29ce4, delivery_id.as_bytes()) | 1;
-    let mut bits = [0; TERMINAL_SUPPRESSION_FILTER_HASHES as usize];
-    for (idx, slot) in bits.iter_mut().enumerate() {
-        let hash = first.wrapping_add((idx as u64).wrapping_mul(second));
-        *slot = (hash % TERMINAL_SUPPRESSION_FILTER_BITS as u64) as usize;
-    }
-    bits
+fn terminal_suppression_hash(delivery_id: &str) -> u64 {
+    fnv1a64(0xcbf29ce484222325, delivery_id.as_bytes())
 }
 
 fn fnv1a64(seed: u64, bytes: &[u8]) -> u64 {
@@ -925,6 +921,15 @@ fn drop_legacy_terminal_suppressed_table(write: &redb::WriteTransaction) -> Resu
     }
 }
 
+fn drop_legacy_terminal_suppression_filter(write: &redb::WriteTransaction) -> Result<()> {
+    let legacy_filter: TableDefinition<&str, &[u8]> =
+        TableDefinition::new("terminal_suppression_filter");
+    match write.delete_table(legacy_filter) {
+        Ok(_) | Err(redb::TableError::TableDoesNotExist(_)) => Ok(()),
+        Err(err) => Err(err.into()),
+    }
+}
+
 fn read_legacy_terminal_suppressed_ids(write: &redb::WriteTransaction) -> Result<Vec<String>> {
     match write.open_table(TERMINAL_SUPPRESSED_BY_ID) {
         Ok(table) => {
@@ -938,6 +943,16 @@ fn read_legacy_terminal_suppressed_ids(write: &redb::WriteTransaction) -> Result
         Err(redb::TableError::TableDoesNotExist(_)) => Ok(Vec::new()),
         Err(err) => Err(err.into()),
     }
+}
+
+#[cfg(test)]
+fn count_suppression_slots(table: &redb::ReadOnlyTable<&str, &str>) -> Result<usize> {
+    let mut count = 0;
+    for entry in table.iter()? {
+        let _ = entry?;
+        count += 1;
+    }
+    Ok(count)
 }
 
 fn import_legacy_terminal_suppressed_ids(write: &redb::WriteTransaction) -> Result<()> {
@@ -1204,6 +1219,17 @@ mod tests {
             suppress_terminal_delivery(&write, delivery_id).unwrap();
         }
         write.commit().unwrap();
+    }
+
+    fn colliding_terminal_id(delivery_id: &str) -> String {
+        let target_slot = terminal_suppression_slot_key(delivery_id);
+        for index in 0..TERMINAL_SUPPRESSION_SLOTS.saturating_mul(2) {
+            let candidate = format!("{delivery_id}-slot-collision-{index}");
+            if terminal_suppression_slot_key(&candidate) == target_slot {
+                return candidate;
+            }
+        }
+        panic!("failed to find terminal suppression slot collision");
     }
 
     #[test]
@@ -2024,10 +2050,7 @@ mod tests {
         assert!(store.get_dead("old").unwrap().is_none());
         assert!(store.get_dead("young").unwrap().is_some());
         assert_eq!(store.terminal_dead_index_len().unwrap(), 1);
-        assert_eq!(
-            store.terminal_suppression_filter_len().unwrap(),
-            TERMINAL_SUPPRESSION_FILTER_BYTES
-        );
+        assert_eq!(store.terminal_suppression_slot_len().unwrap(), 2);
         assert!(store.terminal_suppresses("old").unwrap());
         assert!(store.terminal_suppresses("young").unwrap());
         let leased = store
@@ -2061,10 +2084,7 @@ mod tests {
 
         assert!(store.get_dead("old").unwrap().is_some());
         assert_eq!(store.terminal_dead_index_len().unwrap(), 1);
-        assert_eq!(
-            store.terminal_suppression_filter_len().unwrap(),
-            TERMINAL_SUPPRESSION_FILTER_BYTES
-        );
+        assert_eq!(store.terminal_suppression_slot_len().unwrap(), 1);
         assert!(store.terminal_suppresses("old").unwrap());
         assert!(store
             .lease_for_dept(
@@ -2078,7 +2098,56 @@ mod tests {
     }
 
     #[test]
-    fn terminal_suppression_filter_stays_bounded_after_retention() {
+    fn terminal_suppression_slot_collision_does_not_suppress_fresh_delivery() {
+        let temp = TempDir::new().unwrap();
+        let store = store(&temp);
+        insert_permanent_dead(&store, "old", 100);
+        let colliding = colliding_terminal_id("old");
+        assert!(!store.terminal_suppresses(&colliding).unwrap());
+        let mut fresh = record(&colliding, 100);
+        fresh.observed_at_ms = fresh.not_before_ms;
+
+        store.enqueue(&fresh).unwrap();
+
+        let leased = store
+            .lease_for_dept("worker", fresh.not_before_ms, 10, Duration::from_millis(50))
+            .unwrap();
+        assert_eq!(leased.len(), 1);
+        assert_eq!(leased[0].delivery_id, colliding);
+        assert_eq!(store.terminal_suppression_slot_len().unwrap(), 1);
+    }
+
+    #[test]
+    fn terminal_suppression_slot_collision_fails_explicitly_on_terminal_insert() {
+        let temp = TempDir::new().unwrap();
+        let store = store(&temp);
+        insert_permanent_dead(&store, "old", 100);
+        let colliding = colliding_terminal_id("old");
+        store.enqueue(&record(&colliding, 100)).unwrap();
+        let leased = store
+            .lease_for_dept("worker", 100, 10, Duration::from_millis(50))
+            .unwrap()
+            .remove(0);
+
+        let error = store
+            .retry(
+                &leased.delivery_id,
+                leased.lease_generation,
+                &failure("final", false),
+                &policy(1),
+                120,
+            )
+            .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("terminal suppression slot exhausted"));
+        assert_eq!(store.terminal_suppression_slot_len().unwrap(), 1);
+        assert!(store.get(&colliding).unwrap().is_some());
+    }
+
+    #[test]
+    fn terminal_suppression_slots_stay_bounded_after_retention() {
         let temp = TempDir::new().unwrap();
         let store = store(&temp);
         insert_permanent_dead(&store, "old", 100);
@@ -2093,10 +2162,7 @@ mod tests {
 
         assert!(store.get_dead("old").unwrap().is_none());
         assert_eq!(store.terminal_dead_index_len().unwrap(), 0);
-        assert_eq!(
-            store.terminal_suppression_filter_len().unwrap(),
-            TERMINAL_SUPPRESSION_FILTER_BYTES
-        );
+        assert_eq!(store.terminal_suppression_slot_len().unwrap(), 1);
         assert!(store.terminal_suppresses("old").unwrap());
 
         let mut duplicate = record("old", trigger_time.saturating_add(1));
@@ -2111,10 +2177,7 @@ mod tests {
             )
             .unwrap()
             .is_empty());
-        assert_eq!(
-            store.terminal_suppression_filter_len().unwrap(),
-            TERMINAL_SUPPRESSION_FILTER_BYTES
-        );
+        assert_eq!(store.terminal_suppression_slot_len().unwrap(), 1);
     }
 
     #[test]
@@ -2140,10 +2203,7 @@ mod tests {
         trigger.observed_at_ms = trigger_time;
         store.enqueue(&trigger).unwrap();
 
-        assert_eq!(
-            store.terminal_suppression_filter_len().unwrap(),
-            TERMINAL_SUPPRESSION_FILTER_BYTES
-        );
+        assert_eq!(store.terminal_suppression_slot_len().unwrap(), 1);
         assert!(store.terminal_suppresses("old").unwrap());
         assert_eq!(
             store
@@ -2192,10 +2252,7 @@ mod tests {
 
         assert!(store.get_dead("old").unwrap().is_none());
         assert_eq!(store.terminal_dead_index_len().unwrap(), 0);
-        assert_eq!(
-            store.terminal_suppression_filter_len().unwrap(),
-            TERMINAL_SUPPRESSION_FILTER_BYTES
-        );
+        assert_eq!(store.terminal_suppression_slot_len().unwrap(), 1);
         assert!(store.terminal_suppresses("old").unwrap());
     }
 
@@ -2541,10 +2598,7 @@ mod tests {
         store.enqueue(&fresh).unwrap();
         assert!(store.get_dead("terminal").unwrap().is_none());
         assert_eq!(store.terminal_dead_index_len().unwrap(), 0);
-        assert_eq!(
-            store.terminal_suppression_filter_len().unwrap(),
-            TERMINAL_SUPPRESSION_FILTER_BYTES
-        );
+        assert_eq!(store.terminal_suppression_slot_len().unwrap(), 1);
         assert!(store.terminal_suppresses("terminal").unwrap());
     }
 
