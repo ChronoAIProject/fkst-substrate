@@ -1,7 +1,11 @@
-//! SDK: `now() -> integer`, `exec_sync(cmd | opts) -> {stdout, stderr, exit_code}`.
+//! SDK: `now() -> integer`, `exec_sync(cmd | opts) -> {stdout, stderr, exit_code}`,
+//! `exec_argv(opts) -> {stdout, stderr, exit_code}`.
 //!
 //! `exec_sync` takes either a string command or an options table with `cwd`,
-//! `env`, `timeout`, and optional read coalescing.
+//! `env`, `timeout`, and optional read coalescing; it lowers to `/bin/sh -c` and is the
+//! genuine-shell primitive. `exec_argv` (registered from `sdk_exec_argv`) takes an explicit
+//! `argv` array and runs the program directly with no shell — the egress for `gh`/`git`
+//! adapters. Both share `run_spec_with_context` for mock/coalesce/rate/audit dispatch.
 
 use mlua::{Lua, Result, Table, Value};
 use std::collections::BTreeMap;
@@ -59,6 +63,17 @@ pub(crate) fn register_with_runner(
         })?,
     )?;
 
+    // `exec_argv` is the shell-free, structured-argv egress (no `/bin/sh`). It shares the
+    // mock/coalesce/rate/audit dispatch with `exec_sync` via `run_spec_with_context`, but
+    // derives its rate pool from the program (argv[1]) instead of parsing command text.
+    crate::sdk_exec_argv::register(
+        lua,
+        rate_pools.clone(),
+        runner.clone(),
+        host_root.clone(),
+        CoalesceClock::system(),
+    )?;
+
     lua.globals().set(
         "exec_sync",
         lua.create_function(move |lua, arg: Value| {
@@ -71,17 +86,7 @@ pub(crate) fn register_with_runner(
                 &host_root,
                 &coalesce_clock,
             )?;
-            let t = lua.create_table()?;
-            t.set("stdout", out.stdout)?;
-            t.set("stderr", out.stderr)?;
-            t.set("exit_code", out.exit_code)?;
-            if let Some(timed_out) = out.timed_out {
-                t.set("timed_out", timed_out)?;
-            }
-            if let Some(error_class) = out.error_class {
-                t.set("error_class", error_class)?;
-            }
-            Ok(t)
+            exec_result_to_table(lua, out)
         })?,
     )?;
 
@@ -126,7 +131,7 @@ fn parse_exec_options(arg: Value) -> Result<ExecOptions> {
     }
 }
 
-fn parse_read_coalesce(table: Option<Table>) -> Result<Option<ReadCoalesceOptions>> {
+pub(crate) fn parse_read_coalesce(table: Option<Table>) -> Result<Option<ReadCoalesceOptions>> {
     let Some(table) = table else {
         return Ok(None);
     };
@@ -160,15 +165,71 @@ fn run_exec_sync_with_context(
     host_root: &Path,
     coalesce_clock: &CoalesceClock,
 ) -> Result<ExecResult> {
+    let command_text = opts.cmd;
+    let cwd = opts.cwd;
+    let env = opts.env;
+    let spec = CommandSpec {
+        program: PathBuf::from("/bin/sh"),
+        args: vec!["-c".to_string(), command_text.clone()],
+        cwd: cwd.clone().map(PathBuf::from),
+        env: env.clone(),
+        stdin: CommandStdin::Null,
+        timeout: opts.timeout,
+        process_group: opts.timeout.is_some(),
+    };
+    let invocation = MockCommandInvocation {
+        rendered: command_text.clone(),
+        program: "/bin/sh".to_string(),
+        args: vec!["-c".to_string(), command_text.clone()],
+        stdin: String::new(),
+        cwd,
+        env,
+    };
+    run_spec_with_context(
+        spec,
+        invocation,
+        RateKey::CommandText(command_text),
+        opts.read_coalesce,
+        runner,
+        rate_pools,
+        host_root,
+        coalesce_clock,
+    )
+}
+
+/// Selects how a command's rate pool is resolved before execution.
+pub(crate) enum RateKey {
+    /// Shell command string: derive the pool from the first shell word (`exec_sync`).
+    CommandText(String),
+    /// Explicit program path/name: derive the pool from its basename (`exec_argv`, `sdk_git`).
+    Program(String),
+}
+
+impl RateKey {
+    fn acquire(&self, rate_pools: &RatePoolRegistry) -> Result<()> {
+        match self {
+            RateKey::CommandText(text) => rate_pools.acquire_for_command_text(text),
+            RateKey::Program(program) => rate_pools.acquire_for_program(program),
+        }
+        .map(|_acquired| ())
+        .map_err(mlua::Error::external)
+    }
+}
+
+/// Shared execution dispatch for `exec_sync` and `exec_argv`: mock prepare/record,
+/// read-coalescing, rate-pool acquisition, and audited execution. The two callers differ
+/// only in how they build `spec`/`invocation` and which `RateKey` they pass.
+pub(crate) fn run_spec_with_context(
+    spec: CommandSpec,
+    invocation: MockCommandInvocation,
+    rate: RateKey,
+    read_coalesce: Option<ReadCoalesceOptions>,
+    runner: Option<&MockCommandState>,
+    rate_pools: &RatePoolRegistry,
+    host_root: &Path,
+    coalesce_clock: &CoalesceClock,
+) -> Result<ExecResult> {
     if let Some(runner) = runner {
-        let invocation = MockCommandInvocation {
-            rendered: opts.cmd.clone(),
-            program: "/bin/sh".to_string(),
-            args: vec!["-c".to_string(), opts.cmd.clone()],
-            stdin: String::new(),
-            cwd: opts.cwd.clone(),
-            env: opts.env.clone(),
-        };
         match runner.prepare(invocation.clone())? {
             MockCommandPlan::Return(result) => {
                 return Ok(ExecResult {
@@ -180,18 +241,8 @@ fn run_exec_sync_with_context(
                 });
             }
             MockCommandPlan::Record => {
-                rate_pools
-                    .acquire_for_command_text(&opts.cmd)
-                    .map_err(mlua::Error::external)?;
-                let output = execute_spec(CommandSpec {
-                    program: PathBuf::from("/bin/sh"),
-                    args: vec!["-c".to_string(), opts.cmd],
-                    cwd: opts.cwd.map(PathBuf::from),
-                    env: opts.env,
-                    stdin: CommandStdin::Null,
-                    timeout: opts.timeout,
-                    process_group: opts.timeout.is_some(),
-                })?;
+                rate.acquire(rate_pools)?;
+                let output = execute_spec(spec)?;
                 runner.record(
                     invocation,
                     MockCommandResult {
@@ -205,19 +256,7 @@ fn run_exec_sync_with_context(
         }
     }
 
-    let timeout = opts.timeout;
-    let command_text = opts.cmd.clone();
-    let spec = CommandSpec {
-        program: PathBuf::from("/bin/sh"),
-        args: vec!["-c".to_string(), command_text.clone()],
-        cwd: opts.cwd.map(PathBuf::from),
-        env: opts.env,
-        stdin: CommandStdin::Null,
-        timeout,
-        process_group: timeout.is_some(),
-    };
-
-    if let Some(plan) = coalesce_plan(&opts.read_coalesce, &spec)? {
+    if let Some(plan) = coalesce_plan(&read_coalesce, &spec)? {
         if let Some(hit) = plan
             .get(host_root, coalesce_clock)
             .map_err(mlua::Error::external)?
@@ -233,19 +272,31 @@ fn run_exec_sync_with_context(
         {
             return Ok(hit);
         }
-        rate_pools
-            .acquire_for_command_text(&command_text)
-            .map_err(mlua::Error::external)?;
+        rate.acquire(rate_pools)?;
         let output = execute_spec(spec)?;
         plan.put_success(host_root, &output, coalesce_clock)
             .map_err(mlua::Error::external)?;
         return Ok(output);
     }
 
-    rate_pools
-        .acquire_for_command_text(&command_text)
-        .map_err(mlua::Error::external)?;
+    rate.acquire(rate_pools)?;
     execute_spec(spec)
+}
+
+/// Builds the `{stdout, stderr, exit_code, timed_out?, error_class?}` table returned by
+/// both `exec_sync` and `exec_argv`.
+pub(crate) fn exec_result_to_table(lua: &Lua, out: ExecResult) -> Result<Table> {
+    let t = lua.create_table()?;
+    t.set("stdout", out.stdout)?;
+    t.set("stderr", out.stderr)?;
+    t.set("exit_code", out.exit_code)?;
+    if let Some(timed_out) = out.timed_out {
+        t.set("timed_out", timed_out)?;
+    }
+    if let Some(error_class) = out.error_class {
+        t.set("error_class", error_class)?;
+    }
+    Ok(t)
 }
 
 fn coalesce_plan(
