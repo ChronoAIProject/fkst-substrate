@@ -1,5 +1,6 @@
 //! Schema validation on config load. Refuse-to-start on any violation.
 
+use crate::built_in_provider::built_in_provider_for_queue;
 use crate::config::{Config, RaiserDecl, RetryDecl};
 use crate::error::FkstError;
 
@@ -196,7 +197,8 @@ pub fn validate(cfg: &Config, project_root: &std::path::Path) -> Result<Vec<Stri
 
     // Check every queue has at least one producer or consumer.
     for qname in queue_names {
-        let producers = queue_producers(cfg, qname);
+        let mut producers = queue_producers(cfg, qname);
+        producers.extend(runtime_producers(qname));
         let consumers = queue_consumers(cfg, qname);
         if producers.is_empty() && consumers.is_empty() {
             return Err(FkstError::Schema(format!(
@@ -319,6 +321,12 @@ fn queue_producers(cfg: &Config, qname: &str) -> Vec<String> {
     }
     producers.sort();
     producers
+}
+
+fn runtime_producers(qname: &str) -> Vec<String> {
+    built_in_provider_for_queue(qname)
+        .map(|contract| vec![contract.producer_label.to_string()])
+        .unwrap_or_default()
 }
 
 fn queue_consumers(cfg: &Config, qname: &str) -> Vec<String> {
@@ -554,5 +562,33 @@ mod tests {
         assert!(warnings[0].contains("consumed_only"), "{warnings:?}");
         assert!(warnings[0].contains("department 'd'"), "{warnings:?}");
         assert!(warnings[0].contains("no producer"), "{warnings:?}");
+    }
+
+    #[test]
+    fn runtime_dead_letter_queue_satisfies_producer_contract() {
+        let tmp = tempdir().unwrap();
+        let lua = touch(tmp.path(), "d.lua");
+        let mut cfg = cfg_minimal(&lua);
+        cfg.queue.insert(
+            "consensus.dead_letter".into(),
+            QueueDecl {
+                capacity: 10,
+                fanout: false,
+            },
+        );
+        cfg.department
+            .get_mut("d")
+            .unwrap()
+            .consumes
+            .push("consensus.dead_letter".into());
+        cfg.department
+            .get_mut("d")
+            .unwrap()
+            .ephemeral
+            .push("consensus.dead_letter".into());
+
+        let warnings = validate(&cfg, tmp.path()).unwrap();
+
+        assert!(warnings.is_empty(), "{warnings:?}");
     }
 }
