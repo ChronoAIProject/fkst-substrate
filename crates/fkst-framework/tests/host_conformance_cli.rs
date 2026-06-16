@@ -253,8 +253,21 @@ fn locale_catalogs_reject_machine_tokens() {
 fn package_root_flag_supplies_standard_assets_for_host_department() {
     let package = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
     write_package_raiser(package.path());
+    let package_namespace = package.path().file_name().unwrap().to_string_lossy();
     let host = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
-    write_host_department(host.path());
+    fs::create_dir_all(host.path().join("departments/hello")).unwrap();
+    fs::write(
+        host.path().join("departments/hello/main.lua"),
+        format!(
+            r#"
+local M = {{}}
+M.spec = {{ consumes = {{"{package_namespace}.tick"}}, stall_window = "30s" }}
+function pipeline(_) end
+return M
+"#
+        ),
+    )
+    .unwrap();
 
     let args = [
         std::ffi::OsStr::new("--project-root"),
@@ -306,6 +319,26 @@ return M
     let log = combined_log(&output);
     assert!(log.contains("PASS schema-validation"), "{log}");
     assert!(!log.contains("no producer"), "{log}");
+}
+
+#[test]
+fn consumed_queue_without_producer_fails_schema_validation() {
+    let host = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
+    write_host_defaults(host.path());
+    write_host_department(host.path());
+
+    let args = [
+        std::ffi::OsStr::new("--project-root"),
+        path_arg(host.path()),
+    ];
+    let output = run_conformance(&args, host.path());
+
+    assert_exit(&output, 1);
+    let log = combined_log(&output);
+    assert!(log.contains("FAIL schema-validation"), "{log}");
+    assert!(log.contains("queue 'tick'"), "{log}");
+    assert!(log.contains("department 'hello'"), "{log}");
+    assert!(log.contains("has no producer"), "{log}");
 }
 
 #[test]
