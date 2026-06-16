@@ -2,11 +2,11 @@
 
 use super::delivery_retry::error_excerpt;
 use super::delivery_types::{DeadRecord, DeliveryRecord, SourceRef};
+pub(crate) use fkst_common::built_in_provider::FAILURE_FACT_SCHEMA;
 use fkst_common::Event;
 use serde_json::{json, Value as JsonValue};
 
 pub(crate) const FAILURE_FACT_QUEUE: &str = "fkst.failure_fact";
-pub(crate) const FAILURE_FACT_SCHEMA: &str = "fkst.failure_fact.v1";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ErrorClass {

@@ -270,6 +270,32 @@ return M
 }
 
 #[test]
+fn graph_scan_accepts_engine_dead_letter_queue() {
+    let dir = write_repo(
+        &[(
+            "dead_handler",
+            r#"
+local M = {}
+M.spec = { consumes = {"dead_letter"}, ephemeral = {"dead_letter"}, stall_window = "30s", retry = false }
+function pipeline(_) end
+return M
+"#,
+        )],
+        &[],
+    );
+
+    let cfg = load(dir.path()).unwrap();
+
+    assert!(cfg.queue.contains_key("dead_letter"));
+    assert_eq!(
+        cfg.department.get("dead_handler").unwrap().consumes,
+        vec!["dead_letter"]
+    );
+    let warnings = validate(&cfg, dir.path()).unwrap();
+    assert!(warnings.is_empty(), "{warnings:?}");
+}
+
+#[test]
 fn graph_scan_spec_eval_exposes_truncate_utf8() {
     let dir = write_repo(
         &[(
@@ -317,6 +343,34 @@ return M
     assert!(
         err.to_string().contains("resolve `forger.spec.produces`"),
         "got: {err:#}"
+    );
+}
+
+#[test]
+fn graph_scan_rejects_department_producing_engine_dead_letter_queue() {
+    let dir = write_repo(
+        &[(
+            "forger",
+            r#"
+local M = {}
+M.spec = { produces = {"dead_letter"}, stall_window = "30s" }
+function pipeline(_) end
+return M
+"#,
+        )],
+        &[],
+    );
+
+    let err = load(dir.path()).unwrap_err();
+    let msg = format!("{err:#}");
+
+    assert!(
+        msg.contains("validate `forger.spec.produces`"),
+        "got: {msg}"
+    );
+    assert!(
+        msg.contains("runtime-owned queue `dead_letter`"),
+        "got: {msg}"
     );
 }
 
