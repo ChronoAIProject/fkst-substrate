@@ -254,7 +254,7 @@ fn producer_without_consumer_warns() {
 }
 
 #[test]
-fn consumer_without_producer_warns() {
+fn consumer_without_producer_fails() {
     let tmp = tempdir().unwrap();
     let lua = touch(tmp.path(), "d.lua");
     let mut cfg = cfg_minimal(&lua);
@@ -271,12 +271,12 @@ fn consumer_without_producer_warns() {
         .consumes
         .push("consumed_only".into());
 
-    let warnings = validate(&cfg, tmp.path()).unwrap();
+    let err = validate(&cfg, tmp.path()).unwrap_err();
+    let message = err.to_string();
 
-    assert_eq!(warnings.len(), 1, "{warnings:?}");
-    assert!(warnings[0].contains("consumed_only"), "{warnings:?}");
-    assert!(warnings[0].contains("department 'd'"), "{warnings:?}");
-    assert!(warnings[0].contains("has no producer"), "{warnings:?}");
+    assert!(message.contains("consumed_only"), "{message}");
+    assert!(message.contains("department 'd'"), "{message}");
+    assert!(message.contains("has no producer"), "{message}");
 }
 
 #[test]

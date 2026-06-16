@@ -1133,8 +1133,20 @@ return M
 #[test]
 fn same_department_name_across_package_roots_is_namespaced() {
     let _root = EnvGuard::set("FKST_RUNTIME_ROOT", ".fkst/runtime");
-    let package_a = write_repo(&[("same", &dept(r#""tick""#, ""))], &[]);
-    let package_b = write_repo(&[("same", &dept(r#""tick""#, ""))], &[]);
+    let package_a = write_repo(
+        &[("same", &dept(r#""tick""#, ""))],
+        &[(
+            "tick",
+            r#"return { type = "cron", interval = "10s", produces = "tick" }"#,
+        )],
+    );
+    let package_b = write_repo(
+        &[("same", &dept(r#""tick""#, ""))],
+        &[(
+            "tick",
+            r#"return { type = "cron", interval = "10s", produces = "tick" }"#,
+        )],
+    );
     let host = write_repo(&[], &[]);
     let roots = PackageRoots::resolve(
         host.path(),
@@ -1324,8 +1336,20 @@ fn folded_single_package_same_namespace_qualified_queue_stays_flat() {
 #[test]
 fn same_department_name_across_package_and_host_is_namespaced() {
     let _root = EnvGuard::set("FKST_RUNTIME_ROOT", ".fkst/runtime");
-    let package = write_repo(&[("same", &dept(r#""tick""#, ""))], &[]);
-    let host = write_repo(&[("same", &dept(r#""tick""#, ""))], &[]);
+    let package = write_repo(
+        &[("same", &dept(r#""tick""#, ""))],
+        &[(
+            "tick",
+            r#"return { type = "cron", interval = "10s", produces = "tick" }"#,
+        )],
+    );
+    let host = write_repo(
+        &[("same", &dept(r#""tick""#, ""))],
+        &[(
+            "tick",
+            r#"return { type = "cron", interval = "10s", produces = "tick" }"#,
+        )],
+    );
     let roots = PackageRoots::resolve(host.path(), vec![package.path().to_path_buf()]).unwrap();
 
     let cfg = graph_scan::load_roots(&roots).unwrap();

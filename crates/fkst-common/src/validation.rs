@@ -70,7 +70,8 @@ pub fn validate_runtime_key(key: &str) -> Result<&str, FkstError> {
 ///   must be declared in [queue.*]
 /// - every queue must have at least one producer OR consumer (no isolated queues)
 /// - queues default to one active consumer unless `fanout = true`
-/// - queues with only producers or only consumers emit startup warnings
+/// - queues with only producers emit startup warnings
+/// - queues with only consumers are rejected
 /// - every department's `lua` path must exist on disk
 /// - queue capacity > 0
 /// - department stall_window is parseable (we just check non-empty + ends with s/m/h)
@@ -214,11 +215,11 @@ pub fn validate(cfg: &Config, project_root: &std::path::Path) -> Result<Vec<Stri
             ));
         }
         if producers.is_empty() && !consumers.is_empty() {
-            warnings.push(format!(
+            return Err(FkstError::Schema(format!(
                 "queue '{}' is consumed by {} but has no producer",
                 qname,
                 consumers.join(", ")
-            ));
+            )));
         }
         validate_queue_contract(cfg, qname, &consumers)?;
     }
@@ -539,7 +540,7 @@ mod tests {
     }
 
     #[test]
-    fn consumer_without_producer_warns() {
+    fn consumer_without_producer_fails() {
         let tmp = tempdir().unwrap();
         let lua = touch(tmp.path(), "d.lua");
         let mut cfg = cfg_minimal(&lua);
@@ -556,12 +557,12 @@ mod tests {
             .consumes
             .push("consumed_only".into());
 
-        let warnings = validate(&cfg, tmp.path()).unwrap();
+        let err = validate(&cfg, tmp.path()).unwrap_err();
+        let message = err.to_string();
 
-        assert_eq!(warnings.len(), 1, "{warnings:?}");
-        assert!(warnings[0].contains("consumed_only"), "{warnings:?}");
-        assert!(warnings[0].contains("department 'd'"), "{warnings:?}");
-        assert!(warnings[0].contains("no producer"), "{warnings:?}");
+        assert!(message.contains("consumed_only"), "{message}");
+        assert!(message.contains("department 'd'"), "{message}");
+        assert!(message.contains("no producer"), "{message}");
     }
 
     #[test]
