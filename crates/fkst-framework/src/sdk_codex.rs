@@ -96,7 +96,6 @@ struct CodexStatusRecord {
     status: String,
     #[serde(default)]
     exit_code: Option<i32>,
-    #[serde(default)]
     permit_slot: Option<usize>,
     #[serde(default)]
     output_tail_path: Option<String>,

@@ -20,6 +20,7 @@ pub mod event_fanout;
 pub(crate) mod failure_fact;
 pub(crate) mod graph_scan;
 mod journal;
+mod queue_starvation;
 mod raised;
 pub(crate) mod source_runner;
 mod spawner;

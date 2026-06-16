@@ -259,4 +259,47 @@ mod tests {
             .unwrap()
             .starts_with("framework_child_nonzero:"));
     }
+
+    #[test]
+    fn delivery_failure_fact_does_not_own_queue_liveness_contract() {
+        let record = DeliveryRecord {
+            delivery_id:
+                "delivery/v3/raised/queue/merge-ready/dept/pkg.implementer/dedup/issue-70-pr-82"
+                    .to_string(),
+            queue: "merge-ready".to_string(),
+            dept: "pkg.implementer".to_string(),
+            payload: json!({
+                "queue_liveness": {
+                    "item_id": "caller-supplied",
+                    "linked_item_id": "caller-supplied",
+                    "owner": "caller-supplied",
+                    "state": "caller-supplied",
+                    "order": 99,
+                    "age_seconds": 1,
+                    "slo_seconds": 9,
+                    "breached": false,
+                    "next_action": "caller-supplied",
+                },
+            }),
+            source: Some(SourceRef {
+                kind: super::super::delivery_types::SourceKind::External,
+                reference: "observability-sample/not-queue-starvation".to_string(),
+            }),
+            cron_payload: None,
+            observed_at_ms: 10_000,
+            attempt: 2,
+            redrive_count: 0,
+            collapse_by_dedup_id: true,
+            lease_generation: 3,
+            lease_until_ms: Some(2),
+            not_before_ms: 70,
+            last_error_excerpt: None,
+        };
+
+        let event = delivery_failure_fact(&record, "exit=13 stderr=permission denied");
+
+        assert!(event.payload.get("queue_liveness").is_none());
+        assert_eq!(event.payload["origin_queue"], "merge-ready");
+        assert_eq!(event.payload["origin_dept"], "pkg.implementer");
+    }
 }

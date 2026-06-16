@@ -1282,6 +1282,7 @@ fn spawn_codex_sync_returns_visible_spawn_error() {
     let failed: Table = recent.get(1).unwrap();
     assert_eq!(failed.get::<String>("status").unwrap(), "failed");
     assert_eq!(failed.get::<i64>("exit_code").unwrap(), -1);
+    assert!(failed.get::<String>("log_path").is_err());
     assert!(failed
         .get::<String>("output_tail")
         .unwrap()
@@ -1319,6 +1320,16 @@ exit 1
         result.get::<String>("error_class").unwrap(),
         "auth-degraded"
     );
+
+    let status_fn: mlua::Function = codex_runs_fn(&lua);
+    let status: Table = status_fn.call(()).unwrap();
+    let recent: Table = status.get("recent").unwrap();
+    assert_eq!(recent.raw_len(), 1);
+    let failed: Table = recent.get(1).unwrap();
+    assert_eq!(failed.get::<String>("status").unwrap(), "failed");
+    assert!(failed.get::<String>("error_kind").is_err());
+    assert!(failed.get::<String>("error_class").is_err());
+    assert!(failed.get::<String>("log_path").is_err());
 }
 
 #[cfg(unix)]
