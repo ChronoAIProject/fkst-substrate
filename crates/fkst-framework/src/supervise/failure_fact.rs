@@ -49,7 +49,7 @@ pub(crate) fn classify_delivery_error(error: &str) -> ErrorClass {
 
 pub(crate) fn delivery_failure_fact(record: &DeliveryRecord, error: &str) -> Event {
     let error_class = classify_delivery_error(error);
-    failure_fact_event(json!({
+    let mut payload = json!({
         "schema": FAILURE_FACT_SCHEMA,
         "error_class": error_class.as_str(),
         "fingerprint": fingerprint(error_class, error),
@@ -60,13 +60,14 @@ pub(crate) fn delivery_failure_fact(record: &DeliveryRecord, error: &str) -> Eve
         "origin_dept": record.dept,
         "source_ref": source_ref_json(record.source.as_ref()),
         "observed_at_ms": record.observed_at_ms,
-        "queue_liveness": queue_liveness_json(record),
-    }))
+    });
+    insert_queue_liveness(&mut payload, queue_liveness_json(record));
+    failure_fact_event(payload)
 }
 
 pub(crate) fn dead_letter_payload(record: &DeliveryRecord, error: &str) -> JsonValue {
     let error_class = classify_delivery_error(error);
-    json!({
+    let mut payload = json!({
         "delivery_id": record.delivery_id,
         "dedup_id": record.delivery_id,
         "queue": record.queue,
@@ -78,8 +79,9 @@ pub(crate) fn dead_letter_payload(record: &DeliveryRecord, error: &str) -> JsonV
         "error_class": error_class.as_str(),
         "fingerprint": fingerprint(error_class, error),
         "source_ref": source_ref_json(record.source.as_ref()),
-        "queue_liveness": queue_liveness_json(record),
-    })
+    });
+    insert_queue_liveness(&mut payload, queue_liveness_json(record));
+    payload
 }
 
 pub(crate) fn dead_record_payload(dead: &DeadRecord) -> JsonValue {
@@ -88,7 +90,7 @@ pub(crate) fn dead_record_payload(dead: &DeadRecord) -> JsonValue {
         .as_deref()
         .unwrap_or("unknown delivery failure");
     let error_class = classify_delivery_error(error);
-    json!({
+    let mut payload = json!({
         "delivery_id": dead.delivery_id,
         "dedup_id": dead.delivery_id,
         "queue": dead.queue,
@@ -101,8 +103,9 @@ pub(crate) fn dead_record_payload(dead: &DeadRecord) -> JsonValue {
         "error_class": error_class.as_str(),
         "fingerprint": fingerprint(error_class, error),
         "source_ref": source_ref_json(dead.source.as_ref()),
-        "queue_liveness": queue_liveness_json_for_dead(dead),
-    })
+    });
+    insert_queue_liveness(&mut payload, queue_liveness_json_for_dead(dead));
+    payload
 }
 
 pub(crate) fn store_watchdog_failure_fact(op: &str, dept: &str, elapsed_ms: u64) -> Event {
@@ -154,97 +157,127 @@ fn source_kind_name(source: &SourceRef) -> &'static str {
     }
 }
 
-fn queue_liveness_json(record: &DeliveryRecord) -> JsonValue {
-    let payload = record
-        .payload
-        .get("queue_liveness")
-        .unwrap_or(&record.payload);
-    let item_id = payload
-        .get("item_id")
-        .and_then(JsonValue::as_str)
-        .unwrap_or(record.delivery_id.as_str());
-    let age_seconds = payload
-        .get("age_seconds")
-        .and_then(JsonValue::as_u64)
-        .unwrap_or_else(|| {
-            let observed_at_ms = payload
-                .get("observed_at_ms")
-                .and_then(JsonValue::as_u64)
-                .unwrap_or(record.observed_at_ms);
-            current_unix_ms().saturating_sub(observed_at_ms) / 1000
-        });
-    let slo_seconds = payload.get("slo_seconds").and_then(JsonValue::as_u64);
-    let owner = payload
-        .get("owner")
-        .and_then(JsonValue::as_str)
-        .unwrap_or(record.dept.as_str());
-    let state = payload
-        .get("state")
-        .and_then(JsonValue::as_str)
-        .unwrap_or_else(|| queue_state(record));
-    let order = payload
-        .get("order")
-        .and_then(JsonValue::as_u64)
-        .unwrap_or(record.not_before_ms);
-    let next_action = payload
-        .get("next_action")
-        .and_then(JsonValue::as_str)
-        .unwrap_or("route through normal intake consensus implementation review pipeline");
-    let mut value = json!({
-        "item_id": item_id,
+fn insert_queue_liveness(payload: &mut JsonValue, liveness: Option<JsonValue>) {
+    if let Some(liveness) = liveness {
+        payload["queue_liveness"] = liveness;
+    }
+}
+
+fn queue_liveness_json(record: &DeliveryRecord) -> Option<JsonValue> {
+    let source = queue_starvation_source(record.source.as_ref()?)?;
+    let age_seconds = payload_seconds(
+        &record.payload,
+        &["queue_head_age_seconds", "age_seconds"],
+        &["queue_head_age_minutes", "age_minutes"],
+    )?;
+    let slo_seconds = payload_seconds(
+        &record.payload,
+        &["threshold_seconds", "slo_seconds"],
+        &["threshold_minutes", "slo_minutes"],
+    )?;
+    let order = payload_u64(&record.payload, &["queue_order", "order"]).unwrap_or(1);
+    Some(json!({
+        "item_id": source.item_id(),
+        "linked_item_id": source.linked_item_id(),
         "queue": record.queue,
-        "owner": owner,
-        "state": state,
+        "owner": source.owner,
+        "state": source.state,
         "order": order,
         "age_seconds": age_seconds,
-        "next_action": next_action,
-    });
-    if let Some(linked_item_id) = payload.get("linked_item_id").and_then(JsonValue::as_str) {
-        value["linked_item_id"] = JsonValue::String(linked_item_id.to_string());
-    }
-    if let Some(slo_seconds) = slo_seconds {
-        value["slo_seconds"] = JsonValue::Number(slo_seconds.into());
-        value["breached"] = JsonValue::Bool(
-            payload
-                .get("breached")
-                .and_then(JsonValue::as_bool)
-                .unwrap_or(age_seconds >= slo_seconds),
-        );
-    } else if let Some(breached) = payload.get("breached").and_then(JsonValue::as_bool) {
-        value["breached"] = JsonValue::Bool(breached);
-    }
-    value
-}
-
-fn queue_liveness_json_for_dead(dead: &DeadRecord) -> JsonValue {
-    if let Some(record) = dead.record.as_ref() {
-        return queue_liveness_json(record);
-    }
-    let age_seconds = current_unix_ms().saturating_sub(dead.observed_at_ms) / 1000;
-    json!({
-        "item_id": dead.delivery_id,
-        "queue": dead.queue,
-        "owner": dead.dept,
-        "state": "dead",
-        "order": dead.not_before_ms,
-        "age_seconds": age_seconds,
+        "slo_seconds": slo_seconds,
+        "breached": age_seconds >= slo_seconds,
         "next_action": "route through normal intake consensus implementation review pipeline",
-    })
+    }))
 }
 
-fn queue_state(record: &DeliveryRecord) -> &'static str {
-    if record.lease_until_ms.is_some() {
-        "leased"
-    } else {
-        "queued"
+fn queue_liveness_json_for_dead(dead: &DeadRecord) -> Option<JsonValue> {
+    dead.record.as_ref().and_then(queue_liveness_json)
+}
+
+struct QueueStarvationSource<'a> {
+    repo_owner: &'a str,
+    repo_name: &'a str,
+    state: &'a str,
+    pr_number: &'a str,
+    owner: &'a str,
+    issue_repo_owner: &'a str,
+    issue_repo_name: &'a str,
+    issue_number: &'a str,
+}
+
+impl QueueStarvationSource<'_> {
+    fn item_id(&self) -> String {
+        format!(
+            "{}/issue/{}/{}/{}",
+            self.owner, self.issue_repo_owner, self.issue_repo_name, self.issue_number
+        )
+    }
+
+    fn linked_item_id(&self) -> String {
+        format!(
+            "{}/pr/{}/{}/{}",
+            self.owner, self.repo_owner, self.repo_name, self.pr_number
+        )
     }
 }
 
-fn current_unix_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_millis().min(u64::MAX as u128) as u64)
-        .unwrap_or(0)
+fn queue_starvation_source(source: &SourceRef) -> Option<QueueStarvationSource<'_>> {
+    let segments = source.reference.split('/').collect::<Vec<_>>();
+    let detector = segments
+        .iter()
+        .position(|segment| *segment == "queue-starvation")?;
+    let rest = segments.get(detector + 1..)?;
+    if rest.len() < 11 || rest[3] != "pr" || rest[5] != "proposal" || rest[7] != "issue" {
+        return None;
+    }
+    let parsed = QueueStarvationSource {
+        repo_owner: rest[0],
+        repo_name: rest[1],
+        state: rest[2],
+        pr_number: rest[4],
+        owner: rest[6],
+        issue_repo_owner: rest[8],
+        issue_repo_name: rest[9],
+        issue_number: rest[10],
+    };
+    parsed.has_nonempty_segments().then_some(parsed)
+}
+
+impl QueueStarvationSource<'_> {
+    fn has_nonempty_segments(&self) -> bool {
+        [
+            self.repo_owner,
+            self.repo_name,
+            self.state,
+            self.pr_number,
+            self.owner,
+            self.issue_repo_owner,
+            self.issue_repo_name,
+            self.issue_number,
+        ]
+        .into_iter()
+        .all(|segment| !segment.is_empty())
+    }
+}
+
+fn payload_seconds(payload: &JsonValue, second_keys: &[&str], minute_keys: &[&str]) -> Option<u64> {
+    if let Some(seconds) = payload_u64(payload, second_keys) {
+        return Some(seconds);
+    }
+    payload_u64(payload, minute_keys).map(|minutes| minutes.saturating_mul(60))
+}
+
+fn payload_u64(payload: &JsonValue, keys: &[&str]) -> Option<u64> {
+    keys.iter().find_map(|key| {
+        payload
+            .get(*key)
+            .or_else(|| {
+                payload
+                    .get("watchdog")
+                    .and_then(|watchdog| watchdog.get(*key))
+            })
+            .and_then(JsonValue::as_u64)
+    })
 }
 
 pub(crate) fn fingerprint(error_class: ErrorClass, raw: &str) -> String {
@@ -357,7 +390,7 @@ mod tests {
     }
 
     #[test]
-    fn delivery_failure_fact_carries_authoritative_queue_liveness_fields() {
+    fn delivery_failure_fact_derives_queue_starvation_liveness_from_source_ref() {
         let record = DeliveryRecord {
             delivery_id:
                 "delivery/v3/raised/queue/merge-ready/dept/pkg.implementer/dedup/issue-70-pr-82"
@@ -365,24 +398,27 @@ mod tests {
             queue: "merge-ready".to_string(),
             dept: "pkg.implementer".to_string(),
             payload: json!({
+                "queue_head_age_minutes": 3898_u64,
+                "threshold_minutes": 60_u64,
+                "queue_order": 1,
                 "queue_liveness": {
-                    "item_id": "github-devloop/issue/ChronoAIProject/fkst-substrate/70",
-                    "linked_item_id": "github-devloop/pr/ChronoAIProject/fkst-substrate/82",
-                    "owner": "github-devloop",
-                    "state": "merge-ready",
-                    "order": 1,
-                    "age_seconds": 3898_u64 * 60,
-                    "slo_seconds": 60_u64 * 60,
-                    "breached": true,
-                    "next_action": "route through normal intake consensus implementation review pipeline",
+                    "item_id": "caller-supplied",
+                    "linked_item_id": "caller-supplied",
+                    "owner": "caller-supplied",
+                    "state": "caller-supplied",
+                    "order": 99,
+                    "age_seconds": 1,
+                    "slo_seconds": 9,
+                    "breached": false,
+                    "next_action": "caller-supplied",
                 },
             }),
             source: Some(SourceRef {
                 kind: super::super::delivery_types::SourceKind::External,
-                reference: "observability-sample/queue-starvation".to_string(),
+                reference: "observability-sample/queue-starvation/ChronoAIProject/fkst-substrate/merge-ready/pr/82/proposal/github-devloop/issue/ChronoAIProject/fkst-substrate/70/version/ready-consensus-github-devloo-0129659072".to_string(),
             }),
             cron_payload: None,
-            observed_at_ms: 1,
+            observed_at_ms: 10_000,
             attempt: 2,
             redrive_count: 0,
             collapse_by_dedup_id: true,
@@ -393,7 +429,6 @@ mod tests {
         };
 
         let event = delivery_failure_fact(&record, "exit=13 stderr=permission denied");
-
         let liveness = &event.payload["queue_liveness"];
         assert_eq!(
             liveness["item_id"],
@@ -414,11 +449,48 @@ mod tests {
             liveness["next_action"],
             "route through normal intake consensus implementation review pipeline"
         );
+    }
+
+    #[test]
+    fn delivery_failure_fact_omits_queue_liveness_without_watchdog_source() {
+        let record = DeliveryRecord {
+            delivery_id:
+                "delivery/v3/raised/queue/merge-ready/dept/pkg.implementer/dedup/issue-70-pr-82"
+                    .to_string(),
+            queue: "merge-ready".to_string(),
+            dept: "pkg.implementer".to_string(),
+            payload: json!({
+                "queue_liveness": {
+                    "item_id": "caller-supplied",
+                    "linked_item_id": "caller-supplied",
+                    "owner": "caller-supplied",
+                    "state": "caller-supplied",
+                    "order": 99,
+                    "age_seconds": 1,
+                    "slo_seconds": 9,
+                    "breached": false,
+                    "next_action": "caller-supplied",
+                },
+            }),
+            source: Some(SourceRef {
+                kind: super::super::delivery_types::SourceKind::External,
+                reference: "observability-sample/not-queue-starvation".to_string(),
+            }),
+            cron_payload: None,
+            observed_at_ms: 10_000,
+            attempt: 2,
+            redrive_count: 0,
+            collapse_by_dedup_id: true,
+            lease_generation: 3,
+            lease_until_ms: Some(2),
+            not_before_ms: 70,
+            last_error_excerpt: None,
+        };
+
+        let event = delivery_failure_fact(&record, "exit=13 stderr=permission denied");
+
+        assert!(event.payload.get("queue_liveness").is_none());
         assert_eq!(event.payload["origin_queue"], "merge-ready");
         assert_eq!(event.payload["origin_dept"], "pkg.implementer");
-        assert_eq!(
-            event.payload["source_ref"]["reference"],
-            "observability-sample/queue-starvation"
-        );
     }
 }

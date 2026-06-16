@@ -621,6 +621,7 @@ pub(crate) fn now_unix_millis() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::super::delivery_store::DeliveryStore;
+    use super::super::failure_fact::delivery_failure_fact;
     use super::*;
     use fkst_common::config::{Config, DepartmentDecl, LimitsDecl, QueueDecl};
     use std::time::Duration;
@@ -695,6 +696,40 @@ mod tests {
                 },
             );
         }
+        Config {
+            queue,
+            raiser: BTreeMap::new(),
+            department,
+            limits: LimitsDecl {
+                global_codex_processes: 1,
+            },
+        }
+    }
+
+    fn queue_starvation_config() -> Config {
+        let mut queue = BTreeMap::new();
+        queue.insert(
+            "merge-ready".to_string(),
+            QueueDecl {
+                capacity: 8,
+                fanout: false,
+            },
+        );
+        let mut department = BTreeMap::new();
+        department.insert(
+            "pkg.implementer".to_string(),
+            DepartmentDecl {
+                lua: "departments/implementer/main.lua".into(),
+                owner_root: std::path::PathBuf::from("."),
+                owner_namespace: "pkg".to_string(),
+                consumes: vec!["merge-ready".to_string()],
+                produces: Vec::new(),
+                ephemeral: Vec::new(),
+                stall_window: "30s".to_string(),
+                graph_json: false,
+                retry: None,
+            },
+        );
         Config {
             queue,
             raiser: BTreeMap::new(),
@@ -835,6 +870,78 @@ mod tests {
             "delivery/v1/source/cron/queue/other.jobs/dept/other.worker/ref/pkg.tick"
         );
         assert_ne!(pkg[0].delivery_id, other[0].delivery_id);
+    }
+
+    #[test]
+    fn queue_starvation_publish_path_derives_canonical_liveness_fact() {
+        let cfg = queue_starvation_config();
+        let temp = TempDir::new().unwrap();
+        let store = Arc::new(DeliveryStore::open(temp.path().join("delivery.redb")).unwrap());
+        let router = DeliveryRouter::new(&cfg, Fanout::new(), Some(store.clone()), None);
+        let mut event = Event::new(
+            "merge-ready",
+            serde_json::json!({
+                "queue_head_age_minutes": 3898_u64,
+                "threshold_minutes": 60_u64,
+                "queue_order": 1,
+                "queue_liveness": {
+                    "item_id": "caller-supplied",
+                    "linked_item_id": "caller-supplied",
+                    "owner": "caller-supplied",
+                    "state": "caller-supplied",
+                    "order": 99,
+                    "age_seconds": 1,
+                    "slo_seconds": 9,
+                    "breached": false,
+                    "next_action": "caller-supplied"
+                }
+            }),
+        );
+        event.ts = 10_000;
+
+        router
+            .publish(PublishEnvelope {
+                event,
+                source: Some(SourceRef {
+                    kind: SourceKind::External,
+                    reference: "observability-sample/queue-starvation/ChronoAIProject/fkst-substrate/merge-ready/pr/82/proposal/github-devloop/issue/ChronoAIProject/fkst-substrate/70/version/ready-consensus-github-devloo-0129659072".to_string(),
+                }),
+                cron_payload: None,
+                derived: None,
+            })
+            .unwrap();
+
+        let leased = store
+            .lease_for_dept(
+                "pkg.implementer",
+                now_unix_millis(),
+                8,
+                Duration::from_secs(30),
+            )
+            .unwrap();
+        assert_eq!(leased.len(), 1);
+
+        let fact = delivery_failure_fact(&leased[0], "exit=13 stderr=permission denied");
+        let liveness = &fact.payload["queue_liveness"];
+        assert_eq!(
+            liveness["item_id"],
+            "github-devloop/issue/ChronoAIProject/fkst-substrate/70"
+        );
+        assert_eq!(
+            liveness["linked_item_id"],
+            "github-devloop/pr/ChronoAIProject/fkst-substrate/82"
+        );
+        assert_eq!(liveness["queue"], "merge-ready");
+        assert_eq!(liveness["owner"], "github-devloop");
+        assert_eq!(liveness["state"], "merge-ready");
+        assert_eq!(liveness["order"], 1);
+        assert_eq!(liveness["age_seconds"], 3898_u64 * 60);
+        assert_eq!(liveness["slo_seconds"], 60_u64 * 60);
+        assert_eq!(liveness["breached"], true);
+        assert_eq!(
+            liveness["next_action"],
+            "route through normal intake consensus implementation review pipeline"
+        );
     }
 
     #[test]
