@@ -57,9 +57,40 @@ struct CodexRequest {
     label: Option<String>,
     proposal_id: Option<String>,
     dedup_key: Option<String>,
+    queue_item_id: Option<String>,
+    queue_linked_item_id: Option<String>,
+    queue_name: Option<String>,
+    queue_owner: Option<String>,
+    queue_state: Option<String>,
+    queue_order: Option<u64>,
+    queue_age_seconds: Option<u64>,
+    queue_slo_seconds: Option<u64>,
+    queue_next_action: Option<String>,
     dept: Option<String>,
     started_at_ms: u64,
     adoption_status_path: Option<PathBuf>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct QueueLivenessRecord {
+    item_id: String,
+    #[serde(default)]
+    linked_item_id: Option<String>,
+    #[serde(default)]
+    queue: Option<String>,
+    #[serde(default)]
+    owner: Option<String>,
+    #[serde(default)]
+    state: Option<String>,
+    #[serde(default)]
+    order: Option<u64>,
+    #[serde(default)]
+    age_seconds: Option<u64>,
+    #[serde(default)]
+    slo_seconds: Option<u64>,
+    #[serde(default)]
+    breached: Option<bool>,
+    next_action: String,
 }
 
 #[derive(Clone, Debug)]
@@ -85,6 +116,8 @@ struct CodexStatusRecord {
     proposal_id: Option<String>,
     #[serde(default)]
     dedup_key: Option<String>,
+    #[serde(default)]
+    queue_liveness: Option<QueueLivenessRecord>,
     started_at: String,
     started_at_ms: u64,
     #[serde(default)]
@@ -96,11 +129,6 @@ struct CodexStatusRecord {
     status: String,
     #[serde(default)]
     exit_code: Option<i32>,
-    #[serde(default)]
-    error_kind: Option<String>,
-    #[serde(default)]
-    error_class: Option<String>,
-    #[serde(default)]
     permit_slot: Option<usize>,
     #[serde(default)]
     output_tail_path: Option<String>,
@@ -120,6 +148,8 @@ struct CodexAdoptionRecord {
     proposal_id: Option<String>,
     #[serde(default)]
     dedup_key: Option<String>,
+    #[serde(default)]
+    queue_liveness: Option<QueueLivenessRecord>,
     status: String,
     started_at_ms: u64,
     ended_at_ms: Option<u64>,
@@ -130,7 +160,6 @@ struct CodexAdoptionRecord {
     log_path: String,
     cmd_line: String,
     error_kind: Option<String>,
-    error_class: Option<String>,
     error: Option<String>,
 }
 
@@ -394,6 +423,15 @@ fn codex_request_from_opts(opts: Table, runtime_dept: Option<String>) -> CodexRe
     let label: Option<String> = opts.get("label").ok();
     let proposal_id: Option<String> = opts.get("proposal_id").ok();
     let dedup_key: Option<String> = opts.get("dedup_key").ok();
+    let queue_item_id: Option<String> = opts.get("queue_item_id").ok();
+    let queue_linked_item_id: Option<String> = opts.get("queue_linked_item_id").ok();
+    let queue_name: Option<String> = opts.get("queue").ok();
+    let queue_owner: Option<String> = opts.get("queue_owner").ok();
+    let queue_state: Option<String> = opts.get("queue_state").ok();
+    let queue_order: Option<u64> = opts.get("queue_order").ok();
+    let queue_age_seconds: Option<u64> = opts.get("queue_age_seconds").ok();
+    let queue_slo_seconds: Option<u64> = opts.get("queue_slo_seconds").ok();
+    let queue_next_action: Option<String> = opts.get("queue_next_action").ok();
     let dept: Option<String> = opts.get("dept").ok().or(runtime_dept);
     let timeout: Option<i64> = opts.get("timeout").ok();
     let timeout_seconds = timeout
@@ -414,6 +452,15 @@ fn codex_request_from_opts(opts: Table, runtime_dept: Option<String>) -> CodexRe
         label,
         proposal_id,
         dedup_key,
+        queue_item_id,
+        queue_linked_item_id,
+        queue_name,
+        queue_owner,
+        queue_state,
+        queue_order,
+        queue_age_seconds,
+        queue_slo_seconds,
+        queue_next_action,
         dept,
         started_at_ms,
         adoption_status_path: None,
@@ -532,15 +579,7 @@ fn run_codex_request(
             &command_line_for_request(&request),
             request.timeout_seconds,
         );
-        status.finish(
-            -1,
-            Some("permit".to_string()),
-            Some(
-                crate::boundary_resource::class_for_adapter_failure("permit", &message)
-                    .label()
-                    .to_string(),
-            ),
-        );
+        status.finish(-1);
         write_codex_status(&request.log_path, &status);
         return Ok(CodexResult::failure(
             "permit",
@@ -567,15 +606,7 @@ fn run_codex_request(
                 &command_line_for_request(&request),
                 request.timeout_seconds,
             );
-            status.finish(
-                -1,
-                Some("permit".to_string()),
-                Some(
-                    crate::boundary_resource::class_for_adapter_failure("permit", &message)
-                        .label()
-                        .to_string(),
-                ),
-            );
+            status.finish(-1);
             write_codex_status(&request.log_path, &status);
             return Ok(CodexResult::failure(
                 "permit",
@@ -589,7 +620,7 @@ fn run_codex_request(
     };
 
     let result = run_codex_request_with_permit(request, config);
-    status.finish_from_result(&result);
+    status.finish(result.exit_code);
     write_codex_status(Path::new(&result.log_path), &status);
     Ok(result)
 }
@@ -653,15 +684,14 @@ fn run_mocked_codex_request(
         &cmd_line,
         request.timeout_seconds,
     );
-    let result = CodexResult::success(
-        result.stdout.clone(),
-        result.stderr.clone(),
+    status.finish(result.exit_code);
+    write_codex_status(&request.log_path, &status);
+    Ok(CodexResult::success(
+        result.stdout,
+        result.stderr,
         result.exit_code,
         request.log_path.to_string_lossy().into_owned(),
-    );
-    status.finish_from_result(&result);
-    write_codex_status(&request.log_path, &status);
-    Ok(result)
+    ))
 }
 
 fn adoption_paths_for_request(
@@ -858,6 +888,7 @@ fn start_adoption_worker(
         dept: request.dept.clone(),
         proposal_id: request.proposal_id.clone(),
         dedup_key: request.dedup_key.clone(),
+        queue_liveness: queue_liveness_record_for_request(request),
         status: "running".to_string(),
         started_at_ms: request.started_at_ms,
         ended_at_ms: None,
@@ -868,7 +899,6 @@ fn start_adoption_worker(
         log_path: request.log_path.to_string_lossy().into_owned(),
         cmd_line: command_line_for_request(request),
         error_kind: None,
-        error_class: None,
         error: None,
     };
     drop(child);
@@ -950,6 +980,42 @@ fn codex_worker_args(
     if let Some(dedup_key) = request.dedup_key.as_deref() {
         args.push("--dedup-key".to_string());
         args.push(dedup_key.to_string());
+    }
+    if let Some(item_id) = request.queue_item_id.as_deref() {
+        args.push("--queue-item-id".to_string());
+        args.push(item_id.to_string());
+    }
+    if let Some(linked_item_id) = request.queue_linked_item_id.as_deref() {
+        args.push("--queue-linked-item-id".to_string());
+        args.push(linked_item_id.to_string());
+    }
+    if let Some(queue) = request.queue_name.as_deref() {
+        args.push("--queue".to_string());
+        args.push(queue.to_string());
+    }
+    if let Some(owner) = request.queue_owner.as_deref() {
+        args.push("--queue-owner".to_string());
+        args.push(owner.to_string());
+    }
+    if let Some(state) = request.queue_state.as_deref() {
+        args.push("--queue-state".to_string());
+        args.push(state.to_string());
+    }
+    if let Some(order) = request.queue_order {
+        args.push("--queue-order".to_string());
+        args.push(order.to_string());
+    }
+    if let Some(age_seconds) = request.queue_age_seconds {
+        args.push("--queue-age-seconds".to_string());
+        args.push(age_seconds.to_string());
+    }
+    if let Some(slo_seconds) = request.queue_slo_seconds {
+        args.push("--queue-slo-seconds".to_string());
+        args.push(slo_seconds.to_string());
+    }
+    if let Some(next_action) = request.queue_next_action.as_deref() {
+        args.push("--queue-next-action".to_string());
+        args.push(next_action.to_string());
     }
     if let Some(dept) = request.dept.as_deref() {
         args.push("--dept".to_string());
@@ -1048,6 +1114,15 @@ pub(crate) struct CodexWorkerOptions {
     label: Option<String>,
     proposal_id: Option<String>,
     dedup_key: Option<String>,
+    queue_item_id: Option<String>,
+    queue_linked_item_id: Option<String>,
+    queue_name: Option<String>,
+    queue_owner: Option<String>,
+    queue_state: Option<String>,
+    queue_order: Option<u64>,
+    queue_age_seconds: Option<u64>,
+    queue_slo_seconds: Option<u64>,
+    queue_next_action: Option<String>,
     dept: Option<String>,
 }
 
@@ -1070,6 +1145,24 @@ pub(crate) fn parse_worker_args(args: Vec<String>) -> anyhow::Result<CodexWorker
     let label = parser.optional_string("--label");
     let proposal_id = parser.optional_string("--proposal-id");
     let dedup_key = parser.optional_string("--dedup-key");
+    let queue_item_id = parser.optional_string("--queue-item-id");
+    let queue_linked_item_id = parser.optional_string("--queue-linked-item-id");
+    let queue_name = parser.optional_string("--queue");
+    let queue_owner = parser.optional_string("--queue-owner");
+    let queue_state = parser.optional_string("--queue-state");
+    let queue_order = parser
+        .optional_string("--queue-order")
+        .map(|value| value.parse::<u64>())
+        .transpose()?;
+    let queue_age_seconds = parser
+        .optional_string("--queue-age-seconds")
+        .map(|value| value.parse::<u64>())
+        .transpose()?;
+    let queue_slo_seconds = parser
+        .optional_string("--queue-slo-seconds")
+        .map(|value| value.parse::<u64>())
+        .transpose()?;
+    let queue_next_action = parser.optional_string("--queue-next-action");
     let dept = parser.optional_string("--dept");
     parser.finish()?;
     Ok(CodexWorkerOptions {
@@ -1090,6 +1183,15 @@ pub(crate) fn parse_worker_args(args: Vec<String>) -> anyhow::Result<CodexWorker
         label,
         proposal_id,
         dedup_key,
+        queue_item_id,
+        queue_linked_item_id,
+        queue_name,
+        queue_owner,
+        queue_state,
+        queue_order,
+        queue_age_seconds,
+        queue_slo_seconds,
+        queue_next_action,
         dept,
     })
 }
@@ -1109,6 +1211,15 @@ pub(crate) fn run_codex_worker(options: CodexWorkerOptions) -> anyhow::Result<i3
         label: options.label.clone(),
         proposal_id: options.proposal_id.clone(),
         dedup_key: options.dedup_key.clone(),
+        queue_item_id: options.queue_item_id.clone(),
+        queue_linked_item_id: options.queue_linked_item_id.clone(),
+        queue_name: options.queue_name.clone(),
+        queue_owner: options.queue_owner.clone(),
+        queue_state: options.queue_state.clone(),
+        queue_order: options.queue_order,
+        queue_age_seconds: options.queue_age_seconds,
+        queue_slo_seconds: options.queue_slo_seconds,
+        queue_next_action: options.queue_next_action.clone(),
         dept: options.dept.clone(),
         started_at_ms: options.started_at_ms,
         adoption_status_path: Some(options.status_file.clone()),
@@ -1124,6 +1235,7 @@ pub(crate) fn run_codex_worker(options: CodexWorkerOptions) -> anyhow::Result<i3
         dept: options.dept.clone(),
         proposal_id: options.proposal_id.clone(),
         dedup_key: options.dedup_key.clone(),
+        queue_liveness: queue_liveness_record_for_request(&request),
         status: "running".to_string(),
         started_at_ms: options.started_at_ms,
         ended_at_ms: None,
@@ -1134,7 +1246,6 @@ pub(crate) fn run_codex_worker(options: CodexWorkerOptions) -> anyhow::Result<i3
         log_path: options.log_path.to_string_lossy().into_owned(),
         cmd_line: command_line_for_request(&request),
         error_kind: None,
-        error_class: None,
         error: None,
     };
     write_adoption_record(&options.status_file, &adoption)?;
@@ -1168,10 +1279,9 @@ pub(crate) fn run_codex_worker(options: CodexWorkerOptions) -> anyhow::Result<i3
     adoption.ended_at_ms = Some(unix_duration().as_millis() as u64);
     adoption.exit_code = Some(result.exit_code);
     adoption.error_kind = result.error_kind.clone();
-    adoption.error_class = result.error_class.clone();
     adoption.error = result.error.clone();
     write_adoption_record(&options.status_file, &adoption)?;
-    status.finish_from_result(&result);
+    status.finish(result.exit_code);
     write_codex_status(Path::new(&result.log_path), &status);
     Ok(0)
 }
@@ -1235,6 +1345,29 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn queue_liveness_record_for_request(request: &CodexRequest) -> Option<QueueLivenessRecord> {
+    let item_id = request.queue_item_id.clone()?;
+    let next_action = request.queue_next_action.clone()?;
+    let age_seconds = request.queue_age_seconds.or_else(|| {
+        Some(((unix_duration().as_millis() as u64).saturating_sub(request.started_at_ms)) / 1000)
+    });
+    let breached = request
+        .queue_slo_seconds
+        .and_then(|slo_seconds| age_seconds.map(|age_seconds| age_seconds >= slo_seconds));
+    Some(QueueLivenessRecord {
+        item_id,
+        linked_item_id: request.queue_linked_item_id.clone(),
+        queue: request.queue_name.clone(),
+        owner: request.queue_owner.clone(),
+        state: request.queue_state.clone(),
+        order: request.queue_order,
+        age_seconds,
+        slo_seconds: request.queue_slo_seconds,
+        breached,
+        next_action,
+    })
+}
+
 impl CodexStatusRecord {
     fn from_request(request: &CodexRequest, permit_slot: Option<usize>) -> Self {
         Self {
@@ -1244,6 +1377,7 @@ impl CodexStatusRecord {
             dept: request.dept.clone(),
             proposal_id: request.proposal_id.clone(),
             dedup_key: request.dedup_key.clone(),
+            queue_liveness: queue_liveness_record_for_request(request),
             started_at: unix_millis_to_iso8601(request.started_at_ms),
             started_at_ms: request.started_at_ms,
             ended_at: None,
@@ -1251,30 +1385,18 @@ impl CodexStatusRecord {
             elapsed_ms: None,
             status: "running".to_string(),
             exit_code: None,
-            error_kind: None,
-            error_class: None,
             permit_slot,
             output_tail_path: Some(request.output_tail_path.to_string_lossy().into_owned()),
         }
     }
 
-    fn finish(&mut self, exit_code: i32, error_kind: Option<String>, error_class: Option<String>) {
+    fn finish(&mut self, exit_code: i32) {
         let ended_at_ms = unix_duration().as_millis() as u64;
         self.ended_at = Some(unix_millis_to_iso8601(ended_at_ms));
         self.ended_at_ms = Some(ended_at_ms);
         self.elapsed_ms = Some(ended_at_ms.saturating_sub(self.started_at_ms));
         self.status = "completed".to_string();
         self.exit_code = Some(exit_code);
-        self.error_kind = error_kind;
-        self.error_class = error_class;
-    }
-
-    fn finish_from_result(&mut self, result: &CodexResult) {
-        self.finish(
-            result.exit_code,
-            result.error_kind.clone(),
-            result.error_class.clone(),
-        );
     }
 }
 
@@ -1321,6 +1443,12 @@ fn codex_status_record_table(lua: &Lua, record: &CodexStatusRecord, now_ms: u64)
     if let Some(key) = record.proposal_id.as_ref().or(record.dedup_key.as_ref()) {
         table.set("proposal_id_or_key", key.as_str())?;
     }
+    if let Some(queue_liveness) = &record.queue_liveness {
+        table.set(
+            "queue_liveness",
+            queue_liveness_table(lua, queue_liveness, record, now_ms)?,
+        )?;
+    }
     table.set("started_at", record.started_at.clone())?;
     table.set("started_at_ms", record.started_at_ms)?;
     set_optional_string(&table, "ended_at", &record.ended_at)?;
@@ -1335,12 +1463,43 @@ fn codex_status_record_table(lua: &Lua, record: &CodexStatusRecord, now_ms: u64)
     if let Some(exit_code) = record.exit_code {
         table.set("exit_code", exit_code)?;
     }
-    set_optional_string(&table, "error_kind", &record.error_kind)?;
-    set_optional_string(&table, "error_class", &record.error_class)?;
     if let Some(permit_slot) = record.permit_slot {
         table.set("permit_slot", permit_slot)?;
     }
     table.set("output_tail", read_codex_output_tail(record))?;
+    Ok(table)
+}
+
+fn queue_liveness_table(
+    lua: &Lua,
+    record: &QueueLivenessRecord,
+    status: &CodexStatusRecord,
+    now_ms: u64,
+) -> Result<Table> {
+    let table = lua.create_table()?;
+    table.set("item_id", record.item_id.as_str())?;
+    set_optional_string(&table, "linked_item_id", &record.linked_item_id)?;
+    set_optional_string(&table, "queue", &record.queue)?;
+    set_optional_string(&table, "owner", &record.owner)?;
+    set_optional_string(&table, "state", &record.state)?;
+    if let Some(order) = record.order {
+        table.set("order", order)?;
+    }
+    let age_seconds = record.age_seconds.unwrap_or_else(|| {
+        status
+            .ended_at_ms
+            .unwrap_or(now_ms)
+            .saturating_sub(status.started_at_ms)
+            / 1000
+    });
+    table.set("age_seconds", age_seconds)?;
+    if let Some(slo_seconds) = record.slo_seconds {
+        table.set("slo_seconds", slo_seconds)?;
+        table.set("breached", age_seconds >= slo_seconds)?;
+    } else if let Some(breached) = record.breached {
+        table.set("breached", breached)?;
+    }
+    table.set("next_action", record.next_action.as_str())?;
     Ok(table)
 }
 
@@ -1468,8 +1627,6 @@ fn read_adoption_status_records(host_root: &Path) -> anyhow::Result<Vec<CodexSta
 fn codex_status_record_from_adoption(record: CodexAdoptionRecord) -> CodexStatusRecord {
     let ended_at_ms = record.ended_at_ms;
     let exit_code = adoption_status_exit_code(&record);
-    let error_kind = record.error_kind.clone();
-    let error_class = adoption_error_class(&record);
     let status = if record.status == "running" && adoption_worker_alive(&record) {
         "running".to_string()
     } else {
@@ -1482,6 +1639,7 @@ fn codex_status_record_from_adoption(record: CodexAdoptionRecord) -> CodexStatus
         dept: record.dept,
         proposal_id: record.proposal_id,
         dedup_key: record.dedup_key.or(Some(record.key)),
+        queue_liveness: record.queue_liveness,
         started_at: unix_millis_to_iso8601(record.started_at_ms),
         started_at_ms: record.started_at_ms,
         ended_at: ended_at_ms.map(unix_millis_to_iso8601),
@@ -1489,8 +1647,6 @@ fn codex_status_record_from_adoption(record: CodexAdoptionRecord) -> CodexStatus
         elapsed_ms: ended_at_ms.map(|ended| ended.saturating_sub(record.started_at_ms)),
         status,
         exit_code,
-        error_kind,
-        error_class,
         permit_slot: None,
         output_tail_path: Some(
             codex_output_tail_path(Path::new(&record.log_path))
@@ -1498,19 +1654,6 @@ fn codex_status_record_from_adoption(record: CodexAdoptionRecord) -> CodexStatus
                 .into_owned(),
         ),
     }
-}
-
-fn adoption_error_class(record: &CodexAdoptionRecord) -> Option<String> {
-    record.error_class.clone().or_else(|| {
-        record.error_kind.as_deref().map(|kind| {
-            crate::boundary_resource::class_for_adapter_failure(
-                kind,
-                record.error.as_deref().unwrap_or(""),
-            )
-            .label()
-            .to_string()
-        })
-    })
 }
 
 fn adoption_status_exit_code(record: &CodexAdoptionRecord) -> Option<i32> {

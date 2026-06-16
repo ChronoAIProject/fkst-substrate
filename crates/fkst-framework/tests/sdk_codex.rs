@@ -1282,11 +1282,6 @@ fn spawn_codex_sync_returns_visible_spawn_error() {
     let failed: Table = recent.get(1).unwrap();
     assert_eq!(failed.get::<String>("status").unwrap(), "failed");
     assert_eq!(failed.get::<i64>("exit_code").unwrap(), -1);
-    assert_eq!(failed.get::<String>("error_kind").unwrap(), "spawn");
-    assert_eq!(
-        failed.get::<String>("error_class").unwrap(),
-        "provider-unavailable"
-    );
     assert!(failed.get::<String>("log_path").is_err());
     assert!(failed
         .get::<String>("output_tail")
@@ -1333,16 +1328,13 @@ exit 1
     let failed: Table = recent.get(1).unwrap();
     assert_eq!(failed.get::<String>("status").unwrap(), "failed");
     assert!(failed.get::<String>("error_kind").is_err());
-    assert_eq!(
-        failed.get::<String>("error_class").unwrap(),
-        "auth-degraded"
-    );
+    assert!(failed.get::<String>("error_class").is_err());
     assert!(failed.get::<String>("log_path").is_err());
 }
 
 #[cfg(unix)]
 #[test]
-fn codex_runs_exposes_adopted_worktree_failure_class_without_log_path() {
+fn codex_runs_exposes_canonical_queue_liveness_without_log_path() {
     let tmp = tempfile::tempdir().unwrap();
     let bin_dir = tmp.path().join("bin");
     let worktree = tmp.path().join("wt");
@@ -1375,13 +1367,30 @@ exit 13
     )
     .unwrap();
     opts.set("dedup_key", "issue-70-pr-82").unwrap();
+    opts.set(
+        "queue_item_id",
+        "github-devloop/issue/ChronoAIProject/fkst-substrate/70",
+    )
+    .unwrap();
+    opts.set(
+        "queue_linked_item_id",
+        "github-devloop/pr/ChronoAIProject/fkst-substrate/82",
+    )
+    .unwrap();
+    opts.set("queue", "merge-ready").unwrap();
+    opts.set("queue_owner", "pkg.implementer").unwrap();
+    opts.set("queue_state", "merge-ready").unwrap();
+    opts.set("queue_order", 1_u64).unwrap();
+    opts.set("queue_age_seconds", 3898_u64 * 60).unwrap();
+    opts.set("queue_slo_seconds", 60_u64 * 60).unwrap();
+    opts.set(
+        "queue_next_action",
+        "route through normal intake consensus implementation review pipeline",
+    )
+    .unwrap();
 
     let result: Table = spawn.call(opts).unwrap();
     assert_eq!(result.get::<i64>("exit_code").unwrap(), 13);
-    assert_eq!(
-        result.get::<String>("error_class").unwrap(),
-        "provider-unavailable"
-    );
 
     let status_fn: mlua::Function = codex_runs_fn(&lua);
     let status: Table = status_fn.call(()).unwrap();
@@ -1399,9 +1408,29 @@ exit 13
         "github-devloop/issue/ChronoAIProject/fkst-substrate/70"
     );
     assert!(failed.get::<String>("error_kind").is_err());
+    assert!(failed.get::<String>("error_class").is_err());
+    let liveness: Table = failed.get("queue_liveness").unwrap();
     assert_eq!(
-        failed.get::<String>("error_class").unwrap(),
-        "provider-unavailable"
+        liveness.get::<String>("item_id").unwrap(),
+        "github-devloop/issue/ChronoAIProject/fkst-substrate/70"
+    );
+    assert_eq!(
+        liveness.get::<String>("linked_item_id").unwrap(),
+        "github-devloop/pr/ChronoAIProject/fkst-substrate/82"
+    );
+    assert_eq!(liveness.get::<String>("queue").unwrap(), "merge-ready");
+    assert_eq!(liveness.get::<String>("owner").unwrap(), "pkg.implementer");
+    assert_eq!(liveness.get::<String>("state").unwrap(), "merge-ready");
+    assert_eq!(liveness.get::<u64>("order").unwrap(), 1);
+    assert_eq!(liveness.get::<u64>("age_seconds").unwrap(), 3898_u64 * 60);
+    assert_eq!(liveness.get::<u64>("slo_seconds").unwrap(), 60_u64 * 60);
+    assert!(
+        liveness.get::<u64>("age_seconds").unwrap() >= liveness.get::<u64>("slo_seconds").unwrap()
+    );
+    assert!(liveness.get::<bool>("breached").unwrap());
+    assert_eq!(
+        liveness.get::<String>("next_action").unwrap(),
+        "route through normal intake consensus implementation review pipeline"
     );
     assert!(failed.get::<String>("log_path").is_err());
     assert!(failed

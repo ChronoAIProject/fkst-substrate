@@ -157,8 +157,6 @@ fn classify_text(text: &str) -> Option<BoundaryErrorClass> {
             "connection refused",
             "timed out",
             "timeout",
-            "permission denied",
-            "operation not permitted",
         ],
     ) {
         return Some(BoundaryErrorClass::ProviderUnavailable);
@@ -208,10 +206,6 @@ mod tests {
         assert_eq!(
             classify_process_output(1, "", "HTTP 403 API rate limit exceeded"),
             Some(BoundaryErrorClass::QuotaExhausted)
-        );
-        assert_eq!(
-            classify_process_output(13, "", "permission denied writing worktree marker"),
-            Some(BoundaryErrorClass::ProviderUnavailable)
         );
     }
 }
