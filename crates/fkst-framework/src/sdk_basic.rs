@@ -180,6 +180,9 @@ fn run_exec_sync_with_context(
                 });
             }
             MockCommandPlan::Record => {
+                rate_pools
+                    .acquire_for_command_text(&opts.cmd)
+                    .map_err(mlua::Error::external)?;
                 let output = execute_spec(CommandSpec {
                     program: PathBuf::from("/bin/sh"),
                     args: vec!["-c".to_string(), opts.cmd],
@@ -289,7 +292,9 @@ fn execute_spec(spec: CommandSpec) -> Result<ExecResult> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::external_command::{MockCommandResult, MockCommandState};
+    use crate::external_command::{
+        CommandCassetteMode, CommandCassetteOptions, MockCommandResult, MockCommandState,
+    };
     use crate::rate_pool::{RatePoolConfig, RatePoolRegistry};
     use mlua::Lua;
     #[cfg(unix)]
@@ -634,6 +639,50 @@ printf 'stderr-1\n' >&2
 
         assert_eq!(out.stdout, "[]\n");
         assert!(!dir.path().join("gh.bucket").exists());
+    }
+
+    #[test]
+    fn exec_sync_cassette_record_mode_consumes_rate_pool_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        let gh = bin.join("gh");
+        std::fs::write(&gh, "#!/bin/sh\nprintf '[]\\n'\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&gh).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&gh, perms).unwrap();
+        }
+        seed_rate_bucket(dir.path(), "gh", 1);
+        let rate_pools = registry(dir.path(), "gh");
+        let runner = MockCommandState::new();
+        runner
+            .start_cassette(CommandCassetteOptions {
+                path: dir.path().join("cassette.json"),
+                mode: CommandCassetteMode::Record,
+                redactions: Vec::new(),
+            })
+            .unwrap();
+
+        let out = run_exec_sync(
+            ExecOptions {
+                cmd: "gh issue list --json number".to_string(),
+                cwd: None,
+                env: vec![("PATH".to_string(), bin.to_string_lossy().into_owned())],
+                timeout: None,
+                read_coalesce: None,
+            },
+            Some(&runner),
+            &rate_pools,
+        )
+        .unwrap();
+        runner.finish_cassette().unwrap();
+
+        assert_eq!(out.stdout, "[]\n");
+        let ledger = std::fs::read_to_string(dir.path().join("gh.bucket")).unwrap();
+        assert!(ledger.contains("tokens=0\n"), "{ledger}");
     }
 
     #[test]
