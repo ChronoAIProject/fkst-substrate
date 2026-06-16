@@ -91,9 +91,10 @@ const CI_YML: &str = r#"name: ci
 
 on:
   push:
-    branches: [dev]
+    branches: [dev, integration, "integration-*"]
   pull_request:
-    branches: [dev]
+    branches: [dev, integration, "integration-*"]
+  workflow_dispatch:
 
 concurrency:
   group: ci-${{ github.ref }}

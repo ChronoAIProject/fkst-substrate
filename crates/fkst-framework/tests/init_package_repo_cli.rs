@@ -81,6 +81,21 @@ fn init_package_repo_materializes_empty_repo() {
 }
 
 #[test]
+fn init_package_repo_ci_template_reaches_integration_prs() {
+    let repo = init_git_like_repo();
+
+    assert_exit(&run_init(repo.path(), &["--ref", "test-ref"]), 0);
+
+    let ci = std::fs::read_to_string(repo.path().join(".github/workflows/ci.yml")).unwrap();
+    assert!(ci.contains("push:\n    branches: [dev, integration, \"integration-*\"]"), "{ci}");
+    assert!(
+        ci.contains("pull_request:\n    branches: [dev, integration, \"integration-*\"]"),
+        "{ci}"
+    );
+    assert!(ci.contains("workflow_dispatch:"), "{ci}");
+}
+
+#[test]
 fn init_package_repo_converged_repo_is_noop() {
     let repo = init_git_like_repo();
     assert_exit(&run_init(repo.path(), &["--ref", "test-ref"]), 0);
