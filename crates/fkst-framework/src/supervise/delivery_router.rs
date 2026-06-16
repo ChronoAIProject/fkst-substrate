@@ -5,6 +5,7 @@ use super::delivery_types::{DeliveryRecord, SourceKind, SourceRef};
 use super::event_fanout::Fanout;
 use super::failure_fact::{FAILURE_FACT_QUEUE, FAILURE_FACT_SCHEMA};
 use super::journal::SupervisorJournal;
+use super::queue_starvation;
 use anyhow::{anyhow, bail, Context, Result};
 use fkst_common::config::Config;
 use fkst_common::validate_runtime_key;
@@ -82,7 +83,8 @@ impl DeliveryRouter {
         }
     }
 
-    pub(crate) fn publish(&self, envelope: PublishEnvelope) -> Result<()> {
+    pub(crate) fn publish(&self, mut envelope: PublishEnvelope) -> Result<()> {
+        queue_starvation::canonicalize_event(&mut envelope.event, envelope.source.as_ref());
         let queue = envelope.event.queue.clone();
         let subscribers = self
             .subscriptions
@@ -621,7 +623,6 @@ pub(crate) fn now_unix_millis() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::super::delivery_store::DeliveryStore;
-    use super::super::failure_fact::delivery_failure_fact;
     use super::*;
     use fkst_common::config::{Config, DepartmentDecl, LimitsDecl, QueueDecl};
     use std::time::Duration;
@@ -706,7 +707,7 @@ mod tests {
         }
     }
 
-    fn queue_starvation_config() -> Config {
+    fn queue_starvation_config(ephemeral: bool) -> Config {
         let mut queue = BTreeMap::new();
         queue.insert(
             "merge-ready".to_string(),
@@ -724,7 +725,11 @@ mod tests {
                 owner_namespace: "pkg".to_string(),
                 consumes: vec!["merge-ready".to_string()],
                 produces: Vec::new(),
-                ephemeral: Vec::new(),
+                ephemeral: if ephemeral {
+                    vec!["merge-ready".to_string()]
+                } else {
+                    Vec::new()
+                },
                 stall_window: "30s".to_string(),
                 graph_json: false,
                 retry: None,
@@ -873,8 +878,8 @@ mod tests {
     }
 
     #[test]
-    fn queue_starvation_publish_path_derives_canonical_liveness_fact() {
-        let cfg = queue_starvation_config();
+    fn queue_starvation_publish_path_stores_canonical_liveness_fact() {
+        let cfg = queue_starvation_config(false);
         let temp = TempDir::new().unwrap();
         let store = Arc::new(DeliveryStore::open(temp.path().join("delivery.redb")).unwrap());
         let router = DeliveryRouter::new(&cfg, Fanout::new(), Some(store.clone()), None);
@@ -921,8 +926,7 @@ mod tests {
             .unwrap();
         assert_eq!(leased.len(), 1);
 
-        let fact = delivery_failure_fact(&leased[0], "exit=13 stderr=permission denied");
-        let liveness = &fact.payload["queue_liveness"];
+        let liveness = &leased[0].payload["queue_liveness"];
         assert_eq!(
             liveness["item_id"],
             "github-devloop/issue/ChronoAIProject/fkst-substrate/70"
@@ -937,6 +941,60 @@ mod tests {
         assert_eq!(liveness["order"], 1);
         assert_eq!(liveness["age_seconds"], 3898_u64 * 60);
         assert_eq!(liveness["slo_seconds"], 60_u64 * 60);
+        assert_eq!(liveness["breached"], true);
+        assert_eq!(
+            liveness["next_action"],
+            "route through normal intake consensus implementation review pipeline"
+        );
+    }
+
+    #[tokio::test]
+    async fn queue_starvation_ephemeral_publish_path_emits_canonical_liveness_fact() {
+        let cfg = queue_starvation_config(true);
+        let fanout = Fanout::new();
+        let mut rx = fanout.subscribe("merge-ready", 8).await;
+        let router = DeliveryRouter::new(&cfg, fanout, None, None);
+
+        router
+            .publish(PublishEnvelope {
+                event: Event::new(
+                    "merge-ready",
+                    serde_json::json!({
+                        "watchdog": {
+                            "age_seconds": 233_880_u64,
+                            "slo_seconds": 3_600_u64,
+                            "order": 1
+                        },
+                        "queue_liveness": {
+                            "item_id": "caller-supplied"
+                        }
+                    }),
+                ),
+                source: Some(SourceRef {
+                    kind: SourceKind::External,
+                    reference: "observability-sample/queue-starvation/ChronoAIProject/fkst-substrate/merge-ready/pr/82/proposal/github-devloop/issue/ChronoAIProject/fkst-substrate/70/version/ready-consensus-github-devloo-0129659072".to_string(),
+                }),
+                cron_payload: None,
+                derived: None,
+            })
+            .unwrap();
+
+        let got = rx.recv().await.unwrap();
+        let liveness = &got.payload["queue_liveness"];
+        assert_eq!(
+            liveness["item_id"],
+            "github-devloop/issue/ChronoAIProject/fkst-substrate/70"
+        );
+        assert_eq!(
+            liveness["linked_item_id"],
+            "github-devloop/pr/ChronoAIProject/fkst-substrate/82"
+        );
+        assert_eq!(liveness["queue"], "merge-ready");
+        assert_eq!(liveness["owner"], "github-devloop");
+        assert_eq!(liveness["state"], "merge-ready");
+        assert_eq!(liveness["order"], 1);
+        assert_eq!(liveness["age_seconds"], 233_880_u64);
+        assert_eq!(liveness["slo_seconds"], 3_600_u64);
         assert_eq!(liveness["breached"], true);
         assert_eq!(
             liveness["next_action"],

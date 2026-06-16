@@ -22,6 +22,8 @@ mod failure_fact;
 mod journal;
 #[path = "../src/provenance.rs"]
 mod provenance;
+#[path = "../src/supervise/queue_starvation.rs"]
+mod queue_starvation;
 #[allow(dead_code)]
 #[path = "../src/supervise/source_runner.rs"]
 mod source_runner;
