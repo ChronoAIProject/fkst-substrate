@@ -437,6 +437,11 @@ fn run_git_command<'a>(
                 return Ok(mock_output(result.stdout, result.stderr, result.exit_code));
             }
             MockCommandPlan::Record => {
+                if let Some(rate_pools) = rate_pools {
+                    rate_pools
+                        .acquire_for_program("git")
+                        .map_err(mlua::Error::external)?;
+                }
                 let audited = crate::external_command::run_audited(CommandSpec {
                     program: "git".into(),
                     args: rendered_args,
