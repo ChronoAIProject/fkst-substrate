@@ -389,7 +389,7 @@ read _ < "$RELEASE_FIFO"
     let mut observed_role = String::new();
     let mut observed_key = String::new();
     let mut observed_log_path_is_hidden = false;
-    for _ in 0..50 {
+    for _ in 0..250 {
         let status: Table = status_fn.call(()).unwrap();
         let running: Table = status.get("running").unwrap();
         if running.raw_len() == 1 {
@@ -655,7 +655,10 @@ printf 'result-%s' "$count"
         std::fs::read_to_string(capture_dir.join("spawns")).unwrap(),
         "1"
     );
-    assert!(tmp.path().join("runtime/codex-adoption").exists());
+    assert!(tmp
+        .path()
+        .join(".fkst/runtime/logs/codex-adoption")
+        .exists());
     assert!(!worktree.join(".fkst-codex").exists());
 }
 
@@ -697,7 +700,10 @@ printf 'readonly-ok'
     let result: Table = spawn.call(opts).unwrap();
     assert_eq!(result.get::<i64>("exit_code").unwrap(), 0);
     assert_eq!(result.get::<String>("stdout").unwrap(), "readonly-ok");
-    assert!(tmp.path().join("runtime/codex-adoption").exists());
+    assert!(tmp
+        .path()
+        .join(".fkst/runtime/logs/codex-adoption")
+        .exists());
     assert!(!worktree.join(".fkst-codex").exists());
 }
 
@@ -760,7 +766,7 @@ printf 'result-%s' "$count"
         "2"
     );
 
-    let adoption_dir = tmp.path().join("runtime/codex-adoption");
+    let adoption_dir = tmp.path().join(".fkst/runtime/logs/codex-adoption");
     let dirs: Vec<_> = std::fs::read_dir(&adoption_dir)
         .unwrap()
         .map(|entry| entry.unwrap().path())
@@ -1008,6 +1014,11 @@ printf 'adoption-done'
         active.get::<String>("output_tail").unwrap(),
         "adoption-live-tail\n"
     );
+    assert!(tmp
+        .path()
+        .join(".fkst/runtime/logs/codex-adoption")
+        .exists());
+    assert!(!tmp.path().join("runtime/codex-adoption").exists());
     assert!(active.get::<i64>("exit_code").is_err());
     assert!(active.get::<String>("log_path").is_err());
 

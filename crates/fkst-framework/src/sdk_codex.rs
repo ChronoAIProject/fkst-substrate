@@ -511,7 +511,7 @@ fn run_codex_request(
         return run_mocked_codex_request(request, runner);
     }
 
-    if let Some(paths) = adoption_paths_for_request(&request) {
+    if let Some(paths) = adoption_paths_for_request(&request, host_root)? {
         return run_adoptable_codex_request(request, paths, host_root, config);
     }
 
@@ -642,29 +642,36 @@ fn run_mocked_codex_request(
     ))
 }
 
-fn adoption_paths_for_request(request: &CodexRequest) -> Option<CodexAdoptionPaths> {
-    let worktree = request.worktree.as_deref()?;
+fn adoption_paths_for_request(
+    request: &CodexRequest,
+    host_root: &Path,
+) -> Result<Option<CodexAdoptionPaths>> {
+    let Some(worktree) = request.worktree.as_deref() else {
+        return Ok(None);
+    };
     if worktree.trim().is_empty() {
-        return None;
+        return Ok(None);
     }
     let key = adoption_key_for_request(request);
-    let dir = adoption_runtime_dir(&request.log_path).join(&key);
-    Some(CodexAdoptionPaths {
+    let dir = adoption_runtime_dir(host_root)?.join(&key);
+    Ok(Some(CodexAdoptionPaths {
         key,
         prompt: dir.join("prompt.txt"),
         stdout: dir.join("stdout.txt"),
         stderr: dir.join("stderr.txt"),
         status: dir.join("status.json"),
         dir,
-    })
+    }))
 }
 
-fn adoption_runtime_dir(log_path: &Path) -> PathBuf {
-    log_path
-        .parent()
-        .and_then(Path::parent)
-        .map(|runtime| runtime.join(CODEX_ADOPTION_DIR))
-        .unwrap_or_else(|| runtime_log_dir().join(CODEX_ADOPTION_DIR))
+fn adoption_runtime_dir(host_root: &Path) -> Result<PathBuf> {
+    runtime_context::layout_from_host_root(host_root)
+        .map(|layout| {
+            layout
+                .runtime_dir(RuntimeKind::Logs)
+                .join(CODEX_ADOPTION_DIR)
+        })
+        .map_err(mlua::Error::external)
 }
 
 fn adoption_key_for_request(request: &CodexRequest) -> String {
@@ -1387,12 +1394,14 @@ fn read_codex_status_records(host_root: &Path) -> anyhow::Result<Vec<CodexStatus
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
         Err(err) => return Err(err.into()),
     }
-    records.extend(read_adoption_status_records()?);
+    records.extend(read_adoption_status_records(host_root)?);
     Ok(latest_codex_status_records(records))
 }
 
-fn read_adoption_status_records() -> anyhow::Result<Vec<CodexStatusRecord>> {
-    let adoption_dir = runtime_log_dir().join(CODEX_ADOPTION_DIR);
+fn read_adoption_status_records(host_root: &Path) -> anyhow::Result<Vec<CodexStatusRecord>> {
+    let adoption_dir = runtime_context::layout_from_host_root(host_root)?
+        .runtime_dir(RuntimeKind::Logs)
+        .join(CODEX_ADOPTION_DIR);
     let entries = match std::fs::read_dir(&adoption_dir) {
         Ok(entries) => entries,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
