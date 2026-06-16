@@ -6,7 +6,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use crate::external_command::{MockCommandResult, MockCommandState};
+use crate::external_command::{
+    CommandCassetteMode, CommandCassetteOptions, CommandCassetteRedaction, MockCommandResult,
+    MockCommandState,
+};
 use crate::path_resolver::PackageRoots;
 use crate::raise::RaiseBuffer;
 
@@ -394,12 +397,42 @@ fn register_test_sdk(
                 }
                 entry.set("args", args)?;
                 entry.set("stdin", call.stdin)?;
+                if let Some(cwd) = call.cwd {
+                    entry.set("cwd", cwd)?;
+                }
+                let env = lua.create_table()?;
+                for (env_idx, (key, value)) in call.env.into_iter().enumerate() {
+                    let pair = lua.create_table()?;
+                    pair.set("key", key)?;
+                    pair.set("value", value)?;
+                    env.set(env_idx + 1, pair)?;
+                }
+                entry.set("env", env)?;
                 entry.set("stdout", call.stdout)?;
                 entry.set("stderr", call.stderr)?;
                 entry.set("exit_code", call.exit_code)?;
                 calls.set(idx + 1, entry)?;
             }
             Ok(calls)
+        })?
+    })?;
+    test.set("with_command_cassette", {
+        let mock_commands = mock_commands.clone();
+        let owner_root = owner_root.clone();
+        lua.create_function(move |_, (opts, func): (Table, Function)| {
+            let cassette = CommandCassetteOptions::from_lua(&owner_root, opts)?;
+            mock_commands.start_cassette(cassette)?;
+            let result = func.call::<Value>(());
+            match result {
+                Ok(value) => {
+                    mock_commands.finish_cassette()?;
+                    Ok(value)
+                }
+                Err(err) => {
+                    let _ = mock_commands.abort_cassette();
+                    Err(err)
+                }
+            }
         })?
     })?;
     test.set("run_department", {
@@ -424,6 +457,51 @@ fn register_test_sdk(
     fkst.set("test", test)?;
     globals.set("fkst", fkst)?;
     Ok(())
+}
+
+impl CommandCassetteOptions {
+    fn from_lua(owner_root: &Path, opts: Table) -> mlua::Result<Self> {
+        let path: String = opts.get("path")?;
+        let mode: String = opts.get("mode")?;
+        let mode = match mode.as_str() {
+            "replay" => CommandCassetteMode::Replay,
+            "record" => CommandCassetteMode::Record,
+            other => {
+                return Err(mlua::Error::external(format!(
+                    "unsupported VCR command cassette mode: {other}"
+                )))
+            }
+        };
+        let redactions = parse_command_cassette_redactions(opts.get::<Option<Table>>("redact")?)?;
+        Ok(Self {
+            path: resolve_department_path(owner_root, &path),
+            mode,
+            redactions,
+        })
+    }
+}
+
+fn parse_command_cassette_redactions(
+    table: Option<Table>,
+) -> mlua::Result<Vec<CommandCassetteRedaction>> {
+    let Some(table) = table else {
+        return Ok(Vec::new());
+    };
+    let mut redactions = Vec::new();
+    for value in table.sequence_values::<Table>() {
+        let entry = value?;
+        let value: String = entry.get("value")?;
+        if value.is_empty() {
+            return Err(mlua::Error::external(
+                "VCR command cassette redaction value must not be empty",
+            ));
+        }
+        let replacement = entry
+            .get::<Option<String>>("replacement")?
+            .unwrap_or_else(|| "<REDACTED>".to_string());
+        redactions.push(CommandCassetteRedaction { value, replacement });
+    }
+    Ok(redactions)
 }
 
 fn run_department(

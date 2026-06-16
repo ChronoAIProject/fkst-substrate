@@ -118,10 +118,15 @@ fkst.test.is_nil(value[, msg])
 fkst.test.raises(fn[, msg])
 fkst.test.run_department(path, event[, opts])
 fkst.test.mock_command(pattern, result)
+fkst.test.with_command_cassette(opts, fn)
 fkst.test.command_calls()
 ```
 
 `fkst.test` 不存在于 `run`、`supervise`、`--self-test` 或 conformance production Lua state。`mock_command` 劫持 test mode 中的 `exec_sync`、codex SDK 与 git SDK 外部命令调用；未 mock 的外部命令 fail closed。
+
+`fkst.test.with_command_cassette({ path, mode, redact? }, fn)` is the bounded VCR-style contract-test surface for external commands. It only exists in `fkst-framework test`; production `run`, `supervise`, `--self-test`, and conformance do not register it. `mode` is `"record"` or `"replay"`. `path` is resolved relative to the owner package root unless absolute. During the callback, explicit `mock_command` entries still take precedence; otherwise `exec_sync`, codex SDK, and git SDK calls use the active cassette.
+
+The cassette format is JSON schema `"fkst.test.command-cassette.v1"` with ordered `entries`. Each entry records the command boundary (`rendered`, `program`, `args`, `stdin`, optional `cwd`, sorted `env`) and result (`stdout`, `stderr`, `exit_code`). Replay is deterministic and fail-closed: entries are consumed in order, command boundary fields must match after redaction, unconsumed entries fail when the callback finishes, and replay never starts a real external process. Record mode starts the real command and atomically writes the cassette after the callback succeeds. `redact` is a list of `{ value, replacement? }`; every non-empty `value` is replaced in recorded command boundary fields and outputs, defaulting to `"<REDACTED>"`. Cassettes are package fixtures, not runtime facts or accepted state.
 
 ### 2.3 `exec_sync` read coalescing
 
