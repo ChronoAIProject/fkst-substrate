@@ -1282,6 +1282,12 @@ fn spawn_codex_sync_returns_visible_spawn_error() {
     let failed: Table = recent.get(1).unwrap();
     assert_eq!(failed.get::<String>("status").unwrap(), "failed");
     assert_eq!(failed.get::<i64>("exit_code").unwrap(), -1);
+    assert_eq!(failed.get::<String>("error_kind").unwrap(), "spawn");
+    assert_eq!(
+        failed.get::<String>("error_class").unwrap(),
+        "provider-unavailable"
+    );
+    assert!(failed.get::<String>("log_path").is_err());
     assert!(failed
         .get::<String>("output_tail")
         .unwrap()
@@ -1319,6 +1325,94 @@ exit 1
         result.get::<String>("error_class").unwrap(),
         "auth-degraded"
     );
+
+    let status_fn: mlua::Function = codex_runs_fn(&lua);
+    let status: Table = status_fn.call(()).unwrap();
+    let recent: Table = status.get("recent").unwrap();
+    assert_eq!(recent.raw_len(), 1);
+    let failed: Table = recent.get(1).unwrap();
+    assert_eq!(failed.get::<String>("status").unwrap(), "failed");
+    assert!(failed.get::<String>("error_kind").is_err());
+    assert_eq!(
+        failed.get::<String>("error_class").unwrap(),
+        "auth-degraded"
+    );
+    assert!(failed.get::<String>("log_path").is_err());
+}
+
+#[cfg(unix)]
+#[test]
+fn codex_runs_exposes_adopted_worktree_failure_class_without_log_path() {
+    let tmp = tempfile::tempdir().unwrap();
+    let bin_dir = tmp.path().join("bin");
+    let worktree = tmp.path().join("wt");
+    std::fs::create_dir_all(&worktree).unwrap();
+    install_codex_script(
+        &bin_dir,
+        r#"#!/bin/sh
+cat >/dev/null
+printf 'permission denied writing worktree marker' >&2
+exit 13
+"#,
+    );
+
+    let mut sandbox = ProcessSandbox::new();
+    sandbox.enter_cwd(tmp.path()).runtime_root(".fkst/runtime");
+    sandbox.prepend_path(&bin_dir);
+    sandbox.set_env(CODEX_WORKER_BIN_ENV, framework_bin());
+    sandbox.runtime_log_dir(tmp.path().join("runtime"));
+    let (_lock, _guard) = sandbox.enter();
+
+    let lua = Lua::new();
+    register_with_dept(&lua, Some("pkg.implementer".to_string())).unwrap();
+    let spawn: mlua::Function = lua.globals().get("spawn_codex_sync").unwrap();
+    let opts = lua_opts(&lua, "worktree failure");
+    opts.set("worktree", worktree.to_string_lossy().into_owned())
+        .unwrap();
+    opts.set(
+        "proposal_id",
+        "github-devloop/issue/ChronoAIProject/fkst-substrate/70",
+    )
+    .unwrap();
+    opts.set("dedup_key", "issue-70-pr-82").unwrap();
+
+    let result: Table = spawn.call(opts).unwrap();
+    assert_eq!(result.get::<i64>("exit_code").unwrap(), 13);
+    assert_eq!(
+        result.get::<String>("error_class").unwrap(),
+        "provider-unavailable"
+    );
+
+    let status_fn: mlua::Function = codex_runs_fn(&lua);
+    let status: Table = status_fn.call(()).unwrap();
+    let recent: Table = status.get("recent").unwrap();
+    assert_eq!(recent.raw_len(), 1);
+    let failed: Table = recent.get(1).unwrap();
+    assert_eq!(failed.get::<String>("status").unwrap(), "failed");
+    assert_eq!(
+        failed.get::<String>("proposal_id").unwrap(),
+        "github-devloop/issue/ChronoAIProject/fkst-substrate/70"
+    );
+    assert_eq!(failed.get::<String>("dedup_key").unwrap(), "issue-70-pr-82");
+    assert_eq!(
+        failed.get::<String>("proposal_id_or_key").unwrap(),
+        "github-devloop/issue/ChronoAIProject/fkst-substrate/70"
+    );
+    assert!(failed.get::<String>("error_kind").is_err());
+    assert_eq!(
+        failed.get::<String>("error_class").unwrap(),
+        "provider-unavailable"
+    );
+    assert!(failed.get::<String>("log_path").is_err());
+    assert!(failed
+        .get::<String>("output_tail")
+        .unwrap()
+        .contains("permission denied"));
+    assert!(tmp
+        .path()
+        .join(".fkst/runtime/logs/codex-adoption")
+        .exists());
+    assert!(!worktree.join(".fkst-codex").exists());
 }
 
 #[cfg(unix)]

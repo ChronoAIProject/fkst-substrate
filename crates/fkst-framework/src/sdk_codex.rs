@@ -97,6 +97,10 @@ struct CodexStatusRecord {
     #[serde(default)]
     exit_code: Option<i32>,
     #[serde(default)]
+    error_kind: Option<String>,
+    #[serde(default)]
+    error_class: Option<String>,
+    #[serde(default)]
     permit_slot: Option<usize>,
     #[serde(default)]
     output_tail_path: Option<String>,
@@ -126,6 +130,7 @@ struct CodexAdoptionRecord {
     log_path: String,
     cmd_line: String,
     error_kind: Option<String>,
+    error_class: Option<String>,
     error: Option<String>,
 }
 
@@ -527,7 +532,15 @@ fn run_codex_request(
             &command_line_for_request(&request),
             request.timeout_seconds,
         );
-        status.finish(-1);
+        status.finish(
+            -1,
+            Some("permit".to_string()),
+            Some(
+                crate::boundary_resource::class_for_adapter_failure("permit", &message)
+                    .label()
+                    .to_string(),
+            ),
+        );
         write_codex_status(&request.log_path, &status);
         return Ok(CodexResult::failure(
             "permit",
@@ -554,7 +567,15 @@ fn run_codex_request(
                 &command_line_for_request(&request),
                 request.timeout_seconds,
             );
-            status.finish(-1);
+            status.finish(
+                -1,
+                Some("permit".to_string()),
+                Some(
+                    crate::boundary_resource::class_for_adapter_failure("permit", &message)
+                        .label()
+                        .to_string(),
+                ),
+            );
             write_codex_status(&request.log_path, &status);
             return Ok(CodexResult::failure(
                 "permit",
@@ -568,7 +589,7 @@ fn run_codex_request(
     };
 
     let result = run_codex_request_with_permit(request, config);
-    status.finish(result.exit_code);
+    status.finish_from_result(&result);
     write_codex_status(Path::new(&result.log_path), &status);
     Ok(result)
 }
@@ -632,14 +653,15 @@ fn run_mocked_codex_request(
         &cmd_line,
         request.timeout_seconds,
     );
-    status.finish(result.exit_code);
-    write_codex_status(&request.log_path, &status);
-    Ok(CodexResult::success(
-        result.stdout,
-        result.stderr,
+    let result = CodexResult::success(
+        result.stdout.clone(),
+        result.stderr.clone(),
         result.exit_code,
         request.log_path.to_string_lossy().into_owned(),
-    ))
+    );
+    status.finish_from_result(&result);
+    write_codex_status(&request.log_path, &status);
+    Ok(result)
 }
 
 fn adoption_paths_for_request(
@@ -846,6 +868,7 @@ fn start_adoption_worker(
         log_path: request.log_path.to_string_lossy().into_owned(),
         cmd_line: command_line_for_request(request),
         error_kind: None,
+        error_class: None,
         error: None,
     };
     drop(child);
@@ -1111,6 +1134,7 @@ pub(crate) fn run_codex_worker(options: CodexWorkerOptions) -> anyhow::Result<i3
         log_path: options.log_path.to_string_lossy().into_owned(),
         cmd_line: command_line_for_request(&request),
         error_kind: None,
+        error_class: None,
         error: None,
     };
     write_adoption_record(&options.status_file, &adoption)?;
@@ -1144,9 +1168,10 @@ pub(crate) fn run_codex_worker(options: CodexWorkerOptions) -> anyhow::Result<i3
     adoption.ended_at_ms = Some(unix_duration().as_millis() as u64);
     adoption.exit_code = Some(result.exit_code);
     adoption.error_kind = result.error_kind.clone();
+    adoption.error_class = result.error_class.clone();
     adoption.error = result.error.clone();
     write_adoption_record(&options.status_file, &adoption)?;
-    status.finish(result.exit_code);
+    status.finish_from_result(&result);
     write_codex_status(Path::new(&result.log_path), &status);
     Ok(0)
 }
@@ -1226,18 +1251,30 @@ impl CodexStatusRecord {
             elapsed_ms: None,
             status: "running".to_string(),
             exit_code: None,
+            error_kind: None,
+            error_class: None,
             permit_slot,
             output_tail_path: Some(request.output_tail_path.to_string_lossy().into_owned()),
         }
     }
 
-    fn finish(&mut self, exit_code: i32) {
+    fn finish(&mut self, exit_code: i32, error_kind: Option<String>, error_class: Option<String>) {
         let ended_at_ms = unix_duration().as_millis() as u64;
         self.ended_at = Some(unix_millis_to_iso8601(ended_at_ms));
         self.ended_at_ms = Some(ended_at_ms);
         self.elapsed_ms = Some(ended_at_ms.saturating_sub(self.started_at_ms));
         self.status = "completed".to_string();
         self.exit_code = Some(exit_code);
+        self.error_kind = error_kind;
+        self.error_class = error_class;
+    }
+
+    fn finish_from_result(&mut self, result: &CodexResult) {
+        self.finish(
+            result.exit_code,
+            result.error_kind.clone(),
+            result.error_class.clone(),
+        );
     }
 }
 
@@ -1298,6 +1335,8 @@ fn codex_status_record_table(lua: &Lua, record: &CodexStatusRecord, now_ms: u64)
     if let Some(exit_code) = record.exit_code {
         table.set("exit_code", exit_code)?;
     }
+    set_optional_string(&table, "error_kind", &record.error_kind)?;
+    set_optional_string(&table, "error_class", &record.error_class)?;
     if let Some(permit_slot) = record.permit_slot {
         table.set("permit_slot", permit_slot)?;
     }
@@ -1429,6 +1468,8 @@ fn read_adoption_status_records(host_root: &Path) -> anyhow::Result<Vec<CodexSta
 fn codex_status_record_from_adoption(record: CodexAdoptionRecord) -> CodexStatusRecord {
     let ended_at_ms = record.ended_at_ms;
     let exit_code = adoption_status_exit_code(&record);
+    let error_kind = record.error_kind.clone();
+    let error_class = adoption_error_class(&record);
     let status = if record.status == "running" && adoption_worker_alive(&record) {
         "running".to_string()
     } else {
@@ -1448,6 +1489,8 @@ fn codex_status_record_from_adoption(record: CodexAdoptionRecord) -> CodexStatus
         elapsed_ms: ended_at_ms.map(|ended| ended.saturating_sub(record.started_at_ms)),
         status,
         exit_code,
+        error_kind,
+        error_class,
         permit_slot: None,
         output_tail_path: Some(
             codex_output_tail_path(Path::new(&record.log_path))
@@ -1455,6 +1498,19 @@ fn codex_status_record_from_adoption(record: CodexAdoptionRecord) -> CodexStatus
                 .into_owned(),
         ),
     }
+}
+
+fn adoption_error_class(record: &CodexAdoptionRecord) -> Option<String> {
+    record.error_class.clone().or_else(|| {
+        record.error_kind.as_deref().map(|kind| {
+            crate::boundary_resource::class_for_adapter_failure(
+                kind,
+                record.error.as_deref().unwrap_or(""),
+            )
+            .label()
+            .to_string()
+        })
+    })
 }
 
 fn adoption_status_exit_code(record: &CodexAdoptionRecord) -> Option<i32> {
