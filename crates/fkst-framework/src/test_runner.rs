@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use mlua::{Function, Lua, LuaSerdeExt, Table, Value};
 use serde::Serialize;
+use serde_json::Value as JsonValue;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -11,6 +12,7 @@ use crate::raise::RaiseBuffer;
 
 pub(crate) fn run_tests(roots: PackageRoots, report_json: Option<PathBuf>) -> Result<i32> {
     let files = discover_test_files(&roots)?;
+    let _supervisor_pid_guard = TestModeSupervisorPidGuard::remove();
     let cache = TestRunCache::new(roots.clone());
     let mut passed = 0usize;
     let mut failed = 0usize;
@@ -442,6 +444,14 @@ fn run_department(
     let require_roots = cache.require_roots_for_owner(owner_root)?;
     let graph_json_authorized =
         crate::sdk_graph::department_authorized(roots, owner_root, &lua_path).unwrap_or(false);
+    let qualified_consumes = cache.declared_qualified_consumes(owner_root, &lua_path)?;
+    let event_json = normalize_run_department_event_queue(
+        roots,
+        owner_namespace,
+        event_json,
+        qualified_consumes,
+    )
+    .map_err(mlua::Error::external)?;
     let qualified_produces = cache.declared_qualified_produces(owner_root, &lua_path)?;
     let package_path = cache.package_path_string(&require_roots)?;
 
@@ -504,6 +514,7 @@ struct TestRunCacheInner {
     require_roots: BTreeMap<PathBuf, Vec<PathBuf>>,
     package_paths: BTreeMap<Vec<PathBuf>, String>,
     declared_produces: BTreeMap<PathBuf, BTreeSet<String>>,
+    declared_consumes: BTreeMap<PathBuf, BTreeSet<String>>,
     #[cfg(test)]
     stats: TestRunCacheStats,
 }
@@ -514,6 +525,7 @@ struct TestRunCacheStats {
     require_roots_misses: usize,
     package_path_misses: usize,
     declared_produces_misses: usize,
+    declared_consumes_misses: usize,
 }
 
 impl TestRunCache {
@@ -596,6 +608,41 @@ impl TestRunCache {
         Ok(produces)
     }
 
+    fn declared_qualified_consumes(
+        &self,
+        owner_root: &Path,
+        lua_path: &Path,
+    ) -> mlua::Result<BTreeSet<String>> {
+        let lua_path = lua_path.canonicalize().map_err(mlua::Error::external)?;
+        {
+            let inner = self
+                .inner
+                .lock()
+                .map_err(|_| mlua::Error::runtime("test run cache lock poisoned"))?;
+            if let Some(consumes) = inner.declared_consumes.get(&lua_path) {
+                return Ok(consumes.clone());
+            }
+        }
+        let require_roots = self.require_roots_for_owner(owner_root)?;
+        let package_path = self.package_path_string(&require_roots)?;
+        let consumes = declared_qualified_consumes(
+            owner_root,
+            &lua_path,
+            &package_path,
+            self.lua_chunk_cache(),
+        )?;
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|_| mlua::Error::runtime("test run cache lock poisoned"))?;
+        #[cfg(test)]
+        {
+            inner.stats.declared_consumes_misses += 1;
+        }
+        inner.declared_consumes.insert(lua_path, consumes.clone());
+        Ok(consumes)
+    }
+
     fn lua_chunk_cache(&self) -> &crate::mlua_init::LuaChunkCache {
         &self.lua_chunks
     }
@@ -606,18 +653,35 @@ impl TestRunCache {
     }
 }
 
+fn declared_qualified_consumes(
+    owner_root: &Path,
+    lua_path: &Path,
+    package_path: &str,
+    chunk_cache: &crate::mlua_init::LuaChunkCache,
+) -> mlua::Result<BTreeSet<String>> {
+    declared_qualified_spec_queues(owner_root, lua_path, package_path, chunk_cache, "consumes")
+}
+
 fn declared_qualified_produces(
     owner_root: &Path,
     lua_path: &Path,
     package_path: &str,
     chunk_cache: &crate::mlua_init::LuaChunkCache,
 ) -> mlua::Result<BTreeSet<String>> {
+    declared_qualified_spec_queues(owner_root, lua_path, package_path, chunk_cache, "produces")
+}
+
+fn declared_qualified_spec_queues(
+    owner_root: &Path,
+    lua_path: &Path,
+    package_path: &str,
+    chunk_cache: &crate::mlua_init::LuaChunkCache,
+    field: &str,
+) -> mlua::Result<BTreeSet<String>> {
     if !is_department_entrypoint(owner_root, lua_path) {
         return Ok(BTreeSet::new());
     }
 
-    // Test-mode intentionally performs this bounded second eval before execution;
-    // department entrypoints have no top-level side effects by contract.
     let lua = crate::mlua_init::new_lua();
     crate::mlua_init::set_package_path_string(&lua, package_path)?;
     let value = match chunk_cache.eval_cached_chunk(&lua, lua_path) {
@@ -630,17 +694,44 @@ fn declared_qualified_produces(
     let Some(spec) = module.get::<Option<Table>>("spec")? else {
         return Ok(BTreeSet::new());
     };
-    let Some(produces) = spec.get::<Option<Table>>("produces")? else {
+    let Some(queues) = spec.get::<Option<Table>>(field)? else {
         return Ok(BTreeSet::new());
     };
     let mut qualified = BTreeSet::new();
-    for value in produces.sequence_values::<String>() {
+    for value in queues.sequence_values::<String>() {
         let value = value?;
         if value.contains('.') {
             qualified.insert(value);
         }
     }
     Ok(qualified)
+}
+
+fn normalize_run_department_event_queue(
+    roots: &PackageRoots,
+    owner_namespace: &str,
+    mut event: JsonValue,
+    qualified_consumes: BTreeSet<String>,
+) -> Result<JsonValue> {
+    let Some(raw_queue) = event.get("queue").and_then(JsonValue::as_str) else {
+        return Ok(event);
+    };
+    let dead_letter_queue = roots
+        .name_resolver()
+        .resolve(owner_namespace, "dead_letter")
+        .context("resolve production dead_letter queue")?;
+    let resolver = roots
+        .name_resolver()
+        .with_recorded_only_queues(qualified_consumes)
+        .add_recorded_only_queue(crate::supervise::failure_fact::FAILURE_FACT_QUEUE)
+        .add_recorded_only_queue(dead_letter_queue);
+    let resolved = resolver
+        .resolve(owner_namespace, raw_queue)
+        .with_context(|| format!("resolve test event.queue `{raw_queue}`"))?;
+    if let Some(object) = event.as_object_mut() {
+        object.insert("queue".to_string(), JsonValue::String(resolved));
+    }
+    Ok(event)
 }
 
 fn is_department_entrypoint(owner_root: &Path, lua_path: &Path) -> bool {
@@ -776,6 +867,26 @@ impl Drop for DeptRunEnvGuard {
         }
         if let Some(cwd) = &self.cwd {
             let _ = std::env::set_current_dir(cwd);
+        }
+    }
+}
+
+struct TestModeSupervisorPidGuard {
+    previous: Option<std::ffi::OsString>,
+}
+
+impl TestModeSupervisorPidGuard {
+    fn remove() -> Self {
+        let previous = std::env::var_os("FKST_SUPERVISOR_PID");
+        std::env::remove_var("FKST_SUPERVISOR_PID");
+        Self { previous }
+    }
+}
+
+impl Drop for TestModeSupervisorPidGuard {
+    fn drop(&mut self) {
+        if let Some(value) = &self.previous {
+            std::env::set_var("FKST_SUPERVISOR_PID", value);
         }
     }
 }
@@ -945,6 +1056,7 @@ mod tests {
                 require_roots_misses: 1,
                 package_path_misses: 1,
                 declared_produces_misses: 1,
+                declared_consumes_misses: 1,
             }
         );
         assert_eq!(cache.lua_chunk_cache().chunk_count(), 1);
