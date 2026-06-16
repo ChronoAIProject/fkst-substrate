@@ -280,6 +280,21 @@ fn consumer_without_producer_fails() {
 }
 
 #[test]
+fn built_in_dead_letter_source_contract_satisfies_producerless_queue() {
+    let tmp = tempdir().unwrap();
+    let lua = touch(tmp.path(), "d.lua");
+    let mut cfg = cfg_minimal(&lua);
+    add_queue(&mut cfg, "consensus.dead_letter");
+    let department = cfg.department.get_mut("d").unwrap();
+    department.consumes.push("consensus.dead_letter".into());
+    department.ephemeral.push("consensus.dead_letter".into());
+
+    let warnings = validate(&cfg, tmp.path()).unwrap();
+
+    assert!(warnings.is_empty(), "{warnings:?}");
+}
+
+#[test]
 fn duplicate_consumers_without_fanout_rejected() {
     let tmp = tempdir().unwrap();
     let lua = touch(tmp.path(), "d.lua");
