@@ -24,6 +24,8 @@ mod journal;
 mod provenance;
 #[path = "../src/supervise/queue_starvation.rs"]
 mod queue_starvation;
+#[path = "../src/runtime_context.rs"]
+mod runtime_context;
 #[allow(dead_code)]
 #[path = "../src/supervise/source_runner.rs"]
 mod source_runner;
