@@ -271,6 +271,44 @@ fn package_root_flag_supplies_standard_assets_for_host_department() {
 }
 
 #[test]
+fn package_dead_letter_consumer_does_not_warn_about_missing_package_producer() {
+    let root = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
+    let package = root.path().join("consensus");
+    fs::create_dir_all(package.join("departments/dead_handler")).unwrap();
+    write_host_defaults(&package);
+    fs::write(
+        package.join("departments/dead_handler/main.lua"),
+        r#"
+local M = {}
+M.spec = {
+  consumes = { "dead_letter" },
+  ephemeral = { "dead_letter" },
+  stall_window = "30s",
+  retry = false,
+}
+function pipeline(_) end
+return M
+"#,
+    )
+    .unwrap();
+    let host = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
+    write_host_defaults(host.path());
+
+    let args = [
+        std::ffi::OsStr::new("--project-root"),
+        path_arg(host.path()),
+        std::ffi::OsStr::new("--package-root"),
+        path_arg(&package),
+    ];
+    let output = run_conformance(&args, host.path());
+
+    assert_exit(&output, 0);
+    let log = combined_log(&output);
+    assert!(log.contains("PASS schema-validation"), "{log}");
+    assert!(!log.contains("no producer"), "{log}");
+}
+
+#[test]
 fn rejected_package_root_env_exits_two() {
     let host = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
     write_minimal_host(host.path());

@@ -221,6 +221,8 @@ fn scan_departments(
             .with_context(|| format!("resolve `{}.spec.consumes`", name))?;
         let produces = resolve_queues(resolver, &graph_root.namespace, spec.produces)
             .with_context(|| format!("resolve `{}.spec.produces`", name))?;
+        reject_engine_dead_letter_produces(&produces, &name)
+            .with_context(|| format!("validate `{}.spec.produces`", name))?;
         let fanout = resolve_queues(resolver, &graph_root.namespace, spec.fanout)
             .with_context(|| format!("resolve `{}.spec.fanout`", name))?;
         let ephemeral = resolve_queues(subscribe_resolver, &graph_root.namespace, spec.ephemeral)
@@ -381,6 +383,17 @@ fn is_dead_letter_queue(queue: &str) -> bool {
         .rsplit_once('.')
         .map(|(_, name)| name == "dead_letter")
         .unwrap_or(queue == "dead_letter")
+}
+
+fn reject_engine_dead_letter_produces(produces: &[String], department_name: &str) -> Result<()> {
+    if let Some(queue) = produces.iter().find(|queue| is_dead_letter_queue(queue)) {
+        bail!(
+            "department `{}` must not produce runtime-owned queue `{}`",
+            department_name,
+            queue
+        );
+    }
+    Ok(())
 }
 
 fn resolve_queues(
