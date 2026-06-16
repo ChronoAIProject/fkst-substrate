@@ -17,10 +17,14 @@ cargo test --workspace -- --test-threads=1
 scratch=$(mktemp -d); trap 'rm -rf "$scratch"' EXIT
 
 # Startup self-test needs a writable runtime root for its codex permit pool.
-FKST_RUNTIME_ROOT="$scratch/runtime" target/debug/fkst-framework --self-test
+env -u FKST_SUPERVISOR_PID \
+  FKST_RUNTIME_ROOT="$scratch/runtime" \
+  target/debug/fkst-framework --self-test
 
 # Conformance + Lua tests run against a writable copy of the minimal package.
 host="$scratch/host"; mkdir -p "$host"
 cp -R examples/minimal-package/. "$host/"
-target/debug/fkst-framework conformance --project-root "$host" --package-root "$host"
-target/debug/fkst-framework test --project-root "$host" --package-root "$host"
+env -u FKST_SUPERVISOR_PID \
+  target/debug/fkst-framework conformance --project-root "$host" --package-root "$host"
+env -u FKST_SUPERVISOR_PID \
+  target/debug/fkst-framework test --project-root "$host" --package-root "$host"
