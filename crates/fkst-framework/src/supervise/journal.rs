@@ -1,6 +1,6 @@
 //! Engine-owned supervisor journal.
 
-use fkst_common::{RuntimeKind, RuntimeLayout};
+use fkst_common::RuntimeKind;
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -19,8 +19,8 @@ struct JournalWriter {
 }
 
 impl SupervisorJournal {
-    pub(crate) fn open() -> Self {
-        match Self::try_open() {
+    pub(crate) fn open(host_root: &Path) -> Self {
+        match Self::try_open(host_root) {
             Ok(journal) => journal,
             Err(err) => {
                 warn!(error = %err, "supervisor journal disabled");
@@ -29,8 +29,9 @@ impl SupervisorJournal {
         }
     }
 
-    fn try_open() -> std::io::Result<Self> {
-        let layout = RuntimeLayout::from_env().map_err(std::io::Error::other)?;
+    fn try_open(host_root: &Path) -> std::io::Result<Self> {
+        let layout = crate::runtime_context::layout_from_host_root(host_root)
+            .map_err(std::io::Error::other)?;
         let log_dir = layout.runtime_dir(RuntimeKind::Logs);
         std::fs::create_dir_all(&log_dir)?;
         let path = log_dir.join(format!(
