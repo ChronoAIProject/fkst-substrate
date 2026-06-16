@@ -860,19 +860,20 @@ fn suppress_terminal_delivery_in_table(
     suppression: &mut redb::Table<'_, &str, &str>,
     delivery_id: &str,
 ) -> Result<()> {
-    let slot = terminal_suppression_slot_key(delivery_id);
-    if let Some(current) = suppression.get(slot.as_str())? {
-        let current = current.value();
-        if current == delivery_id {
-            return Ok(());
+    for slot in terminal_suppression_probe_keys(delivery_id) {
+        if let Some(current) = suppression.get(slot.as_str())? {
+            if current.value() == delivery_id {
+                return Ok(());
+            }
+            continue;
         }
-        bail!(
-            "terminal suppression slot exhausted for delivery_id: {}",
-            delivery_id
-        );
+        suppression.insert(slot.as_str(), delivery_id)?;
+        return Ok(());
     }
-    suppression.insert(slot.as_str(), delivery_id)?;
-    Ok(())
+    bail!(
+        "terminal suppression table exhausted for delivery_id: {}",
+        delivery_id
+    );
 }
 
 fn terminal_delivery_is_suppressed(
@@ -887,18 +888,27 @@ fn terminal_delivery_is_suppressed_in_table<T>(table: &T, delivery_id: &str) -> 
 where
     T: ReadableTable<&'static str, &'static str>,
 {
-    let slot = terminal_suppression_slot_key(delivery_id);
-    let Some(current) = table.get(slot.as_str())? else {
-        return Ok(false);
-    };
-    Ok(current.value() == delivery_id)
+    for slot in terminal_suppression_probe_keys(delivery_id) {
+        let Some(current) = table.get(slot.as_str())? else {
+            return Ok(false);
+        };
+        if current.value() == delivery_id {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
-fn terminal_suppression_slot_key(delivery_id: &str) -> String {
-    format!(
-        "{:05x}",
-        terminal_suppression_hash(delivery_id) % TERMINAL_SUPPRESSION_SLOTS
-    )
+fn terminal_suppression_probe_keys(delivery_id: &str) -> impl Iterator<Item = String> {
+    let start = terminal_suppression_hash(delivery_id) % TERMINAL_SUPPRESSION_SLOTS;
+    (0..TERMINAL_SUPPRESSION_SLOTS).map(move |offset| {
+        let slot = (start + offset) % TERMINAL_SUPPRESSION_SLOTS;
+        terminal_suppression_slot_key(slot)
+    })
+}
+
+fn terminal_suppression_slot_key(slot: u64) -> String {
+    format!("{slot:05x}")
 }
 
 fn terminal_suppression_hash(delivery_id: &str) -> u64 {
@@ -1222,10 +1232,10 @@ mod tests {
     }
 
     fn colliding_terminal_id(delivery_id: &str) -> String {
-        let target_slot = terminal_suppression_slot_key(delivery_id);
+        let target_slot = terminal_suppression_hash(delivery_id) % TERMINAL_SUPPRESSION_SLOTS;
         for index in 0..TERMINAL_SUPPRESSION_SLOTS.saturating_mul(2) {
             let candidate = format!("{delivery_id}-slot-collision-{index}");
-            if terminal_suppression_slot_key(&candidate) == target_slot {
+            if terminal_suppression_hash(&candidate) % TERMINAL_SUPPRESSION_SLOTS == target_slot {
                 return candidate;
             }
         }
@@ -2118,7 +2128,7 @@ mod tests {
     }
 
     #[test]
-    fn terminal_suppression_slot_collision_fails_explicitly_on_terminal_insert() {
+    fn terminal_suppression_slot_collision_terminalizes_and_suppresses_exact_ids() {
         let temp = TempDir::new().unwrap();
         let store = store(&temp);
         insert_permanent_dead(&store, "old", 100);
@@ -2129,7 +2139,7 @@ mod tests {
             .unwrap()
             .remove(0);
 
-        let error = store
+        let outcome = store
             .retry(
                 &leased.delivery_id,
                 leased.lease_generation,
@@ -2137,13 +2147,26 @@ mod tests {
                 &policy(1),
                 120,
             )
-            .unwrap_err();
+            .unwrap();
 
-        assert!(error
-            .to_string()
-            .contains("terminal suppression slot exhausted"));
-        assert_eq!(store.terminal_suppression_slot_len().unwrap(), 1);
-        assert!(store.get(&colliding).unwrap().is_some());
+        assert_eq!(outcome, RetryOutcome::PermanentDead);
+        assert_eq!(store.terminal_suppression_slot_len().unwrap(), 2);
+        assert!(store.get(&colliding).unwrap().is_none());
+        assert!(store.terminal_suppresses("old").unwrap());
+        assert!(store.terminal_suppresses(&colliding).unwrap());
+
+        let mut duplicate = record(&colliding, 130);
+        duplicate.observed_at_ms = duplicate.not_before_ms;
+        store.enqueue(&duplicate).unwrap();
+        assert!(store
+            .lease_for_dept(
+                "worker",
+                duplicate.not_before_ms,
+                10,
+                Duration::from_millis(50),
+            )
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
