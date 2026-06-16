@@ -5,6 +5,7 @@ on:
     branches: [main, dev, integration, "integration-*"]
   pull_request:
     branches: [main, dev, integration, "integration-*"]
+  workflow_dispatch:
 
 concurrency:
   group: ci-${{ github.ref }}
