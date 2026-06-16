@@ -10,7 +10,10 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use crate::config_registry::ConfigContext;
-use crate::external_command::{CommandSpec, CommandStdin, MockCommandState};
+use crate::external_command::{
+    CommandSpec, CommandStdin, MockCommandInvocation, MockCommandPlan, MockCommandResult,
+    MockCommandState,
+};
 use crate::rate_pool::RatePoolRegistry;
 use crate::read_coalesce::{CoalesceClock, ReadCoalesceOptions, ReadCoalescePlan};
 
@@ -158,19 +161,45 @@ fn run_exec_sync_with_context(
     coalesce_clock: &CoalesceClock,
 ) -> Result<ExecResult> {
     if let Some(runner) = runner {
-        let result = runner.execute(
-            opts.cmd.clone(),
-            "/bin/sh".to_string(),
-            vec!["-c".to_string(), opts.cmd],
-            String::new(),
-        )?;
-        return Ok(ExecResult {
-            stdout: result.stdout,
-            stderr: result.stderr,
-            exit_code: result.exit_code,
-            timed_out: None,
-            error_class: None,
-        });
+        let invocation = MockCommandInvocation {
+            rendered: opts.cmd.clone(),
+            program: "/bin/sh".to_string(),
+            args: vec!["-c".to_string(), opts.cmd.clone()],
+            stdin: String::new(),
+            cwd: opts.cwd.clone(),
+            env: opts.env.clone(),
+        };
+        match runner.prepare(invocation.clone())? {
+            MockCommandPlan::Return(result) => {
+                return Ok(ExecResult {
+                    stdout: result.stdout,
+                    stderr: result.stderr,
+                    exit_code: result.exit_code,
+                    timed_out: None,
+                    error_class: None,
+                });
+            }
+            MockCommandPlan::Record => {
+                let output = execute_spec(CommandSpec {
+                    program: PathBuf::from("/bin/sh"),
+                    args: vec!["-c".to_string(), opts.cmd],
+                    cwd: opts.cwd.map(PathBuf::from),
+                    env: opts.env,
+                    stdin: CommandStdin::Null,
+                    timeout: opts.timeout,
+                    process_group: opts.timeout.is_some(),
+                })?;
+                runner.record(
+                    invocation,
+                    MockCommandResult {
+                        stdout: output.stdout.clone(),
+                        stderr: output.stderr.clone(),
+                        exit_code: output.exit_code,
+                    },
+                )?;
+                return Ok(output);
+            }
+        }
     }
 
     let timeout = opts.timeout;

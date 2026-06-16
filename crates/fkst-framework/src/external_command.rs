@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
+use serde::{Deserialize, Serialize};
 use std::io::{Read, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -23,6 +24,7 @@ pub(crate) struct MockCommandState {
 struct MockCommandInner {
     mocks: Vec<MockCommand>,
     calls: Vec<MockCommandCall>,
+    cassette: Option<ActiveCommandCassette>,
 }
 
 #[derive(Clone, Debug)]
@@ -44,9 +46,82 @@ pub(crate) struct MockCommandCall {
     pub(crate) program: String,
     pub(crate) args: Vec<String>,
     pub(crate) stdin: String,
+    pub(crate) cwd: Option<String>,
+    pub(crate) env: Vec<(String, String)>,
     pub(crate) stdout: String,
     pub(crate) stderr: String,
     pub(crate) exit_code: i32,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct MockCommandInvocation {
+    pub(crate) rendered: String,
+    pub(crate) program: String,
+    pub(crate) args: Vec<String>,
+    pub(crate) stdin: String,
+    pub(crate) cwd: Option<String>,
+    pub(crate) env: Vec<(String, String)>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) enum MockCommandPlan {
+    Return(MockCommandResult),
+    Record,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) enum CommandCassetteMode {
+    Replay,
+    Record,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct CommandCassetteOptions {
+    pub(crate) path: PathBuf,
+    pub(crate) mode: CommandCassetteMode,
+    pub(crate) redactions: Vec<CommandCassetteRedaction>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct CommandCassetteRedaction {
+    pub(crate) value: String,
+    pub(crate) replacement: String,
+}
+
+#[derive(Debug)]
+struct ActiveCommandCassette {
+    path: PathBuf,
+    mode: CommandCassetteMode,
+    redactions: Vec<CommandCassetteRedaction>,
+    entries: Vec<CommandCassetteEntry>,
+    cursor: usize,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct CommandCassetteFile {
+    schema: String,
+    entries: Vec<CommandCassetteEntry>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct CommandCassetteEntry {
+    rendered: String,
+    program: String,
+    args: Vec<String>,
+    stdin: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cwd: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    env: Vec<CommandCassetteEnv>,
+    stdout: String,
+    stderr: String,
+    exit_code: i32,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+struct CommandCassetteEnv {
+    key: String,
+    value: String,
 }
 
 impl MockCommandState {
@@ -60,6 +135,7 @@ impl MockCommandState {
         let mut inner = self.lock()?;
         inner.mocks.clear();
         inner.calls.clear();
+        inner.cassette = None;
         Ok(())
     }
 
@@ -74,34 +150,149 @@ impl MockCommandState {
         Ok(inner.calls.clone())
     }
 
-    pub(crate) fn execute(
+    pub(crate) fn prepare(
         &self,
-        rendered: String,
-        program: String,
-        args: Vec<String>,
-        stdin: String,
-    ) -> mlua::Result<MockCommandResult> {
+        invocation: MockCommandInvocation,
+    ) -> mlua::Result<MockCommandPlan> {
         let mut inner = self.lock()?;
         let index = inner
             .mocks
             .iter()
             .position(|mock| {
-                rendered.starts_with(&mock.pattern) || rendered.contains(&mock.pattern)
+                invocation.rendered.starts_with(&mock.pattern)
+                    || invocation.rendered.contains(&mock.pattern)
             })
-            .ok_or_else(|| {
-                mlua::Error::external(format!("unmocked external command: {rendered}"))
-            })?;
-        let mock = inner.mocks.remove(index);
-        inner.calls.push(MockCommandCall {
-            rendered,
-            program,
-            args,
-            stdin,
-            stdout: mock.result.stdout.clone(),
-            stderr: mock.result.stderr.clone(),
-            exit_code: mock.result.exit_code,
+            .map(|index| inner.mocks.remove(index));
+        if let Some(mock) = index {
+            inner.calls.push(call_from_invocation(
+                invocation,
+                mock.result.stdout.clone(),
+                mock.result.stderr.clone(),
+                mock.result.exit_code,
+            ));
+            return Ok(MockCommandPlan::Return(mock.result));
+        }
+
+        let Some(cassette) = inner.cassette.as_mut() else {
+            return Err(mlua::Error::external(format!(
+                "unmocked external command: {}",
+                invocation.rendered
+            )));
+        };
+
+        match cassette.mode {
+            CommandCassetteMode::Replay => {
+                let actual = cassette.sanitized_entry_for(&invocation, None);
+                let expected = cassette
+                    .entries
+                    .get(cassette.cursor)
+                    .cloned()
+                    .ok_or_else(|| {
+                        mlua::Error::external(format!(
+                            "VCR replay exhausted for external command: {}",
+                            invocation.rendered
+                        ))
+                    })?;
+                if !same_command_boundary(&expected, &actual) {
+                    return Err(mlua::Error::external(format!(
+                        "VCR replay mismatch at entry {}: expected {}, got {}",
+                        cassette.cursor + 1,
+                        expected.rendered,
+                        actual.rendered
+                    )));
+                }
+                cassette.cursor += 1;
+                let result = MockCommandResult {
+                    stdout: expected.stdout,
+                    stderr: expected.stderr,
+                    exit_code: expected.exit_code,
+                };
+                inner.calls.push(call_from_invocation(
+                    invocation,
+                    result.stdout.clone(),
+                    result.stderr.clone(),
+                    result.exit_code,
+                ));
+                Ok(MockCommandPlan::Return(result))
+            }
+            CommandCassetteMode::Record => Ok(MockCommandPlan::Record),
+        }
+    }
+
+    pub(crate) fn record(
+        &self,
+        invocation: MockCommandInvocation,
+        result: MockCommandResult,
+    ) -> mlua::Result<()> {
+        let mut inner = self.lock()?;
+        let Some(cassette) = inner.cassette.as_mut() else {
+            return Err(mlua::Error::external(
+                "no active VCR cassette for external command record",
+            ));
+        };
+        if !matches!(cassette.mode, CommandCassetteMode::Record) {
+            return Err(mlua::Error::external(
+                "active VCR cassette is not in record mode",
+            ));
+        }
+        let entry = cassette.sanitized_entry_for(&invocation, Some(&result));
+        cassette.entries.push(entry);
+        inner.calls.push(call_from_invocation(
+            invocation,
+            result.stdout,
+            result.stderr,
+            result.exit_code,
+        ));
+        Ok(())
+    }
+
+    pub(crate) fn start_cassette(&self, opts: CommandCassetteOptions) -> mlua::Result<()> {
+        let mut inner = self.lock()?;
+        if inner.cassette.is_some() {
+            return Err(mlua::Error::external(
+                "nested VCR command cassettes are not supported",
+            ));
+        }
+        let entries = match opts.mode {
+            CommandCassetteMode::Replay => read_cassette_entries(&opts.path)?,
+            CommandCassetteMode::Record => Vec::new(),
+        };
+        inner.cassette = Some(ActiveCommandCassette {
+            path: opts.path,
+            mode: opts.mode,
+            redactions: opts.redactions,
+            entries,
+            cursor: 0,
         });
-        Ok(mock.result)
+        Ok(())
+    }
+
+    pub(crate) fn finish_cassette(&self) -> mlua::Result<()> {
+        let cassette = {
+            let mut inner = self.lock()?;
+            inner.cassette.take()
+        };
+        let Some(cassette) = cassette else {
+            return Err(mlua::Error::external("no active VCR command cassette"));
+        };
+        match cassette.mode {
+            CommandCassetteMode::Replay => {
+                if cassette.cursor != cassette.entries.len() {
+                    return Err(mlua::Error::external(format!(
+                        "VCR replay left {} unused cassette entries",
+                        cassette.entries.len() - cassette.cursor
+                    )));
+                }
+                Ok(())
+            }
+            CommandCassetteMode::Record => write_cassette_entries(&cassette.path, cassette.entries),
+        }
+    }
+
+    pub(crate) fn abort_cassette(&self) -> mlua::Result<()> {
+        let mut inner = self.lock()?;
+        inner.cassette = None;
+        Ok(())
     }
 
     fn lock(&self) -> mlua::Result<std::sync::MutexGuard<'_, MockCommandInner>> {
@@ -109,6 +300,138 @@ impl MockCommandState {
             .lock()
             .map_err(|_| mlua::Error::external("mock command state lock is poisoned"))
     }
+}
+
+impl ActiveCommandCassette {
+    fn sanitized_entry_for(
+        &self,
+        invocation: &MockCommandInvocation,
+        result: Option<&MockCommandResult>,
+    ) -> CommandCassetteEntry {
+        let mut env = invocation
+            .env
+            .iter()
+            .map(|(key, value)| CommandCassetteEnv {
+                key: self.redact(key),
+                value: self.redact(value),
+            })
+            .collect::<Vec<_>>();
+        env.sort_by(|a, b| a.key.cmp(&b.key).then_with(|| a.value.cmp(&b.value)));
+        CommandCassetteEntry {
+            rendered: self.redact(&invocation.rendered),
+            program: self.redact(&invocation.program),
+            args: invocation.args.iter().map(|arg| self.redact(arg)).collect(),
+            stdin: self.redact(&invocation.stdin),
+            cwd: invocation.cwd.as_ref().map(|cwd| self.redact(cwd)),
+            env,
+            stdout: result
+                .map(|result| self.redact(&result.stdout))
+                .unwrap_or_default(),
+            stderr: result
+                .map(|result| self.redact(&result.stderr))
+                .unwrap_or_default(),
+            exit_code: result.map(|result| result.exit_code).unwrap_or_default(),
+        }
+    }
+
+    fn redact(&self, value: &str) -> String {
+        let mut redacted = value.to_string();
+        for redaction in &self.redactions {
+            if !redaction.value.is_empty() {
+                redacted = redacted.replace(&redaction.value, &redaction.replacement);
+            }
+        }
+        redacted
+    }
+}
+
+fn same_command_boundary(expected: &CommandCassetteEntry, actual: &CommandCassetteEntry) -> bool {
+    expected.rendered == actual.rendered
+        && expected.program == actual.program
+        && expected.args == actual.args
+        && expected.stdin == actual.stdin
+        && expected.cwd == actual.cwd
+        && expected.env == actual.env
+}
+
+fn call_from_invocation(
+    invocation: MockCommandInvocation,
+    stdout: String,
+    stderr: String,
+    exit_code: i32,
+) -> MockCommandCall {
+    MockCommandCall {
+        rendered: invocation.rendered,
+        program: invocation.program,
+        args: invocation.args,
+        stdin: invocation.stdin,
+        cwd: invocation.cwd,
+        env: invocation.env,
+        stdout,
+        stderr,
+        exit_code,
+    }
+}
+
+fn read_cassette_entries(path: &Path) -> mlua::Result<Vec<CommandCassetteEntry>> {
+    let data = std::fs::read(path).map_err(|err| {
+        mlua::Error::external(format!(
+            "read VCR command cassette {}: {err}",
+            path.display()
+        ))
+    })?;
+    let file: CommandCassetteFile = serde_json::from_slice(&data).map_err(|err| {
+        mlua::Error::external(format!(
+            "parse VCR command cassette {}: {err}",
+            path.display()
+        ))
+    })?;
+    if file.schema != "fkst.test.command-cassette.v1" {
+        return Err(mlua::Error::external(format!(
+            "unsupported VCR command cassette schema '{}'",
+            file.schema
+        )));
+    }
+    Ok(file.entries)
+}
+
+fn write_cassette_entries(path: &Path, entries: Vec<CommandCassetteEntry>) -> mlua::Result<()> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(parent).map_err(|err| {
+        mlua::Error::external(format!(
+            "create VCR command cassette directory {}: {err}",
+            parent.display()
+        ))
+    })?;
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| mlua::Error::external("VCR command cassette path has no file name"))?;
+    let tmp_path = parent.join(format!(
+        ".{}.{}.tmp",
+        file_name.to_string_lossy(),
+        std::process::id()
+    ));
+    let data = serde_json::to_vec_pretty(&CommandCassetteFile {
+        schema: "fkst.test.command-cassette.v1".to_string(),
+        entries,
+    })
+    .map_err(mlua::Error::external)?;
+    std::fs::write(&tmp_path, data).map_err(|err| {
+        mlua::Error::external(format!(
+            "write temporary VCR command cassette {}: {err}",
+            tmp_path.display()
+        ))
+    })?;
+    std::fs::rename(&tmp_path, path).map_err(|err| {
+        mlua::Error::external(format!(
+            "rename {} to {}: {err}",
+            tmp_path.display(),
+            path.display()
+        ))
+    })
 }
 
 pub(crate) fn format_command(program: &str, args: &[String]) -> String {

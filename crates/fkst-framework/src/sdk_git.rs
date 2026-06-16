@@ -17,7 +17,10 @@ use std::process::Output;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::config_registry::{ConfigContext, ConfigKey};
-use crate::external_command::{format_command, CommandSpec, MockCommandState};
+use crate::external_command::{
+    format_command, CommandSpec, MockCommandInvocation, MockCommandPlan, MockCommandResult,
+    MockCommandState,
+};
 use crate::rate_pool::RatePoolRegistry;
 use crate::runtime_context;
 
@@ -421,13 +424,38 @@ fn run_git_command<'a>(
     let mut rendered_args = vec!["-C".to_string(), host_root.to_string_lossy().into_owned()];
     rendered_args.extend(args.into_iter().map(ToOwned::to_owned));
     if let Some(runner) = runner {
-        let result = runner.execute(
-            format_command("git", &rendered_args),
-            "git".to_string(),
-            rendered_args,
-            String::new(),
-        )?;
-        return Ok(mock_output(result.stdout, result.stderr, result.exit_code));
+        let invocation = MockCommandInvocation {
+            rendered: format_command("git", &rendered_args),
+            program: "git".to_string(),
+            args: rendered_args.clone(),
+            stdin: String::new(),
+            cwd: None,
+            env: Vec::new(),
+        };
+        match runner.prepare(invocation.clone())? {
+            MockCommandPlan::Return(result) => {
+                return Ok(mock_output(result.stdout, result.stderr, result.exit_code));
+            }
+            MockCommandPlan::Record => {
+                let audited = crate::external_command::run_audited(CommandSpec {
+                    program: "git".into(),
+                    args: rendered_args,
+                    cwd: None,
+                    env: Vec::new(),
+                    stdin: crate::external_command::CommandStdin::Null,
+                    timeout: None,
+                    process_group: false,
+                })
+                .map_err(mlua::Error::external)?;
+                let result = MockCommandResult {
+                    stdout: String::from_utf8_lossy(&audited.stdout).to_string(),
+                    stderr: String::from_utf8_lossy(&audited.stderr).to_string(),
+                    exit_code: audited.exit_code,
+                };
+                runner.record(invocation, result.clone())?;
+                return Ok(mock_output(result.stdout, result.stderr, result.exit_code));
+            }
+        }
     }
 
     if let Some(rate_pools) = rate_pools {

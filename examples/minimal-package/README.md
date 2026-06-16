@@ -58,7 +58,7 @@ target/debug/fkst-framework test \
 
 `run producer` 的 stdout 应包含 `RAISED:`，解码后 queue 是 `example_event`。`run consumer` 的 stderr 应包含 `consumer received Event{queue=example_event`。这两个命令都是单 pipeline 注入，不经过 supervise 路由。
 
-Lua 单元测试由 `fkst-framework test` 执行。runner 只扫描 `departments/*/*_test.lua` 和 `tests/*_test.lua`，不全树递归，也不扫描 `raisers/` 或 `fkst/`。`fkst.test` 只在 test-mode 注册，断言包含 `eq`、`is_true`、`raises`、`is_nil`；`run_department(path, event[, opts])` 可用 fresh Lua state 运行一个 department entrypoint 并返回 captured raises。test-mode 还提供 `mock_command(pattern, result)` 与 `command_calls()`，用于劫持 `exec_sync`、codex SDK 与 git SDK 的外部命令调用。它不是 production SDK surface。
+Lua 单元测试由 `fkst-framework test` 执行。runner 只扫描 `departments/*/*_test.lua` 和 `tests/*_test.lua`，不全树递归，也不扫描 `raisers/` 或 `fkst/`。`fkst.test` 只在 test-mode 注册，断言包含 `eq`、`is_true`、`raises`、`is_nil`；`run_department(path, event[, opts])` 可用 fresh Lua state 运行一个 department entrypoint 并返回 captured raises。test-mode 还提供 `mock_command(pattern, result)`、`with_command_cassette(opts, fn)` 与 `command_calls()`，用于劫持 `exec_sync`、codex SDK 与 git SDK 的外部命令调用。`with_command_cassette` 使用 `"fkst.test.command-cassette.v1"` JSON cassette，支持 `"record"` / `"replay"` 和 exact-value redaction；replay deterministic fail-closed 且不启动真实外部进程。它不是 production SDK surface。
 
 可以手动运行 supervise 观察真实路由，运行后用 `Ctrl-C` 停止；它不是 example 测试依赖：
 

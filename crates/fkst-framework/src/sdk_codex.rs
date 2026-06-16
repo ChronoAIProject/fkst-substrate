@@ -24,7 +24,9 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::config_registry::{ConfigContext, ConfigKey};
-use crate::external_command::{format_command, MockCommandState};
+use crate::external_command::{
+    format_command, MockCommandInvocation, MockCommandPlan, MockCommandResult, MockCommandState,
+};
 use crate::runtime_context;
 
 pub(crate) const CODEX_PERMIT_SLOTS_ENV: &str = "FKST_CODEX_PERMIT_SLOTS";
@@ -507,7 +509,7 @@ fn run_codex_request(
 ) -> Result<CodexResult> {
     prune_codex_logs_for_request(&request);
     if let Some(runner) = runner {
-        return run_mocked_codex_request(request, runner);
+        return run_mocked_codex_request(request, host_root, config, runner);
     }
 
     if let Some(paths) = adoption_paths_for_request(&request, host_root)? {
@@ -606,18 +608,37 @@ fn run_adoptable_codex_request(
 
 fn run_mocked_codex_request(
     request: CodexRequest,
+    host_root: &Path,
+    config: &ConfigContext,
     runner: &MockCommandState,
 ) -> Result<CodexResult> {
-    let mut status = CodexStatusRecord::from_request(&request, None);
-    write_codex_status(&request.log_path, &status);
     let args = command_args_for_request(&request);
     let cmd_line = format_command("codex", &args);
-    let result = runner.execute(
-        cmd_line.clone(),
-        "codex".to_string(),
+    let invocation = MockCommandInvocation {
+        rendered: cmd_line.clone(),
+        program: "codex".to_string(),
         args,
-        request.prompt.clone(),
-    )?;
+        stdin: request.prompt.clone(),
+        cwd: request.worktree.clone(),
+        env: Vec::new(),
+    };
+    let result = match runner.prepare(invocation.clone())? {
+        MockCommandPlan::Return(result) => result,
+        MockCommandPlan::Record => {
+            let result = run_codex_request(request, host_root, config, None)?;
+            runner.record(
+                invocation,
+                MockCommandResult {
+                    stdout: result.stdout.clone(),
+                    stderr: result.stderr.clone(),
+                    exit_code: result.exit_code,
+                },
+            )?;
+            return Ok(result);
+        }
+    };
+    let mut status = CodexStatusRecord::from_request(&request, None);
+    write_codex_status(&request.log_path, &status);
     write_live_output_tail(
         Some(&request.output_tail_path),
         result.stdout.as_bytes(),

@@ -71,7 +71,7 @@ Lua 单元测试用 `fkst-framework test` 执行。runner 只扫描 `departments
   --package-root "$tmp_host"
 ```
 
-`fkst.test` 提供 `eq`、`is_true`、`raises`、`is_nil` 四个断言，并提供 `mock_command(pattern, result)` 与 `command_calls()` 劫持 test mode 外部命令调用。本 fixture 的 Lua 单测只测纯字符串逻辑，不调用 codex。
+`fkst.test` 提供 `eq`、`is_true`、`raises`、`is_nil` 四个断言，并提供 `mock_command(pattern, result)`、`with_command_cassette(opts, fn)` 与 `command_calls()` 劫持 test mode 外部命令调用。`with_command_cassette` 使用 `"fkst.test.command-cassette.v1"` JSON cassette，支持 `"record"` / `"replay"` 和 exact-value redaction；replay deterministic fail-closed 且不启动真实外部进程。本 fixture 的 Lua 单测只测纯字符串逻辑，不调用 codex。
 
 如果要手动验证 codex 调用路径，可以放一个 fake `codex` 到 `PATH` 前面：
 
