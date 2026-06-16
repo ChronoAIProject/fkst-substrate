@@ -128,7 +128,7 @@ impl DeliveryStore {
                 make_index_key(&record.dept, record.not_before_ms, &record.delivery_id).as_str(),
                 &(),
             )?;
-            compact_terminal_dead_records(&write, record.not_before_ms)?;
+            compact_terminal_dead_records(&write, record.observed_at_ms)?;
         }
         commit_write(write)?;
         Ok(())
@@ -839,8 +839,7 @@ fn compact_terminal_dead_records(write: &redb::WriteTransaction, now_ms: u64) ->
             terminal_index.remove(key.key.as_str())?;
             if is_terminal_dead_record(&record) {
                 terminal_index.insert(
-                    make_dead_due_index_key(&record.dept, record.dead_at_ms, &delivery_id)
-                        .as_str(),
+                    make_dead_due_index_key(&record.dept, record.dead_at_ms, &delivery_id).as_str(),
                     &(),
                 )?;
             }
@@ -1876,14 +1875,14 @@ mod tests {
             100_u64.saturating_add(TERMINAL_DEAD_RETENTION_MS),
         );
 
-        store
-            .enqueue(&record(
-                "fresh",
-                100_u64
-                    .saturating_add(TERMINAL_DEAD_RETENTION_MS)
-                    .saturating_add(1),
-            ))
-            .unwrap();
+        let mut fresh = record(
+            "fresh",
+            100_u64
+                .saturating_add(TERMINAL_DEAD_RETENTION_MS)
+                .saturating_add(1),
+        );
+        fresh.observed_at_ms = fresh.not_before_ms;
+        store.enqueue(&fresh).unwrap();
 
         assert!(store.get_dead("old").unwrap().is_none());
         assert!(store.get_dead("young").unwrap().is_some());
@@ -1900,6 +1899,41 @@ mod tests {
             .unwrap();
         assert_eq!(leased.len(), 1);
         assert_eq!(leased[0].delivery_id, "fresh");
+    }
+
+    #[test]
+    fn future_scheduled_enqueue_does_not_compact_before_observed_retention() {
+        let temp = TempDir::new().unwrap();
+        let store = store(&temp);
+        insert_permanent_dead(&store, "old", 100);
+        let mut future = record(
+            "future",
+            100_u64
+                .saturating_add(TERMINAL_DEAD_RETENTION_MS)
+                .saturating_add(1),
+        );
+        future.observed_at_ms = 101;
+
+        store.enqueue(&future).unwrap();
+
+        assert!(store.get_dead("old").unwrap().is_some());
+        assert_eq!(store.terminal_dead_index_len().unwrap(), 1);
+    }
+
+    #[test]
+    fn observed_enqueue_after_retention_compacts_terminal_dead_records() {
+        let temp = TempDir::new().unwrap();
+        let store = store(&temp);
+        insert_permanent_dead(&store, "old", 100);
+        let mut fresh = record("fresh", 100);
+        fresh.observed_at_ms = 100_u64
+            .saturating_add(TERMINAL_DEAD_RETENTION_MS)
+            .saturating_add(1);
+
+        store.enqueue(&fresh).unwrap();
+
+        assert!(store.get_dead("old").unwrap().is_none());
+        assert_eq!(store.terminal_dead_index_len().unwrap(), 0);
     }
 
     #[test]
@@ -2233,15 +2267,15 @@ mod tests {
         let store = DeliveryStore::open(&path).unwrap();
 
         assert_eq!(store.terminal_dead_index_len().unwrap(), 1);
-        store
-            .enqueue(&record(
-                "fresh",
-                terminal
-                    .dead_at_ms
-                    .saturating_add(TERMINAL_DEAD_RETENTION_MS)
-                    .saturating_add(1),
-            ))
-            .unwrap();
+        let mut fresh = record(
+            "fresh",
+            terminal
+                .dead_at_ms
+                .saturating_add(TERMINAL_DEAD_RETENTION_MS)
+                .saturating_add(1),
+        );
+        fresh.observed_at_ms = fresh.not_before_ms;
+        store.enqueue(&fresh).unwrap();
         assert!(store.get_dead("terminal").unwrap().is_none());
         assert_eq!(store.terminal_dead_index_len().unwrap(), 0);
     }
