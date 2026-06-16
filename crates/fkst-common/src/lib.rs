@@ -1,5 +1,6 @@
 //! Shared types between fkst-supervisor and fkst-framework.
 
+pub mod built_in_provider;
 pub mod config;
 pub mod durable_layout;
 pub mod error;

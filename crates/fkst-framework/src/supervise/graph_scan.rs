@@ -10,6 +10,7 @@
 //! Host graph defaults are read before graph materialization.
 
 use anyhow::{anyhow, bail, Context, Result};
+use fkst_common::built_in_provider::{built_in_provider_for_queue, BUILT_IN_DEAD_LETTER_PROVIDER};
 use fkst_common::config::{Config, DepartmentDecl, LimitsDecl, QueueDecl, RaiserDecl, RetryDecl};
 use mlua::{Lua, LuaSerdeExt, Table, Value as LuaValue};
 use serde::Deserialize;
@@ -379,18 +380,19 @@ pub(crate) fn insert_raiser_decl(
 }
 
 fn is_dead_letter_queue(queue: &str) -> bool {
-    queue
-        .rsplit_once('.')
-        .map(|(_, name)| name == "dead_letter")
-        .unwrap_or(queue == "dead_letter")
+    built_in_provider_for_queue(queue) == Some(BUILT_IN_DEAD_LETTER_PROVIDER)
 }
 
 fn reject_engine_dead_letter_produces(produces: &[String], department_name: &str) -> Result<()> {
-    if let Some(queue) = produces.iter().find(|queue| is_dead_letter_queue(queue)) {
+    if let Some((queue, contract)) = produces
+        .iter()
+        .find_map(|queue| built_in_provider_for_queue(queue).map(|contract| (queue, contract)))
+    {
         bail!(
-            "department `{}` must not produce runtime-owned queue `{}`",
+            "department `{}` must not produce runtime-owned queue `{}` from built-in provider `{}`",
             department_name,
-            queue
+            queue,
+            contract.provider
         );
     }
     Ok(())

@@ -1,5 +1,6 @@
 //! Schema validation on config load. Refuse-to-start on any violation.
 
+use crate::built_in_provider::built_in_provider_for_queue;
 use crate::config::{Config, RaiserDecl, RetryDecl};
 use crate::error::FkstError;
 
@@ -323,18 +324,9 @@ fn queue_producers(cfg: &Config, qname: &str) -> Vec<String> {
 }
 
 fn runtime_producers(qname: &str) -> Vec<String> {
-    if is_dead_letter_queue(qname) {
-        vec!["runtime 'dead_letter'".to_string()]
-    } else {
-        Vec::new()
-    }
-}
-
-fn is_dead_letter_queue(queue: &str) -> bool {
-    queue
-        .rsplit_once('.')
-        .map(|(_, name)| name == "dead_letter")
-        .unwrap_or(queue == "dead_letter")
+    built_in_provider_for_queue(qname)
+        .map(|contract| vec![contract.producer_label.to_string()])
+        .unwrap_or_default()
 }
 
 fn queue_consumers(cfg: &Config, qname: &str) -> Vec<String> {
