@@ -21,10 +21,14 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::time::Duration;
 
-const SCHEMA_VERSION: &str = "4";
+const SCHEMA_VERSION: &str = "5";
+const TERMINAL_DEAD_RETENTION_MS: u64 = 24 * 60 * 60 * 1_000;
+const TERMINAL_DEAD_COMPACTION_LIMIT: usize = 1_024;
 
 const DELIVERY_BY_ID: TableDefinition<&str, &[u8]> = TableDefinition::new("delivery_by_id");
 const DEAD_BY_ID: TableDefinition<&str, &[u8]> = TableDefinition::new("dead_by_id");
+const TERMINAL_DEAD_BY_TIME: TableDefinition<&str, ()> =
+    TableDefinition::new("terminal_dead_by_time");
 const META: TableDefinition<&str, &str> = TableDefinition::new("meta");
 const OLD_READY_BY_DUE: TableDefinition<(u64, &str), ()> = TableDefinition::new("ready_by_due");
 const OLD_LEASED_BY_UNTIL: TableDefinition<(u64, &str), ()> =
@@ -82,6 +86,7 @@ impl DeliveryStore {
                 write.delete_table(DEAD_BY_ID)?;
             }
             write.open_table(DEAD_BY_ID)?;
+            write.open_table(TERMINAL_DEAD_BY_TIME)?;
             if current_version.as_deref() != Some(SCHEMA_VERSION) {
                 delete_old_global_indexes(&write)?;
                 rebuild_due_indexes(&write, DELIVERY_BY_ID)?;
@@ -89,6 +94,7 @@ impl DeliveryStore {
                     mark_existing_dead_records_permanent(&write)?;
                 }
                 rebuild_dead_due_index(&write)?;
+                rebuild_terminal_dead_index(&write)?;
             }
             let mut meta = write.open_table(META)?;
             meta.insert("schema_version", SCHEMA_VERSION)?;
@@ -122,6 +128,7 @@ impl DeliveryStore {
                 make_index_key(&record.dept, record.not_before_ms, &record.delivery_id).as_str(),
                 &(),
             )?;
+            compact_terminal_dead_records(&write, record.not_before_ms)?;
         }
         commit_write(write)?;
         Ok(())
@@ -405,6 +412,13 @@ impl DeliveryStore {
                                     .as_str(),
                                 &(),
                             )?;
+                        } else {
+                            let mut terminal_index = write.open_table(TERMINAL_DEAD_BY_TIME)?;
+                            terminal_index.insert(
+                                make_dead_due_index_key(&dead.dept, dead.dead_at_ms, delivery_id)
+                                    .as_str(),
+                                &(),
+                            )?;
                         }
                         delivery.remove(delivery_id)?;
                         if failure.replayable {
@@ -433,6 +447,7 @@ impl DeliveryStore {
                 RetryOutcome::Missing
             }
         };
+        compact_terminal_dead_records(&write, now_ms)?;
         commit_write(write)?;
         Ok(outcome)
     }
@@ -463,6 +478,7 @@ impl DeliveryStore {
             let mut delivery = write.open_table(DELIVERY_BY_ID)?;
             let mut ready = write.open_table(READY_BY_DEPT_DUE)?;
             let mut dead_index = write.open_table(DEAD_BY_DEPT_DUE)?;
+            let mut terminal_index = write.open_table(TERMINAL_DEAD_BY_TIME)?;
             for key in due_keys {
                 let delivery_id = key.delivery_id;
                 let Some(mut dead) = read_dead_table(&dead_table, &delivery_id)? else {
@@ -496,6 +512,11 @@ impl DeliveryStore {
                     dead.replayable = false;
                     let bytes = serde_json::to_vec(&dead)?;
                     dead_table.insert(delivery_id.as_str(), bytes.as_slice())?;
+                    terminal_index.insert(
+                        make_dead_due_index_key(&dead.dept, dead.dead_at_ms, delivery_id.as_str())
+                            .as_str(),
+                        &(),
+                    )?;
                     result.permanent.push(dead);
                     mutated = true;
                     continue;
@@ -507,6 +528,11 @@ impl DeliveryStore {
                     dead.record = None;
                     let bytes = serde_json::to_vec(&dead)?;
                     dead_table.insert(delivery_id.as_str(), bytes.as_slice())?;
+                    terminal_index.insert(
+                        make_dead_due_index_key(&dead.dept, dead.dead_at_ms, delivery_id.as_str())
+                            .as_str(),
+                        &(),
+                    )?;
                     result.permanent.push(dead);
                     mutated = true;
                     continue;
@@ -520,6 +546,11 @@ impl DeliveryStore {
                         Some(error_excerpt("redrive collision with live delivery"));
                     let bytes = serde_json::to_vec(&dead)?;
                     dead_table.insert(delivery_id.as_str(), bytes.as_slice())?;
+                    terminal_index.insert(
+                        make_dead_due_index_key(&dead.dept, dead.dead_at_ms, delivery_id.as_str())
+                            .as_str(),
+                        &(),
+                    )?;
                     result.permanent.push(dead);
                     mutated = true;
                     continue;
@@ -542,6 +573,12 @@ impl DeliveryStore {
                 result.redriven.push(record);
                 mutated = true;
             }
+            drop(dead_table);
+            drop(delivery);
+            drop(ready);
+            drop(dead_index);
+            drop(terminal_index);
+            mutated |= compact_terminal_dead_records(&write, now_ms)? > 0;
         }
         if mutated {
             commit_write(write)?;
@@ -631,6 +668,13 @@ impl DeliveryStore {
         let read = self.db.begin_read()?;
         let dead = read.open_table(DEAD_BY_DEPT_DUE)?;
         count_index_entries(&dead)
+    }
+
+    #[cfg(test)]
+    fn terminal_dead_index_len(&self) -> Result<usize> {
+        let read = self.db.begin_read()?;
+        let terminal = read.open_table(TERMINAL_DEAD_BY_TIME)?;
+        count_index_entries(&terminal)
     }
 
     #[cfg(test)]
@@ -738,8 +782,100 @@ fn rebuild_dead_due_index(write: &redb::WriteTransaction) -> Result<()> {
     Ok(())
 }
 
+fn rebuild_terminal_dead_index(write: &redb::WriteTransaction) -> Result<()> {
+    write.delete_table(TERMINAL_DEAD_BY_TIME)?;
+    let dead_rows = {
+        let dead = write.open_table(DEAD_BY_ID)?;
+        let mut rows = Vec::new();
+        for entry in dead.iter()? {
+            let (key, bytes) = entry?;
+            rows.push((key.value().to_string(), bytes.value().to_vec()));
+        }
+        rows
+    };
+    let mut terminal_index = write.open_table(TERMINAL_DEAD_BY_TIME)?;
+    for (delivery_id, bytes) in dead_rows {
+        let Some(record) = decode_dead_record(&delivery_id, &bytes) else {
+            continue;
+        };
+        if is_terminal_dead_record(&record) {
+            terminal_index.insert(
+                make_dead_due_index_key(&record.dept, record.dead_at_ms, &delivery_id).as_str(),
+                &(),
+            )?;
+        }
+    }
+    Ok(())
+}
+
 fn should_index_dead_record(record: &DeadRecord) -> bool {
     !record.permanent && record.replayable && record.record.is_some()
+}
+
+fn is_terminal_dead_record(record: &DeadRecord) -> bool {
+    record.permanent || !record.replayable
+}
+
+fn compact_terminal_dead_records(write: &redb::WriteTransaction, now_ms: u64) -> Result<usize> {
+    let Some(cutoff_ms) = now_ms.checked_sub(TERMINAL_DEAD_RETENTION_MS) else {
+        return Ok(0);
+    };
+    let stale_keys = collect_compactable_terminal_dead_keys(write, cutoff_ms)?;
+    if stale_keys.is_empty() {
+        return Ok(0);
+    }
+    let mut compacted = 0;
+    let mut dead = write.open_table(DEAD_BY_ID)?;
+    let mut terminal_index = write.open_table(TERMINAL_DEAD_BY_TIME)?;
+    let mut dead_due_index = write.open_table(DEAD_BY_DEPT_DUE)?;
+    for key in stale_keys {
+        let delivery_id = key.delivery_id;
+        let Some(record) = read_dead_table(&dead, &delivery_id)? else {
+            terminal_index.remove(key.key.as_str())?;
+            compacted += 1;
+            continue;
+        };
+        if record.dead_at_ms != key.due_ms || !is_terminal_dead_record(&record) {
+            terminal_index.remove(key.key.as_str())?;
+            if is_terminal_dead_record(&record) {
+                terminal_index.insert(
+                    make_dead_due_index_key(&record.dept, record.dead_at_ms, &delivery_id)
+                        .as_str(),
+                    &(),
+                )?;
+            }
+            compacted += 1;
+            continue;
+        }
+        if record.dead_at_ms > cutoff_ms {
+            break;
+        }
+        dead.remove(delivery_id.as_str())?;
+        terminal_index.remove(key.key.as_str())?;
+        dead_due_index.remove(
+            make_dead_due_index_key(&record.dept, record.dead_at_ms, &delivery_id).as_str(),
+        )?;
+        compacted += 1;
+    }
+    Ok(compacted)
+}
+
+fn collect_compactable_terminal_dead_keys(
+    write: &redb::WriteTransaction,
+    cutoff_ms: u64,
+) -> Result<Vec<super::delivery_index::DueIndexKey>> {
+    let terminal_index = write.open_table(TERMINAL_DEAD_BY_TIME)?;
+    let start = format!("{:020}/", 0);
+    let end = format!("{cutoff_ms:020}/\u{10ffff}");
+    let mut keys = Vec::new();
+    for entry in terminal_index.range::<&str>(start.as_str()..=end.as_str())? {
+        let (key, _) = entry?;
+        keys.push(parse_dead_due_index_key(key.value())?);
+        if keys.len() >= TERMINAL_DEAD_COMPACTION_LIMIT {
+            break;
+        }
+    }
+    Ok(keys)
 }
 
 #[allow(dead_code)]
@@ -892,6 +1028,39 @@ mod tests {
                 .unwrap();
             let mut dead_index = write.open_table(DEAD_BY_DEPT_DUE).unwrap();
             dead_index
+                .insert(
+                    make_dead_due_index_key(&dead.dept, dead.dead_at_ms, delivery_id).as_str(),
+                    &(),
+                )
+                .unwrap();
+        }
+        write.commit().unwrap();
+    }
+
+    fn insert_permanent_dead(store: &DeliveryStore, delivery_id: &str, dead_at_ms: u64) {
+        let dead = DeadRecord {
+            delivery_id: delivery_id.to_string(),
+            queue: "input".to_string(),
+            dept: "worker".to_string(),
+            source: None,
+            observed_at_ms: 10,
+            not_before_ms: 100,
+            dead_at_ms,
+            attempts: 1,
+            redrive_count: 0,
+            replayable: false,
+            permanent: true,
+            error_excerpt: Some("final".to_string()),
+            record: None,
+        };
+        let write = store.db.begin_write().unwrap();
+        {
+            let mut dead_table = write.open_table(DEAD_BY_ID).unwrap();
+            dead_table
+                .insert(delivery_id, serde_json::to_vec(&dead).unwrap().as_slice())
+                .unwrap();
+            let mut terminal_index = write.open_table(TERMINAL_DEAD_BY_TIME).unwrap();
+            terminal_index
                 .insert(
                     make_dead_due_index_key(&dead.dept, dead.dead_at_ms, delivery_id).as_str(),
                     &(),
@@ -1697,6 +1866,77 @@ mod tests {
     }
 
     #[test]
+    fn terminal_dead_records_are_compacted_after_retention() {
+        let temp = TempDir::new().unwrap();
+        let store = store(&temp);
+        insert_permanent_dead(&store, "old", 100);
+        insert_permanent_dead(
+            &store,
+            "young",
+            100_u64.saturating_add(TERMINAL_DEAD_RETENTION_MS),
+        );
+
+        store
+            .enqueue(&record(
+                "fresh",
+                100_u64
+                    .saturating_add(TERMINAL_DEAD_RETENTION_MS)
+                    .saturating_add(1),
+            ))
+            .unwrap();
+
+        assert!(store.get_dead("old").unwrap().is_none());
+        assert!(store.get_dead("young").unwrap().is_some());
+        assert_eq!(store.terminal_dead_index_len().unwrap(), 1);
+        let leased = store
+            .lease_for_dept(
+                "worker",
+                100_u64
+                    .saturating_add(TERMINAL_DEAD_RETENTION_MS)
+                    .saturating_add(1),
+                10,
+                Duration::from_millis(50),
+            )
+            .unwrap();
+        assert_eq!(leased.len(), 1);
+        assert_eq!(leased[0].delivery_id, "fresh");
+    }
+
+    #[test]
+    fn replayable_dead_records_are_not_terminal_compaction_candidates() {
+        let temp = TempDir::new().unwrap();
+        let store = store(&temp);
+        insert_replayable_dead(&store, "replayable", 100);
+
+        store
+            .enqueue(&record(
+                "fresh",
+                100_u64
+                    .saturating_add(TERMINAL_DEAD_RETENTION_MS)
+                    .saturating_add(1),
+            ))
+            .unwrap();
+
+        assert!(store.get_dead("replayable").unwrap().is_some());
+        assert_eq!(store.dead_due_index_len().unwrap(), 1);
+        assert_eq!(store.terminal_dead_index_len().unwrap(), 0);
+        let result = store
+            .redrive_due(
+                &RedrivePolicy {
+                    max_redrives: 3,
+                    cooldown: Duration::ZERO,
+                },
+                100_u64
+                    .saturating_add(TERMINAL_DEAD_RETENTION_MS)
+                    .saturating_add(1),
+                10,
+            )
+            .unwrap();
+        assert_eq!(result.redriven.len(), 1);
+        assert_eq!(result.redriven[0].delivery_id, "replayable");
+    }
+
+    #[test]
     fn expired_lease_can_be_leased_again() {
         let temp = TempDir::new().unwrap();
         let store = store(&temp);
@@ -1949,6 +2189,61 @@ mod tests {
             .record
             .is_none());
         assert!(store.get_dead("undecodable").unwrap().is_none());
+    }
+
+    #[test]
+    fn schema_v4_open_rebuilds_terminal_dead_index_for_compaction() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("delivery.redb");
+        let terminal = DeadRecord {
+            delivery_id: "terminal".to_string(),
+            queue: "input".to_string(),
+            dept: "worker".to_string(),
+            source: None,
+            observed_at_ms: 10,
+            not_before_ms: 100,
+            dead_at_ms: 100,
+            attempts: 1,
+            redrive_count: 0,
+            replayable: false,
+            permanent: true,
+            error_excerpt: Some("final".to_string()),
+            record: None,
+        };
+        {
+            let db = Database::create(&path).unwrap();
+            let write = db.begin_write().unwrap();
+            {
+                write.open_table(DELIVERY_BY_ID).unwrap();
+                write.open_table(READY_BY_DEPT_DUE).unwrap();
+                write.open_table(LEASED_BY_DEPT_UNTIL).unwrap();
+                write.open_table(DEAD_BY_DEPT_DUE).unwrap();
+                let mut dead = write.open_table(DEAD_BY_ID).unwrap();
+                dead.insert(
+                    terminal.delivery_id.as_str(),
+                    serde_json::to_vec(&terminal).unwrap().as_slice(),
+                )
+                .unwrap();
+                let mut meta = write.open_table(META).unwrap();
+                meta.insert("schema_version", "4").unwrap();
+            }
+            write.commit().unwrap();
+        }
+
+        let store = DeliveryStore::open(&path).unwrap();
+
+        assert_eq!(store.terminal_dead_index_len().unwrap(), 1);
+        store
+            .enqueue(&record(
+                "fresh",
+                terminal
+                    .dead_at_ms
+                    .saturating_add(TERMINAL_DEAD_RETENTION_MS)
+                    .saturating_add(1),
+            ))
+            .unwrap();
+        assert!(store.get_dead("terminal").unwrap().is_none());
+        assert_eq!(store.terminal_dead_index_len().unwrap(), 0);
     }
 
     #[test]
