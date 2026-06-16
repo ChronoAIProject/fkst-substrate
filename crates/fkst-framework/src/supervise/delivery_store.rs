@@ -21,7 +21,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::time::Duration;
 
-const SCHEMA_VERSION: &str = "5";
+const SCHEMA_VERSION: &str = "6";
 const TERMINAL_DEAD_RETENTION_MS: u64 = 24 * 60 * 60 * 1_000;
 const TERMINAL_DEAD_COMPACTION_LIMIT: usize = 1_024;
 
@@ -29,6 +29,8 @@ const DELIVERY_BY_ID: TableDefinition<&str, &[u8]> = TableDefinition::new("deliv
 const DEAD_BY_ID: TableDefinition<&str, &[u8]> = TableDefinition::new("dead_by_id");
 const TERMINAL_DEAD_BY_TIME: TableDefinition<&str, ()> =
     TableDefinition::new("terminal_dead_by_time");
+const TERMINAL_SUPPRESSED_BY_ID: TableDefinition<&str, ()> =
+    TableDefinition::new("terminal_suppressed_by_id");
 const META: TableDefinition<&str, &str> = TableDefinition::new("meta");
 const OLD_READY_BY_DUE: TableDefinition<(u64, &str), ()> = TableDefinition::new("ready_by_due");
 const OLD_LEASED_BY_UNTIL: TableDefinition<(u64, &str), ()> =
@@ -87,6 +89,7 @@ impl DeliveryStore {
             }
             write.open_table(DEAD_BY_ID)?;
             write.open_table(TERMINAL_DEAD_BY_TIME)?;
+            write.open_table(TERMINAL_SUPPRESSED_BY_ID)?;
             if current_version.as_deref() != Some(SCHEMA_VERSION) {
                 delete_old_global_indexes(&write)?;
                 rebuild_due_indexes(&write, DELIVERY_BY_ID)?;
@@ -94,7 +97,7 @@ impl DeliveryStore {
                     mark_existing_dead_records_permanent(&write)?;
                 }
                 rebuild_dead_due_index(&write)?;
-                rebuild_terminal_dead_index(&write)?;
+                rebuild_terminal_dead_tables(&write)?;
             }
             let mut meta = write.open_table(META)?;
             meta.insert("schema_version", SCHEMA_VERSION)?;
@@ -121,6 +124,15 @@ impl DeliveryStore {
                 }
                 bail!("conflicting duplicate delivery_id: {}", record.delivery_id);
             }
+            let suppressed = write.open_table(TERMINAL_SUPPRESSED_BY_ID)?;
+            if suppressed.get(record.delivery_id.as_str())?.is_some() {
+                drop(suppressed);
+                drop(delivery);
+                compact_terminal_dead_records(&write, record.observed_at_ms)?;
+                commit_write(write)?;
+                return Ok(());
+            }
+            drop(suppressed);
             let bytes = serde_json::to_vec(record)?;
             delivery.insert(record.delivery_id.as_str(), bytes.as_slice())?;
             let mut ready = write.open_table(READY_BY_DEPT_DUE)?;
@@ -419,6 +431,8 @@ impl DeliveryStore {
                                     .as_str(),
                                 &(),
                             )?;
+                            let mut suppressed = write.open_table(TERMINAL_SUPPRESSED_BY_ID)?;
+                            suppressed.insert(delivery_id, &())?;
                         }
                         delivery.remove(delivery_id)?;
                         if failure.replayable {
@@ -517,6 +531,8 @@ impl DeliveryStore {
                             .as_str(),
                         &(),
                     )?;
+                    let mut suppressed = write.open_table(TERMINAL_SUPPRESSED_BY_ID)?;
+                    suppressed.insert(delivery_id.as_str(), &())?;
                     result.permanent.push(dead);
                     mutated = true;
                     continue;
@@ -533,6 +549,8 @@ impl DeliveryStore {
                             .as_str(),
                         &(),
                     )?;
+                    let mut suppressed = write.open_table(TERMINAL_SUPPRESSED_BY_ID)?;
+                    suppressed.insert(delivery_id.as_str(), &())?;
                     result.permanent.push(dead);
                     mutated = true;
                     continue;
@@ -551,6 +569,8 @@ impl DeliveryStore {
                             .as_str(),
                         &(),
                     )?;
+                    let mut suppressed = write.open_table(TERMINAL_SUPPRESSED_BY_ID)?;
+                    suppressed.insert(delivery_id.as_str(), &())?;
                     result.permanent.push(dead);
                     mutated = true;
                     continue;
@@ -678,6 +698,13 @@ impl DeliveryStore {
     }
 
     #[cfg(test)]
+    fn terminal_suppressed_len(&self) -> Result<usize> {
+        let read = self.db.begin_read()?;
+        let suppressed = read.open_table(TERMINAL_SUPPRESSED_BY_ID)?;
+        count_index_entries(&suppressed)
+    }
+
+    #[cfg(test)]
     fn reset_write_counts() {
         WRITE_TXN_COUNT.set(0);
         WRITE_COMMIT_COUNT.set(0);
@@ -782,8 +809,9 @@ fn rebuild_dead_due_index(write: &redb::WriteTransaction) -> Result<()> {
     Ok(())
 }
 
-fn rebuild_terminal_dead_index(write: &redb::WriteTransaction) -> Result<()> {
+fn rebuild_terminal_dead_tables(write: &redb::WriteTransaction) -> Result<()> {
     write.delete_table(TERMINAL_DEAD_BY_TIME)?;
+    write.delete_table(TERMINAL_SUPPRESSED_BY_ID)?;
     let dead_rows = {
         let dead = write.open_table(DEAD_BY_ID)?;
         let mut rows = Vec::new();
@@ -794,6 +822,7 @@ fn rebuild_terminal_dead_index(write: &redb::WriteTransaction) -> Result<()> {
         rows
     };
     let mut terminal_index = write.open_table(TERMINAL_DEAD_BY_TIME)?;
+    let mut suppressed = write.open_table(TERMINAL_SUPPRESSED_BY_ID)?;
     for (delivery_id, bytes) in dead_rows {
         let Some(record) = decode_dead_record(&delivery_id, &bytes) else {
             continue;
@@ -803,6 +832,7 @@ fn rebuild_terminal_dead_index(write: &redb::WriteTransaction) -> Result<()> {
                 make_dead_due_index_key(&record.dept, record.dead_at_ms, &delivery_id).as_str(),
                 &(),
             )?;
+            suppressed.insert(delivery_id.as_str(), &())?;
         }
     }
     Ok(())
@@ -828,6 +858,7 @@ fn compact_terminal_dead_records(write: &redb::WriteTransaction, now_ms: u64) ->
     let mut dead = write.open_table(DEAD_BY_ID)?;
     let mut terminal_index = write.open_table(TERMINAL_DEAD_BY_TIME)?;
     let mut dead_due_index = write.open_table(DEAD_BY_DEPT_DUE)?;
+    let mut suppressed = write.open_table(TERMINAL_SUPPRESSED_BY_ID)?;
     for key in stale_keys {
         let delivery_id = key.delivery_id;
         let Some(record) = read_dead_table(&dead, &delivery_id)? else {
@@ -842,6 +873,7 @@ fn compact_terminal_dead_records(write: &redb::WriteTransaction, now_ms: u64) ->
                     make_dead_due_index_key(&record.dept, record.dead_at_ms, &delivery_id).as_str(),
                     &(),
                 )?;
+                suppressed.insert(delivery_id.as_str(), &())?;
             }
             compacted += 1;
             continue;
@@ -849,6 +881,7 @@ fn compact_terminal_dead_records(write: &redb::WriteTransaction, now_ms: u64) ->
         if record.dead_at_ms > cutoff_ms {
             break;
         }
+        suppressed.insert(delivery_id.as_str(), &())?;
         dead.remove(delivery_id.as_str())?;
         terminal_index.remove(key.key.as_str())?;
         dead_due_index.remove(
@@ -1065,6 +1098,8 @@ mod tests {
                     &(),
                 )
                 .unwrap();
+            let mut suppressed = write.open_table(TERMINAL_SUPPRESSED_BY_ID).unwrap();
+            suppressed.insert(delivery_id, &()).unwrap();
         }
         write.commit().unwrap();
     }
@@ -1887,6 +1922,7 @@ mod tests {
         assert!(store.get_dead("old").unwrap().is_none());
         assert!(store.get_dead("young").unwrap().is_some());
         assert_eq!(store.terminal_dead_index_len().unwrap(), 1);
+        assert_eq!(store.terminal_suppressed_len().unwrap(), 2);
         let leased = store
             .lease_for_dept(
                 "worker",
@@ -1899,6 +1935,35 @@ mod tests {
             .unwrap();
         assert_eq!(leased.len(), 1);
         assert_eq!(leased[0].delivery_id, "fresh");
+    }
+
+    #[test]
+    fn compacted_terminal_id_is_not_redelivered() {
+        let temp = TempDir::new().unwrap();
+        let store = store(&temp);
+        insert_permanent_dead(&store, "old", 100);
+        let mut duplicate = record(
+            "old",
+            100_u64
+                .saturating_add(TERMINAL_DEAD_RETENTION_MS)
+                .saturating_add(1),
+        );
+        duplicate.observed_at_ms = duplicate.not_before_ms;
+
+        store.enqueue(&duplicate).unwrap();
+
+        assert!(store.get_dead("old").unwrap().is_none());
+        assert_eq!(store.terminal_dead_index_len().unwrap(), 0);
+        assert_eq!(store.terminal_suppressed_len().unwrap(), 1);
+        assert!(store
+            .lease_for_dept(
+                "worker",
+                duplicate.not_before_ms,
+                10,
+                Duration::from_millis(50),
+            )
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
@@ -1934,6 +1999,7 @@ mod tests {
 
         assert!(store.get_dead("old").unwrap().is_none());
         assert_eq!(store.terminal_dead_index_len().unwrap(), 0);
+        assert_eq!(store.terminal_suppressed_len().unwrap(), 1);
     }
 
     #[test]
@@ -2226,7 +2292,7 @@ mod tests {
     }
 
     #[test]
-    fn schema_v4_open_rebuilds_terminal_dead_index_for_compaction() {
+    fn schema_v5_open_rebuilds_terminal_dead_tables_for_compaction() {
         let temp = TempDir::new().unwrap();
         let path = temp.path().join("delivery.redb");
         let terminal = DeadRecord {
@@ -2259,7 +2325,7 @@ mod tests {
                 )
                 .unwrap();
                 let mut meta = write.open_table(META).unwrap();
-                meta.insert("schema_version", "4").unwrap();
+                meta.insert("schema_version", "5").unwrap();
             }
             write.commit().unwrap();
         }
@@ -2278,6 +2344,7 @@ mod tests {
         store.enqueue(&fresh).unwrap();
         assert!(store.get_dead("terminal").unwrap().is_none());
         assert_eq!(store.terminal_dead_index_len().unwrap(), 0);
+        assert_eq!(store.terminal_suppressed_len().unwrap(), 1);
     }
 
     #[test]
