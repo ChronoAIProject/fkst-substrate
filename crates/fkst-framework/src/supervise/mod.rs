@@ -41,7 +41,7 @@ pub(crate) fn load_host_graph_for_conformance(roots: &PackageRoots) -> Result<Co
 
 pub async fn supervise(roots: PackageRoots, framework_bin: PathBuf) -> Result<()> {
     let project_root = roots.host_root().to_path_buf();
-    let journal = SupervisorJournal::open();
+    let journal = SupervisorJournal::open(&project_root);
     info!(
         package_roots = ?roots.package_roots(),
         host_root = %project_root.display(),

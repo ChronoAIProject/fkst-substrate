@@ -36,6 +36,23 @@ fn copy_minimal_package(host: &Path) {
     copy_dir(&package, host);
 }
 
+fn write_runtime_touch_package(package: &Path) {
+    let dept = package.join("departments/probe");
+    fs::create_dir_all(&dept).unwrap();
+    fs::write(
+        dept.join("main.lua"),
+        r#"
+local M = {}
+M.spec = { consumes = {"tick"}, produces = {} }
+function pipeline(event)
+  once("runtime-root-probe", function() end)
+end
+return M
+"#,
+    )
+    .unwrap();
+}
+
 fn run_department(host: &Path, runtime: &Path, lua: &str, event: &str) -> Output {
     Command::new(framework_bin())
         .arg("run")
@@ -95,6 +112,42 @@ fn decode_raised(stdout: &str) -> Value {
         .decode(encoded)
         .unwrap();
     serde_json::from_slice(&bytes).unwrap()
+}
+
+#[test]
+fn relative_runtime_root_anchors_to_git_root_not_package_project_root() {
+    let root = tempfile::tempdir().unwrap();
+    let repo = root.path().join("repo");
+    let package = repo.join("packages/pkg");
+    fs::create_dir_all(&package).unwrap();
+    fs::create_dir(repo.join(".git")).unwrap();
+    write_runtime_touch_package(&package);
+
+    let output = Command::new(framework_bin())
+        .arg("run")
+        .arg(package.join("departments/probe/main.lua"))
+        .arg("--project-root")
+        .arg(&package)
+        .arg("--package-root")
+        .arg(&package)
+        .arg("--event")
+        .arg(r#"{"queue":"tick","payload":{}}"#)
+        .current_dir(&repo)
+        .env_remove("FKST_SUPERVISOR_PID")
+        .env("FKST_RUNTIME_ROOT", ".fkst/runtime")
+        .output()
+        .unwrap();
+    assert_success(&output);
+
+    assert!(
+        repo.join(".fkst/runtime/marks/runtime-root-probe/=mark")
+            .is_file(),
+        "runtime marker should be anchored at repo root"
+    );
+    assert!(
+        !package.join(".fkst").exists(),
+        "relative runtime root must not create package-local .fkst"
+    );
 }
 
 #[test]
