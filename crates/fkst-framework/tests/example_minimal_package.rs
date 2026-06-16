@@ -120,7 +120,7 @@ fn relative_runtime_root_anchors_to_git_root_not_package_project_root() {
     let repo = root.path().join("repo");
     let package = repo.join("packages/pkg");
     fs::create_dir_all(&package).unwrap();
-    fs::create_dir(repo.join(".git")).unwrap();
+    git(&repo, ["init"]);
     write_runtime_touch_package(&package);
 
     let output = Command::new(framework_bin())
@@ -147,6 +147,21 @@ fn relative_runtime_root_anchors_to_git_root_not_package_project_root() {
     assert!(
         !package.join(".fkst").exists(),
         "relative runtime root must not create package-local .fkst"
+    );
+}
+
+fn git<const N: usize>(repo: &Path, args: [&str; N]) {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
     );
 }
 
