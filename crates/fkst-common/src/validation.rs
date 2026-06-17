@@ -77,8 +77,8 @@ pub fn validate_runtime_key(key: &str) -> Result<&str, FkstError> {
 /// - every queue must have at least one producer OR consumer (no isolated queues)
 /// - queues default to one active consumer unless `fanout = true`
 /// - queues with only producers emit startup warnings
-/// - closed-world queues with only consumers are rejected unless a built-in
-///   source contract explicitly owns the queue
+/// - closed-world queues with only consumers are rejected unless a runtime
+///   producer contract explicitly owns the queue
 /// - partial-graph queues with only consumers emit startup warnings
 /// - every department's `lua` path must exist on disk
 /// - queue capacity > 0
@@ -215,7 +215,7 @@ pub fn validate_with_scope(
     // Check every queue has at least one producer or consumer.
     for qname in queue_names {
         let mut producers = queue_producers(cfg, qname);
-        producers.extend(built_in_source_contract_producers(qname));
+        producers.extend(runtime_produced_queue_producers(qname));
         let consumers = queue_consumers(cfg, qname);
         if producers.is_empty() && consumers.is_empty() {
             return Err(FkstError::Schema(format!(
@@ -351,8 +351,8 @@ fn queue_producers(cfg: &Config, qname: &str) -> Vec<String> {
     producers
 }
 
-// Built-in source contracts are the only valid producerless-queue exemption.
-fn built_in_source_contract_producers(qname: &str) -> Vec<String> {
+// Runtime-produced contracts are the only valid producerless-queue exemption.
+fn runtime_produced_queue_producers(qname: &str) -> Vec<String> {
     built_in_provider_for_queue(qname)
         .map(|contract| vec![contract.producer_label.to_string()])
         .unwrap_or_default()
