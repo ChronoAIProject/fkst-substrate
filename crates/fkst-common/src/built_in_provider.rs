@@ -24,7 +24,7 @@ impl BuiltInProviderContract {
 pub const BUILT_IN_DEAD_LETTER_PROVIDER: BuiltInProviderContract = BuiltInProviderContract {
     provider: "runtime.dead_letter",
     queue_local_name: "dead_letter",
-    producer_label: "built-in provider 'runtime.dead_letter'",
+    producer_label: "runtime-produced provider 'runtime.dead_letter'",
     source_of_truth: "durable delivery dead table",
     payload_schema: FAILURE_FACT_SCHEMA,
     trust_boundary: "framework reliable delivery runtime",
@@ -45,16 +45,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn dead_letter_provider_declares_runtime_contract() {
+    fn built_in_provider_for_queue_covers_dead_letter_only() {
         let contract = built_in_provider_for_queue("consensus.dead_letter").unwrap();
 
         assert_eq!(contract.provider, "runtime.dead_letter");
         assert_eq!(contract.queue_local_name, "dead_letter");
+        assert_eq!(
+            contract.producer_label,
+            "runtime-produced provider 'runtime.dead_letter'"
+        );
         assert_eq!(contract.source_of_truth, "durable delivery dead table");
         assert_eq!(contract.payload_schema, "fkst.failure_fact.v1");
         assert_eq!(
             contract.trust_boundary,
             "framework reliable delivery runtime"
         );
+        assert_eq!(built_in_provider_for_queue("consensus.proposal"), None);
     }
 }
