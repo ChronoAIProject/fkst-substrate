@@ -317,6 +317,36 @@ return M
 
 #[test]
 fn package_consensus_dead_letter_consumer_proves_no_producer_gap_closed() {
+    let missing_producer_root = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
+    let missing_producer_package = missing_producer_root.path().join("consensus");
+    fs::create_dir_all(&missing_producer_package).unwrap();
+    write_host_defaults(&missing_producer_package);
+    write_package_consumer(&missing_producer_package, "proposal");
+    let missing_producer_host = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
+    write_host_defaults(missing_producer_host.path());
+
+    let missing_producer_args = [
+        std::ffi::OsStr::new("--project-root"),
+        path_arg(missing_producer_host.path()),
+        std::ffi::OsStr::new("--package-root"),
+        path_arg(&missing_producer_package),
+    ];
+    let missing_producer_output =
+        run_conformance(&missing_producer_args, missing_producer_host.path());
+
+    assert_exit(&missing_producer_output, 1);
+    let missing_producer_log = combined_log(&missing_producer_output);
+    assert!(
+        missing_producer_log.contains("FAIL schema-validation"),
+        "{missing_producer_log}"
+    );
+    assert!(
+        missing_producer_log.contains(
+            "queue 'consensus.proposal' is consumed by department 'consensus.consumer' but has no producer"
+        ),
+        "{missing_producer_log}"
+    );
+
     let root = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
     let package = root.path().join("consensus");
     fs::create_dir_all(package.join("departments/dead_handler")).unwrap();
