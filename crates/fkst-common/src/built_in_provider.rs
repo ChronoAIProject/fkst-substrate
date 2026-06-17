@@ -45,7 +45,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn dead_letter_provider_declares_runtime_contract() {
+    fn built_in_provider_for_queue_covers_dead_letter_only() {
         let contract = built_in_provider_for_queue("consensus.dead_letter").unwrap();
 
         assert_eq!(contract.provider, "runtime.dead_letter");
@@ -60,5 +60,6 @@ mod tests {
             contract.trust_boundary,
             "framework reliable delivery runtime"
         );
+        assert_eq!(built_in_provider_for_queue("consensus.proposal"), None);
     }
 }
