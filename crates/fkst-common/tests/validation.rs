@@ -308,7 +308,7 @@ fn partial_graph_consumer_without_producer_warns() {
 }
 
 #[test]
-fn built_in_dead_letter_source_contract_satisfies_producerless_queue() {
+fn runtime_dead_letter_contract_satisfies_producerless_queue() {
     let tmp = tempdir().unwrap();
     let lua = touch(tmp.path(), "d.lua");
     let mut cfg = cfg_minimal(&lua);
@@ -320,6 +320,26 @@ fn built_in_dead_letter_source_contract_satisfies_producerless_queue() {
     let warnings = validate(&cfg, tmp.path()).unwrap();
 
     assert!(warnings.is_empty(), "{warnings:?}");
+}
+
+#[test]
+fn runtime_dead_letter_warning_names_runtime_produced_owner() {
+    let tmp = tempdir().unwrap();
+    let lua = touch(tmp.path(), "d.lua");
+    let mut cfg = cfg_minimal(&lua);
+    add_queue(&mut cfg, "consensus.dead_letter");
+
+    let warnings = validate(&cfg, tmp.path()).unwrap();
+
+    assert_eq!(warnings.len(), 1, "{warnings:?}");
+    assert!(
+        warnings[0].contains("consensus.dead_letter"),
+        "{warnings:?}"
+    );
+    assert!(
+        warnings[0].contains("runtime-produced provider 'runtime.dead_letter'"),
+        "{warnings:?}"
+    );
 }
 
 #[test]
