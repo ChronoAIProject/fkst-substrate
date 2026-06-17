@@ -316,7 +316,7 @@ return M
 }
 
 #[test]
-fn package_dead_letter_consumer_does_not_warn_about_missing_package_producer() {
+fn package_consensus_dead_letter_consumer_proves_no_producer_gap_closed() {
     let root = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
     let package = root.path().join("consensus");
     fs::create_dir_all(package.join("departments/dead_handler")).unwrap();
@@ -350,7 +350,12 @@ return M
     assert_exit(&output, 0);
     let log = combined_log(&output);
     assert!(log.contains("PASS schema-validation"), "{log}");
-    assert!(!log.contains("no producer"), "{log}");
+    assert!(
+        !log.contains(
+            "queue 'consensus.dead_letter' is consumed by department 'consensus.dead_handler' but has no producer"
+        ),
+        "{log}"
+    );
 }
 
 #[test]
