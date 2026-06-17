@@ -115,6 +115,38 @@ return M
     .unwrap();
 }
 
+fn write_package_consumer(root: &std::path::Path, queue: &str) {
+    fs::create_dir_all(root.join("departments/consumer")).unwrap();
+    fs::write(
+        root.join("departments/consumer/main.lua"),
+        format!(
+            r#"
+local M = {{}}
+M.spec = {{ consumes = {{"{queue}"}}, stall_window = "30s" }}
+function pipeline(_) end
+return M
+"#
+        ),
+    )
+    .unwrap();
+}
+
+fn write_package_producer(root: &std::path::Path, queue: &str) {
+    fs::create_dir_all(root.join("departments/producer")).unwrap();
+    fs::write(
+        root.join("departments/producer/main.lua"),
+        format!(
+            r#"
+local M = {{}}
+M.spec = {{ consumes = {{}}, produces = {{"{queue}"}}, stall_window = "30s" }}
+function pipeline(_) end
+return M
+"#
+        ),
+    )
+    .unwrap();
+}
+
 fn path_arg(path: &std::path::Path) -> &std::ffi::OsStr {
     path.as_os_str()
 }
@@ -322,7 +354,7 @@ return M
 }
 
 #[test]
-fn consumed_queue_without_producer_fails_schema_validation() {
+fn single_root_flat_consumed_queue_without_producer_warns() {
     let host = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
     write_host_defaults(host.path());
     write_host_department(host.path());
@@ -333,11 +365,73 @@ fn consumed_queue_without_producer_fails_schema_validation() {
     ];
     let output = run_conformance(&args, host.path());
 
+    assert_exit(&output, 0);
+    let log = combined_log(&output);
+    assert!(log.contains("PASS schema-validation"), "{log}");
+    assert!(
+        log.contains("schema validation passed with 1 warnings"),
+        "{log}"
+    );
+}
+
+#[test]
+fn composed_graph_sibling_producer_satisfies_consumed_queue() {
+    let root = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
+    let consumer_package = root.path().join("consensus");
+    let producer_package = root.path().join("github-devloop");
+    fs::create_dir_all(&consumer_package).unwrap();
+    fs::create_dir_all(&producer_package).unwrap();
+    write_host_defaults(&consumer_package);
+    write_host_defaults(&producer_package);
+    write_package_consumer(&consumer_package, "proposal");
+    write_package_producer(&producer_package, "consensus.proposal");
+    let host = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
+    write_host_defaults(host.path());
+
+    let args = [
+        std::ffi::OsStr::new("--project-root"),
+        path_arg(host.path()),
+        std::ffi::OsStr::new("--package-root"),
+        path_arg(&consumer_package),
+        std::ffi::OsStr::new("--package-root"),
+        path_arg(&producer_package),
+    ];
+    let output = run_conformance(&args, host.path());
+
+    assert_exit(&output, 0);
+    let log = combined_log(&output);
+    assert!(log.contains("PASS schema-validation"), "{log}");
+    assert!(!log.contains("no producer"), "{log}");
+}
+
+#[test]
+fn composed_graph_consumed_queue_without_any_producer_fails() {
+    let root = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
+    let consumer_package = root.path().join("consensus");
+    let sibling_package = root.path().join("github-devloop");
+    fs::create_dir_all(&consumer_package).unwrap();
+    fs::create_dir_all(&sibling_package).unwrap();
+    write_host_defaults(&consumer_package);
+    write_host_defaults(&sibling_package);
+    write_package_consumer(&consumer_package, "proposal");
+    let host = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
+    write_host_defaults(host.path());
+
+    let args = [
+        std::ffi::OsStr::new("--project-root"),
+        path_arg(host.path()),
+        std::ffi::OsStr::new("--package-root"),
+        path_arg(&consumer_package),
+        std::ffi::OsStr::new("--package-root"),
+        path_arg(&sibling_package),
+    ];
+    let output = run_conformance(&args, host.path());
+
     assert_exit(&output, 1);
     let log = combined_log(&output);
     assert!(log.contains("FAIL schema-validation"), "{log}");
-    assert!(log.contains("queue 'tick'"), "{log}");
-    assert!(log.contains("department 'hello'"), "{log}");
+    assert!(log.contains("queue 'consensus.proposal'"), "{log}");
+    assert!(log.contains("department 'consensus.consumer'"), "{log}");
     assert!(log.contains("has no producer"), "{log}");
 }
 

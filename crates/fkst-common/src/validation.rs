@@ -4,6 +4,12 @@ use crate::built_in_provider::built_in_provider_for_queue;
 use crate::config::{Config, RaiserDecl, RetryDecl};
 use crate::error::FkstError;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ValidationScope {
+    ClosedWorld,
+    PartialGraph,
+}
+
 /// Validate a runtime scratch key before joining it below a RuntimeLayout subdir.
 ///
 /// Valid keys are non-empty relative filesystem paths. Each segment must match
@@ -71,13 +77,22 @@ pub fn validate_runtime_key(key: &str) -> Result<&str, FkstError> {
 /// - every queue must have at least one producer OR consumer (no isolated queues)
 /// - queues default to one active consumer unless `fanout = true`
 /// - queues with only producers emit startup warnings
-/// - queues with only consumers are rejected unless a built-in source
-///   contract explicitly owns the queue
+/// - closed-world queues with only consumers are rejected unless a built-in
+///   source contract explicitly owns the queue
+/// - partial-graph queues with only consumers emit startup warnings
 /// - every department's `lua` path must exist on disk
 /// - queue capacity > 0
 /// - department stall_window is parseable (we just check non-empty + ends with s/m/h)
 /// - duplicate raiser → same name impossible (HashMap), so skip
 pub fn validate(cfg: &Config, project_root: &std::path::Path) -> Result<Vec<String>, FkstError> {
+    validate_with_scope(cfg, project_root, ValidationScope::ClosedWorld)
+}
+
+pub fn validate_with_scope(
+    cfg: &Config,
+    project_root: &std::path::Path,
+    scope: ValidationScope,
+) -> Result<Vec<String>, FkstError> {
     if cfg.limits.global_codex_processes == 0 {
         return Err(FkstError::Schema(
             "limits.global_codex_processes must be > 0".to_string(),
@@ -216,11 +231,22 @@ pub fn validate(cfg: &Config, project_root: &std::path::Path) -> Result<Vec<Stri
             ));
         }
         if producers.is_empty() && !consumers.is_empty() {
-            return Err(FkstError::Schema(format!(
-                "queue '{}' is consumed by {} but has no producer",
-                qname,
-                consumers.join(", ")
-            )));
+            match scope {
+                ValidationScope::ClosedWorld => {
+                    return Err(FkstError::Schema(format!(
+                        "queue '{}' is consumed by {} but has no producer",
+                        qname,
+                        consumers.join(", ")
+                    )));
+                }
+                ValidationScope::PartialGraph => {
+                    warnings.push(format!(
+                        "queue '{}' is consumed by {} but has no producer in this partial graph",
+                        qname,
+                        consumers.join(", ")
+                    ));
+                }
+            }
         }
         validate_queue_contract(cfg, qname, &consumers)?;
     }
@@ -565,6 +591,33 @@ mod tests {
         assert!(message.contains("consumed_only"), "{message}");
         assert!(message.contains("department 'd'"), "{message}");
         assert!(message.contains("no producer"), "{message}");
+    }
+
+    #[test]
+    fn partial_graph_consumer_without_producer_warns() {
+        let tmp = tempdir().unwrap();
+        let lua = touch(tmp.path(), "d.lua");
+        let mut cfg = cfg_minimal(&lua);
+        cfg.queue.insert(
+            "consumed_only".into(),
+            QueueDecl {
+                capacity: 10,
+                fanout: false,
+            },
+        );
+        cfg.department
+            .get_mut("d")
+            .unwrap()
+            .consumes
+            .push("consumed_only".into());
+
+        let warnings =
+            validate_with_scope(&cfg, tmp.path(), ValidationScope::PartialGraph).unwrap();
+
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("consumed_only"), "{warnings:?}");
+        assert!(warnings[0].contains("department 'd'"), "{warnings:?}");
+        assert!(warnings[0].contains("partial graph"), "{warnings:?}");
     }
 
     #[test]
