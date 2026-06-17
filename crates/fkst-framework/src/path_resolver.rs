@@ -176,6 +176,16 @@ impl PackageRoots {
         roots
     }
 
+    pub(crate) fn is_single_folded_graph_root(&self) -> bool {
+        matches!(
+            self.graph_roots().as_slice(),
+            [GraphRoot {
+                kind: GraphRootKind::PackageAndHost,
+                ..
+            }]
+        )
+    }
+
     pub(crate) fn name_resolver(&self) -> NameResolver {
         let graph_roots = self.graph_roots();
         NameResolver::new(graph_roots.iter().map(|root| root.namespace.clone()))

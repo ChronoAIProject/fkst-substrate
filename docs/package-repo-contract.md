@@ -275,7 +275,7 @@ schema-validation
 | `M.spec.retry` 只能 nil / false / table，`retry=true` 拒绝 | engine graph scan |
 | `retry.max_attempts > 0`，`base` / `cap` 是正 `s/m/h` duration 且 `cap >= base` | engine schema validation |
 | queue capacity > 0 | engine schema validation |
-| queue 引用必须存在，queue 不能孤立 | engine schema validation |
+| queue 引用必须存在，queue 不能孤立；consumed-only queues are warnings in flat single-root conformance and failures in composed conformance / runtime startup | engine schema validation |
 | 多消费者或同 Department consume+produce 同 queue 必须 fanout | engine schema validation |
 | Department lua 文件必须存在 | engine schema validation |
 | source kind 只支持 `cron` 与 `file_watch` | engine graph scan / serde parse |
