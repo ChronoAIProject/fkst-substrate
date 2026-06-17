@@ -1,7 +1,9 @@
 // crate-level integration tests own behavior coverage while runtime modules keep runtime code.
 
 use fkst_common::config::{Config, DepartmentDecl, LimitsDecl, QueueDecl, RaiserDecl, RetryDecl};
-use fkst_common::validation::{validate, validate_runtime_key};
+use fkst_common::validation::{
+    validate, validate_runtime_key, validate_with_scope, ValidationScope,
+};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use tempfile::tempdir;
@@ -277,6 +279,32 @@ fn consumer_without_producer_fails() {
     assert!(message.contains("consumed_only"), "{message}");
     assert!(message.contains("department 'd'"), "{message}");
     assert!(message.contains("has no producer"), "{message}");
+}
+
+#[test]
+fn partial_graph_consumer_without_producer_warns() {
+    let tmp = tempdir().unwrap();
+    let lua = touch(tmp.path(), "d.lua");
+    let mut cfg = cfg_minimal(&lua);
+    cfg.queue.insert(
+        "consumed_only".into(),
+        QueueDecl {
+            capacity: 10,
+            fanout: false,
+        },
+    );
+    cfg.department
+        .get_mut("d")
+        .unwrap()
+        .consumes
+        .push("consumed_only".into());
+
+    let warnings = validate_with_scope(&cfg, tmp.path(), ValidationScope::PartialGraph).unwrap();
+
+    assert_eq!(warnings.len(), 1, "{warnings:?}");
+    assert!(warnings[0].contains("consumed_only"), "{warnings:?}");
+    assert!(warnings[0].contains("department 'd'"), "{warnings:?}");
+    assert!(warnings[0].contains("partial graph"), "{warnings:?}");
 }
 
 #[test]

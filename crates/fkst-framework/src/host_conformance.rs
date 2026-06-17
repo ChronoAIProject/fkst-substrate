@@ -2,7 +2,7 @@ use crate::path_resolver::PackageRoots;
 use crate::supervise;
 use anyhow::{Context, Result};
 use fkst_common::runtime_layout::RUNTIME_ROOT_ENV;
-use fkst_common::validation::validate;
+use fkst_common::validation::{validate_with_scope, ValidationScope};
 use fkst_common::RuntimeKind;
 
 pub(crate) struct HostConformanceOptions {
@@ -178,7 +178,12 @@ impl HostConformanceSuite {
     }
 
     fn check_schema_validation(&self, cfg: &fkst_common::config::Config) -> HostCheck {
-        match validate(cfg, self.options.roots.host_root()) {
+        let scope = if self.options.roots.is_single_folded_graph_root() {
+            ValidationScope::PartialGraph
+        } else {
+            ValidationScope::ClosedWorld
+        };
+        match validate_with_scope(cfg, self.options.roots.host_root(), scope) {
             Ok(warnings) => {
                 if warnings.is_empty() {
                     HostCheck::pass("schema-validation", "schema validation passed".to_string())
