@@ -48,6 +48,7 @@ static NEXT_PIPELINE_OWNER_ID: AtomicU64 = AtomicU64::new(1);
 static NEXT_CODEX_RUN_ID: AtomicU64 = AtomicU64::new(1);
 
 // both sync and async SDK calls share one immutable request description.
+#[derive(Clone)]
 struct CodexRequest {
     run_id: String,
     prompt: String,
@@ -348,9 +349,15 @@ pub(crate) fn register_with_runner(
         lua.create_function(move |lua, opts: Table| {
             crate::process_tree::ensure_supervisor_parent_alive()?;
             let request = codex_request_from_opts(opts, dept.as_deref().map(str::to_string));
-            flush_raises_before_sync_codex(&raise_buf, raised_auth_token.as_deref());
-            run_codex_request(request, &host_root, &config, runner.as_ref().as_ref())?
-                .into_lua_table(lua)
+            run_codex_sync_request(
+                request,
+                &host_root,
+                &config,
+                runner.as_ref().as_ref(),
+                raise_buf.clone(),
+                raised_auth_token.as_ref().clone(),
+            )?
+            .into_lua_table(lua)
         })?
     })?;
     lua.globals().set("spawn_codex", {
@@ -402,6 +409,35 @@ fn flush_raises_before_sync_codex(raise_buf: &RaiseBuffer, raised_auth_token: Op
     if let Some(token) = raised_auth_token {
         raise_buf.drain_emit_authenticated_stdout(token);
     }
+}
+
+fn run_codex_sync_request(
+    request: CodexRequest,
+    host_root: &Path,
+    config: &ConfigContext,
+    runner: Option<&MockCommandState>,
+    raise_buf: RaiseBuffer,
+    raised_auth_token: Option<String>,
+) -> Result<CodexResult> {
+    if let Some(token) = raised_auth_token {
+        let timeout = codex_sync_timeout(request.timeout_seconds);
+        let timeout_request = request.clone();
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            flush_raises_before_sync_codex(&raise_buf, Some(&token));
+            let _ = tx.send(());
+        });
+        match rx.recv_timeout(timeout) {
+            Ok(()) => {}
+            Err(RecvTimeoutError::Timeout) => return Ok(sync_timeout_result(&timeout_request)),
+            Err(RecvTimeoutError::Disconnected) => {
+                return Err(mlua::Error::external(
+                    "spawn_codex_sync raise flush exited without result",
+                ))
+            }
+        }
+    }
+    run_codex_request(request, host_root, config, runner)
 }
 
 // the same input names an overall wall-clock timeout with a bounded default.
@@ -615,7 +651,10 @@ fn run_adoptable_codex_request(
         .write(true)
         .open(lock_path)
         .map_err(mlua::Error::external)?;
-    flock(lock_file.as_raw_fd(), FlockArg::LockExclusive).map_err(mlua::Error::external)?;
+    let deadline = codex_deadline(request.timeout_seconds);
+    if !try_lock_until_deadline(lock_file.as_raw_fd(), deadline).map_err(mlua::Error::external)? {
+        return Ok(adoption_timeout_result(&request, &paths)?);
+    }
     if let Some(result) = read_completed_adoption_result(&paths)? {
         drop(lock_file);
         return Ok(result);
@@ -982,10 +1021,7 @@ fn wait_for_adoption_result(
     request: &CodexRequest,
     paths: &CodexAdoptionPaths,
 ) -> Result<CodexResult> {
-    let deadline = Instant::now()
-        + overall_timeout(request.timeout_seconds)
-            .unwrap_or_else(|| Duration::from_secs(DEFAULT_CODEX_TIMEOUT_SECONDS as u64))
-        + CODEX_ADOPTION_TIMEOUT_GRACE;
+    let deadline = codex_deadline(request.timeout_seconds) + CODEX_ADOPTION_TIMEOUT_GRACE;
     loop {
         if let Some(result) = read_completed_adoption_result(paths)? {
             return Ok(result);
@@ -994,21 +1030,70 @@ fn wait_for_adoption_result(
             if let Some(record) = read_adoption_record(&paths.status)? {
                 kill_adoption_worker_group(&record);
             }
-            let message = format!(
-                "adopted codex timed out waiting for result after {}s wall clock",
-                request.timeout_seconds
-            );
-            return Ok(CodexResult::failure(
-                "timeout",
-                message,
-                read_optional_string(&paths.stdout).map_err(mlua::Error::external)?,
-                read_optional_string(&paths.stderr).map_err(mlua::Error::external)?,
-                124,
-                request.log_path.to_string_lossy().into_owned(),
-            ));
+            return Ok(adoption_timeout_result(request, paths)?);
         }
         std::thread::sleep(CODEX_ADOPTION_POLL);
     }
+}
+
+fn adoption_timeout_result(
+    request: &CodexRequest,
+    paths: &CodexAdoptionPaths,
+) -> Result<CodexResult> {
+    let message = format!(
+        "adopted codex timed out waiting for result after {}s wall clock",
+        request.timeout_seconds
+    );
+    Ok(CodexResult::failure(
+        "timeout",
+        message,
+        read_optional_string(&paths.stdout).map_err(mlua::Error::external)?,
+        read_optional_string(&paths.stderr).map_err(mlua::Error::external)?,
+        124,
+        request.log_path.to_string_lossy().into_owned(),
+    ))
+}
+
+fn sync_timeout_result(request: &CodexRequest) -> CodexResult {
+    CodexResult::failure(
+        "timeout",
+        format!(
+            "spawn_codex_sync timed out after {}s wall clock",
+            request.timeout_seconds
+        ),
+        String::new(),
+        String::new(),
+        124,
+        request.log_path.to_string_lossy().into_owned(),
+    )
+}
+
+fn codex_sync_timeout(timeout_seconds: i64) -> Duration {
+    overall_timeout(timeout_seconds)
+        .unwrap_or_else(|| Duration::from_secs(DEFAULT_CODEX_TIMEOUT_SECONDS as u64))
+}
+
+fn codex_deadline(timeout_seconds: i64) -> Instant {
+    Instant::now() + codex_sync_timeout(timeout_seconds)
+}
+
+fn try_lock_until_deadline(fd: std::os::fd::RawFd, deadline: Instant) -> anyhow::Result<bool> {
+    loop {
+        match flock(fd, FlockArg::LockExclusiveNonblock) {
+            Ok(()) => return Ok(true),
+            Err(err) if lock_is_busy(err) => {
+                if Instant::now() >= deadline {
+                    return Ok(false);
+                }
+                std::thread::sleep(CODEX_ADOPTION_POLL);
+            }
+            Err(err) => return Err(err.into()),
+        }
+    }
+}
+
+fn lock_is_busy(err: nix::errno::Errno) -> bool {
+    err == nix::errno::Errno::EWOULDBLOCK || err == nix::errno::Errno::EAGAIN
 }
 
 #[cfg(unix)]
@@ -1769,6 +1854,7 @@ fn wait_codex_with_timeout_and_tail(
                 } else {
                     killed_for_timeout = Some(message);
                 }
+                break Err("codex overall timeout reached".to_string());
             }
             Err(RecvTimeoutError::Disconnected) => {
                 break Err("codex wait channel closed before process exit".to_string());
@@ -1777,9 +1863,13 @@ fn wait_codex_with_timeout_and_tail(
     };
 
     for reader in readers {
-        let _ = reader.join();
+        if killed_for_timeout.is_none() {
+            let _ = reader.join();
+        }
     }
-    let _ = waiter.join();
+    if killed_for_timeout.is_none() {
+        let _ = waiter.join();
+    }
     drain_codex_events(&rx, &mut stdout, &mut stderr);
     write_live_output_tail(output_tail_path.as_deref(), &stdout, &stderr);
 

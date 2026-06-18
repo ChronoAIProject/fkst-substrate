@@ -101,6 +101,21 @@ fn recv_result(rx: &std::sync::mpsc::Receiver<String>, label: &str) -> String {
 }
 
 #[cfg(unix)]
+fn wait_for_process_exit(pid: i32, timeout: Duration) -> bool {
+    use nix::sys::signal::kill;
+    use nix::unistd::Pid;
+
+    let deadline = std::time::Instant::now() + timeout;
+    while std::time::Instant::now() < deadline {
+        if kill(Pid::from_raw(pid), None).is_err() {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    false
+}
+
+#[cfg(unix)]
 fn continuous_output_codex_script(stream_redirect: &'static str) -> String {
     format!(
         r#"#!/bin/sh
@@ -931,6 +946,118 @@ printf 'adopted-%s' "$count"
         std::fs::read_to_string(capture_dir.join("spawns")).unwrap(),
         "1"
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn spawn_codex_sync_adoption_quiet_child_returns_timeout_failure() {
+    let tmp = tempfile::tempdir().unwrap();
+    let bin_dir = tmp.path().join("bin");
+    let worktree = tmp.path().join("wt");
+    let pid_fifo = tmp.path().join("pid.fifo");
+    std::fs::create_dir_all(&worktree).unwrap();
+    make_fifo(&pid_fifo);
+    install_codex_script(
+        &bin_dir,
+        r#"#!/bin/sh
+cat >/dev/null
+printf '%s' "$$" > "$PID_FIFO"
+while :; do sleep 10; done
+"#,
+    );
+
+    let mut sandbox = ProcessSandbox::new();
+    sandbox.enter_cwd(tmp.path()).runtime_root(".fkst/runtime");
+    sandbox.prepend_path(&bin_dir);
+    sandbox.set_env("PID_FIFO", pid_fifo.to_string_lossy().into_owned());
+    sandbox.set_env(CODEX_WORKER_BIN_ENV, framework_bin());
+    sandbox.runtime_log_dir(tmp.path().join("runtime"));
+    let (_lock, _guard) = sandbox.enter();
+
+    let pid_reader = std::thread::spawn({
+        let pid_fifo = pid_fifo.clone();
+        move || read_fifo(&pid_fifo).trim().parse::<i32>().unwrap()
+    });
+
+    let lua = Lua::new();
+    register(&lua).unwrap();
+    let spawn: mlua::Function = lua.globals().get("spawn_codex_sync").unwrap();
+    let opts = lua_opts(&lua, "quiet adoption timeout");
+    opts.set("worktree", worktree.to_string_lossy().into_owned())
+        .unwrap();
+    opts.set("dedup_key", "quiet-timeout").unwrap();
+    opts.set("timeout", 1).unwrap();
+
+    let result: Table = spawn.call(opts).unwrap();
+    let child_pid = pid_reader.join().unwrap();
+    assert_eq!(result.get::<i64>("exit_code").unwrap(), 124);
+    assert_eq!(result.get::<String>("error_kind").unwrap(), "timeout");
+    assert!(result.get::<String>("error").unwrap().contains("timed out"));
+    assert!(wait_for_process_exit(child_pid, Duration::from_secs(3)));
+}
+
+#[cfg(unix)]
+#[test]
+fn spawn_codex_sync_adoption_lock_wait_is_bounded_by_timeout() {
+    let tmp = tempfile::tempdir().unwrap();
+    let bin_dir = tmp.path().join("bin");
+    let worktree = tmp.path().join("wt");
+    std::fs::create_dir_all(&worktree).unwrap();
+    install_codex_script(
+        &bin_dir,
+        r#"#!/bin/sh
+cat >/dev/null
+printf 'must-not-run'
+"#,
+    );
+
+    let mut sandbox = ProcessSandbox::new();
+    sandbox.enter_cwd(tmp.path()).runtime_root(".fkst/runtime");
+    sandbox.prepend_path(&bin_dir);
+    sandbox.set_env(CODEX_WORKER_BIN_ENV, framework_bin());
+    sandbox.runtime_log_dir(tmp.path().join("runtime"));
+    let (_lock, _guard) = sandbox.enter();
+
+    let lua = Lua::new();
+    register(&lua).unwrap();
+    let spawn: mlua::Function = lua.globals().get("spawn_codex_sync").unwrap();
+    let first_opts = lua_opts(&lua, "stale lock");
+    first_opts
+        .set("worktree", worktree.to_string_lossy().into_owned())
+        .unwrap();
+    first_opts.set("dedup_key", "lock-timeout").unwrap();
+    first_opts.set("timeout", 30).unwrap();
+
+    let first: Table = spawn.call(first_opts).unwrap();
+    assert_eq!(first.get::<String>("stdout").unwrap(), "must-not-run");
+
+    let adoption_dir = tmp.path().join(".fkst/runtime/logs/codex-adoption");
+    let adoption_key_dir = std::fs::read_dir(&adoption_dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| path.is_dir())
+        .expect("adoption key dir");
+    let lock_file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(adoption_key_dir.join("run.lock"))
+        .unwrap();
+    flock(lock_file.as_raw_fd(), FlockArg::LockExclusiveNonblock).unwrap();
+    std::fs::remove_file(adoption_key_dir.join("status.json")).unwrap();
+
+    let second_opts = lua_opts(&lua, "stale lock");
+    second_opts
+        .set("worktree", worktree.to_string_lossy().into_owned())
+        .unwrap();
+    second_opts.set("dedup_key", "lock-timeout").unwrap();
+    second_opts.set("timeout", 1).unwrap();
+    let started = std::time::Instant::now();
+    let second: Table = spawn.call(second_opts).unwrap();
+
+    assert!(started.elapsed() < Duration::from_secs(5));
+    assert_eq!(second.get::<i64>("exit_code").unwrap(), 124);
+    assert_eq!(second.get::<String>("error_kind").unwrap(), "timeout");
+    assert!(second.get::<String>("error").unwrap().contains("timed out"));
 }
 
 #[cfg(unix)]
