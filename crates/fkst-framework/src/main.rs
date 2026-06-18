@@ -473,6 +473,7 @@ fn run_pipeline(
         RaiseAuthority::new(declared_produces),
         Some(roots.clone()),
         graph_json_authorized,
+        raised_auth_token.clone(),
     )?;
 
     let exit_code = match mlua_init::run_dept_with_require_roots(

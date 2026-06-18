@@ -57,6 +57,7 @@ pub(crate) fn run_tests(
             Some(mock_commands.clone()),
             Some(roots.clone()),
             false,
+            None,
         )
         .with_context(|| format!("register SDK for {}", relpath))?;
         register_test_sdk(
@@ -586,6 +587,7 @@ fn run_department(
         Some(mock_commands),
         Some(roots.clone()),
         graph_json_authorized,
+        None,
     )?;
     if let Some(coverage) = &coverage {
         coverage.install(&dept_lua)?;

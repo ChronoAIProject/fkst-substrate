@@ -142,6 +142,7 @@ fn check_sdk_registration(host_root: &std::path::Path) -> Result<()> {
         crate::raise::RaiseAuthority::new(Default::default()),
         None,
         false,
+        None,
     )
     .context("register framework SDK")?;
     lua.load(
