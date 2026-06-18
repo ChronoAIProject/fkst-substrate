@@ -27,6 +27,7 @@ use crate::config_registry::{ConfigContext, ConfigKey};
 use crate::external_command::{
     format_command, MockCommandInvocation, MockCommandPlan, MockCommandResult, MockCommandState,
 };
+use crate::raise::RaiseBuffer;
 use crate::runtime_context;
 
 pub(crate) const CODEX_PERMIT_SLOTS_ENV: &str = "FKST_CODEX_PERMIT_SLOTS";
@@ -306,8 +307,18 @@ pub fn register(
     host_root: &Path,
     config: ConfigContext,
     dept: Option<String>,
+    raise_buf: RaiseBuffer,
+    raised_auth_token: Option<String>,
 ) -> Result<()> {
-    register_with_runner(lua, host_root, config, dept, None)
+    register_with_runner(
+        lua,
+        host_root,
+        config,
+        dept,
+        None,
+        raise_buf,
+        raised_auth_token,
+    )
 }
 
 pub(crate) fn register_with_runner(
@@ -316,6 +327,8 @@ pub(crate) fn register_with_runner(
     config: ConfigContext,
     dept: Option<String>,
     runner: Option<MockCommandState>,
+    raise_buf: RaiseBuffer,
+    raised_auth_token: Option<String>,
 ) -> Result<()> {
     let owner_id = NEXT_PIPELINE_OWNER_ID.fetch_add(1, Ordering::Relaxed);
     let next_task_id = Arc::new(AtomicU64::new(1));
@@ -323,15 +336,19 @@ pub(crate) fn register_with_runner(
     let config = Arc::new(config);
     let dept = Arc::new(dept);
     let runner = Arc::new(runner);
+    let raised_auth_token = Arc::new(raised_auth_token);
 
     lua.globals().set("spawn_codex_sync", {
         let host_root = Arc::clone(&host_root);
         let config = Arc::clone(&config);
         let dept = Arc::clone(&dept);
         let runner = Arc::clone(&runner);
+        let raise_buf = raise_buf.clone();
+        let raised_auth_token = Arc::clone(&raised_auth_token);
         lua.create_function(move |lua, opts: Table| {
             crate::process_tree::ensure_supervisor_parent_alive()?;
             let request = codex_request_from_opts(opts, dept.as_deref().map(str::to_string));
+            flush_raises_before_sync_codex(&raise_buf, raised_auth_token.as_deref());
             run_codex_request(request, &host_root, &config, runner.as_ref().as_ref())?
                 .into_lua_table(lua)
         })?
@@ -379,6 +396,12 @@ pub(crate) fn register_with_runner(
     })?;
     lua.globals().set("fkst", fkst)?;
     Ok(())
+}
+
+fn flush_raises_before_sync_codex(raise_buf: &RaiseBuffer, raised_auth_token: Option<&str>) {
+    if let Some(token) = raised_auth_token {
+        raise_buf.drain_emit_authenticated_stdout(token);
+    }
 }
 
 // the same input names an overall wall-clock timeout with a bounded default.

@@ -478,10 +478,7 @@ fn supervisor_framework_completes_release_probe_raised_cycle() {
             child_log.contains("DEPT=release_probe\n"),
             "log={child_log}"
         );
-        assert!(
-            child_log.contains("RAISED_AUTH=enabled"),
-            "log={child_log}"
-        );
+        assert!(child_log.contains("RAISED_AUTH=enabled"), "log={child_log}");
         assert!(child_log.contains("EXIT=0\n"), "log={child_log}");
     }
 
