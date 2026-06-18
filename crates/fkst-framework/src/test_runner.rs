@@ -10,13 +10,31 @@ use crate::external_command::{
     CommandCassetteMode, CommandCassetteOptions, CommandCassetteRedaction, MockCommandResult,
     MockCommandState,
 };
+use crate::lua_coverage::LuaCoverage;
 use crate::path_resolver::PackageRoots;
 use crate::raise::RaiseBuffer;
 
-pub(crate) fn run_tests(roots: PackageRoots, report_json: Option<PathBuf>) -> Result<i32> {
+pub(crate) fn run_tests(
+    roots: PackageRoots,
+    report_json: Option<PathBuf>,
+    coverage_dir: Option<PathBuf>,
+) -> Result<i32> {
     let files = discover_test_files(&roots)?;
     let _supervisor_pid_guard = TestModeSupervisorPidGuard::remove();
     let cache = TestRunCache::new(roots.clone());
+    let coverage = coverage_dir
+        .as_ref()
+        .map(|_| {
+            LuaCoverage::new(
+                roots
+                    .graph_roots()
+                    .into_iter()
+                    .map(|root| root.root)
+                    .collect::<Vec<_>>(),
+            )
+        })
+        .transpose()
+        .context("initialize Lua coverage")?;
     let mut passed = 0usize;
     let mut failed = 0usize;
     let mut report = TestReport::new();
@@ -47,10 +65,16 @@ pub(crate) fn run_tests(roots: PackageRoots, report_json: Option<PathBuf>) -> Re
             file.owner_root.clone(),
             file.owner_namespace.clone(),
             mock_commands.clone(),
+            coverage.clone(),
         )
         .with_context(|| format!("register fkst.test for {}", relpath))?;
+        if let Some(coverage) = &coverage {
+            coverage
+                .install(&lua)
+                .with_context(|| format!("install coverage hook for {}", relpath))?;
+        }
 
-        match load_test_table(&lua, &file.path) {
+        match load_test_table(&lua, &file.path, &file.owner_root) {
             Ok(tests) => {
                 for (name, func) in tests {
                     mock_commands
@@ -93,6 +117,11 @@ pub(crate) fn run_tests(roots: PackageRoots, report_json: Option<PathBuf>) -> Re
     if let Some(path) = report_json {
         write_report_json(&path, &report)
             .with_context(|| format!("write test report {}", path.display()))?;
+    }
+    if let (Some(path), Some(coverage)) = (coverage_dir, coverage) {
+        coverage
+            .write_outputs(&path)
+            .with_context(|| format!("write coverage outputs {}", path.display()))?;
     }
     Ok(if failed == 0 { 0 } else { 1 })
 }
@@ -270,9 +299,11 @@ fn is_test_file(path: &Path) -> bool {
         .is_some_and(|name| name.ends_with("_test.lua"))
 }
 
-fn load_test_table(lua: &Lua, file: &Path) -> Result<Vec<(String, Function)>> {
+fn load_test_table(lua: &Lua, file: &Path, owner_root: &Path) -> Result<Vec<(String, Function)>> {
     let src = std::fs::read_to_string(file).with_context(|| format!("read {}", file.display()))?;
-    let chunk = lua.load(&src).set_name(file.to_string_lossy());
+    let chunk = lua
+        .load(&src)
+        .set_name(crate::lua_coverage::chunk_name(file, owner_root));
     let table: Table = chunk
         .eval()
         .with_context(|| format!("eval {}", file.display()))?;
@@ -297,6 +328,7 @@ fn register_test_sdk(
     owner_root: PathBuf,
     owner_namespace: String,
     mock_commands: MockCommandState,
+    coverage: Option<LuaCoverage>,
 ) -> mlua::Result<()> {
     let globals = lua.globals();
     let fkst = match globals.get::<Value>("fkst")? {
@@ -450,6 +482,7 @@ fn register_test_sdk(
                     path,
                     event,
                     opts,
+                    coverage.clone(),
                 )
             },
         )?
@@ -514,6 +547,7 @@ fn run_department(
     path: String,
     event: Value,
     opts: Option<Table>,
+    coverage: Option<LuaCoverage>,
 ) -> mlua::Result<Table> {
     let opts = DeptRunOptions::from_lua(opts)?;
     let lua_path = resolve_department_path(owner_root, &path);
@@ -550,12 +584,21 @@ fn run_department(
         Some(roots.clone()),
         graph_json_authorized,
     )?;
+    if let Some(coverage) = &coverage {
+        coverage.install(&dept_lua)?;
+    }
 
-    let exit_code = match crate::mlua_init::run_dept_with_package_path_and_chunk_cache(
+    let chunk_cache = if coverage.is_some() {
+        None
+    } else {
+        Some(cache.lua_chunk_cache())
+    };
+    let exit_code = match crate::mlua_init::run_dept_with_package_path_chunk_cache_and_name_root(
         &dept_lua,
         &lua_path,
         &event_json,
-        Some(cache.lua_chunk_cache()),
+        chunk_cache,
+        owner_root,
     ) {
         Ok(()) => 0,
         Err(err) => {
@@ -1084,6 +1127,7 @@ mod tests {
             "departments/worker/main.lua".to_string(),
             first_event,
             None,
+            None,
         )
         .unwrap();
         assert_eq!(first.get::<i64>("exit_code").unwrap(), 0);
@@ -1117,6 +1161,7 @@ mod tests {
             mock_commands.clone(),
             "departments/worker/main.lua".to_string(),
             second_event,
+            None,
             None,
         )
         .unwrap();

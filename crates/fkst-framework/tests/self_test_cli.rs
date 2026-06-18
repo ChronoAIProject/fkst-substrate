@@ -132,6 +132,75 @@ fn self_test_reports_permit_pool_slot_env_failure() {
 }
 
 #[test]
+fn self_test_coverage_runs_lua_tests_and_writes_artifacts() {
+    let tmp = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
+    std::fs::create_dir_all(tmp.path().join("departments/probe")).unwrap();
+    std::fs::create_dir_all(tmp.path().join("tests")).unwrap();
+    std::fs::write(
+        tmp.path().join("departments/probe/main.lua"),
+        r#"
+function pipeline(event)
+  local value = event.payload.value .. "-covered"
+  raise("done", { value = value })
+end
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        tmp.path().join("tests/self_test_coverage_test.lua"),
+        r#"
+local t = fkst.test
+
+return {
+  test_department = function()
+    local result = fkst.test.run_department("departments/probe/main.lua", { payload = { value = "ok" } })
+    t.eq(result.exit_code, 0)
+    t.eq(result.raises[1].payload.value, "ok-covered")
+  end,
+}
+"#,
+    )
+    .unwrap();
+    let coverage_dir = tmp.path().join("coverage");
+
+    let output = Command::new(framework_bin())
+        .arg("--self-test")
+        .arg("--coverage")
+        .arg(&coverage_dir)
+        .env(RUNTIME_ROOT_ENV, ".fkst/runtime")
+        .current_dir(tmp.path())
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let coverage: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(coverage_dir.join("coverage.json")).unwrap())
+            .unwrap();
+    assert!(
+        coverage.get("departments/probe/main.lua").is_some(),
+        "coverage: {coverage}"
+    );
+    assert!(
+        coverage.get("tests/self_test_coverage_test.lua").is_none(),
+        "coverage: {coverage}"
+    );
+    let lcov = std::fs::read_to_string(coverage_dir.join("lcov.info")).unwrap();
+    assert!(
+        lcov.contains("SF:departments/probe/main.lua"),
+        "lcov: {lcov}"
+    );
+    assert!(
+        !lcov.contains("self_test_coverage_test.lua"),
+        "lcov: {lcov}"
+    );
+}
+
+#[test]
 fn run_subcommand_still_executes_pipeline() {
     let tmp = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
     let lua = tmp.path().join("dept.lua");

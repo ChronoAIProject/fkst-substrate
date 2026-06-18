@@ -219,9 +219,9 @@ Pool ledgers live under `FKST_RATE_POOL_ROOT`, default `~/.fkst/rate-pools`. Thi
 当前 `fkst-framework` CLI surface 来自 `crates/fkst-framework/src/main.rs`：
 
 ```text
-fkst-framework --self-test
+fkst-framework --self-test [--coverage <dir>]
 fkst-framework conformance --project-root <path> [--package-root <path> ...]
-fkst-framework test --project-root <path> [--package-root <path> ...] [--report-json <path>]
+fkst-framework test --project-root <path> [--package-root <path> ...] [--report-json <path>] [--coverage <dir>]
 fkst-framework run <lua> --project-root <path> --package-root <path> [--package-root <path> ...] [--owner-namespace <id>] --event <json>
 fkst-framework supervise --project-root <path> --framework-bin <path> [--package-root <path> ...]
 fkst-framework config --project-root <path> [--package-root <path> ...]
@@ -229,6 +229,8 @@ fkst-framework init-package-repo [--ref <substrate-ref>] [--force]
 ```
 
 `--self-test` 运行引擎自检。`conformance` 支持 flat single-root 与 composed multi-root，通过 `--project-root` 和可重复 `--package-root` 形成 host + package graph。`test` 发现 `<ROOT>/departments/*/*_test.lua` 与 `<ROOT>/tests/*_test.lua`；`--report-json <path>` 写 schema 为 `fkst.test.report.v1` 的机器报告，条目身份是 `owner_namespace`、`file`、`name`。stdout 的 `PASS` / `FAIL` / summary 行只是 human / compatibility surface，不是 authoritative inventory。
+
+`--coverage <dir>` is opt-in engine-owned Lua line coverage. It installs an `mlua` line hook only for that test run, writes `<dir>/coverage.json` as `{ "<file>": { "covered_lines": [n] } }`, and writes `<dir>/lcov.info` with line-only `DA` records. It excludes `*_test.lua` and generated `=fkst:<purpose>` chunks, and it names engine-loaded chunks as `@<owner-root-relative-path>` so `debug.source()` maps back to package source files. The surface is line-granularity only; branch/condition coverage and mutation evidence remain outside the engine coverage primitive. Hooks are applied to the main Lua state and threads created through standard `coroutine.create` during coverage runs. Without `--coverage`, no coverage hook is installed. `fkst-framework --self-test --coverage <dir>` runs the normal self-test and then the same Lua test runner against the current directory as a folded host/package root before writing these artifacts.
 
 `run` 执行一个 Lua entrypoint。无 `--owner-namespace` 时，只在单一 package root 可唯一确定 owner namespace 的情况下默认；多个 `--package-root` 时必须传 `--owner-namespace <id>`。当前 `run` 明确拒绝 `FKST_PACKAGE_ROOTS` env；应通过可重复 `--package-root` 传 composed namespace catalog。
 
