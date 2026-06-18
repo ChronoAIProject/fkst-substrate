@@ -18,6 +18,7 @@ use anyhow::{Context, Result};
 use host_conformance::HostConformanceOptions;
 use path_resolver::PackageRoots;
 use serde_json::Value as JsonValue;
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 mod boundary_resource;
@@ -48,6 +49,7 @@ mod sdk_log;
 mod sdk_mark;
 mod sdk_strings;
 mod self_test;
+mod spec_queues;
 mod supervise;
 mod test_runner;
 
@@ -56,7 +58,7 @@ mod test_env {
     pub(crate) static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 }
 
-use raise::RaiseBuffer;
+use raise::{RaiseAuthority, RaiseBuffer, RAISED_AUTH_TOKEN_ENV};
 
 enum CliCommand {
     Run {
@@ -442,6 +444,8 @@ fn run_pipeline(
         eprintln!("[framework] supervisor parent lost before pipeline start");
         return Ok(125);
     }
+    let raised_auth_token = std::env::var(RAISED_AUTH_TOKEN_ENV).ok();
+    std::env::remove_var(RAISED_AUTH_TOKEN_ENV);
     let lua = mlua_init::new_lua();
     let raise_buf = RaiseBuffer::new();
     let owner_root = roots
@@ -452,6 +456,9 @@ fn run_pipeline(
     let require_roots = roots.require_roots_for_owner(owner_root);
     let graph_json_authorized =
         sdk_graph::department_authorized(&roots, owner_root, &lua_path).unwrap_or(false);
+    let declared_produces =
+        department_declared_resolved_produces(&roots, owner_root, &owner_namespace, &lua_path)
+            .with_context(|| format!("resolve raise authority for {}", lua_path.display()))?;
 
     mlua_init::register_framework_sdk(
         &lua,
@@ -459,8 +466,11 @@ fn run_pipeline(
         roots.host_root(),
         owner_root,
         department_name_for_lua(&lua_path, owner_root, &owner_namespace),
-        roots.name_resolver(),
+        roots
+            .name_resolver()
+            .with_recorded_only_queues(declared_produces.clone()),
         owner_namespace.clone(),
+        RaiseAuthority::new(declared_produces),
         Some(roots.clone()),
         graph_json_authorized,
     )?;
@@ -478,8 +488,34 @@ fn run_pipeline(
         }
     };
 
-    raise_buf.emit_stdout();
+    if let Some(token) = raised_auth_token {
+        raise_buf.emit_authenticated_stdout(&token);
+    } else {
+        raise_buf.emit_stdout();
+    }
     Ok(exit_code)
+}
+
+fn department_declared_resolved_produces(
+    roots: &PackageRoots,
+    owner_root: &Path,
+    owner_namespace: &str,
+    lua_path: &Path,
+) -> Result<BTreeSet<String>> {
+    let lua_path = lua_path
+        .canonicalize()
+        .with_context(|| format!("canonicalize {}", lua_path.display()))?;
+    let require_roots = roots.require_roots_for_owner(owner_root);
+    let package_path = mlua_init::package_roots_path(require_roots.iter().map(PathBuf::as_path));
+    spec_queues::declared_resolved_produces(
+        roots,
+        owner_namespace,
+        owner_root,
+        &lua_path,
+        &package_path,
+        &mlua_init::LuaChunkCache::default(),
+    )
+    .map_err(anyhow::Error::from)
 }
 
 fn department_name_for_lua(

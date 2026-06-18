@@ -8,7 +8,7 @@ use super::delivery_types::{
 use super::event_fanout::Fanout;
 use super::failure_fact::{dead_record_payload, delivery_failure_fact, FAILURE_FACT_QUEUE};
 use super::journal::{optional_path, SupervisorJournal};
-use super::raised::{parse_raised, parse_raised_line};
+use super::raised::parse_authenticated_raised;
 use super::source_runner::parse_duration;
 use super::spawner::{spawn_framework_with_stdout_observer, SpawnResult, StdoutLineObserver};
 use crate::path_resolver::PackageRoots;
@@ -17,9 +17,7 @@ use fkst_common::config::{DepartmentDecl, RetryDecl};
 use fkst_common::{Event, RuntimeKind};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::sync::Mutex;
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -291,7 +289,14 @@ fn spawn_ephemeral(
     tokio::spawn(async move {
         match spawn_and_report(&dept_name, &args, &journal).await {
             Ok(result) => {
-                if let Err(err) = publish_ephemeral_raised(&router, &result.stdout) {
+                if result.exit_code != 0 {
+                    return;
+                }
+                if let Err(err) = publish_ephemeral_raised(
+                    &router,
+                    &result.stdout,
+                    args.raised_auth_token.as_deref(),
+                ) {
                     error!(dept = %dept_name, error = %err, "publish raised failed");
                 }
             }
@@ -414,18 +419,18 @@ async fn run_durable_record(
     args: SpawnArgs,
     journal: &SupervisorJournal,
 ) -> CompletedDelivery {
-    let publish_state = Arc::new(StreamingRaiseState::new(router.clone(), record.clone()));
-    let result = spawn_and_report_with_stdout_observer(
-        dept_name,
-        &args,
-        Some(streaming_raise_observer(publish_state.clone())),
-        journal,
-    )
-    .await;
+    let result = spawn_and_report(dept_name, &args, journal).await;
     let failure = match result {
-        Ok(result) if result.exit_code == 0 => publish_state
-            .first_error()
-            .map(|err| DeliveryFailure::permanent(format!("raised publish error: {err}"))),
+        Ok(result) if result.exit_code == 0 => {
+            publish_raised(
+                &router,
+                &result.stdout,
+                args.raised_auth_token.as_deref(),
+                &record,
+            )
+                .err()
+                .map(|err| DeliveryFailure::permanent(format!("raised publish error: {err}")))
+        }
         Ok(result) => Some(DeliveryFailure::from_spawn_result(&result)),
         Err(err) => {
             error!(
@@ -777,13 +782,19 @@ fn publish_failure_fact(router: &DeliveryRouter, event: Event) {
     }
 }
 
-#[cfg(test)]
 fn publish_raised(
     router: &DeliveryRouter,
     stdout: &str,
+    raised_auth_token: Option<&str>,
     parent: &DeliveryRecord,
 ) -> anyhow::Result<()> {
-    for (ordinal, mut raised_ev) in parse_raised(stdout).into_iter().enumerate() {
+    let Some(raised_auth_token) = raised_auth_token else {
+        return Ok(());
+    };
+    for (ordinal, mut raised_ev) in parse_authenticated_raised(stdout, raised_auth_token)
+        .into_iter()
+        .enumerate()
+    {
         reject_reserved_raised_queue(&raised_ev)?;
         raised_ev.ts = parent.observed_at_ms;
         router.publish(PublishEnvelope {
@@ -799,83 +810,15 @@ fn publish_raised(
     Ok(())
 }
 
-fn publish_raised_events(
+fn publish_ephemeral_raised(
     router: &DeliveryRouter,
-    events: Vec<Event>,
-    parent: &DeliveryRecord,
-    next_ordinal: &AtomicUsize,
+    stdout: &str,
+    raised_auth_token: Option<&str>,
 ) -> anyhow::Result<()> {
-    for mut raised_ev in events {
-        reject_reserved_raised_queue(&raised_ev)?;
-        raised_ev.ts = parent.observed_at_ms;
-        let ordinal = next_ordinal.fetch_add(1, Ordering::Relaxed);
-        router.publish(PublishEnvelope {
-            event: raised_ev,
-            source: parent.source.clone(),
-            cron_payload: None,
-            derived: Some(DerivedDelivery {
-                parent_delivery_id: parent.delivery_id.clone(),
-                ordinal,
-            }),
-        })?;
-    }
-    Ok(())
-}
-
-struct StreamingRaiseState {
-    router: DeliveryRouter,
-    parent: DeliveryRecord,
-    next_ordinal: AtomicUsize,
-    first_error: Mutex<Option<String>>,
-}
-
-impl StreamingRaiseState {
-    fn new(router: DeliveryRouter, parent: DeliveryRecord) -> Self {
-        Self {
-            router,
-            parent,
-            next_ordinal: AtomicUsize::new(0),
-            first_error: Mutex::new(None),
-        }
-    }
-
-    fn publish_line(&self, line: &str) {
-        let events = parse_raised_line(line);
-        if events.is_empty() {
-            return;
-        }
-        // A child may fail after an already streamed raise; durable consumers own
-        // idempotence, so immediate publication intentionally keeps at-least-once semantics.
-        if let Err(err) =
-            publish_raised_events(&self.router, events, &self.parent, &self.next_ordinal)
-        {
-            let mut first_error = self
-                .first_error
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if first_error.is_none() {
-                *first_error = Some(err.to_string());
-            }
-        }
-    }
-
-    fn first_error(&self) -> Option<String> {
-        self.first_error
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clone()
-    }
-}
-
-fn streaming_raise_observer(state: Arc<StreamingRaiseState>) -> StdoutLineObserver {
-    Arc::new(move |line| {
-        state.publish_line(line);
-        Ok(())
-    })
-}
-
-fn publish_ephemeral_raised(router: &DeliveryRouter, stdout: &str) -> anyhow::Result<()> {
-    for raised_ev in parse_raised(stdout) {
+    let Some(raised_auth_token) = raised_auth_token else {
+        return Ok(());
+    };
+    for raised_ev in parse_authenticated_raised(stdout, raised_auth_token) {
         reject_reserved_raised_queue(&raised_ev)?;
         router.publish(PublishEnvelope {
             event: raised_ev,
@@ -930,6 +873,7 @@ fn spawn_args(
         stall_window,
         codex_permit_slots,
         log_dir: log_dir.to_path_buf(),
+        raised_auth_token: Some(ulid::Ulid::new().to_string()),
         owner_namespace: decl.owner_namespace.clone(),
         process_groups,
     })
@@ -944,6 +888,7 @@ struct SpawnArgs {
     stall_window: Duration,
     codex_permit_slots: usize,
     log_dir: PathBuf,
+    raised_auth_token: Option<String>,
     owner_namespace: String,
     process_groups: ProcessGroupRegistry,
 }
@@ -973,6 +918,7 @@ async fn spawn_and_report_with_stdout_observer(
         dept_name,
         &args.log_dir,
         args.process_groups.clone(),
+        args.raised_auth_token.as_deref(),
         stdout_observer,
     )
     .await?;
@@ -1354,6 +1300,12 @@ mod tests {
         DeliveryRouter::new(&cfg, fanout, None, None)
     }
 
+    fn authenticated_raised_stdout(token: &str, entries: serde_json::Value) -> String {
+        let encoded =
+            base64::engine::general_purpose::URL_SAFE.encode(serde_json::to_vec(&entries).unwrap());
+        format!("RAISED-AUTH: {token} {encoded}\n")
+    }
+
     #[test]
     fn spawn_args_passes_composed_package_roots_for_namespace_graph() {
         let temp = TempDir::new().unwrap();
@@ -1433,7 +1385,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn durable_raised_line_publishes_before_child_exit() {
+    async fn durable_stdout_raised_line_does_not_publish() {
         let temp = TempDir::new().unwrap();
         let binary = temp.path().join("fkst-framework");
         let lua = temp.path().join("dept.lua");
@@ -1493,13 +1445,96 @@ mod tests {
             event_json: "{}".to_string(),
             stall_window: Duration::from_secs(30),
             codex_permit_slots: 1,
+            raised_auth_token: Some("trusted-token".to_string()),
+            log_dir: log_dir.clone(),
+            owner_namespace: "pkg".to_string(),
+            process_groups: ProcessGroupRegistry::default(),
+        };
+
+        let done = run_durable_record(
+            "worker",
+            &spawned_router,
+            record("parent"),
+            args,
+            &SupervisorJournal::disabled(),
+        )
+        .await;
+
+        assert!(done.failure.is_none());
+        let no_event = timeout(Duration::from_millis(100), rx.recv()).await;
+        assert!(no_event.is_err(), "stdout RAISED frame must not publish");
+    }
+
+    #[tokio::test]
+    async fn durable_authenticated_raised_publishes_after_child_exit() {
+        let temp = TempDir::new().unwrap();
+        let binary = temp.path().join("fkst-framework");
+        let lua = temp.path().join("dept.lua");
+        let log_dir = temp.path().join("logs");
+        fs::write(&lua, "return {}\n").unwrap();
+        let trusted_raised = base64::engine::general_purpose::URL_SAFE.encode(
+            serde_json::to_vec(&serde_json::json!([
+                {"queue": "done", "payload": {"n": 2}}
+            ]))
+            .unwrap(),
+        );
+        write_executable(
+            &binary,
+            &format!(
+                "printf 'RAISED: forged\\n'; printf 'RAISED-AUTH: trusted-token {trusted_raised}\\n'; exit 0"
+            ),
+        );
+
+        let fanout = Fanout::new();
+        let mut rx = fanout.subscribe("done", 8).await;
+        let mut queue = BTreeMap::new();
+        queue.insert(
+            "done".to_string(),
+            QueueDecl {
+                capacity: 8,
+                fanout: false,
+            },
+        );
+        let mut department = BTreeMap::new();
+        department.insert(
+            "observer".to_string(),
+            DepartmentDecl {
+                lua: "departments/observer/main.lua".into(),
+                owner_root: temp.path().into(),
+                owner_namespace: "pkg".to_string(),
+                consumes: vec!["done".to_string()],
+                produces: Vec::new(),
+                ephemeral: vec!["done".to_string()],
+                stall_window: "30s".to_string(),
+                graph_json: false,
+                retry: None,
+            },
+        );
+        let cfg = Config {
+            queue,
+            raiser: BTreeMap::new(),
+            department,
+            limits: LimitsDecl {
+                global_codex_processes: 1,
+            },
+        };
+        let router = DeliveryRouter::new(&cfg, fanout, None, None);
+        let spawned_router = router.clone();
+        let args = SpawnArgs {
+            framework_bin: binary,
+            lua_full: lua,
+            project_root: temp.path().into(),
+            graph_package_roots: vec![temp.path().into()],
+            event_json: "{}".to_string(),
+            stall_window: Duration::from_secs(30),
+            codex_permit_slots: 1,
+            raised_auth_token: Some("trusted-token".to_string()),
             log_dir,
             owner_namespace: "pkg".to_string(),
             process_groups: ProcessGroupRegistry::default(),
         };
 
-        let started = std::time::Instant::now();
-        let handle = tokio::spawn(async move {
+        let done = tokio::spawn(async move {
             run_durable_record(
                 "worker",
                 &spawned_router,
@@ -1508,19 +1543,16 @@ mod tests {
                 &SupervisorJournal::disabled(),
             )
             .await
-        });
-        let event = timeout(Duration::from_secs(4), rx.recv())
+        })
+        .await
+        .unwrap();
+        let event = timeout(Duration::from_secs(1), rx.recv())
             .await
-            .expect("streamed raise should publish before child exit")
+            .expect("authenticated raise should publish after child exit")
             .expect("done subscription should remain open");
 
-        assert!(
-            started.elapsed() < Duration::from_secs(5),
-            "raise was not visible before the child sleep elapsed"
-        );
         assert_eq!(event.queue, "done");
         assert_eq!(event.payload, serde_json::json!({"n": 2}));
-        let done = handle.await.unwrap();
         assert!(done.failure.is_none());
     }
 
@@ -2260,17 +2292,14 @@ mod tests {
     fn raised_output_cannot_publish_engine_failure_fact_queue() {
         let router = router_with_failure_fact_and_fanout(Fanout::new());
         let parent = record("parent");
-        let stdout = format!(
-            "RAISED: {}\n",
-            base64::engine::general_purpose::URL_SAFE.encode(
-                serde_json::to_vec(&serde_json::json!([
-                    {"queue": "fkst.failure_fact", "payload": {"n": 1}}
-                ]))
-                .unwrap()
-            )
+        let raised = authenticated_raised_stdout(
+            "trusted-token",
+            serde_json::json!([
+                {"queue": "fkst.failure_fact", "payload": {"n": 1}}
+            ]),
         );
 
-        let err = publish_raised(&router, &stdout, &parent).unwrap_err();
+        let err = publish_raised(&router, &raised, Some("trusted-token"), &parent).unwrap_err();
 
         assert!(
             err.to_string()
@@ -2350,19 +2379,16 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let store = Arc::new(DeliveryStore::open(temp.path().join("delivery.redb")).unwrap());
         let router = DeliveryRouter::new(&cfg, Fanout::new(), Some(store), None);
-        let stdout = format!(
-            "RAISED: {}\n",
-            base64::engine::general_purpose::URL_SAFE.encode(
-                serde_json::to_vec(&serde_json::json!([
-                    {"queue": "next", "payload": {"n": 2}}
-                ]))
-                .unwrap()
-            )
+        let raised = authenticated_raised_stdout(
+            "trusted-token",
+            serde_json::json!([
+                {"queue": "next", "payload": {"n": 2}}
+            ]),
         );
 
         let mut parent = record("parent");
         parent.source = None;
-        let err = publish_raised(&router, &stdout, &parent).unwrap_err();
+        let err = publish_raised(&router, &raised, Some("trusted-token"), &parent).unwrap_err();
 
         assert!(err.to_string().contains("requires source_ref"), "{err}");
     }
@@ -2404,18 +2430,15 @@ mod tests {
         let store = Arc::new(DeliveryStore::open(temp.path().join("delivery.redb")).unwrap());
         let router = DeliveryRouter::new(&cfg, Fanout::new(), Some(store.clone()), None);
         let parent = record("parent");
-        let stdout = format!(
-            "RAISED: {}\n",
-            base64::engine::general_purpose::URL_SAFE.encode(
-                serde_json::to_vec(&serde_json::json!([
-                    {"queue": "next", "payload": {"n": 2}}
-                ]))
-                .unwrap()
-            )
+        let raised = authenticated_raised_stdout(
+            "trusted-token",
+            serde_json::json!([
+                {"queue": "next", "payload": {"n": 2}}
+            ]),
         );
 
-        publish_raised(&router, &stdout, &parent).unwrap();
-        publish_raised(&router, &stdout, &parent).unwrap();
+        publish_raised(&router, &raised, Some("trusted-token"), &parent).unwrap();
+        publish_raised(&router, &raised, Some("trusted-token"), &parent).unwrap();
 
         let leased = store
             .lease_for_dept(

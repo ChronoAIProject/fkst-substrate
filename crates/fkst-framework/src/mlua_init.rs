@@ -11,7 +11,7 @@ use std::time::SystemTime;
 use crate::config_registry::ConfigContext;
 use crate::external_command::MockCommandState;
 use crate::path_resolver::{package_root_path, NameResolver, PackageRoots};
-use crate::raise::RaiseBuffer;
+use crate::raise::{RaiseAuthority, RaiseBuffer};
 
 /// Create a Lua state with stdlib enabled.
 pub fn new_lua() -> Lua {
@@ -27,6 +27,7 @@ pub fn register_framework_sdk(
     dept: Option<String>,
     resolver: NameResolver,
     owner_namespace: String,
+    raise_authority: RaiseAuthority,
     graph_roots: Option<PackageRoots>,
     graph_json_authorized: bool,
 ) -> mlua::Result<()> {
@@ -43,7 +44,7 @@ pub fn register_framework_sdk(
     crate::sdk_mark::register(lua, host_root)?;
     crate::sdk_cache::register(lua, host_root)?;
     crate::sdk_codex::register(lua, host_root, config, dept)?;
-    crate::raise::register(lua, raise_buf, resolver, owner_namespace)?;
+    crate::raise::register(lua, raise_buf, resolver, owner_namespace, raise_authority)?;
     Ok(())
 }
 
@@ -55,6 +56,7 @@ pub(crate) fn register_framework_sdk_with_runner(
     dept: Option<String>,
     resolver: NameResolver,
     owner_namespace: String,
+    raise_authority: RaiseAuthority,
     runner: Option<MockCommandState>,
     graph_roots: Option<PackageRoots>,
     graph_json_authorized: bool,
@@ -72,7 +74,7 @@ pub(crate) fn register_framework_sdk_with_runner(
     crate::sdk_mark::register(lua, host_root)?;
     crate::sdk_cache::register(lua, host_root)?;
     crate::sdk_codex::register_with_runner(lua, host_root, config, dept, runner)?;
-    crate::raise::register(lua, raise_buf, resolver, owner_namespace)?;
+    crate::raise::register(lua, raise_buf, resolver, owner_namespace, raise_authority)?;
     Ok(())
 }
 

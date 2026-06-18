@@ -1,15 +1,19 @@
-//! SDK: `raise(queue_name, payload)` — buffers in-process; emit RAISED stdout line on exit.
+//! SDK: `raise(queue_name, payload)` — buffers in-process for trusted parent transport.
 //!
 //! Raise is best-effort, at-most-once, and derived-only. Durable intent goes through filesystem.
-//! Emit format = `RAISED: <base64-url-encoded JSON [{queue, payload}, ...]>`.
+//! External direct `run` compatibility still emits `RAISED: <base64-url-encoded JSON
+//! [{queue, payload}, ...]>` when no supervise authentication token is supplied.
 
 use base64::Engine;
 use mlua::{Lua, LuaSerdeExt, Result};
 use serde::Serialize;
 use serde_json::Value as JsonValue;
+use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex};
 
 use crate::path_resolver::NameResolver;
+
+pub(crate) const RAISED_AUTH_TOKEN_ENV: &str = "FKST_RAISED_AUTH_TOKEN";
 
 #[derive(Serialize, Debug, Clone)]
 struct RaisedEntry {
@@ -19,6 +23,26 @@ struct RaisedEntry {
 
 #[derive(Clone, Default)]
 pub struct RaiseBuffer(Arc<Mutex<Vec<RaisedEntry>>>);
+
+#[derive(Clone, Debug)]
+pub(crate) struct RaiseAuthority {
+    allowed_queues: BTreeSet<String>,
+}
+
+impl RaiseAuthority {
+    pub(crate) fn new(allowed_queues: BTreeSet<String>) -> Self {
+        Self { allowed_queues }
+    }
+
+    fn ensure_allowed(&self, queue: &str) -> Result<()> {
+        if self.allowed_queues.contains(queue) {
+            return Ok(());
+        }
+        Err(mlua::Error::external(format!(
+            "raise queue `{queue}` is not declared in department M.spec.produces"
+        )))
+    }
+}
 
 impl RaiseBuffer {
     pub fn new() -> Self {
@@ -38,14 +62,25 @@ impl RaiseBuffer {
         self.0.lock().unwrap().push(RaisedEntry { queue, payload });
     }
 
-    pub fn emit_stdout(&self) {
+    pub fn encoded_frame(&self) -> Option<String> {
         let entries = self.0.lock().unwrap().clone();
         if entries.is_empty() {
-            return;
+            return None;
         }
         let json = serde_json::to_string(&entries).expect("serialize raise entries");
-        let b64 = base64::engine::general_purpose::URL_SAFE.encode(json.as_bytes());
-        println!("RAISED: {}", b64);
+        Some(base64::engine::general_purpose::URL_SAFE.encode(json.as_bytes()))
+    }
+
+    pub fn emit_stdout(&self) {
+        if let Some(b64) = self.encoded_frame() {
+            println!("RAISED: {}", b64);
+        }
+    }
+
+    pub(crate) fn emit_authenticated_stdout(&self, token: &str) {
+        if let Some(b64) = self.encoded_frame() {
+            println!("RAISED-AUTH: {token} {b64}");
+        }
     }
 }
 
@@ -54,6 +89,7 @@ pub fn register(
     buf: RaiseBuffer,
     resolver: NameResolver,
     owner_namespace: String,
+    authority: RaiseAuthority,
 ) -> Result<()> {
     let buf_clone = buf.clone();
     lua.globals().set(
@@ -63,6 +99,7 @@ pub fn register(
             let queue = resolver
                 .resolve(&owner_namespace, &queue)
                 .map_err(mlua::Error::external)?;
+            authority.ensure_allowed(&queue)?;
             let p_json: JsonValue = lua.from_value(payload).unwrap_or(JsonValue::Null);
             buf_clone.push(queue, p_json);
             Ok(())
@@ -83,6 +120,7 @@ mod tests {
             buf,
             NameResolver::new(["pkg".to_string()]),
             "pkg".to_string(),
+            RaiseAuthority::new(BTreeSet::from(["done".to_string()])),
         )
         .unwrap();
     }
@@ -96,6 +134,7 @@ mod tests {
             buf.clone(),
             NameResolver::new(["pkg".to_string()]),
             "pkg".to_string(),
+            RaiseAuthority::new(BTreeSet::from(["done".to_string()])),
         )
         .unwrap();
         lua.load(r#"raise("done", {n=42})"#).exec().unwrap();
@@ -114,6 +153,7 @@ mod tests {
             buf.clone(),
             NameResolver::new(["pkg".to_string()]),
             "pkg".to_string(),
+            RaiseAuthority::new(BTreeSet::from(["q1".to_string(), "q2".to_string()])),
         )
         .unwrap();
         lua.load(
@@ -216,6 +256,7 @@ mod tests {
             buf.clone(),
             NameResolver::new(["pkg".to_string(), "host".to_string()]),
             "pkg".to_string(),
+            RaiseAuthority::new(BTreeSet::from(["pkg.done".to_string()])),
         )
         .unwrap();
 
@@ -246,6 +287,7 @@ mod tests {
             buf.clone(),
             NameResolver::new(["pkg".to_string(), "host".to_string()]),
             "pkg".to_string(),
+            RaiseAuthority::new(BTreeSet::from(["pkg.done".to_string()])),
         )
         .unwrap();
 
@@ -255,6 +297,30 @@ mod tests {
             .unwrap_err();
 
         assert!(err.to_string().contains("unknown namespace"), "got: {err}");
+        let entries = buf.0.lock().unwrap();
+        assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn raise_rejects_resolved_queue_not_in_authority() {
+        let lua = Lua::new();
+        let buf = RaiseBuffer::new();
+        register(
+            &lua,
+            buf.clone(),
+            NameResolver::new(["pkg".to_string(), "host".to_string()]),
+            "pkg".to_string(),
+            RaiseAuthority::new(BTreeSet::from(["pkg.done".to_string()])),
+        )
+        .unwrap();
+
+        let err = lua.load(r#"raise("other", {})"#).exec().unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("raise queue `pkg.other` is not declared"),
+            "got: {err}"
+        );
         let entries = buf.0.lock().unwrap();
         assert!(entries.is_empty());
     }

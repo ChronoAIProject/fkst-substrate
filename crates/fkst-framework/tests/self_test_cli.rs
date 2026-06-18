@@ -139,10 +139,13 @@ fn self_test_coverage_runs_lua_tests_and_writes_artifacts() {
     std::fs::write(
         tmp.path().join("departments/probe/main.lua"),
         r#"
+local M = {}
+M.spec = { produces = { "done" } }
 function pipeline(event)
   local value = event.payload.value .. "-covered"
   raise("done", { value = value })
 end
+return M
 "#,
     )
     .unwrap();
@@ -255,6 +258,8 @@ fn run_project_root_controls_host_facts_and_git_sdk_when_cwd_differs() {
         &lua,
         format!(
             r#"
+local M = {{}}
+M.spec = {{ produces = {{ "done" }} }}
 function pipeline(event)
     local count = git_log_count("sdk git host fact regression", "1970-01-01T00:00:00Z")
     local worktree = setup_worktree("host-root-test")
@@ -264,6 +269,7 @@ function pipeline(event)
     f:close()
     raise("done", {{ count = count }})
 end
+return M
 "#,
             witness.to_string_lossy()
         ),

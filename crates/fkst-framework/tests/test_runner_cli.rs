@@ -202,6 +202,43 @@ return M
 }
 
 #[test]
+fn production_run_uses_same_resolved_produces_contract_as_test() {
+    let temp = tempfile::tempdir().unwrap();
+    let package = temp.path().join("pkg");
+    fs::create_dir_all(package.join("departments/probe")).unwrap();
+    let probe = package.join("departments/probe/main.lua");
+    fs::write(
+        &probe,
+        r#"
+local M = {}
+M.spec = { produces = { "pkg.seen" } }
+function pipeline(event)
+  raise("pkg.seen", { value = event.payload.value })
+end
+return M
+"#,
+    )
+    .unwrap();
+
+    let output = run_command(&package, &probe)
+        .arg("--package-root")
+        .arg(&package)
+        .output()
+        .unwrap();
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stdout: {}\nstderr: {}",
+        stdout(&output),
+        stderr(&output)
+    );
+    let raises = raised_entries(&output);
+    assert_eq!(raises[0]["queue"], "pkg.seen");
+    assert_eq!(raises[0]["payload"]["value"], "ok");
+}
+
+#[test]
 fn production_run_resolves_owner_locale_catalog() {
     let temp = tempfile::tempdir().unwrap();
     let host = temp.path().join("host");
@@ -223,9 +260,12 @@ fn production_run_resolves_owner_locale_catalog() {
     fs::write(
         &probe,
         r#"
+local M = {}
+M.spec = { produces = { "checked" } }
 function pipeline(event)
   raise("checked", { message = t("result.summary", { name = event.payload.value }) })
 end
+return M
 "#,
     )
     .unwrap();
@@ -266,12 +306,15 @@ fn production_run_composed_namespace_roots_do_not_authorize_sibling_require() {
     fs::write(
         &probe,
         r#"
+local M = {}
+M.spec = { produces = { "checked" } }
 function pipeline(event)
   local ok, err = pcall(require, "sibling_only")
   assert(not ok, "sibling module leaked into owner package.path")
   assert(string.find(err, "module 'sibling_only' not found", 1, true), err)
   raise("checked", { isolated = true })
 end
+return M
 "#,
     )
     .unwrap();
@@ -672,10 +715,13 @@ fn test_runner_isolates_each_test_file_to_its_owner_root() {
         fs::write(
             package.join("departments/probe/main.lua"),
             r#"
+local M = {}
+M.spec = { produces = { "seen" } }
 local core = require("core")
 function pipeline(event)
   raise("seen", { value = core.value, expected = event.payload.expected })
 end
+return M
 "#,
         )
         .unwrap();
@@ -741,10 +787,13 @@ fn test_runner_host_department_uses_package_standard_asset() {
     fs::write(
         host.path().join("departments/probe/main.lua"),
         r#"
+local M = {}
+M.spec = { produces = { "seen" } }
 local standard = require("fkst.standard_asset")
 function pipeline(event)
   raise("seen", { value = standard.value() })
 end
+return M
 "#,
     )
     .unwrap();
@@ -1705,6 +1754,8 @@ fn test_coverage_writes_json_and_lcov_for_production_lua_lines() {
     fs::write(
         host.path().join("departments/probe/main.lua"),
         r#"
+local M = {}
+M.spec = { produces = { "done" } }
 local helper = require("helper")
 
 function pipeline(event)
@@ -1716,6 +1767,7 @@ function pipeline(event)
   assert(ok, err)
   raise("done", { value = value })
 end
+return M
 "#,
     )
     .unwrap();
@@ -1802,10 +1854,13 @@ fn test_runner_mocks_external_commands_fail_closed_and_isolates_tests() {
     fs::write(
         host.path().join("departments/probe/main.lua"),
         r#"
+local M = {}
+M.spec = { produces = { "seen" } }
 function pipeline(event)
   local result = exec_sync(event.payload.cmd)
   raise("seen", { stdout = result.stdout, exit_code = result.exit_code })
 end
+return M
 "#,
     )
     .unwrap();
@@ -2123,10 +2178,13 @@ fn production_run_does_not_require_from_host_cwd_when_owner_lacks_module() {
     fs::write(
         &probe,
         r#"
+local M = {}
+M.spec = { produces = { "seen" } }
 local core = require("core")
 function pipeline(event)
   raise("seen", { value = core.value })
 end
+return M
 "#,
     )
     .unwrap();
@@ -2166,10 +2224,13 @@ fn production_exec_sync_returns_typed_boundary_error_class() {
     fs::write(
         &probe,
         r#"
+local M = {}
+M.spec = { produces = { "seen" } }
 function pipeline(event)
   local result = exec_sync(event.payload.cmd)
   raise("seen", { exit_code = result.exit_code, error_class = result.error_class })
 end
+return M
 "#,
     )
     .unwrap();
@@ -2244,10 +2305,13 @@ fn run_accepts_host_owner_with_multiple_package_root_flags_as_require_roots() {
     fs::write(
         &probe,
         r#"
+local M = {}
+M.spec = { produces = { "seen" } }
 local core = require("core")
 function pipeline(event)
   raise("seen", { value = core.value })
 end
+return M
 "#,
     )
     .unwrap();
@@ -2316,10 +2380,13 @@ fn run_single_package_entrypoints_are_equivalent() {
     fs::write(
         &probe,
         r#"
+local M = {}
+M.spec = { produces = { "seen" } }
 local core = require("core")
 function pipeline(event)
   raise("seen", { core = core.value, input = event.payload.value })
 end
+return M
 "#,
     )
     .unwrap();
