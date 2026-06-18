@@ -25,6 +25,7 @@ mod config_registry;
 mod external_command;
 mod host_conformance;
 mod init_package_repo;
+mod lua_coverage;
 mod mlua_init;
 mod path_resolver;
 mod process_tree;
@@ -82,7 +83,7 @@ enum CliCommand {
     Test(TestCli),
     InitPackageRepo(init_package_repo::InitPackageRepoOptions),
     CodexWorker(sdk_codex::CodexWorkerOptions),
-    SelfTest,
+    SelfTest(SelfTestCli),
 }
 
 fn parse_args() -> Result<CliCommand> {
@@ -94,10 +95,8 @@ fn parse_args() -> Result<CliCommand> {
         )
     })?;
     if sub == "--self-test" {
-        if let Some(other) = args_iter.next() {
-            anyhow::bail!("unknown --self-test option: {}", other);
-        }
-        return Ok(CliCommand::SelfTest);
+        let rest = args_iter.collect::<Vec<_>>();
+        return Ok(CliCommand::SelfTest(parse_self_test_args(&rest)?));
     }
     if sub == "__codex-worker" {
         return Ok(CliCommand::CodexWorker(sdk_codex::parse_worker_args(
@@ -235,6 +234,12 @@ struct ConfigCli {
 struct TestCli {
     roots: PackageRoots,
     report_json: Option<PathBuf>,
+    coverage: Option<PathBuf>,
+}
+
+#[derive(Clone, Debug)]
+struct SelfTestCli {
+    coverage: Option<PathBuf>,
 }
 
 fn parse_conformance_args(args: &[String]) -> Result<HostConformanceOptions> {
@@ -297,6 +302,7 @@ fn parse_test_args(args: &[String]) -> Result<TestCli> {
     let mut project_root: Option<PathBuf> = None;
     let mut package_roots: Vec<PathBuf> = Vec::new();
     let mut report_json: Option<PathBuf> = None;
+    let mut coverage: Option<PathBuf> = None;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -318,6 +324,19 @@ fn parse_test_args(args: &[String]) -> Result<TestCli> {
                 i += 1;
                 report_json = Some(next_value(args, i, "--report-json")?.into());
             }
+            "--coverage" => {
+                if coverage.is_some() {
+                    anyhow::bail!("duplicate --coverage");
+                }
+                i += 1;
+                coverage = Some(next_value(args, i, "--coverage")?.into());
+            }
+            arg if arg.starts_with("--coverage=") => {
+                if coverage.is_some() {
+                    anyhow::bail!("duplicate --coverage");
+                }
+                coverage = Some(arg["--coverage=".len()..].into());
+            }
             other => anyhow::bail!("unknown test argument: {}", other),
         }
         i += 1;
@@ -327,7 +346,33 @@ fn parse_test_args(args: &[String]) -> Result<TestCli> {
     Ok(TestCli {
         roots: PackageRoots::resolve(root, package_roots)?,
         report_json,
+        coverage,
     })
+}
+
+fn parse_self_test_args(args: &[String]) -> Result<SelfTestCli> {
+    let mut coverage: Option<PathBuf> = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--coverage" => {
+                if coverage.is_some() {
+                    anyhow::bail!("duplicate --coverage");
+                }
+                i += 1;
+                coverage = Some(next_value(args, i, "--coverage")?.into());
+            }
+            arg if arg.starts_with("--coverage=") => {
+                if coverage.is_some() {
+                    anyhow::bail!("duplicate --coverage");
+                }
+                coverage = Some(arg["--coverage=".len()..].into());
+            }
+            other => anyhow::bail!("unknown --self-test option: {}", other),
+        }
+        i += 1;
+    }
+    Ok(SelfTestCli { coverage })
 }
 
 fn parse_init_package_repo_args(
@@ -589,11 +634,21 @@ fn run() -> Result<i32> {
             program,
             args,
         } => run_rate_exec(&pool, program, args),
-        CliCommand::Test(options) => test_runner::run_tests(options.roots, options.report_json),
+        CliCommand::Test(options) => {
+            test_runner::run_tests(options.roots, options.report_json, options.coverage)
+        }
         CliCommand::InitPackageRepo(options) => init_package_repo::run(options),
         CliCommand::CodexWorker(options) => sdk_codex::run_codex_worker(options),
-        CliCommand::SelfTest => match self_test::run() {
-            Ok(()) => Ok(0),
+        CliCommand::SelfTest(options) => match self_test::run() {
+            Ok(()) => {
+                if let Some(coverage) = options.coverage {
+                    let cwd = std::env::current_dir().context("read current directory")?;
+                    let roots = PackageRoots::resolve(&cwd, vec![cwd.clone()])?;
+                    test_runner::run_tests(roots, None, Some(coverage))
+                } else {
+                    Ok(0)
+                }
+            }
             Err(err) => {
                 eprintln!("SELF_TEST_FAILED:{}: {:#}", err.class(), err.source());
                 Ok(2)

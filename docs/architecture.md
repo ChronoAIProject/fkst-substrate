@@ -80,8 +80,8 @@ fkst-framework supervise --project-root <path> [--package-root <path> ...] --fra
 fkst-framework conformance --project-root <path> [--package-root <path> ...]
 fkst-framework config --project-root <path> [--package-root <path> ...]
 fkst-framework boundary-resources
-fkst-framework test --project-root <path> [--package-root <path> ...] [--report-json <path>]
-fkst-framework --self-test
+fkst-framework test --project-root <path> [--package-root <path> ...] [--report-json <path>] [--coverage <dir>]
+fkst-framework --self-test [--coverage <dir>]
 ```
 
 `fkst-supervisor` 没有业务子命令；它只把当前目录作为 host root，启动 `fkst-framework supervise`。
@@ -113,6 +113,10 @@ runner 不全树递归，不扫描 `raisers/` 或 `fkst/`。每个测试文件�
 ```
 
 失败条目额外包含 `error`。加载或 eval 测试文件失败时，报告条目使用 `name = "<load>"` 且计入 failed。报告条目来自 Rust 侧枚举出的测试文件和 `test_*` key；每个条目的身份是 `owner_namespace`、`file`、`name` 三元组，不提供可被分隔符碰撞污染的拼接 `id`。Lua `print` 不能向报告注入伪造测试；stdout 的 `PASS` / `FAIL` / summary 行保留为 legacy human / compatibility surface，不是 authoritative machine channel。
+
+`--coverage <dir>` is an opt-in engine-owned Lua line coverage mode for the test runner. It installs an `mlua` `HookTriggers::EVERY_LINE` hook only for the covered run, names engine-loaded file chunks as `@<owner-root-relative-path>`, and writes `<dir>/coverage.json` plus `<dir>/lcov.info` after the full run. `coverage.json` has the shape `{ "<file>": { "covered_lines": [1, 2] } }`; `lcov.info` emits only `TN`, `SF`, `DA`, and `end_of_record` records. This is honest line coverage only: branch, condition, and mutation evidence are outside this surface. Files ending in `*_test.lua` and generated chunks named `=fkst:<purpose>` are excluded from production coverage. Hooks are also applied to threads created through the standard `coroutine.create` table during coverage runs. Without `--coverage`, no hook is installed and the runner keeps the normal zero-coverage-overhead path.
+
+`fkst-framework --self-test --coverage <dir>` first runs the normal engine self-test, then runs the same Lua test runner against the current directory as the folded host/package root and writes the same coverage artifacts. Plain `--self-test` remains the startup self-test and does not run package Lua tests.
 
 明确非目标：当前 test runner 不向 package author 提供 router、可靠投递或 supervise 的 Lua 原语；不承担 Lua stray-global 或 unused-local lint；不使用随机 sentinel 或专用 fd 分离测试输出；不沙箱恶意 Lua。它的范围是运行受信 package 的 Lua 测试、提供 Rust 枚举来源的机器报告，并保持 stdout 兼容面。
 

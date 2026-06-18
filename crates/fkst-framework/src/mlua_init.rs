@@ -112,23 +112,28 @@ pub(crate) struct LuaChunkCache {
 }
 
 impl LuaChunkCache {
-    pub(crate) fn load_cached_chunk(&self, lua: &Lua, path: &Path) -> Result<()> {
-        let bytecode = self.bytecode_for(path)?;
+    pub(crate) fn load_cached_chunk_with_name(
+        &self,
+        lua: &Lua,
+        path: &Path,
+        owner_root: &Path,
+    ) -> Result<()> {
+        let bytecode = self.bytecode_for(path, owner_root)?;
         lua.load(bytecode.as_slice())
-            .set_name(path.to_string_lossy())
+            .set_name(crate::lua_coverage::chunk_name(path, owner_root))
             .exec()
             .with_context(|| format!("exec {}", path.display()))
     }
 
     pub(crate) fn eval_cached_chunk(&self, lua: &Lua, path: &Path) -> Result<LuaValue> {
-        let bytecode = self.bytecode_for(path)?;
+        let bytecode = self.bytecode_for(path, path)?;
         lua.load(bytecode.as_slice())
             .set_name(path.to_string_lossy())
             .eval()
             .with_context(|| format!("eval {}", path.display()))
     }
 
-    fn bytecode_for(&self, path: &Path) -> Result<Vec<u8>> {
+    fn bytecode_for(&self, path: &Path, owner_root: &Path) -> Result<Vec<u8>> {
         let src =
             std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
         let key = CachedChunkKey::for_path(path, src.as_bytes())?;
@@ -144,7 +149,7 @@ impl LuaChunkCache {
         let lua = new_lua();
         let function = lua
             .load(&src)
-            .set_name(path.to_string_lossy())
+            .set_name(crate::lua_coverage::chunk_name(path, owner_root))
             .into_function()
             .with_context(|| format!("compile {}", path.display()))?;
         let bytecode = function.dump(true);
@@ -216,6 +221,10 @@ pub fn run_dept_with_require_roots<'a>(
     package_roots: impl IntoIterator<Item = &'a Path>,
 ) -> Result<()> {
     let package_roots = package_roots.into_iter().collect::<Vec<_>>();
+    let owner_root = package_roots
+        .first()
+        .copied()
+        .ok_or_else(|| anyhow::anyhow!("department runner requires at least one package root"))?;
     let roots_label = package_roots
         .iter()
         .map(|root| root.display().to_string())
@@ -223,7 +232,7 @@ pub fn run_dept_with_require_roots<'a>(
         .join(";");
     set_package_roots_path(lua, package_roots.iter().copied())
         .with_context(|| format!("set package.path for {}", roots_label))?;
-    run_dept_with_package_path_and_chunk_cache(lua, lua_path, event, None)
+    run_dept_with_package_path_chunk_cache_and_name_root(lua, lua_path, event, None, owner_root)
 }
 
 pub(crate) fn run_dept_with_package_path_and_chunk_cache(
@@ -232,12 +241,24 @@ pub(crate) fn run_dept_with_package_path_and_chunk_cache(
     event: &JsonValue,
     cache: Option<&LuaChunkCache>,
 ) -> Result<()> {
+    run_dept_with_package_path_chunk_cache_and_name_root(lua, lua_path, event, cache, lua_path)
+}
+
+pub(crate) fn run_dept_with_package_path_chunk_cache_and_name_root(
+    lua: &Lua,
+    lua_path: &Path,
+    event: &JsonValue,
+    cache: Option<&LuaChunkCache>,
+    owner_root: &Path,
+) -> Result<()> {
     if let Some(cache) = cache {
-        cache.load_cached_chunk(lua, lua_path)?;
+        cache.load_cached_chunk_with_name(lua, lua_path, owner_root)?;
     } else {
         let src = std::fs::read_to_string(lua_path)
             .with_context(|| format!("read {}", lua_path.display()))?;
-        let chunk = lua.load(&src).set_name(lua_path.to_string_lossy());
+        let chunk = lua
+            .load(&src)
+            .set_name(crate::lua_coverage::chunk_name(lua_path, owner_root));
         chunk
             .exec()
             .with_context(|| format!("exec {}", lua_path.display()))?;
@@ -332,13 +353,17 @@ mod tests {
         let cache = LuaChunkCache::default();
 
         let lua = new_lua();
-        cache.load_cached_chunk(&lua, &main).unwrap();
+        cache
+            .load_cached_chunk_with_name(&lua, &main, dir.path())
+            .unwrap();
         let value: String = lua.globals().get("value").unwrap();
         assert_eq!(value, "first");
 
         std::fs::write(&main, second).unwrap();
         force_mtime(&main, 1_000);
-        cache.load_cached_chunk(&lua, &main).unwrap();
+        cache
+            .load_cached_chunk_with_name(&lua, &main, dir.path())
+            .unwrap();
         let value: String = lua.globals().get("value").unwrap();
 
         assert_eq!(value, "fresh");
@@ -371,6 +396,49 @@ mod tests {
         run_dept_with_package_root(&lua, &main, &serde_json::json!({}), dir.path()).unwrap();
         let called: String = lua.globals().get("called").unwrap();
         assert_eq!(called, "ok");
+    }
+
+    #[test]
+    fn run_dept_names_loaded_chunk_relative_to_package_root() {
+        let dir = TempDir::new().unwrap();
+        std::fs::create_dir_all(dir.path().join("departments/demo")).unwrap();
+        let main = dir.path().join("departments/demo/main.lua");
+        std::fs::write(
+            &main,
+            r#"
+            function pipeline(event)
+                called = true
+            end
+        "#,
+        )
+        .unwrap();
+
+        let lua = new_lua();
+        let sources = Arc::new(Mutex::new(Vec::<String>::new()));
+        let hook_sources = sources.clone();
+        lua.set_hook(mlua::HookTriggers::new().on_calls(), move |_, debug| {
+            if let Some(source) = debug.source().source {
+                if let Ok(mut sources) = hook_sources.lock() {
+                    sources.push(source.into_owned());
+                }
+            }
+            Ok(mlua::VmState::Continue)
+        });
+        run_dept_with_require_roots(&lua, &main, &serde_json::json!({}), [dir.path()]).unwrap();
+        let called: bool = lua.globals().get("called").unwrap();
+        let sources = sources.lock().unwrap();
+
+        assert!(called);
+        assert!(
+            sources
+                .iter()
+                .any(|source| source == "@departments/demo/main.lua"),
+            "sources: {sources:?}"
+        );
+        assert!(
+            sources.iter().all(|source| source != "@"),
+            "sources: {sources:?}"
+        );
     }
 
     #[test]
