@@ -202,6 +202,43 @@ return M
 }
 
 #[test]
+fn production_run_uses_same_resolved_produces_contract_as_test() {
+    let temp = tempfile::tempdir().unwrap();
+    let package = temp.path().join("pkg");
+    fs::create_dir_all(package.join("departments/probe")).unwrap();
+    let probe = package.join("departments/probe/main.lua");
+    fs::write(
+        &probe,
+        r#"
+local M = {}
+M.spec = { produces = { "pkg.seen" } }
+function pipeline(event)
+  raise("pkg.seen", { value = event.payload.value })
+end
+return M
+"#,
+    )
+    .unwrap();
+
+    let output = run_command(&package, &probe)
+        .arg("--package-root")
+        .arg(&package)
+        .output()
+        .unwrap();
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stdout: {}\nstderr: {}",
+        stdout(&output),
+        stderr(&output)
+    );
+    let raises = raised_entries(&output);
+    assert_eq!(raises[0]["queue"], "pkg.seen");
+    assert_eq!(raises[0]["payload"]["value"], "ok");
+}
+
+#[test]
 fn production_run_resolves_owner_locale_catalog() {
     let temp = tempfile::tempdir().unwrap();
     let host = temp.path().join("host");

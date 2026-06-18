@@ -18,6 +18,7 @@ use anyhow::{Context, Result};
 use host_conformance::HostConformanceOptions;
 use path_resolver::PackageRoots;
 use serde_json::Value as JsonValue;
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 mod boundary_resource;
@@ -48,6 +49,7 @@ mod sdk_log;
 mod sdk_mark;
 mod sdk_strings;
 mod self_test;
+mod spec_queues;
 mod supervise;
 mod test_runner;
 
@@ -454,8 +456,9 @@ fn run_pipeline(
     let require_roots = roots.require_roots_for_owner(owner_root);
     let graph_json_authorized =
         sdk_graph::department_authorized(&roots, owner_root, &lua_path).unwrap_or(false);
-    let raise_authority = department_raise_authority(&roots, owner_root, &lua_path)
-        .with_context(|| format!("resolve raise authority for {}", lua_path.display()))?;
+    let declared_produces =
+        department_declared_resolved_produces(&roots, owner_root, &owner_namespace, &lua_path)
+            .with_context(|| format!("resolve raise authority for {}", lua_path.display()))?;
 
     mlua_init::register_framework_sdk(
         &lua,
@@ -463,9 +466,11 @@ fn run_pipeline(
         roots.host_root(),
         owner_root,
         department_name_for_lua(&lua_path, owner_root, &owner_namespace),
-        roots.name_resolver(),
+        roots
+            .name_resolver()
+            .with_recorded_only_queues(declared_produces.clone()),
         owner_namespace.clone(),
-        raise_authority,
+        RaiseAuthority::new(declared_produces),
         Some(roots.clone()),
         graph_json_authorized,
     )?;
@@ -491,31 +496,26 @@ fn run_pipeline(
     Ok(exit_code)
 }
 
-fn department_raise_authority(
+fn department_declared_resolved_produces(
     roots: &PackageRoots,
     owner_root: &Path,
+    owner_namespace: &str,
     lua_path: &Path,
-) -> Result<RaiseAuthority> {
+) -> Result<BTreeSet<String>> {
     let lua_path = lua_path
         .canonicalize()
         .with_context(|| format!("canonicalize {}", lua_path.display()))?;
-    let Ok(config) = supervise::graph_scan::load_roots(roots) else {
-        return Ok(RaiseAuthority::new(Default::default()));
-    };
-    let allowed = config
-        .department
-        .values()
-        .find(|dept| {
-            let declared = if dept.lua.is_absolute() {
-                dept.lua.clone()
-            } else {
-                owner_root.join(&dept.lua)
-            };
-            declared.canonicalize().ok().as_deref() == Some(lua_path.as_path())
-        })
-        .map(|dept| dept.produces.iter().cloned().collect())
-        .unwrap_or_default();
-    Ok(RaiseAuthority::new(allowed))
+    let require_roots = roots.require_roots_for_owner(owner_root);
+    let package_path = mlua_init::package_roots_path(require_roots.iter().map(PathBuf::as_path));
+    spec_queues::declared_resolved_produces(
+        roots,
+        owner_namespace,
+        owner_root,
+        &lua_path,
+        &package_path,
+        &mlua_init::LuaChunkCache::default(),
+    )
+    .map_err(anyhow::Error::from)
 }
 
 fn department_name_for_lua(
