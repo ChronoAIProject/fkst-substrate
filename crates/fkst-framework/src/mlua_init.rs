@@ -112,23 +112,28 @@ pub(crate) struct LuaChunkCache {
 }
 
 impl LuaChunkCache {
-    pub(crate) fn load_cached_chunk(&self, lua: &Lua, path: &Path) -> Result<()> {
-        let bytecode = self.bytecode_for(path)?;
+    pub(crate) fn load_cached_chunk_with_name(
+        &self,
+        lua: &Lua,
+        path: &Path,
+        owner_root: &Path,
+    ) -> Result<()> {
+        let bytecode = self.bytecode_for(path, owner_root)?;
         lua.load(bytecode.as_slice())
-            .set_name(path.to_string_lossy())
+            .set_name(crate::lua_coverage::chunk_name(path, owner_root))
             .exec()
             .with_context(|| format!("exec {}", path.display()))
     }
 
     pub(crate) fn eval_cached_chunk(&self, lua: &Lua, path: &Path) -> Result<LuaValue> {
-        let bytecode = self.bytecode_for(path)?;
+        let bytecode = self.bytecode_for(path, path)?;
         lua.load(bytecode.as_slice())
             .set_name(path.to_string_lossy())
             .eval()
             .with_context(|| format!("eval {}", path.display()))
     }
 
-    fn bytecode_for(&self, path: &Path) -> Result<Vec<u8>> {
+    fn bytecode_for(&self, path: &Path, owner_root: &Path) -> Result<Vec<u8>> {
         let src =
             std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
         let key = CachedChunkKey::for_path(path, src.as_bytes())?;
@@ -144,7 +149,7 @@ impl LuaChunkCache {
         let lua = new_lua();
         let function = lua
             .load(&src)
-            .set_name(path.to_string_lossy())
+            .set_name(crate::lua_coverage::chunk_name(path, owner_root))
             .into_function()
             .with_context(|| format!("compile {}", path.display()))?;
         let bytecode = function.dump(true);
@@ -232,12 +237,24 @@ pub(crate) fn run_dept_with_package_path_and_chunk_cache(
     event: &JsonValue,
     cache: Option<&LuaChunkCache>,
 ) -> Result<()> {
+    run_dept_with_package_path_chunk_cache_and_name_root(lua, lua_path, event, cache, lua_path)
+}
+
+pub(crate) fn run_dept_with_package_path_chunk_cache_and_name_root(
+    lua: &Lua,
+    lua_path: &Path,
+    event: &JsonValue,
+    cache: Option<&LuaChunkCache>,
+    owner_root: &Path,
+) -> Result<()> {
     if let Some(cache) = cache {
-        cache.load_cached_chunk(lua, lua_path)?;
+        cache.load_cached_chunk_with_name(lua, lua_path, owner_root)?;
     } else {
         let src = std::fs::read_to_string(lua_path)
             .with_context(|| format!("read {}", lua_path.display()))?;
-        let chunk = lua.load(&src).set_name(lua_path.to_string_lossy());
+        let chunk = lua
+            .load(&src)
+            .set_name(crate::lua_coverage::chunk_name(lua_path, owner_root));
         chunk
             .exec()
             .with_context(|| format!("exec {}", lua_path.display()))?;
@@ -332,13 +349,17 @@ mod tests {
         let cache = LuaChunkCache::default();
 
         let lua = new_lua();
-        cache.load_cached_chunk(&lua, &main).unwrap();
+        cache
+            .load_cached_chunk_with_name(&lua, &main, dir.path())
+            .unwrap();
         let value: String = lua.globals().get("value").unwrap();
         assert_eq!(value, "first");
 
         std::fs::write(&main, second).unwrap();
         force_mtime(&main, 1_000);
-        cache.load_cached_chunk(&lua, &main).unwrap();
+        cache
+            .load_cached_chunk_with_name(&lua, &main, dir.path())
+            .unwrap();
         let value: String = lua.globals().get("value").unwrap();
 
         assert_eq!(value, "fresh");

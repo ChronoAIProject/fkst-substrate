@@ -98,6 +98,21 @@ fn run_lua_tests_with_packages_and_report(
         .unwrap()
 }
 
+fn run_lua_tests_with_coverage(host: &Path, package: &Path, coverage: &Path) -> Output {
+    framework_command()
+        .arg("test")
+        .arg("--project-root")
+        .arg(host)
+        .arg("--package-root")
+        .arg(package)
+        .arg("--coverage")
+        .arg(coverage)
+        .current_dir(host)
+        .env("FKST_RUNTIME_ROOT", host.join(".fkst/runtime"))
+        .output()
+        .unwrap()
+}
+
 fn read_report(path: &Path) -> serde_json::Value {
     serde_json::from_slice(&fs::read(path).unwrap()).unwrap()
 }
@@ -1012,7 +1027,9 @@ return M
     .unwrap();
     fs::create_dir_all(package.path().join("tests")).unwrap();
     fs::write(
-        package.path().join("tests/dead_letter_event_queue_test.lua"),
+        package
+            .path()
+            .join("tests/dead_letter_event_queue_test.lua"),
         format!(
             r#"
 local t = fkst.test
@@ -1678,6 +1695,99 @@ return {
         "tests/same_test.lua".to_string(),
         "test_same".to_string()
     )));
+}
+
+#[test]
+fn test_coverage_writes_json_and_lcov_for_production_lua_lines() {
+    let host = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
+    fs::create_dir_all(host.path().join("departments/probe")).unwrap();
+    fs::create_dir_all(host.path().join("tests")).unwrap();
+    fs::write(
+        host.path().join("departments/probe/main.lua"),
+        r#"
+local helper = require("helper")
+
+function pipeline(event)
+  local value = helper.value(event.payload.value)
+  local co = coroutine.create(function()
+    helper.from_coroutine()
+  end)
+  local ok, err = coroutine.resume(co)
+  assert(ok, err)
+  raise("done", { value = value })
+end
+"#,
+    )
+    .unwrap();
+    fs::write(
+        host.path().join("helper.lua"),
+        r#"
+local M = {}
+
+function M.value(value)
+  local result = value .. "-covered"
+  return result
+end
+
+function M.from_coroutine()
+  local marker = "coroutine-covered"
+  return marker
+end
+
+return M
+"#,
+    )
+    .unwrap();
+    fs::write(
+        host.path().join("tests/coverage_test.lua"),
+        r#"
+local t = fkst.test
+
+return {
+  test_department = function()
+    local result = fkst.test.run_department("departments/probe/main.lua", { payload = { value = "ok" } })
+    t.eq(result.exit_code, 0)
+    t.eq(result.raises[1].queue, "done")
+    t.eq(result.raises[1].payload.value, "ok-covered")
+  end,
+}
+"#,
+    )
+    .unwrap();
+    let coverage_dir = host.path().join("coverage");
+
+    let output = run_lua_tests_with_coverage(host.path(), host.path(), &coverage_dir);
+
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}",
+        stdout(&output),
+        stderr(&output)
+    );
+    let coverage = read_report(&coverage_dir.join("coverage.json"));
+    assert!(
+        coverage.get("departments/probe/main.lua").is_some(),
+        "coverage: {coverage}"
+    );
+    assert!(coverage.get("helper.lua").is_some(), "coverage: {coverage}");
+    assert!(
+        coverage.get("tests/coverage_test.lua").is_none(),
+        "test files must be excluded from production coverage: {coverage}"
+    );
+    let helper_lines = coverage["helper.lua"]["covered_lines"].as_array().unwrap();
+    assert!(
+        helper_lines.iter().any(|line| line.as_u64() == Some(10)),
+        "coroutine-created lines must be covered: {coverage}"
+    );
+    let lcov = fs::read_to_string(coverage_dir.join("lcov.info")).unwrap();
+    assert!(
+        lcov.contains("SF:departments/probe/main.lua"),
+        "lcov: {lcov}"
+    );
+    assert!(lcov.contains("SF:helper.lua"), "lcov: {lcov}");
+    assert!(lcov.contains("DA:10,1"), "lcov: {lcov}");
+    assert!(!lcov.contains("coverage_test.lua"), "lcov: {lcov}");
+    assert!(!lcov.contains("BRDA:"), "lcov: {lcov}");
 }
 
 #[test]
