@@ -18,6 +18,7 @@ use tokio::task::JoinHandle;
 use tracing::info;
 
 static NEXT_FRAMEWORK_CHILD_LOG_ID: AtomicU64 = AtomicU64::new(1);
+const RAISED_AUTH_TOKEN_ENV: &str = "FKST_RAISED_AUTH_TOKEN";
 
 pub struct SpawnResult {
     pub pid: u32,
@@ -69,6 +70,7 @@ pub async fn spawn_framework(
         log_dir,
         process_groups,
         None,
+        None,
     )
     .await
 }
@@ -85,6 +87,7 @@ pub async fn spawn_framework_with_stdout_observer(
     child_label: &str,
     log_dir: &Path,
     process_groups: ProcessGroupRegistry,
+    raised_auth_token: Option<&str>,
     stdout_observer: Option<StdoutLineObserver>,
 ) -> Result<SpawnResult> {
     let start = std::time::Instant::now();
@@ -118,6 +121,9 @@ pub async fn spawn_framework_with_stdout_observer(
         crate::provenance::current_pkg_versions_summary()
     ));
     log.write_line(&format!("DEPT={child_label}"));
+    if raised_auth_token.is_some() {
+        log.write_line("RAISED_AUTH=enabled");
+    }
 
     let mut cmd = Command::new(binary);
     cmd.arg("run")
@@ -142,6 +148,9 @@ pub async fn spawn_framework_with_stdout_observer(
         "FKST_SUPERVISOR_PID",
         crate::process_tree::current_pid().to_string(),
     );
+    if let Some(token) = raised_auth_token {
+        cmd.env(RAISED_AUTH_TOKEN_ENV, token);
+    }
     cmd.current_dir(host_root);
 
     // Set a new process group before exec so framework becomes its own group leader.

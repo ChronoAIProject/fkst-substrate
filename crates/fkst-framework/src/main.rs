@@ -56,7 +56,7 @@ mod test_env {
     pub(crate) static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 }
 
-use raise::RaiseBuffer;
+use raise::{RaiseAuthority, RaiseBuffer, RAISED_AUTH_TOKEN_ENV};
 
 enum CliCommand {
     Run {
@@ -442,6 +442,8 @@ fn run_pipeline(
         eprintln!("[framework] supervisor parent lost before pipeline start");
         return Ok(125);
     }
+    let raised_auth_token = std::env::var(RAISED_AUTH_TOKEN_ENV).ok();
+    std::env::remove_var(RAISED_AUTH_TOKEN_ENV);
     let lua = mlua_init::new_lua();
     let raise_buf = RaiseBuffer::new();
     let owner_root = roots
@@ -452,6 +454,8 @@ fn run_pipeline(
     let require_roots = roots.require_roots_for_owner(owner_root);
     let graph_json_authorized =
         sdk_graph::department_authorized(&roots, owner_root, &lua_path).unwrap_or(false);
+    let raise_authority = department_raise_authority(&roots, owner_root, &lua_path)
+        .with_context(|| format!("resolve raise authority for {}", lua_path.display()))?;
 
     mlua_init::register_framework_sdk(
         &lua,
@@ -461,6 +465,7 @@ fn run_pipeline(
         department_name_for_lua(&lua_path, owner_root, &owner_namespace),
         roots.name_resolver(),
         owner_namespace.clone(),
+        raise_authority,
         Some(roots.clone()),
         graph_json_authorized,
     )?;
@@ -478,8 +483,39 @@ fn run_pipeline(
         }
     };
 
-    raise_buf.emit_stdout();
+    if let Some(token) = raised_auth_token {
+        raise_buf.emit_authenticated_stdout(&token);
+    } else {
+        raise_buf.emit_stdout();
+    }
     Ok(exit_code)
+}
+
+fn department_raise_authority(
+    roots: &PackageRoots,
+    owner_root: &Path,
+    lua_path: &Path,
+) -> Result<RaiseAuthority> {
+    let lua_path = lua_path
+        .canonicalize()
+        .with_context(|| format!("canonicalize {}", lua_path.display()))?;
+    let Ok(config) = supervise::graph_scan::load_roots(roots) else {
+        return Ok(RaiseAuthority::new(Default::default()));
+    };
+    let allowed = config
+        .department
+        .values()
+        .find(|dept| {
+            let declared = if dept.lua.is_absolute() {
+                dept.lua.clone()
+            } else {
+                owner_root.join(&dept.lua)
+            };
+            declared.canonicalize().ok().as_deref() == Some(lua_path.as_path())
+        })
+        .map(|dept| dept.produces.iter().cloned().collect())
+        .unwrap_or_default();
+    Ok(RaiseAuthority::new(allowed))
 }
 
 fn department_name_for_lua(

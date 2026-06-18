@@ -53,6 +53,7 @@ pub(crate) fn run_tests(
             None,
             roots.name_resolver(),
             file.owner_namespace.clone(),
+            crate::raise::RaiseAuthority::new(Default::default()),
             Some(mock_commands.clone()),
             Some(roots.clone()),
             false,
@@ -564,7 +565,8 @@ fn run_department(
         qualified_consumes,
     )
     .map_err(mlua::Error::external)?;
-    let qualified_produces = cache.declared_qualified_produces(owner_root, &lua_path)?;
+    let declared_produces =
+        cache.declared_resolved_produces(owner_root, owner_namespace, &lua_path)?;
     let package_path = cache.package_path_string(&require_roots)?;
 
     let dept_lua = crate::mlua_init::new_lua();
@@ -578,8 +580,9 @@ fn run_department(
         department_name_for_lua(&lua_path, owner_root, owner_namespace),
         roots
             .name_resolver()
-            .with_recorded_only_queues(qualified_produces),
+            .with_recorded_only_queues(declared_produces.clone()),
         owner_namespace.to_string(),
+        crate::raise::RaiseAuthority::new(declared_produces),
         Some(mock_commands),
         Some(roots.clone()),
         graph_json_authorized,
@@ -694,9 +697,10 @@ impl TestRunCache {
         Ok(path)
     }
 
-    fn declared_qualified_produces(
+    fn declared_resolved_produces(
         &self,
         owner_root: &Path,
+        owner_namespace: &str,
         lua_path: &Path,
     ) -> mlua::Result<BTreeSet<String>> {
         let lua_path = lua_path.canonicalize().map_err(mlua::Error::external)?;
@@ -711,7 +715,9 @@ impl TestRunCache {
         }
         let require_roots = self.require_roots_for_owner(owner_root)?;
         let package_path = self.package_path_string(&require_roots)?;
-        let produces = declared_qualified_produces(
+        let produces = declared_resolved_produces(
+            &self.roots,
+            owner_namespace,
             owner_root,
             &lua_path,
             &package_path,
@@ -783,16 +789,45 @@ fn declared_qualified_consumes(
     declared_qualified_spec_queues(owner_root, lua_path, package_path, chunk_cache, "consumes")
 }
 
-fn declared_qualified_produces(
+fn declared_resolved_produces(
+    roots: &PackageRoots,
+    owner_namespace: &str,
     owner_root: &Path,
     lua_path: &Path,
     package_path: &str,
     chunk_cache: &crate::mlua_init::LuaChunkCache,
 ) -> mlua::Result<BTreeSet<String>> {
-    declared_qualified_spec_queues(owner_root, lua_path, package_path, chunk_cache, "produces")
+    let raw = declared_spec_queues(owner_root, lua_path, package_path, chunk_cache, "produces")?;
+    let resolver = roots.name_resolver().with_recorded_only_queues(
+        raw.iter()
+            .filter(|queue| queue.contains('.'))
+            .cloned()
+            .collect(),
+    );
+    raw.into_iter()
+        .map(|queue| {
+            resolver
+                .resolve(owner_namespace, &queue)
+                .map_err(mlua::Error::external)
+        })
+        .collect()
 }
 
 fn declared_qualified_spec_queues(
+    owner_root: &Path,
+    lua_path: &Path,
+    package_path: &str,
+    chunk_cache: &crate::mlua_init::LuaChunkCache,
+    field: &str,
+) -> mlua::Result<BTreeSet<String>> {
+    let raw = declared_spec_queues(owner_root, lua_path, package_path, chunk_cache, field)?;
+    Ok(raw
+        .into_iter()
+        .filter(|queue| queue.contains('.'))
+        .collect())
+}
+
+fn declared_spec_queues(
     owner_root: &Path,
     lua_path: &Path,
     package_path: &str,
@@ -820,10 +855,7 @@ fn declared_qualified_spec_queues(
     };
     let mut qualified = BTreeSet::new();
     for value in queues.sequence_values::<String>() {
-        let value = value?;
-        if value.contains('.') {
-            qualified.insert(value);
-        }
+        qualified.insert(value?);
     }
     Ok(qualified)
 }

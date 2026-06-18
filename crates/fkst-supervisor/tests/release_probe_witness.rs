@@ -157,7 +157,7 @@ fn wait_for_witness(
     )
 }
 
-fn wait_for_child_log_with_raised(
+fn wait_for_child_log_with_raised_auth(
     deadline: Instant,
     child: &mut Child,
     supervisor_log: &Path,
@@ -168,7 +168,7 @@ fn wait_for_child_log_with_raised(
         child,
         supervisor_log,
         child_log_dir,
-        "RAISED child log",
+        "raised auth child log",
         || {
             let entries = fs::read_dir(child_log_dir).ok()?;
             for entry in entries.flatten() {
@@ -179,7 +179,9 @@ fn wait_for_child_log_with_raised(
                 let Ok(content) = fs::read_to_string(&path) else {
                     continue;
                 };
-                if content.contains("RAISED: ") {
+                if content.contains("DEPT=release_probe\n")
+                    && content.contains("RAISED_AUTH=enabled")
+                {
                     return Some(content);
                 }
             }
@@ -453,7 +455,7 @@ fn supervisor_framework_completes_release_probe_raised_cycle() {
             &child_log_dir,
             &witness,
         );
-        let child_log = wait_for_child_log_with_raised(
+        let child_log = wait_for_child_log_with_raised_auth(
             deadline,
             supervisor.child_mut(),
             &supervisor_log,
@@ -476,7 +478,10 @@ fn supervisor_framework_completes_release_probe_raised_cycle() {
             child_log.contains("DEPT=release_probe\n"),
             "log={child_log}"
         );
-        assert!(child_log.contains("RAISED: "), "log={child_log}");
+        assert!(
+            child_log.contains("RAISED_AUTH=enabled"),
+            "log={child_log}"
+        );
         assert!(child_log.contains("EXIT=0\n"), "log={child_log}");
     }
 
