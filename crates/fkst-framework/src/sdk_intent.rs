@@ -95,7 +95,7 @@ impl IntentStore {
                 let Some(existing) = read_intent(&by_id, &existing_id)? else {
                     bail!("intent index points to missing intent_id: {existing_id}");
                 };
-                if existing == record {
+                if same_intent_tuple(&existing, &record) {
                     drop(by_id);
                     drop(by_effect_key);
                     write.commit()?;
@@ -177,6 +177,14 @@ impl IntentStore {
         write.commit()?;
         Ok(record)
     }
+}
+
+fn same_intent_tuple(left: &IntentRecord, right: &IntentRecord) -> bool {
+    left.intent_id == right.intent_id
+        && left.edge == right.edge
+        && left.generation == right.generation
+        && left.effect_kind == right.effect_kind
+        && left.effect_key == right.effect_key
 }
 
 pub(crate) fn register(lua: &Lua) -> mlua::Result<()> {
@@ -450,11 +458,44 @@ mod tests {
                 "issue-1".to_string(),
                 "codex".to_string(),
                 "issue/1/attempt".to_string(),
-                10,
+                99,
             )
             .unwrap();
 
         assert_eq!(first, second);
+        assert_eq!(second.declared_at_ms, 10);
+        assert_eq!(store.intent(&first.intent_id).unwrap(), Some(first));
+    }
+
+    #[test]
+    fn declare_intent_is_idempotent_after_store_reopen() {
+        let root = tempdir().unwrap();
+        let db_path = root.path().join("intent.redb");
+        let store = IntentStore::open(&db_path).unwrap();
+        let first = store
+            .declare_intent(
+                "ready-implementing".to_string(),
+                "issue-1".to_string(),
+                "codex".to_string(),
+                "issue/1/attempt".to_string(),
+                10,
+            )
+            .unwrap();
+        drop(store);
+
+        let store = IntentStore::open(&db_path).unwrap();
+        let second = store
+            .declare_intent(
+                "ready-implementing".to_string(),
+                "issue-1".to_string(),
+                "codex".to_string(),
+                "issue/1/attempt".to_string(),
+                99,
+            )
+            .unwrap();
+
+        assert_eq!(first, second);
+        assert_eq!(second.declared_at_ms, 10);
         assert_eq!(store.intent(&first.intent_id).unwrap(), Some(first));
     }
 
