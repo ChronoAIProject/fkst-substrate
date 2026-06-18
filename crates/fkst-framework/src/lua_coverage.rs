@@ -1,33 +1,41 @@
 use anyhow::{Context, Result};
-use mlua::{HookTriggers, Lua, Thread, Value, VmState};
+use mlua::{DebugEvent, HookTriggers, Lua, Thread, Value, VmState};
 use serde::Serialize;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+
+const NO_SOURCE_ID: usize = usize::MAX;
+const COVERAGE_TRIGGERS: HookTriggers = HookTriggers::new().on_calls().on_returns().every_line();
 
 #[derive(Clone, Debug)]
 pub(crate) struct LuaCoverage {
-    inner: Arc<Mutex<BTreeMap<String, BTreeSet<u32>>>>,
-    roots: Arc<Vec<PathBuf>>,
+    files: Arc<Vec<CoverageHits>>,
+    source_ids: Arc<BTreeMap<String, usize>>,
 }
 
 impl LuaCoverage {
-    pub(crate) fn new(roots: impl IntoIterator<Item = PathBuf>) -> Self {
-        Self {
-            inner: Arc::new(Mutex::new(BTreeMap::new())),
-            roots: Arc::new(roots.into_iter().collect()),
+    pub(crate) fn new(roots: impl IntoIterator<Item = PathBuf>) -> Result<Self> {
+        let roots = roots.into_iter().collect::<Vec<_>>();
+        let files = collect_coverage_files(&roots)?;
+        let mut source_ids = BTreeMap::new();
+        for (idx, file) in files.iter().enumerate() {
+            for source in &file.sources {
+                source_ids.insert(source.clone(), idx);
+            }
         }
+        Ok(Self {
+            files: Arc::new(files),
+            source_ids: Arc::new(source_ids),
+        })
     }
 
     pub(crate) fn install(&self, lua: &Lua) -> mlua::Result<()> {
         let coverage = self.clone();
-        lua.set_hook(HookTriggers::EVERY_LINE, move |_, debug| {
-            let line = debug.curr_line();
-            if line <= 0 {
-                return Ok(VmState::Continue);
-            }
-            let source = debug.source().source.map(|value| value.into_owned());
-            coverage.record(source.as_deref(), line as u32);
+        let state = Arc::new(HookState::default());
+        lua.set_hook(COVERAGE_TRIGGERS, move |_, debug| {
+            coverage.record_hook_event(&state, debug);
             Ok(VmState::Continue)
         });
         self.install_coroutine_create_hook(lua)
@@ -35,10 +43,38 @@ impl LuaCoverage {
 
     pub(crate) fn write_outputs(&self, dir: &Path) -> Result<()> {
         std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
-        let snapshot = self.snapshot()?;
+        let snapshot = self.snapshot();
         write_json(&dir.join("coverage.json"), &snapshot)?;
         write_lcov(&dir.join("lcov.info"), &snapshot)?;
         Ok(())
+    }
+
+    fn record_hook_event(&self, state: &HookState, debug: mlua::Debug<'_>) {
+        match debug.event() {
+            DebugEvent::Call => {
+                let id = self.source_id(debug.source().source.as_deref());
+                state.enter(id);
+            }
+            DebugEvent::TailCall => {
+                let id = self.source_id(debug.source().source.as_deref());
+                state.replace(id);
+            }
+            DebugEvent::Ret => state.leave(),
+            DebugEvent::Line => {
+                let line = debug.curr_line();
+                if line > 0 {
+                    self.mark(state.current(), line as u32);
+                }
+            }
+            DebugEvent::Count | DebugEvent::Unknown(_) => {}
+        }
+    }
+
+    fn source_id(&self, source: Option<&str>) -> usize {
+        source
+            .and_then(|source| source.strip_prefix('@'))
+            .and_then(|source| self.source_ids.get(source).copied())
+            .unwrap_or(NO_SOURCE_ID)
     }
 
     fn install_coroutine_create_hook(&self, lua: &Lua) -> mlua::Result<()> {
@@ -61,42 +97,110 @@ impl LuaCoverage {
 
     fn install_thread(&self, thread: &Thread) {
         let coverage = self.clone();
-        thread.set_hook(HookTriggers::EVERY_LINE, move |_, debug| {
-            let line = debug.curr_line();
-            if line <= 0 {
-                return Ok(VmState::Continue);
-            }
-            let source = debug.source().source.map(|value| value.into_owned());
-            coverage.record(source.as_deref(), line as u32);
+        let state = Arc::new(HookState::default());
+        thread.set_hook(COVERAGE_TRIGGERS, move |_, debug| {
+            coverage.record_hook_event(&state, debug);
             Ok(VmState::Continue)
         });
     }
 
-    fn record(&self, source: Option<&str>, line: u32) {
-        let Some(file) = normalize_source(source, &self.roots) else {
+    fn mark(&self, source_id: usize, line: u32) {
+        let Some(file) = self.files.get(source_id) else {
             return;
         };
-        if let Ok(mut covered) = self.inner.lock() {
-            covered.entry(file).or_default().insert(line);
+        let line_idx = line.saturating_sub(1) as usize;
+        let word_idx = line_idx / 64;
+        let bit = 1u64 << (line_idx % 64);
+        if let Some(word) = file.words.get(word_idx) {
+            word.fetch_or(bit, Ordering::Relaxed);
         }
     }
 
-    fn snapshot(&self) -> Result<BTreeMap<String, CoverageFile>> {
-        let covered = self
-            .inner
-            .lock()
-            .map_err(|_| anyhow::anyhow!("lua coverage lock poisoned"))?;
-        Ok(covered
+    fn snapshot(&self) -> BTreeMap<String, CoverageFile> {
+        self.files
             .iter()
-            .map(|(file, lines)| {
-                (
-                    file.clone(),
-                    CoverageFile {
-                        covered_lines: lines.iter().copied().collect(),
-                    },
-                )
+            .filter_map(|file| {
+                let covered_lines = file.covered_lines();
+                if covered_lines.is_empty() {
+                    None
+                } else {
+                    Some((file.file.clone(), CoverageFile { covered_lines }))
+                }
             })
-            .collect())
+            .collect()
+    }
+}
+
+#[derive(Debug)]
+struct CoverageHits {
+    file: String,
+    sources: Vec<String>,
+    words: Vec<AtomicU64>,
+}
+
+impl CoverageHits {
+    fn new(file: String, sources: Vec<String>, line_count: usize) -> Self {
+        let word_count = line_count.div_ceil(64).max(1);
+        Self {
+            file,
+            sources,
+            words: (0..word_count).map(|_| AtomicU64::new(0)).collect(),
+        }
+    }
+
+    fn covered_lines(&self) -> Vec<u32> {
+        let mut lines = Vec::new();
+        for (word_idx, word) in self.words.iter().enumerate() {
+            let mut bits = word.load(Ordering::Relaxed);
+            while bits != 0 {
+                let bit_idx = bits.trailing_zeros() as usize;
+                lines.push((word_idx * 64 + bit_idx + 1) as u32);
+                bits &= !(1u64 << bit_idx);
+            }
+        }
+        lines
+    }
+}
+
+#[derive(Debug)]
+struct HookState {
+    current: AtomicUsize,
+    stack: Mutex<Vec<usize>>,
+}
+
+impl Default for HookState {
+    fn default() -> Self {
+        Self {
+            current: AtomicUsize::new(NO_SOURCE_ID),
+            stack: Mutex::new(Vec::new()),
+        }
+    }
+}
+
+impl HookState {
+    fn current(&self) -> usize {
+        self.current.load(Ordering::Relaxed)
+    }
+
+    fn enter(&self, id: usize) {
+        let previous = self.current.swap(id, Ordering::Relaxed);
+        if let Ok(mut stack) = self.stack.lock() {
+            stack.push(previous);
+        }
+    }
+
+    fn replace(&self, id: usize) {
+        self.current.store(id, Ordering::Relaxed);
+    }
+
+    fn leave(&self) {
+        let previous = self
+            .stack
+            .lock()
+            .ok()
+            .and_then(|mut stack| stack.pop())
+            .unwrap_or(NO_SOURCE_ID);
+        self.current.store(previous, Ordering::Relaxed);
     }
 }
 
@@ -126,6 +230,71 @@ fn normalize_source(source: Option<&str>, roots: &[PathBuf]) -> Option<String> {
         return None;
     }
     Some(normalized)
+}
+
+fn collect_coverage_files(roots: &[PathBuf]) -> Result<Vec<CoverageHits>> {
+    let mut files = BTreeMap::<String, CoverageSource>::new();
+    for root in roots {
+        collect_coverage_files_from_root(root, root, &mut files)
+            .with_context(|| format!("scan coverage files in {}", root.display()))?;
+    }
+    Ok(files
+        .into_iter()
+        .map(|(file, source)| CoverageHits::new(file, source.sources, source.line_count))
+        .collect())
+}
+
+fn collect_coverage_files_from_root(
+    root: &Path,
+    dir: &Path,
+    files: &mut BTreeMap<String, CoverageSource>,
+) -> Result<()> {
+    if !dir.exists() {
+        return Ok(());
+    }
+    for entry in std::fs::read_dir(dir).with_context(|| format!("read {}", dir.display()))? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.is_dir() {
+            collect_coverage_files_from_root(root, &path, files)?;
+        } else if path.extension().and_then(|ext| ext.to_str()) == Some("lua") {
+            let file = chunk_name(&path, root);
+            let Some(file) = normalize_source(Some(&file), &[]) else {
+                continue;
+            };
+            let source = std::fs::read_to_string(&path)
+                .with_context(|| format!("read {}", path.display()))?;
+            files.entry(file.clone()).or_insert_with(|| CoverageSource {
+                sources: coverage_source_names(&path, &file),
+                line_count: line_count(&source),
+            });
+        }
+    }
+    Ok(())
+}
+
+#[derive(Debug)]
+struct CoverageSource {
+    sources: Vec<String>,
+    line_count: usize,
+}
+
+fn coverage_source_names(path: &Path, normalized_file: &str) -> Vec<String> {
+    let mut sources = vec![normalized_file.to_string()];
+    let raw_path = path.to_string_lossy().into_owned();
+    if raw_path != normalized_file {
+        sources.push(raw_path);
+    }
+    sources
+}
+
+fn line_count(source: &str) -> usize {
+    source
+        .as_bytes()
+        .iter()
+        .filter(|byte| **byte == b'\n')
+        .count()
+        + 1
 }
 
 fn normalize_path(path: &Path) -> String {

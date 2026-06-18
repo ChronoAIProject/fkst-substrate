@@ -22,15 +22,19 @@ pub(crate) fn run_tests(
     let files = discover_test_files(&roots)?;
     let _supervisor_pid_guard = TestModeSupervisorPidGuard::remove();
     let cache = TestRunCache::new(roots.clone());
-    let coverage = coverage_dir.as_ref().map(|_| {
-        LuaCoverage::new(
-            roots
-                .graph_roots()
-                .into_iter()
-                .map(|root| root.root)
-                .collect::<Vec<_>>(),
-        )
-    });
+    let coverage = coverage_dir
+        .as_ref()
+        .map(|_| {
+            LuaCoverage::new(
+                roots
+                    .graph_roots()
+                    .into_iter()
+                    .map(|root| root.root)
+                    .collect::<Vec<_>>(),
+            )
+        })
+        .transpose()
+        .context("initialize Lua coverage")?;
     let mut passed = 0usize;
     let mut failed = 0usize;
     let mut report = TestReport::new();
