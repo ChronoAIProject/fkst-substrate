@@ -6,10 +6,14 @@ mod boundary_resource;
 mod config_registry;
 #[path = "../src/external_command.rs"]
 mod external_command;
+#[path = "../src/path_resolver.rs"]
+mod path_resolver;
 #[path = "../src/process_tree.rs"]
 mod process_tree;
 #[path = "../src/provenance.rs"]
 mod provenance;
+#[path = "../src/raise.rs"]
+mod raise;
 #[path = "../src/rate_pool.rs"]
 mod rate_pool;
 #[path = "../src/rate_shim.rs"]
@@ -18,10 +22,13 @@ mod rate_shim;
 mod runtime_context;
 #[path = "../src/sdk_codex.rs"]
 mod sdk_codex;
+#[path = "../src/sdk_json.rs"]
+mod sdk_json;
 mod support;
 
 use mlua::{AnyUserData, Function, Lua, Table};
 use nix::fcntl::{flock, FlockArg};
+use raise::RaiseBuffer;
 use sdk_codex::{
     acquire_permit, ensure_pool, CodexResult, CodexTaskHandle, CODEX_PERMIT_SLOTS_ENV,
 };
@@ -42,7 +49,7 @@ fn register_with_dept(lua: &Lua, dept: Option<String>) -> mlua::Result<()> {
     let host_root = std::env::current_dir().map_err(mlua::Error::external)?;
     let config = config_registry::ConfigContext::from_host_root(&host_root)
         .map_err(mlua::Error::external)?;
-    sdk_codex::register(lua, &host_root, config, dept)
+    sdk_codex::register(lua, &host_root, config, dept, RaiseBuffer::new(), None)
 }
 
 #[cfg(unix)]

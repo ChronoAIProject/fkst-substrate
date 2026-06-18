@@ -9,6 +9,7 @@ use mlua::{Lua, LuaSerdeExt, Result};
 use serde::Serialize;
 use serde_json::Value as JsonValue;
 use std::collections::BTreeSet;
+use std::io::Write;
 use std::sync::{Arc, Mutex};
 
 use crate::path_resolver::NameResolver;
@@ -64,6 +65,15 @@ impl RaiseBuffer {
 
     pub fn encoded_frame(&self) -> Option<String> {
         let entries = self.0.lock().unwrap().clone();
+        Self::encode_entries(entries)
+    }
+
+    pub(crate) fn drain_encoded_frame(&self) -> Option<String> {
+        let entries = self.0.lock().unwrap().drain(..).collect();
+        Self::encode_entries(entries)
+    }
+
+    fn encode_entries(entries: Vec<RaisedEntry>) -> Option<String> {
         if entries.is_empty() {
             return None;
         }
@@ -74,12 +84,21 @@ impl RaiseBuffer {
     pub fn emit_stdout(&self) {
         if let Some(b64) = self.encoded_frame() {
             println!("RAISED: {}", b64);
+            let _ = std::io::stdout().flush();
         }
     }
 
     pub(crate) fn emit_authenticated_stdout(&self, token: &str) {
         if let Some(b64) = self.encoded_frame() {
             println!("RAISED-AUTH: {token} {b64}");
+            let _ = std::io::stdout().flush();
+        }
+    }
+
+    pub(crate) fn drain_emit_authenticated_stdout(&self, token: &str) {
+        if let Some(b64) = self.drain_encoded_frame() {
+            println!("RAISED-AUTH: {token} {b64}");
+            let _ = std::io::stdout().flush();
         }
     }
 }
@@ -330,5 +349,15 @@ mod tests {
         let buf = RaiseBuffer::new();
         // Just verify no panic; output goes to real stdout in tests so we can't capture cleanly.
         buf.emit_stdout();
+    }
+
+    #[test]
+    fn drain_encoded_frame_removes_buffered_entries() {
+        let buf = RaiseBuffer::new();
+        buf.push("done".to_string(), serde_json::json!({"n": 1}));
+
+        assert!(buf.drain_encoded_frame().is_some());
+        assert!(buf.encoded_frame().is_none());
+        assert!(buf.snapshot().is_empty());
     }
 }

@@ -8,7 +8,7 @@ use super::delivery_types::{
 use super::event_fanout::Fanout;
 use super::failure_fact::{dead_record_payload, delivery_failure_fact, FAILURE_FACT_QUEUE};
 use super::journal::{optional_path, SupervisorJournal};
-use super::raised::parse_authenticated_raised;
+use super::raised::{parse_authenticated_raised, parse_authenticated_raised_line};
 use super::source_runner::parse_duration;
 use super::spawner::{spawn_framework_with_stdout_observer, SpawnResult, StdoutLineObserver};
 use crate::path_resolver::PackageRoots;
@@ -17,6 +17,7 @@ use fkst_common::config::{DepartmentDecl, RetryDecl};
 use fkst_common::{Event, RuntimeKind};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -287,17 +288,46 @@ fn spawn_ephemeral(
     let dept_name = name.to_string();
     let router = router.clone();
     tokio::spawn(async move {
-        match spawn_and_report(&dept_name, &args, &journal).await {
+        let raised_observed = Arc::new(AtomicBool::new(false));
+        let publish_error = Arc::new(std::sync::Mutex::new(None::<String>));
+        let stdout_observer = args.raised_auth_token.clone().map(|token| {
+            let router = router.clone();
+            let raised_observed = Arc::clone(&raised_observed);
+            let publish_error = Arc::clone(&publish_error);
+            Arc::new(move |line: &str| -> anyhow::Result<()> {
+                let raised_events = parse_authenticated_raised_line(line, &token);
+                if !raised_events.is_empty() {
+                    raised_observed.store(true, Ordering::Relaxed);
+                }
+                if let Err(err) = publish_ephemeral_raised_events(&router, raised_events) {
+                    if let Ok(mut publish_error) = publish_error.lock() {
+                        *publish_error = Some(err.to_string());
+                    }
+                }
+                Ok(())
+            }) as StdoutLineObserver
+        });
+        match spawn_and_report_with_stdout_observer(&dept_name, &args, stdout_observer, &journal)
+            .await
+        {
             Ok(result) => {
                 if result.exit_code != 0 {
                     return;
                 }
-                if let Err(err) = publish_ephemeral_raised(
-                    &router,
-                    &result.stdout,
-                    args.raised_auth_token.as_deref(),
-                ) {
-                    error!(dept = %dept_name, error = %err, "publish raised failed");
+                if let Ok(mut publish_error) = publish_error.lock() {
+                    if let Some(err) = publish_error.take() {
+                        error!(dept = %dept_name, error = %err, "publish raised failed");
+                        return;
+                    }
+                }
+                if !raised_observed.load(Ordering::Relaxed) {
+                    if let Err(err) = publish_ephemeral_raised(
+                        &router,
+                        &result.stdout,
+                        args.raised_auth_token.as_deref(),
+                    ) {
+                        error!(dept = %dept_name, error = %err, "publish raised failed");
+                    }
                 }
             }
             Err(err) => {
@@ -419,17 +449,71 @@ async fn run_durable_record(
     args: SpawnArgs,
     journal: &SupervisorJournal,
 ) -> CompletedDelivery {
-    let result = spawn_and_report(dept_name, &args, journal).await;
+    let next_ordinal = Arc::new(std::sync::Mutex::new(0_usize));
+    let publish_error = Arc::new(std::sync::Mutex::new(None::<String>));
+    let stdout_observer = args.raised_auth_token.clone().map(|token| {
+        let router = router.clone();
+        let record = record.clone();
+        let next_ordinal = Arc::clone(&next_ordinal);
+        let publish_error = Arc::clone(&publish_error);
+        Arc::new(move |line: &str| -> anyhow::Result<()> {
+            let raised_events = parse_authenticated_raised_line(line, &token);
+            match next_ordinal.lock() {
+                Ok(mut next_ordinal) => {
+                    if let Err(err) =
+                        publish_raised_events(&router, raised_events, &record, &mut next_ordinal)
+                    {
+                        if let Ok(mut publish_error) = publish_error.lock() {
+                            *publish_error = Some(err.to_string());
+                        }
+                    }
+                }
+                Err(_) => {
+                    if let Ok(mut publish_error) = publish_error.lock() {
+                        *publish_error = Some("raised ordinal lock poisoned".to_string());
+                    }
+                }
+            }
+            Ok(())
+        }) as StdoutLineObserver
+    });
+    let result =
+        spawn_and_report_with_stdout_observer(dept_name, &args, stdout_observer, journal).await;
     let failure = match result {
         Ok(result) if result.exit_code == 0 => {
-            publish_raised(
-                &router,
-                &result.stdout,
-                args.raised_auth_token.as_deref(),
-                &record,
-            )
-                .err()
-                .map(|err| DeliveryFailure::permanent(format!("raised publish error: {err}")))
+            let publish_error_message = match publish_error.lock() {
+                Ok(mut publish_error) => publish_error.take(),
+                Err(_) => Some("raised publish error lock poisoned".to_string()),
+            };
+            if let Some(err) = publish_error_message {
+                return CompletedDelivery {
+                    record,
+                    failure: Some(DeliveryFailure::permanent(format!(
+                        "raised publish error: {err}"
+                    ))),
+                };
+            }
+            let next_ordinal = match next_ordinal.lock() {
+                Ok(next_ordinal) => next_ordinal,
+                Err(_) => {
+                    return CompletedDelivery {
+                        record,
+                        failure: Some(DeliveryFailure::permanent("raised ordinal lock poisoned")),
+                    }
+                }
+            };
+            if *next_ordinal == 0 {
+                publish_raised(
+                    &router,
+                    &result.stdout,
+                    args.raised_auth_token.as_deref(),
+                    &record,
+                )
+            } else {
+                Ok(())
+            }
+            .err()
+            .map(|err| DeliveryFailure::permanent(format!("raised publish error: {err}")))
         }
         Ok(result) => Some(DeliveryFailure::from_spawn_result(&result)),
         Err(err) => {
@@ -791,12 +875,26 @@ fn publish_raised(
     let Some(raised_auth_token) = raised_auth_token else {
         return Ok(());
     };
-    for (ordinal, mut raised_ev) in parse_authenticated_raised(stdout, raised_auth_token)
-        .into_iter()
-        .enumerate()
-    {
+    let mut next_ordinal = 0;
+    publish_raised_events(
+        router,
+        parse_authenticated_raised(stdout, raised_auth_token),
+        parent,
+        &mut next_ordinal,
+    )
+}
+
+fn publish_raised_events(
+    router: &DeliveryRouter,
+    raised_events: Vec<Event>,
+    parent: &DeliveryRecord,
+    next_ordinal: &mut usize,
+) -> anyhow::Result<()> {
+    for mut raised_ev in raised_events {
         reject_reserved_raised_queue(&raised_ev)?;
         raised_ev.ts = parent.observed_at_ms;
+        let ordinal = *next_ordinal;
+        *next_ordinal = next_ordinal.saturating_add(1);
         router.publish(PublishEnvelope {
             event: raised_ev,
             source: parent.source.clone(),
@@ -818,7 +916,17 @@ fn publish_ephemeral_raised(
     let Some(raised_auth_token) = raised_auth_token else {
         return Ok(());
     };
-    for raised_ev in parse_authenticated_raised(stdout, raised_auth_token) {
+    publish_ephemeral_raised_events(
+        router,
+        parse_authenticated_raised(stdout, raised_auth_token),
+    )
+}
+
+fn publish_ephemeral_raised_events(
+    router: &DeliveryRouter,
+    raised_events: Vec<Event>,
+) -> anyhow::Result<()> {
+    for raised_ev in raised_events {
         reject_reserved_raised_queue(&raised_ev)?;
         router.publish(PublishEnvelope {
             event: raised_ev,
@@ -1466,11 +1574,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn durable_authenticated_raised_publishes_after_child_exit() {
+    async fn durable_authenticated_raised_publishes_before_child_exit() {
         let temp = TempDir::new().unwrap();
         let binary = temp.path().join("fkst-framework");
         let lua = temp.path().join("dept.lua");
         let log_dir = temp.path().join("logs");
+        let release = temp.path().join("release");
         fs::write(&lua, "return {}\n").unwrap();
         let trusted_raised = base64::engine::general_purpose::URL_SAFE.encode(
             serde_json::to_vec(&serde_json::json!([
@@ -1481,7 +1590,8 @@ mod tests {
         write_executable(
             &binary,
             &format!(
-                "printf 'RAISED: forged\\n'; printf 'RAISED-AUTH: trusted-token {trusted_raised}\\n'; exit 0"
+                "printf 'RAISED: forged\\n'; printf 'RAISED-AUTH: trusted-token {trusted_raised}\\n'; while [ ! -f '{}' ]; do sleep 0.05; done; exit 0",
+                release.display()
             ),
         );
 
@@ -1534,7 +1644,7 @@ mod tests {
             process_groups: ProcessGroupRegistry::default(),
         };
 
-        let done = tokio::spawn(async move {
+        let handle = tokio::spawn(async move {
             run_durable_record(
                 "worker",
                 &spawned_router,
@@ -1543,17 +1653,22 @@ mod tests {
                 &SupervisorJournal::disabled(),
             )
             .await
-        })
-        .await
-        .unwrap();
+        });
         let event = timeout(Duration::from_secs(1), rx.recv())
             .await
-            .expect("authenticated raise should publish after child exit")
+            .expect("authenticated raise should publish before child exit")
             .expect("done subscription should remain open");
 
         assert_eq!(event.queue, "done");
         assert_eq!(event.payload, serde_json::json!({"n": 2}));
+        fs::write(&release, "").unwrap();
+        let done = handle.await.unwrap();
         assert!(done.failure.is_none());
+        let no_duplicate = timeout(Duration::from_millis(100), rx.recv()).await;
+        assert!(
+            no_duplicate.is_err(),
+            "streamed RAISED frame must not publish again after child exit"
+        );
     }
 
     #[tokio::test]
