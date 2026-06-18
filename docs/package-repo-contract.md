@@ -38,6 +38,12 @@ flat package 指 `package-root == host-root` 且只有一个 graph root；它保
 pipeline(event)
 source
 raise(queue, payload)
+declare_intent(edge, generation, effect_kind, effect_key)
+wait_until_intent_visible(intent_id)
+perform_or_recover_effect(intent_id, effect_key, recover_fn, perform_fn)
+write_result_marker(intent_id, result)
+wait_until_result_visible(result_id)
+derive_next_transition_from_visible_result(result_id)
 spawn_codex_sync(opts)
 spawn_codex(opts)
 fkst.codex_runs()

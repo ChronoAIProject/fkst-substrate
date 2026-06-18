@@ -77,6 +77,13 @@ impl ProcessSandbox {
         self.set_env("FKST_RUNTIME_LOG_DIR", path.as_ref().as_os_str().to_owned())
     }
 
+    pub fn durable_root(&mut self, path: impl AsRef<Path>) -> &mut Self {
+        self.set_env(
+            fkst_common::durable_layout::DURABLE_ROOT_ENV,
+            path.as_ref().as_os_str().to_owned(),
+        )
+    }
+
     pub fn enter(&self) -> (std::sync::MutexGuard<'static, ()>, ProcessSandboxGuard) {
         let lock = PROCESS_LOCK
             .get_or_init(|| Mutex::new(()))

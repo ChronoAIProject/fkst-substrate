@@ -44,6 +44,7 @@ mod sdk_fs;
 mod sdk_git;
 mod sdk_graph;
 mod sdk_i18n;
+mod sdk_intent;
 mod sdk_json;
 mod sdk_log;
 mod sdk_mark;

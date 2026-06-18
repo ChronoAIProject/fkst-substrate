@@ -256,7 +256,7 @@ Department 收到的标准事件是 `Event{queue,payload,ts}`，其中 `ts` 是 
 
 `raise` 不落盘。它通过 `LuaSerdeExt` 的 `lua.from_value` 将 Lua payload 转为 JSON 后进入 stdout `RAISED:` 协议。bare Lua empty table 没有数组 / 对象意图标记，序列化为 JSON object `{}`；由 `json.decode("[]")` 构造的 array-tagged empty table 会保持为 JSON array `[]`。需要可能为空的数组字段时，package 必须显式构造 array-tagged table；engine 不根据字段名或 schema 推断空表形态。
 
-需要 durable intent 或完成态事实时，package/host 必须显式写入 git commit、host repo 文件或外部源，再由 package controller 通过 `cron` / `file_watch` 重新引入事件。
+需要 non-idempotent effect 的 visible-intent barrier 时，package/host 使用 `declare_intent` → `wait_until_intent_visible` → `perform_or_recover_effect` → `write_result_marker` → `wait_until_result_visible` → `derive_next_transition_from_visible_result`。该 ledger 落在 `FKST_DURABLE_ROOT`，只承载 effect intent/result ordering、`effect_key` idempotency 和 recovery fencing；业务完成态事实仍必须显式写入 git commit、host repo 文件或外部源，再由 package controller 通过 `cron` / `file_watch` 重新引入事件。
 
 ## 8. 瞬时队列与恢复模型
 

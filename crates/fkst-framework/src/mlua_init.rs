@@ -40,6 +40,7 @@ pub fn register_framework_sdk(
     crate::sdk_graph::register(lua, graph_roots, graph_json_authorized)?;
     crate::sdk_fs::register(lua)?;
     crate::sdk_json::register(lua)?;
+    crate::sdk_intent::register(lua)?;
     crate::sdk_git::register(lua, host_root, config.clone())?;
     crate::sdk_mark::register(lua, host_root)?;
     crate::sdk_cache::register(lua, host_root)?;
@@ -70,6 +71,7 @@ pub(crate) fn register_framework_sdk_with_runner(
     crate::sdk_graph::register(lua, graph_roots, graph_json_authorized)?;
     crate::sdk_fs::register(lua)?;
     crate::sdk_json::register(lua)?;
+    crate::sdk_intent::register(lua)?;
     crate::sdk_git::register_with_runner(lua, host_root, config.clone(), runner.clone())?;
     crate::sdk_mark::register(lua, host_root)?;
     crate::sdk_cache::register(lua, host_root)?;

@@ -36,6 +36,16 @@ impl DurableLayout {
     pub fn delivery_db_path(&self) -> PathBuf {
         self.root.join("delivery.redb")
     }
+
+    // DurableLayout owns the visible-intent database location.
+    pub fn intent_db_path(&self) -> PathBuf {
+        self.root.join("intent.redb")
+    }
+
+    // DurableLayout owns process-local locks for effect intent execution.
+    pub fn intent_lock_dir(&self) -> PathBuf {
+        self.root.join("intent-locks")
+    }
 }
 
 fn reject_traversal(path: &Path) -> Result<()> {
@@ -108,6 +118,19 @@ mod tests {
         assert_eq!(
             layout.delivery_db_path(),
             PathBuf::from("/tmp/fkst-durable/repo-a/delivery.redb")
+        );
+    }
+
+    #[test]
+    fn intent_paths_are_under_durable_root() {
+        let layout = DurableLayout::new("/tmp/fkst-durable/repo-a").unwrap();
+        assert_eq!(
+            layout.intent_db_path(),
+            PathBuf::from("/tmp/fkst-durable/repo-a/intent.redb")
+        );
+        assert_eq!(
+            layout.intent_lock_dir(),
+            PathBuf::from("/tmp/fkst-durable/repo-a/intent-locks")
         );
     }
 
