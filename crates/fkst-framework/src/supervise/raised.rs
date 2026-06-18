@@ -1,9 +1,10 @@
-//! RAISED stdout protocol parser.
+//! RAISED frame parser.
 //!
-//! Framework prints exactly one final line `RAISED: <base64-url-encoded-JSON>` on stdout
-//! before exit. The JSON decodes to `[{queue, payload}, ...]`. Multiple RAISED lines →
-//! last wins. No RAISED line → empty list, no error. Malformed base64/JSON → log
-//! warning, treat as empty (don't crash supervisor).
+//! Direct `run` compatibility prints one final line `RAISED:
+//! <base64-url-encoded-JSON>` on stdout before exit. Supervise requires a
+//! parent-generated `RAISED-AUTH: <token> <base64-url-encoded-JSON>` frame, and
+//! `run` removes the token from the Lua-visible environment before loading user
+//! code.
 //!
 //! Scanning from end of stdout buffer prevents log lines like
 //! `log.info("RAISED: foo")` from being mistaken for the actual protocol.
@@ -21,12 +22,7 @@ struct RaisedEntry {
     payload: Value,
 }
 
-pub fn parse_raised_line(line: &str) -> Vec<Event> {
-    if !line.trim_start().starts_with("RAISED: ") {
-        return Vec::new();
-    }
-
-    let b64_part = line.trim_start().trim_start_matches("RAISED: ").trim();
+fn decode_raised_payload(b64_part: &str) -> Vec<Event> {
     let decoded_bytes = match base64::engine::general_purpose::URL_SAFE.decode(b64_part) {
         Ok(b) => b,
         Err(e) => {
@@ -47,9 +43,42 @@ pub fn parse_raised_line(line: &str) -> Vec<Event> {
         .collect()
 }
 
-/// Parse stdout into a list of (queue, Event) tuples. Returns empty vec if no RAISED line.
+pub fn parse_raised_line(line: &str) -> Vec<Event> {
+    let Some(b64_part) = line.trim_start().strip_prefix("RAISED: ") else {
+        return Vec::new();
+    };
+
+    decode_raised_payload(b64_part.trim())
+}
+
+pub fn parse_authenticated_raised_line(line: &str, token: &str) -> Vec<Event> {
+    let Some(rest) = line.trim_start().strip_prefix("RAISED-AUTH: ") else {
+        return Vec::new();
+    };
+    let Some((frame_token, b64_part)) = rest.trim().split_once(' ') else {
+        warn!("RAISED-AUTH line missing payload");
+        return Vec::new();
+    };
+    if frame_token != token {
+        warn!("RAISED-AUTH line token mismatch");
+        return Vec::new();
+    }
+    decode_raised_payload(b64_part.trim())
+}
+
+pub fn parse_authenticated_raised(stdout: &str, token: &str) -> Vec<Event> {
+    let last = stdout
+        .lines()
+        .rev()
+        .find(|line| line.trim_start().starts_with("RAISED-AUTH: "));
+    let Some(line) = last else {
+        return Vec::new();
+    };
+    parse_authenticated_raised_line(line, token)
+}
+
+/// Parse stdout into a list of events. Returns empty vec if no RAISED line.
 pub fn parse_raised(stdout: &str) -> Vec<Event> {
-    // Find the LAST line starting with "RAISED: " (after any trailing whitespace).
     let last = stdout
         .lines()
         .rev()
@@ -88,6 +117,28 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].queue, "done");
         assert_eq!(events[0].payload, serde_json::json!({"n": 1}));
+    }
+
+    #[test]
+    fn authenticated_raised_requires_matching_token() {
+        let payload = encode(r#"[{"queue":"done","payload":{"n":1}}]"#);
+        let stdout = format!(
+            "RAISED-AUTH: wrong {}\nRAISED-AUTH: expected {}\n",
+            payload, payload
+        );
+
+        let events = parse_authenticated_raised(&stdout, "expected");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].queue, "done");
+        assert!(parse_authenticated_raised(&stdout, "wrong").is_empty());
+    }
+
+    #[test]
+    fn authenticated_raised_ignores_plain_raised() {
+        let payload = encode(r#"[{"queue":"done","payload":{"n":1}}]"#);
+        let stdout = format!("RAISED: {}\n", payload);
+
+        assert!(parse_authenticated_raised(&stdout, "expected").is_empty());
     }
 
     #[test]

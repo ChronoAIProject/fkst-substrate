@@ -139,6 +139,7 @@ fn check_sdk_registration(host_root: &std::path::Path) -> Result<()> {
         Some("pkg.self_test".to_string()),
         NameResolver::new(["pkg".to_string()]),
         "pkg".to_string(),
+        crate::raise::RaiseAuthority::new(Default::default()),
         None,
         false,
     )
