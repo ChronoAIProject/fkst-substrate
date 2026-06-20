@@ -11,13 +11,16 @@ use super::delivery_index::{
 use super::delivery_retry::ERROR_EXCERPT_LIMIT;
 use super::delivery_retry::{backoff_delay, bounded_jitter, error_excerpt};
 use super::delivery_transition::{lease_key, read_delivery_table, rebuild_due_indexes};
-use super::delivery_types::{DeadRecord, DeliveryRecord, RedrivePolicy, RetryPolicy};
+use super::delivery_types::{DeadRecord, DeliveryRecord, RedrivePolicy, RetryPolicy, SourceRef};
 use super::delivery_watch::StoreOpWatch;
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use redb::{Database, ReadableTable, TableDefinition};
+use serde::{Deserialize, Serialize};
+use serde_json::Value as JsonValue;
 #[cfg(test)]
 use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt::Write as _;
 use std::path::Path;
 use std::time::Duration;
 
@@ -70,6 +73,105 @@ pub(crate) struct DeliveryStore {
     db: Database,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct DeliveryObserveOptions {
+    pub(crate) now_ms: u64,
+    pub(crate) limit: usize,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub(crate) struct DeliveryObserveSnapshot {
+    pub(crate) schema_version: u32,
+    pub(crate) generated_at_ms: u64,
+    pub(crate) source: DeliveryObserveSource,
+    pub(crate) limits: DeliveryObserveLimits,
+    pub(crate) truncated: DeliveryObserveTruncated,
+    pub(crate) queues: Vec<QueueObserveState>,
+    pub(crate) deliveries: Vec<DeliveryObserveEntry>,
+    pub(crate) dead_letters: Vec<DeadLetterObserveEntry>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub(crate) struct DeliveryObserveSource {
+    pub(crate) durable_root: String,
+    pub(crate) database: String,
+    pub(crate) read_semantics: String,
+    pub(crate) history_semantics: String,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub(crate) struct DeliveryObserveLimits {
+    pub(crate) max_deliveries: usize,
+    pub(crate) max_dead_letters: usize,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+pub(crate) struct DeliveryObserveTruncated {
+    pub(crate) deliveries: bool,
+    pub(crate) dead_letters: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub(crate) struct QueueObserveState {
+    pub(crate) queue: String,
+    pub(crate) depth: usize,
+    pub(crate) pending: usize,
+    pub(crate) in_flight: usize,
+    pub(crate) retrying: usize,
+    pub(crate) oldest_pending_age_ms: Option<u64>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub(crate) struct DeliveryObserveEntry {
+    pub(crate) delivery_id: String,
+    pub(crate) queue: String,
+    pub(crate) dept: String,
+    pub(crate) source: Option<SourceRef>,
+    pub(crate) status: DeliveryObserveStatus,
+    pub(crate) observed_at_ms: u64,
+    pub(crate) not_before_ms: u64,
+    pub(crate) attempt: u64,
+    pub(crate) redrive_count: u64,
+    pub(crate) lease_generation: u64,
+    pub(crate) lease_until_ms: Option<u64>,
+    pub(crate) fence_token: String,
+    pub(crate) payload: PayloadObserveSummary,
+    pub(crate) last_error_excerpt: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub(crate) struct DeadLetterObserveEntry {
+    pub(crate) delivery_id: String,
+    pub(crate) queue: String,
+    pub(crate) dept: String,
+    pub(crate) source: Option<SourceRef>,
+    pub(crate) observed_at_ms: u64,
+    pub(crate) not_before_ms: u64,
+    pub(crate) dead_at_ms: u64,
+    pub(crate) attempts: u64,
+    pub(crate) redrive_count: u64,
+    pub(crate) replayable: bool,
+    pub(crate) permanent: bool,
+    pub(crate) payload: PayloadObserveSummary,
+    pub(crate) error_excerpt: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum DeliveryObserveStatus {
+    Pending,
+    InFlight,
+    Retrying,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub(crate) struct PayloadObserveSummary {
+    pub(crate) schema: Option<String>,
+    pub(crate) dedup_key: Option<String>,
+    pub(crate) digest: String,
+    pub(crate) bytes: usize,
+}
+
 impl DeliveryStore {
     pub(crate) fn open(path: impl AsRef<Path>) -> Result<Self> {
         if let Some(parent) = path.as_ref().parent() {
@@ -109,6 +211,16 @@ impl DeliveryStore {
             meta.insert("schema_version", SCHEMA_VERSION)?;
         }
         write.commit()?;
+        Ok(Self { db })
+    }
+
+    pub(crate) fn open_existing(path: impl AsRef<Path>) -> Result<Self> {
+        let db = Database::open(path.as_ref()).with_context(|| {
+            format!(
+                "open existing durable delivery database `{}`",
+                path.as_ref().display()
+            )
+        })?;
         Ok(Self { db })
     }
 
@@ -669,6 +781,98 @@ impl DeliveryStore {
         }
     }
 
+    pub(crate) fn observe_snapshot(
+        &self,
+        durable_root: &Path,
+        database: &Path,
+        options: &DeliveryObserveOptions,
+    ) -> Result<DeliveryObserveSnapshot> {
+        let read = self.db.begin_read()?;
+        let delivery = read.open_table(DELIVERY_BY_ID)?;
+        let dead = read.open_table(DEAD_BY_ID)?;
+        let mut deliveries = Vec::new();
+        let mut dead_letters = Vec::new();
+        let mut queues = BTreeMap::<String, QueueAccumulator>::new();
+        let mut truncated = DeliveryObserveTruncated::default();
+
+        for entry in delivery.iter()? {
+            let (delivery_id, bytes) = entry?;
+            let delivery_id = delivery_id.value().to_string();
+            let record = match serde_json::from_slice::<DeliveryRecord>(bytes.value()) {
+                Ok(record) => record,
+                Err(err) => {
+                    tracing::warn!(
+                        delivery_id = %delivery_id,
+                        error = %err,
+                        "skipping undecodable delivery record"
+                    );
+                    continue;
+                }
+            };
+            queues
+                .entry(record.queue.clone())
+                .or_default()
+                .observe_delivery(&record, options.now_ms);
+            if deliveries.len() < options.limit {
+                deliveries.push(delivery_observe_entry(record, options.now_ms)?);
+            } else {
+                truncated.deliveries = true;
+            }
+        }
+
+        for entry in dead.iter()? {
+            let (delivery_id, bytes) = entry?;
+            let delivery_id = delivery_id.value().to_string();
+            let Some(record) = decode_dead_record(&delivery_id, bytes.value()) else {
+                continue;
+            };
+            if dead_letters.len() < options.limit {
+                dead_letters.push(dead_letter_observe_entry(record)?);
+            } else {
+                truncated.dead_letters = true;
+            }
+        }
+
+        deliveries.sort_by(|left, right| {
+            left.queue
+                .cmp(&right.queue)
+                .then_with(|| left.dept.cmp(&right.dept))
+                .then_with(|| left.not_before_ms.cmp(&right.not_before_ms))
+                .then_with(|| left.delivery_id.cmp(&right.delivery_id))
+        });
+        dead_letters.sort_by(|left, right| {
+            left.dead_at_ms
+                .cmp(&right.dead_at_ms)
+                .then_with(|| left.delivery_id.cmp(&right.delivery_id))
+        });
+
+        Ok(DeliveryObserveSnapshot {
+            schema_version: 1,
+            generated_at_ms: options.now_ms,
+            source: DeliveryObserveSource {
+                durable_root: durable_root.display().to_string(),
+                database: database.display().to_string(),
+                read_semantics:
+                    "single read transaction over the owner redb handle for live supervise snapshots or over an offline database open"
+                        .to_string(),
+                history_semantics:
+                    "delivery queue snapshot only; acked deliveries are removed and historical timelines require a journal"
+                        .to_string(),
+            },
+            limits: DeliveryObserveLimits {
+                max_deliveries: options.limit,
+                max_dead_letters: options.limit,
+            },
+            truncated,
+            queues: queues
+                .into_iter()
+                .map(|(queue, accumulator)| accumulator.finish(queue, options.now_ms))
+                .collect(),
+            deliveries,
+            dead_letters,
+        })
+    }
+
     #[cfg(test)]
     fn ready_index_len(&self) -> Result<usize> {
         let read = self.db.begin_read()?;
@@ -746,6 +950,245 @@ fn same_delivery_content(left: &DeliveryRecord, right: &DeliveryRecord) -> bool 
         && left.payload == right.payload
         && left.source == right.source
         && left.cron_payload == right.cron_payload
+}
+
+#[derive(Clone, Debug, Default)]
+struct QueueAccumulator {
+    pending: usize,
+    in_flight: usize,
+    retrying: usize,
+    oldest_pending_ms: Option<u64>,
+}
+
+impl QueueAccumulator {
+    fn observe_delivery(&mut self, record: &DeliveryRecord, now_ms: u64) {
+        match delivery_status(record, now_ms) {
+            DeliveryObserveStatus::Pending => {
+                self.pending += 1;
+                self.oldest_pending_ms = Some(
+                    self.oldest_pending_ms
+                        .map(|oldest| oldest.min(record.not_before_ms))
+                        .unwrap_or(record.not_before_ms),
+                );
+            }
+            DeliveryObserveStatus::InFlight => self.in_flight += 1,
+            DeliveryObserveStatus::Retrying => self.retrying += 1,
+        }
+    }
+
+    fn finish(self, queue: String, now_ms: u64) -> QueueObserveState {
+        QueueObserveState {
+            queue,
+            depth: self
+                .pending
+                .saturating_add(self.in_flight)
+                .saturating_add(self.retrying),
+            pending: self.pending,
+            in_flight: self.in_flight,
+            retrying: self.retrying,
+            oldest_pending_age_ms: self
+                .oldest_pending_ms
+                .map(|observed| now_ms.saturating_sub(observed)),
+        }
+    }
+}
+
+fn delivery_observe_entry(record: DeliveryRecord, now_ms: u64) -> Result<DeliveryObserveEntry> {
+    let payload = payload_summary(&record.payload)?;
+    let status = delivery_status(&record, now_ms);
+    Ok(DeliveryObserveEntry {
+        fence_token: fence_token(&record.delivery_id, record.lease_generation),
+        delivery_id: record.delivery_id,
+        queue: record.queue,
+        dept: record.dept,
+        source: record.source,
+        status,
+        observed_at_ms: record.observed_at_ms,
+        not_before_ms: record.not_before_ms,
+        attempt: record.attempt,
+        redrive_count: record.redrive_count,
+        lease_generation: record.lease_generation,
+        lease_until_ms: record.lease_until_ms,
+        payload,
+        last_error_excerpt: record.last_error_excerpt,
+    })
+}
+
+fn dead_letter_observe_entry(record: DeadRecord) -> Result<DeadLetterObserveEntry> {
+    let payload = match record.record.as_ref() {
+        Some(delivery) => payload_summary(&delivery.payload)?,
+        None => PayloadObserveSummary::empty(),
+    };
+    Ok(DeadLetterObserveEntry {
+        delivery_id: record.delivery_id,
+        queue: record.queue,
+        dept: record.dept,
+        source: record.source,
+        observed_at_ms: record.observed_at_ms,
+        not_before_ms: record.not_before_ms,
+        dead_at_ms: record.dead_at_ms,
+        attempts: record.attempts,
+        redrive_count: record.redrive_count,
+        replayable: record.replayable,
+        permanent: record.permanent,
+        payload,
+        error_excerpt: record.error_excerpt,
+    })
+}
+
+fn delivery_status(record: &DeliveryRecord, now_ms: u64) -> DeliveryObserveStatus {
+    if record
+        .lease_until_ms
+        .is_some_and(|lease_until| lease_until > now_ms)
+    {
+        DeliveryObserveStatus::InFlight
+    } else if record.attempt > 0 && record.not_before_ms > now_ms {
+        DeliveryObserveStatus::Retrying
+    } else {
+        DeliveryObserveStatus::Pending
+    }
+}
+
+fn fence_token(delivery_id: &str, lease_generation: u64) -> String {
+    format!("{delivery_id}#{lease_generation}")
+}
+
+impl PayloadObserveSummary {
+    fn empty() -> Self {
+        Self {
+            schema: None,
+            dedup_key: None,
+            digest: stable_json_digest(&JsonValue::Null),
+            bytes: 4,
+        }
+    }
+}
+
+fn payload_summary(payload: &JsonValue) -> Result<PayloadObserveSummary> {
+    let bytes = serde_json::to_vec(payload)?;
+    Ok(PayloadObserveSummary {
+        schema: payload_string_field(payload, "schema"),
+        dedup_key: payload_string_field(payload, "dedup_key"),
+        digest: stable_digest(&bytes),
+        bytes: bytes.len(),
+    })
+}
+
+fn payload_string_field(payload: &JsonValue, key: &str) -> Option<String> {
+    payload
+        .as_object()
+        .and_then(|object| object.get(key))
+        .and_then(|value| value.as_str())
+        .map(ToOwned::to_owned)
+}
+
+fn stable_json_digest(value: &JsonValue) -> String {
+    stable_digest(&serde_json::to_vec(value).expect("serialize JSON value"))
+}
+
+fn stable_digest(bytes: &[u8]) -> String {
+    let digest = sha256(bytes);
+    let mut hex = String::with_capacity(64);
+    for byte in digest {
+        write!(&mut hex, "{byte:02x}").expect("writing to string should not fail");
+    }
+    hex
+}
+
+fn sha256(input: &[u8]) -> [u8; 32] {
+    const H0: [u32; 8] = [
+        0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
+        0x5be0cd19,
+    ];
+    const K: [u32; 64] = [
+        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4,
+        0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe,
+        0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f,
+        0x4a7484aa, 0x5cb0a9dc, 0x76f988da, 0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7,
+        0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc,
+        0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b,
+        0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070, 0x19a4c116,
+        0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+        0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7,
+        0xc67178f2,
+    ];
+    let bit_len = (input.len() as u64).wrapping_mul(8);
+    let mut data = input.to_vec();
+    data.push(0x80);
+    while data.len() % 64 != 56 {
+        data.push(0);
+    }
+    data.extend_from_slice(&bit_len.to_be_bytes());
+
+    let mut state = H0;
+    for chunk in data.chunks_exact(64) {
+        let mut words = [0_u32; 64];
+        for (i, word) in words.iter_mut().take(16).enumerate() {
+            *word = u32::from_be_bytes([
+                chunk[i * 4],
+                chunk[i * 4 + 1],
+                chunk[i * 4 + 2],
+                chunk[i * 4 + 3],
+            ]);
+        }
+        for i in 16..64 {
+            let s0 = words[i - 15].rotate_right(7)
+                ^ words[i - 15].rotate_right(18)
+                ^ (words[i - 15] >> 3);
+            let s1 = words[i - 2].rotate_right(17)
+                ^ words[i - 2].rotate_right(19)
+                ^ (words[i - 2] >> 10);
+            words[i] = words[i - 16]
+                .wrapping_add(s0)
+                .wrapping_add(words[i - 7])
+                .wrapping_add(s1);
+        }
+
+        let mut a = state[0];
+        let mut b = state[1];
+        let mut c = state[2];
+        let mut d = state[3];
+        let mut e = state[4];
+        let mut f = state[5];
+        let mut g = state[6];
+        let mut h = state[7];
+
+        for i in 0..64 {
+            let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
+            let ch = (e & f) ^ ((!e) & g);
+            let temp1 = h
+                .wrapping_add(s1)
+                .wrapping_add(ch)
+                .wrapping_add(K[i])
+                .wrapping_add(words[i]);
+            let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
+            let maj = (a & b) ^ (a & c) ^ (b & c);
+            let temp2 = s0.wrapping_add(maj);
+            h = g;
+            g = f;
+            f = e;
+            e = d.wrapping_add(temp1);
+            d = c;
+            c = b;
+            b = a;
+            a = temp1.wrapping_add(temp2);
+        }
+
+        state[0] = state[0].wrapping_add(a);
+        state[1] = state[1].wrapping_add(b);
+        state[2] = state[2].wrapping_add(c);
+        state[3] = state[3].wrapping_add(d);
+        state[4] = state[4].wrapping_add(e);
+        state[5] = state[5].wrapping_add(f);
+        state[6] = state[6].wrapping_add(g);
+        state[7] = state[7].wrapping_add(h);
+    }
+
+    let mut out = [0_u8; 32];
+    for (idx, word) in state.iter().enumerate() {
+        out[idx * 4..idx * 4 + 4].copy_from_slice(&word.to_be_bytes());
+    }
+    out
 }
 
 fn expired_lease_quota(batch_limit: usize) -> usize {
@@ -2311,6 +2754,125 @@ mod tests {
             .unwrap();
         assert_eq!(result.redriven.len(), 1);
         assert_eq!(result.redriven[0].delivery_id, "replayable");
+    }
+
+    #[test]
+    fn observe_snapshot_reports_queue_state_without_payload_body() {
+        let temp = TempDir::new().unwrap();
+        let store = store(&temp);
+        let mut pending = record("pending", 100);
+        pending.payload = serde_json::json!({
+            "schema": "github.issue",
+            "dedup_key": "issue-81",
+            "body": "secret body must not be emitted"
+        });
+        let retrying = record("retrying", 250);
+        store.enqueue(&pending).unwrap();
+        store.enqueue(&retrying).unwrap();
+        store.lease(100, 1, Duration::from_millis(100)).unwrap();
+
+        let snapshot = store
+            .observe_snapshot(
+                temp.path(),
+                &temp.path().join("delivery.redb"),
+                &DeliveryObserveOptions {
+                    now_ms: 150,
+                    limit: 10,
+                },
+            )
+            .unwrap();
+        let queue = snapshot
+            .queues
+            .iter()
+            .find(|entry| entry.queue == "input")
+            .unwrap();
+
+        assert_eq!(queue.depth, 2);
+        assert_eq!(queue.pending, 1);
+        assert_eq!(queue.in_flight, 1);
+        assert_eq!(queue.retrying, 0);
+        assert_eq!(queue.oldest_pending_age_ms, Some(0));
+        let json = serde_json::to_string(&snapshot).unwrap();
+        assert!(json.contains("\"schema\":\"github.issue\""));
+        assert!(json.contains("\"dedup_key\":\"issue-81\""));
+        assert!(!json.contains("secret body must not be emitted"));
+    }
+
+    #[test]
+    fn observe_snapshot_reports_retrying_and_dead_letters() {
+        let temp = TempDir::new().unwrap();
+        let store = store(&temp);
+        store.enqueue(&record("one", 100)).unwrap();
+        let leased = store
+            .lease(100, 1, Duration::from_millis(50))
+            .unwrap()
+            .remove(0);
+        store
+            .retry(
+                &leased.delivery_id,
+                leased.lease_generation,
+                &failure("temporary", false),
+                &policy(3),
+                120,
+            )
+            .unwrap();
+        store.enqueue(&record("dead", 100)).unwrap();
+        let dead = store
+            .lease(100, 1, Duration::from_millis(50))
+            .unwrap()
+            .remove(0);
+        store
+            .retry(
+                &dead.delivery_id,
+                dead.lease_generation,
+                &failure("final", false),
+                &policy(1),
+                130,
+            )
+            .unwrap();
+
+        let snapshot = store
+            .observe_snapshot(
+                temp.path(),
+                &temp.path().join("delivery.redb"),
+                &DeliveryObserveOptions {
+                    now_ms: 121,
+                    limit: 10,
+                },
+            )
+            .unwrap();
+        let queue = snapshot
+            .queues
+            .iter()
+            .find(|entry| entry.queue == "input")
+            .unwrap();
+
+        assert_eq!(queue.retrying, 1);
+        assert_eq!(snapshot.dead_letters.len(), 1);
+        assert_eq!(snapshot.dead_letters[0].delivery_id, "dead");
+        assert_eq!(snapshot.dead_letters[0].payload.bytes, 4);
+    }
+
+    #[test]
+    fn observe_snapshot_marks_truncation() {
+        let temp = TempDir::new().unwrap();
+        let store = store(&temp);
+        store.enqueue(&record("one", 100)).unwrap();
+        store.enqueue(&record("two", 100)).unwrap();
+
+        let snapshot = store
+            .observe_snapshot(
+                temp.path(),
+                &temp.path().join("delivery.redb"),
+                &DeliveryObserveOptions {
+                    now_ms: 100,
+                    limit: 1,
+                },
+            )
+            .unwrap();
+
+        assert_eq!(snapshot.deliveries.len(), 1);
+        assert!(snapshot.truncated.deliveries);
     }
 
     #[test]

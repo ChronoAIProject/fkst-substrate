@@ -1,6 +1,7 @@
 //! Durable delivery path resolver.
 
 use anyhow::{anyhow, Result};
+use std::fmt::Write as _;
 use std::path::{Component, Path, PathBuf};
 
 pub const DURABLE_ROOT_ENV: &str = "FKST_DURABLE_ROOT";
@@ -36,6 +37,11 @@ impl DurableLayout {
     pub fn delivery_db_path(&self) -> PathBuf {
         self.root.join("delivery.redb")
     }
+
+    // Supervise owns this transient live-observe endpoint while the store is open.
+    pub fn observe_socket_path(&self) -> PathBuf {
+        PathBuf::from("/tmp").join(format!("fkst-observe-{}.sock", stable_hex_hash(&self.root)))
+    }
 }
 
 fn reject_traversal(path: &Path) -> Result<()> {
@@ -48,6 +54,17 @@ fn reject_traversal(path: &Path) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn stable_hex_hash(path: &Path) -> String {
+    let mut hash = 0xcbf29ce484222325_u64;
+    for byte in path.as_os_str().to_string_lossy().as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    let mut out = String::with_capacity(16);
+    write!(&mut out, "{hash:016x}").expect("writing to string should not fail");
+    out
 }
 
 #[cfg(test)]
@@ -109,6 +126,20 @@ mod tests {
             layout.delivery_db_path(),
             PathBuf::from("/tmp/fkst-durable/repo-a/delivery.redb")
         );
+    }
+
+    #[test]
+    fn observe_socket_path_is_short_and_stable() {
+        let layout = DurableLayout::new("/tmp/fkst-durable/repo-a").unwrap();
+        assert_eq!(layout.observe_socket_path(), layout.observe_socket_path());
+        assert!(layout.observe_socket_path().starts_with("/tmp"));
+        assert!(layout
+            .observe_socket_path()
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .ends_with(".sock"));
+        assert!(layout.observe_socket_path().to_string_lossy().len() < 100);
     }
 
     #[test]
