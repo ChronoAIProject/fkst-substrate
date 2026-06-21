@@ -41,11 +41,14 @@ jobs:
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@cargo-llvm-cov
       - name: Generate LCOV coverage
-        # Serial test execution: several substrate tests share concurrency-sensitive
-        # resources (the codex permit pool flock, git-submodule fixtures); under the
-        # slower llvm-cov-instrumented binaries they race in parallel. --test-threads=1
-        # makes the coverage run deterministic. (The verify gate runs separately.)
-        run: cargo llvm-cov --workspace --lcov --output-path lcov.info -- --test-threads=1
+        # Unit-test coverage only (--lib --bins): the integration tests (tests/) spawn and
+        # SIGKILL fkst-framework subprocesses (supervise/spawn lifecycle); under llvm-cov the
+        # killed instrumented children write partial .profraw files that corrupt the profile
+        # merge (a known cargo-llvm-cov limitation with spawn-and-kill subprocesses). Unit
+        # tests in src/ don't spawn-and-kill instrumented binaries, so they cover cleanly.
+        # --test-threads=1 keeps it deterministic. Coverage is non-gating VISUALIZATION; the
+        # hermetic verify job remains the enforcement authority and runs the full suite.
+        run: cargo llvm-cov --lib --bins --workspace --lcov --output-path lcov.info -- --test-threads=1
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@v5
         with:
