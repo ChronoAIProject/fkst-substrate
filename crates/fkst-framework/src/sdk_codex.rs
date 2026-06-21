@@ -75,6 +75,7 @@ struct CodexAdoptionPaths {
     prompt: PathBuf,
     stdout: PathBuf,
     stderr: PathBuf,
+    effect: PathBuf,
     result: PathBuf,
     status: PathBuf,
 }
@@ -138,6 +139,17 @@ struct CodexAdoptionRecord {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 struct CodexAdoptionResultRecord {
     ended_at_ms: u64,
+    exit_code: i32,
+    error_kind: Option<String>,
+    error: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct CodexAdoptionEffectRecord {
+    effect_key: String,
+    ended_at_ms: u64,
+    stdout: String,
+    stderr: String,
     exit_code: i32,
     error_kind: Option<String>,
     error: Option<String>,
@@ -720,6 +732,7 @@ fn adoption_paths_for_request(
         prompt: dir.join("prompt.txt"),
         stdout: dir.join("stdout.txt"),
         stderr: dir.join("stderr.txt"),
+        effect: dir.join("effect.json"),
         result: dir.join("result.json"),
         status: dir.join("status.json"),
         dir,
@@ -830,29 +843,86 @@ fn read_completed_adoption_result(paths: &CodexAdoptionPaths) -> Result<Option<C
 }
 
 fn recover_completed_adoption_result(paths: &CodexAdoptionPaths) -> Result<Option<CodexResult>> {
-    let Some(result) = read_adoption_result_record(&paths.result)? else {
+    let recovered =
+        recover_completed_adoption_result_from_disk(paths).map_err(mlua::Error::external)?;
+    if !recovered {
         return Ok(None);
     };
-    let Some(mut record) = read_adoption_record(&paths.status)? else {
-        return Ok(None);
+    read_completed_adoption_result(paths)
+}
+
+fn recover_completed_adoption_result_from_disk(paths: &CodexAdoptionPaths) -> anyhow::Result<bool> {
+    if let Some(result) = read_adoption_result_record_from_disk(&paths.result)? {
+        return promote_completed_adoption_result(paths, result);
+    }
+    recover_completed_adoption_effect_by_key(paths)
+}
+
+fn promote_completed_adoption_result(
+    paths: &CodexAdoptionPaths,
+    result: CodexAdoptionResultRecord,
+) -> anyhow::Result<bool> {
+    let Some(mut record) = read_adoption_record_from_disk(&paths.status)? else {
+        return Ok(false);
     };
     record.status = CODEX_ADOPTION_STATUS_COMPLETED.to_string();
     record.ended_at_ms = Some(result.ended_at_ms);
     record.exit_code = Some(result.exit_code);
     record.error_kind = result.error_kind;
     record.error = result.error;
-    write_visible_adoption_record(&paths.status, &record, CODEX_ADOPTION_STATUS_COMPLETED)
-        .map_err(mlua::Error::external)?;
-    read_completed_adoption_result(paths)
+    write_visible_adoption_record(&paths.status, &record, CODEX_ADOPTION_STATUS_COMPLETED)?;
+    Ok(true)
 }
 
-fn read_adoption_result_record(path: &Path) -> Result<Option<CodexAdoptionResultRecord>> {
+fn recover_completed_adoption_effect_by_key(paths: &CodexAdoptionPaths) -> anyhow::Result<bool> {
+    let Some(record) = read_adoption_record_from_disk(&paths.status)? else {
+        return Ok(false);
+    };
+    if record.status == CODEX_ADOPTION_STATUS_COMPLETED
+        || record.key != paths.key
+        || adoption_effect_alive(&record)
+    {
+        return Ok(false);
+    }
+    let Some(effect) = read_adoption_effect_record_from_disk(&paths.effect)? else {
+        return Ok(false);
+    };
+    if effect.effect_key != paths.key {
+        anyhow::bail!(
+            "codex adoption effect key mismatch: expected {} got {}",
+            paths.key,
+            effect.effect_key
+        );
+    }
+    write_atomic(&paths.stdout, effect.stdout.as_bytes())?;
+    write_atomic(&paths.stderr, effect.stderr.as_bytes())?;
+    let result = CodexAdoptionResultRecord {
+        ended_at_ms: effect.ended_at_ms,
+        exit_code: effect.exit_code,
+        error_kind: effect.error_kind,
+        error: effect.error,
+    };
+    write_adoption_result_record(&paths.result, &result)?;
+    promote_completed_adoption_result(paths, result)
+}
+
+fn read_adoption_result_record_from_disk(
+    path: &Path,
+) -> anyhow::Result<Option<CodexAdoptionResultRecord>> {
     match std::fs::read_to_string(path) {
-        Ok(body) => serde_json::from_str(&body)
-            .map(Some)
-            .map_err(mlua::Error::external),
+        Ok(body) => serde_json::from_str(&body).map(Some).map_err(Into::into),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(err) => Err(mlua::Error::external(err)),
+        Err(err) => Err(err.into()),
+    }
+}
+
+fn read_adoption_effect_record_from_disk(
+    path: &Path,
+) -> anyhow::Result<Option<CodexAdoptionEffectRecord>> {
+    match std::fs::read_to_string(path) {
+        Ok(body) => serde_json::from_str(&body).map(Some).map_err(Into::into),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(err.into()),
     }
 }
 
@@ -1003,6 +1073,8 @@ fn codex_worker_args(
         paths.stdout.to_string_lossy().into_owned(),
         "--stderr-file".to_string(),
         paths.stderr.to_string_lossy().into_owned(),
+        "--effect-file".to_string(),
+        paths.effect.to_string_lossy().into_owned(),
         "--result-file".to_string(),
         paths.result.to_string_lossy().into_owned(),
         "--status-file".to_string(),
@@ -1131,6 +1203,7 @@ pub(crate) struct CodexWorkerOptions {
     prompt_file: PathBuf,
     stdout_file: PathBuf,
     stderr_file: PathBuf,
+    effect_file: PathBuf,
     result_file: PathBuf,
     status_file: PathBuf,
     log_path: PathBuf,
@@ -1154,6 +1227,7 @@ pub(crate) fn parse_worker_args(args: Vec<String>) -> anyhow::Result<CodexWorker
     let prompt_file = parser.required_path("--prompt-file")?;
     let stdout_file = parser.required_path("--stdout-file")?;
     let stderr_file = parser.required_path("--stderr-file")?;
+    let effect_file = parser.required_path("--effect-file")?;
     let result_file = parser.required_path("--result-file")?;
     let status_file = parser.required_path("--status-file")?;
     let log_path = parser.required_path("--log-path")?;
@@ -1175,6 +1249,7 @@ pub(crate) fn parse_worker_args(args: Vec<String>) -> anyhow::Result<CodexWorker
         prompt_file,
         stdout_file,
         stderr_file,
+        effect_file,
         result_file,
         status_file,
         log_path,
@@ -1261,9 +1336,21 @@ pub(crate) fn run_codex_worker(options: CodexWorkerOptions) -> anyhow::Result<i3
         }
     };
 
+    let ended_at_ms = unix_duration().as_millis() as u64;
+    write_adoption_effect_record(
+        &options.effect_file,
+        &CodexAdoptionEffectRecord {
+            effect_key: options.key.clone(),
+            ended_at_ms,
+            stdout: result.stdout.clone(),
+            stderr: result.stderr.clone(),
+            exit_code: result.exit_code,
+            error_kind: result.error_kind.clone(),
+            error: result.error.clone(),
+        },
+    )?;
     write_atomic(&options.stdout_file, result.stdout.as_bytes())?;
     write_atomic(&options.stderr_file, result.stderr.as_bytes())?;
-    let ended_at_ms = unix_duration().as_millis() as u64;
     write_adoption_result_record(
         &options.result_file,
         &CodexAdoptionResultRecord {
@@ -1300,6 +1387,20 @@ fn claim_adoption_worker(
         .write(true)
         .open(lock_path)?;
     flock(lock_file.as_raw_fd(), FlockArg::LockExclusive).map_err(anyhow::Error::from)?;
+    let paths = CodexAdoptionPaths {
+        key: options.key.clone(),
+        dir: options.work_dir.clone(),
+        prompt: options.prompt_file.clone(),
+        stdout: options.stdout_file.clone(),
+        stderr: options.stderr_file.clone(),
+        effect: options.effect_file.clone(),
+        result: options.result_file.clone(),
+        status: options.status_file.clone(),
+    };
+    if recover_completed_adoption_result_from_disk(&paths)? {
+        drop(lock_file);
+        return Ok(false);
+    }
     let current_pid = std::process::id();
     let existing = read_adoption_record_from_disk(&options.status_file)?;
     if existing
@@ -1376,6 +1477,13 @@ fn write_adoption_record(path: &Path, record: &CodexAdoptionRecord) -> anyhow::R
 fn write_adoption_result_record(
     path: &Path,
     record: &CodexAdoptionResultRecord,
+) -> anyhow::Result<()> {
+    write_atomic(path, serde_json::to_string(record)?.as_bytes())
+}
+
+fn write_adoption_effect_record(
+    path: &Path,
+    record: &CodexAdoptionEffectRecord,
 ) -> anyhow::Result<()> {
     write_atomic(path, serde_json::to_string(record)?.as_bytes())
 }

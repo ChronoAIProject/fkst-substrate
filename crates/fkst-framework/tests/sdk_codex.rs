@@ -213,6 +213,16 @@ fn adoption_status_records(root: &Path) -> Vec<serde_json::Value> {
     records
 }
 
+fn adoption_work_dir(root: &Path) -> PathBuf {
+    let adoption_dir = root.join(".fkst/runtime/logs/codex-adoption");
+    std::fs::read_dir(&adoption_dir)
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path()
+}
+
 fn wait_for_adoption_status(root: &Path, expected: &str) {
     for _ in 0..100 {
         if adoption_status_values(root)
@@ -1101,14 +1111,7 @@ printf 'recovered-%s' "$count"
         std::fs::read_to_string(capture_dir.join("spawns")).unwrap(),
         "1"
     );
-    let adoption_dir = tmp.path().join(".fkst/runtime/logs/codex-adoption");
-    let status_path = std::fs::read_dir(&adoption_dir)
-        .unwrap()
-        .next()
-        .unwrap()
-        .unwrap()
-        .path()
-        .join("status.json");
+    let status_path = adoption_work_dir(tmp.path()).join("status.json");
     let mut status: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&status_path).unwrap()).unwrap();
     status["status"] = serde_json::Value::String("running".to_string());
@@ -1124,6 +1127,79 @@ printf 'recovered-%s' "$count"
         std::fs::read_to_string(capture_dir.join("spawns")).unwrap(),
         "1"
     );
+    let records = adoption_status_records(tmp.path());
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0]["status"], "completed");
+    assert_eq!(records[0]["exit_code"], 0);
+}
+
+#[cfg(unix)]
+#[test]
+fn spawn_codex_sync_recovers_completed_effect_by_key_without_result_marker() {
+    let tmp = tempfile::tempdir().unwrap();
+    let bin_dir = tmp.path().join("bin");
+    let worktree = tmp.path().join("wt");
+    let capture_dir = tmp.path().join("capture");
+    std::fs::create_dir_all(&worktree).unwrap();
+    std::fs::create_dir_all(&capture_dir).unwrap();
+    install_codex_script(
+        &bin_dir,
+        r#"#!/bin/sh
+cat >/dev/null
+count_file="$CAPTURE_DIR/spawns"
+count=0
+if [ -f "$count_file" ]; then
+  count=$(cat "$count_file")
+fi
+count=$((count + 1))
+printf '%s' "$count" > "$count_file"
+printf 'effect-key-%s' "$count"
+"#,
+    );
+
+    let mut sandbox = ProcessSandbox::new();
+    sandbox.enter_cwd(tmp.path()).runtime_root(".fkst/runtime");
+    sandbox.prepend_path(&bin_dir);
+    sandbox.set_env("CAPTURE_DIR", capture_dir.to_string_lossy().into_owned());
+    sandbox.set_env(CODEX_WORKER_BIN_ENV, framework_bin());
+    sandbox.runtime_log_dir(tmp.path().join("runtime"));
+    let (_lock, _guard) = sandbox.enter();
+
+    let lua = Lua::new();
+    register(&lua).unwrap();
+    let spawn: mlua::Function = lua.globals().get("spawn_codex_sync").unwrap();
+    let worktree_arg = worktree.to_string_lossy().into_owned();
+    let opts = lua_opts(&lua, "effect-key-recovery");
+    opts.set("worktree", worktree_arg).unwrap();
+    opts.set("dedup_key", "recover-effect-key").unwrap();
+    let first: Table = spawn.call(opts.clone()).unwrap();
+    assert_eq!(first.get::<String>("stdout").unwrap(), "effect-key-1");
+    assert_eq!(
+        std::fs::read_to_string(capture_dir.join("spawns")).unwrap(),
+        "1"
+    );
+
+    let adoption_path = adoption_work_dir(tmp.path());
+    std::fs::remove_file(adoption_path.join("stdout.txt")).unwrap();
+    std::fs::remove_file(adoption_path.join("stderr.txt")).unwrap();
+    std::fs::remove_file(adoption_path.join("result.json")).unwrap();
+    let status_path = adoption_path.join("status.json");
+    let mut status: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&status_path).unwrap()).unwrap();
+    status["status"] = serde_json::Value::String("running".to_string());
+    status["ended_at_ms"] = serde_json::Value::Null;
+    status["exit_code"] = serde_json::Value::Null;
+    status["worker_pid"] = serde_json::Value::Null;
+    status["codex_pid"] = serde_json::Value::Null;
+    std::fs::write(&status_path, serde_json::to_string(&status).unwrap()).unwrap();
+
+    let recovered: Table = spawn.call(opts.clone()).unwrap();
+    assert_eq!(recovered.get::<String>("stdout").unwrap(), "effect-key-1");
+    assert_eq!(
+        std::fs::read_to_string(capture_dir.join("spawns")).unwrap(),
+        "1"
+    );
+    assert!(adoption_path.join("result.json").exists());
     let records = adoption_status_records(tmp.path());
     assert_eq!(records.len(), 1);
     assert_eq!(records[0]["status"], "completed");
