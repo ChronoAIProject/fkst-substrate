@@ -13,6 +13,7 @@ fkst-common = { path = "../fkst-common" }
 mlua = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+toml = "0.8"
 anyhow = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }

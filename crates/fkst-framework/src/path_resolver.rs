@@ -1,5 +1,6 @@
 //! Resolve fixed package roots, host graph inputs, and package-local names.
 
+use crate::manifest::{ManifestRequireScope, UnitCatalog};
 use anyhow::{bail, Context, Result};
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -26,6 +27,8 @@ pub(crate) struct PackageRoots {
     host_root: PathBuf,
     package_namespaces: Vec<String>,
     run_host_owner: bool,
+    #[allow(dead_code)]
+    catalog: Option<UnitCatalog>,
 }
 
 impl PackageRoots {
@@ -113,11 +116,13 @@ impl PackageRoots {
                 );
             }
         }
+        let catalog = UnitCatalog::discover(&host_root)?;
         Ok(Self {
             package_roots,
             host_root,
             package_namespaces,
             run_host_owner,
+            catalog,
         })
     }
 
@@ -141,6 +146,23 @@ impl PackageRoots {
             return roots;
         }
         vec![owner_root.to_path_buf()]
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn require_scope_for(&self, owner_root: &Path) -> Result<RequireScope> {
+        if let Some(catalog) = &self.catalog {
+            return Ok(RequireScope::Manifest(
+                catalog.require_scope_for_root(owner_root)?,
+            ));
+        }
+        Ok(RequireScope::Legacy {
+            roots: self.require_roots_for_owner(owner_root),
+        })
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn unit_catalog(&self) -> Option<&UnitCatalog> {
+        self.catalog.as_ref()
     }
 
     pub(crate) fn graph_roots(&self) -> Vec<GraphRoot> {
@@ -207,6 +229,13 @@ impl PackageRoots {
                 }
             })
     }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[allow(dead_code)]
+pub(crate) enum RequireScope {
+    Legacy { roots: Vec<PathBuf> },
+    Manifest(ManifestRequireScope),
 }
 
 #[derive(Clone, Debug)]
@@ -474,7 +503,15 @@ mod tests {
                 })
                 .collect(),
             run_host_owner: false,
+            catalog: None,
         }
+    }
+
+    fn write(path: &Path, body: &str) {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(path, body).unwrap();
     }
 
     // A package department resolves require() against its own package root only,
@@ -532,6 +569,68 @@ mod tests {
             r.require_roots_for_owner(Path::new("/combined")),
             vec![PathBuf::from("/combined")]
         );
+    }
+
+    #[test]
+    fn missing_workspace_manifest_yields_legacy_require_scope() {
+        let temp = tempfile::tempdir().unwrap();
+        let r = PackageRoots::resolve(temp.path(), vec![temp.path().to_path_buf()]).unwrap();
+
+        assert!(r.unit_catalog().is_none());
+        assert_eq!(
+            r.require_scope_for(r.host_root()).unwrap(),
+            RequireScope::Legacy {
+                roots: vec![r.host_root().to_path_buf()]
+            }
+        );
+    }
+
+    #[test]
+    fn workspace_manifest_yields_manifest_require_scope() {
+        let temp = tempfile::tempdir().unwrap();
+        write(
+            &temp.path().join("fkst.workspace.toml"),
+            r#"
+[workspace]
+units = ["packages/*", "libraries/*"]
+"#,
+        );
+        write(
+            &temp.path().join("packages/app/fkst.toml"),
+            r#"
+kind = "package"
+name = "app"
+
+[code]
+root = "."
+
+[lib_deps]
+libraries = ["std"]
+"#,
+        );
+        write(&temp.path().join("packages/app/main.lua"), "");
+        write(
+            &temp.path().join("libraries/std/fkst.toml"),
+            r#"
+kind = "library"
+name = "std"
+
+[code]
+root = "."
+"#,
+        );
+        write(&temp.path().join("libraries/std/public/fkst/json.lua"), "");
+
+        let app_root = temp.path().join("packages/app");
+        let r = PackageRoots::resolve(temp.path(), vec![app_root.clone()]).unwrap();
+
+        assert!(r.unit_catalog().is_some());
+        let RequireScope::Manifest(scope) = r.require_scope_for(&app_root).unwrap() else {
+            panic!("expected manifest require scope");
+        };
+        assert_eq!(scope.owner_unit(), "app");
+        assert!(scope.resolve("main").is_some());
+        assert!(scope.resolve("fkst.json").is_some());
     }
 
     #[test]

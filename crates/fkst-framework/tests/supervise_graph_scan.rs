@@ -4,6 +4,8 @@
 mod config_registry;
 #[path = "../src/supervise/graph_scan.rs"]
 mod graph_scan;
+#[path = "../src/manifest.rs"]
+mod manifest;
 #[path = "../src/path_resolver.rs"]
 mod path_resolver;
 #[path = "../src/provenance.rs"]

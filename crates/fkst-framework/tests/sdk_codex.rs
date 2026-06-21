@@ -6,6 +6,8 @@ mod boundary_resource;
 mod config_registry;
 #[path = "../src/external_command.rs"]
 mod external_command;
+#[path = "../src/manifest.rs"]
+mod manifest;
 #[path = "../src/path_resolver.rs"]
 mod path_resolver;
 #[path = "../src/process_tree.rs"]

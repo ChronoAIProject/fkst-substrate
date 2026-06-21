@@ -28,6 +28,7 @@ mod external_command;
 mod host_conformance;
 mod init_package_repo;
 mod lua_coverage;
+mod manifest;
 mod mlua_init;
 mod observe;
 mod path_resolver;
