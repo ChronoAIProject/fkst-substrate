@@ -40,16 +40,22 @@ jobs:
           rustc --version
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@cargo-llvm-cov
-      - name: Generate LCOV coverage
-        # Unit-test coverage only (--lib --bins): the integration tests (tests/) spawn and
-        # SIGKILL fkst-framework subprocesses (supervise/spawn lifecycle); under llvm-cov the
-        # killed instrumented children write partial .profraw files that corrupt the profile
-        # merge (a known cargo-llvm-cov limitation with spawn-and-kill subprocesses). Unit
-        # tests in src/ don't spawn-and-kill instrumented binaries, so they cover cleanly.
-        # --test-threads=1 keeps it deterministic. Coverage is non-gating VISUALIZATION; the
-        # hermetic verify job remains the enforcement authority and runs the full suite.
-        run: cargo llvm-cov --lib --bins --workspace --lcov --output-path lcov.info -- --test-threads=1
+      - name: Generate LCOV coverage (best-effort)
+        # Coverage is non-gating VISUALIZATION; the hermetic verify job is the enforcement
+        # authority and runs the full suite. Some substrate tests spawn and SIGKILL
+        # fkst-framework subprocesses (supervise/spawn lifecycle); under llvm-cov a killed
+        # instrumented child writes a partial .profraw that corrupts the profile merge (a
+        # known cargo-llvm-cov limitation). We measure unit tests (--lib --bins, serial) and
+        # treat a merge failure as best-effort: warn + skip upload rather than fail the job.
+        run: |
+          if cargo llvm-cov --lib --bins --workspace --lcov --output-path lcov.info -- --test-threads=1; then
+            echo "coverage generated"
+          else
+            echo "::warning::coverage generation failed (likely spawn-kill subprocess profraw corruption); skipping upload"
+            rm -f lcov.info
+          fi
       - name: Upload coverage to Codecov
+        if: hashFiles('lcov.info') != ''
         uses: codecov/codecov-action@v5
         with:
           files: ./lcov.info
