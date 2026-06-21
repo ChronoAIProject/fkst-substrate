@@ -23,3 +23,31 @@ jobs:
           rustc --version
       - name: Run verification gates
         run: ./scripts/verify.sh
+
+  coverage:
+    # Coverage is VISUALIZATION, not a merge gate (matches fkst-packages doctrine).
+    # cargo-llvm-cov produces LCOV from an instrumented test run; the Codecov upload is an
+    # EXTERNAL service and must NOT gate green CI (fail_ci_if_error: false). Do NOT add this
+    # job to branch-protection required checks. Repo is PUBLIC: tokenless upload may work;
+    # CODECOV_TOKEN is an OPTIONAL operator secret; PR comments/status need the Codecov GitHub App.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install stable Rust + llvm-tools
+        run: |
+          rustup toolchain install stable --profile minimal --component llvm-tools-preview
+          rustup default stable
+          rustc --version
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@cargo-llvm-cov
+      - name: Generate LCOV coverage
+        run: cargo llvm-cov --workspace --lcov --output-path lcov.info
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v5
+        with:
+          files: ./lcov.info
+          disable_search: true
+          flags: rust
+          name: rust-coverage
+          token: ${{ secrets.CODECOV_TOKEN }}
+          fail_ci_if_error: false
