@@ -11,6 +11,7 @@ Implement the engine side of ADR 0001: a unit (`package` | `library`) declares i
 - **Cache key** = `\x1ffkst:<provider-unit-id>:<logical-module>` (keyed by PROVIDER unit + module, not caller) so same-named private modules don't poison each other; one shared-library instance per department PROCESS (departments are already separate processes → package.loaded already per-process).
 - The custom loader executes the chunk with the ORIGINAL logical name as `...`, set_name("@path") for tracebacks.
 - **Enforce mode replaces searchers**: `package.searchers = { engine_preload_searcher?, fkst_exact_file_searcher }`; remove default Lua/C/all-in-one searchers; package.path empty in enforce mode (owner-only retained in legacy/compat). Rust/C modules = fixed engine preloads, no package.cpath.
+- Native `loadfile` and `dofile` are not reachable in unit environments. `load` stays available for in-memory chunks, but its default environment reaches the engine's erroring raw global `require`, not Lua's native package searchers.
 
 ## Exports = physical layout (NOT manifest globs — avoids a 2nd drifting API inventory)
 ```

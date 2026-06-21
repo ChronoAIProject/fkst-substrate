@@ -62,6 +62,34 @@ version = "0.1.0"
     );
 }
 
+fn write_library_allowing(root: &Path, name: &str, allow: &[&str]) {
+    let allow = allow
+        .iter()
+        .map(|unit| format!(r#""{unit}""#))
+        .collect::<Vec<_>>()
+        .join(", ");
+    write(
+        &root.join(format!("libraries/{name}/fkst.toml")),
+        &format!(
+            r#"
+kind = "library"
+name = "{name}"
+
+[code]
+root = "."
+
+[library]
+name = "{name}"
+stable_id = "{name}"
+version = "0.1.0"
+
+[visibility]
+allow = [{allow}]
+"#
+        ),
+    );
+}
+
 #[test]
 fn parses_workspace_unit_and_lock_manifests() {
     let temp = tempfile::tempdir().unwrap();
@@ -187,6 +215,24 @@ fn catalog_rejects_visible_library_module_ambiguity() {
 }
 
 #[test]
+fn catalog_rejects_lib_dep_disallowed_by_visibility_allowlist() {
+    let temp = tempfile::tempdir().unwrap();
+    write_workspace(temp.path());
+    write_package(temp.path(), "app", &["restricted"]);
+    write_library_allowing(temp.path(), "restricted", &["allowed-app"]);
+    write(
+        &temp.path().join("libraries/restricted/public/tool.lua"),
+        "return {}\n",
+    );
+
+    let err = UnitCatalog::discover(temp.path()).unwrap_err();
+
+    assert!(err
+        .to_string()
+        .contains("unit `app` is not allowed to declare library `restricted`"));
+}
+
+#[test]
 fn catalog_rejects_file_and_init_module_collision() {
     let temp = tempfile::tempdir().unwrap();
     write_workspace(temp.path());
@@ -200,7 +246,7 @@ fn catalog_rejects_file_and_init_module_collision() {
 }
 
 #[test]
-fn missing_workspace_manifest_is_legacy_mode() {
+fn missing_workspace_manifest_returns_no_catalog() {
     let temp = tempfile::tempdir().unwrap();
 
     assert!(UnitCatalog::discover(temp.path()).unwrap().is_none());

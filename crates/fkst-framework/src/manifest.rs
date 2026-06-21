@@ -446,6 +446,11 @@ impl UnitCatalog {
                         )
                     })?
                     .clone();
+                validate_library_visibility(
+                    unit_name.as_str(),
+                    dep.as_str(),
+                    &self.units[&library_unit_name],
+                )?;
                 let public_modules = self.units[&library_unit_name].public_modules.clone();
                 for (logical, path) in public_modules {
                     if let Some(previous_library) =
@@ -777,6 +782,20 @@ fn canonical_unit_code_root(unit_root: &Path, manifest: &UnitManifest) -> Result
         bail!("code root is not a directory: {}", canonical.display());
     }
     Ok(canonical)
+}
+
+fn validate_library_visibility(
+    consumer_unit: &str,
+    declared_library: &str,
+    library_unit: &CatalogUnit,
+) -> Result<()> {
+    match &library_unit.manifest.visibility {
+        Visibility::Public => Ok(()),
+        Visibility::Allow(allow) if allow.iter().any(|unit| unit == consumer_unit) => Ok(()),
+        Visibility::Allow(_) => {
+            bail!("unit `{consumer_unit}` is not allowed to declare library `{declared_library}`")
+        }
+    }
 }
 
 fn discover_unit_roots(workspace_root: &Path, patterns: &[String]) -> Result<Vec<PathBuf>> {

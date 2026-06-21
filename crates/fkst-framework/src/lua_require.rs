@@ -6,6 +6,8 @@ use std::sync::Arc;
 
 pub(crate) const CACHE_KEY_PREFIX: &str = "\x1ffkst:";
 const ENV_REGISTRY_PREFIX: &str = "fkst.require.env.";
+const LOADED_REGISTRY_KEY: &str = "fkst.require.loaded";
+const PACKAGE_REGISTRY_KEY: &str = "fkst.require.package";
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum ResolveError {
@@ -51,7 +53,7 @@ pub(crate) fn install_scoped_require(
     catalog: Arc<UnitCatalog>,
     unit_id: &str,
 ) -> mlua::Result<mlua::Table> {
-    neutralize_package_searchers(lua)?;
+    install_enforced_globals(lua)?;
     unit_environment(lua, catalog, unit_id)
 }
 
@@ -70,15 +72,17 @@ pub(crate) fn unit_environment(
         return Ok(env);
     }
 
-    neutralize_package_searchers(lua)?;
+    install_enforced_globals(lua)?;
     let env = lua.create_table()?;
     let require = scoped_require_for(lua, catalog, unit_id.to_string())?;
     env.set("require", require)?;
+    env.set("_G", env.clone())?;
 
     let metatable = lua.create_table()?;
     let globals = lua.globals();
     metatable.set("__index", globals.clone())?;
-    metatable.set("__newindex", globals)?;
+    metatable.set("__newindex", protected_global_newindex(lua, globals)?)?;
+    metatable.set("__metatable", "fkst unit environment")?;
     env.set_metatable(Some(metatable));
     lua.set_named_registry_value(&registry_key, env.clone())?;
     Ok(env)
@@ -113,8 +117,7 @@ fn scoped_require_for(
     lua.create_function(move |lua, module: String| {
         let entry = resolve(&catalog, &caller_unit, &module).map_err(mlua::Error::external)?;
         let cache_key = canonical_cache_key(&entry.provider_unit, &module);
-        let package = package_table(lua)?;
-        let loaded: Table = package.get("loaded")?;
+        let loaded = module_cache(lua)?;
         let cached: LuaValue = loaded.raw_get(cache_key.as_str())?;
         if !matches!(cached, LuaValue::Nil) {
             return Ok(cached);
@@ -147,23 +150,81 @@ fn env_registry_key(unit_id: &str) -> String {
     format!("{ENV_REGISTRY_PREFIX}{unit_id}")
 }
 
-fn neutralize_package_searchers(lua: &Lua) -> mlua::Result<()> {
-    let package = package_table(lua)?;
+fn install_enforced_globals(lua: &Lua) -> mlua::Result<()> {
+    let _ = private_package_table(lua)?;
+    let globals = lua.globals();
+    globals.set("require", raw_global_require_error(lua)?)?;
+    globals.set("package", LuaValue::Nil)?;
+    globals.set("loadfile", LuaValue::Nil)?;
+    globals.set("dofile", LuaValue::Nil)?;
+    // `load` remains available for in-memory chunks; its default environment reaches this
+    // erroring global require, not Lua's native filesystem/package searchers.
+    Ok(())
+}
+
+fn private_package_table(lua: &Lua) -> mlua::Result<Table> {
+    if let Ok(package) = lua.named_registry_value::<Table>(PACKAGE_REGISTRY_KEY) {
+        return Ok(package);
+    }
+
+    let globals = lua.globals();
+    let preload = match globals.get::<LuaValue>("package")? {
+        LuaValue::Table(package) => match package.get::<LuaValue>("preload")? {
+            LuaValue::Table(preload) => preload,
+            _ => lua.create_table()?,
+        },
+        _ => lua.create_table()?,
+    };
+
+    let package = lua.create_table()?;
     package.set("path", "")?;
     package.set("cpath", "")?;
+    package.set("loaded", module_cache(lua)?)?;
+    package.set("preload", preload)?;
     let searchers = lua.create_table()?;
     searchers.set(1, engine_preload_searcher(lua)?)?;
     searchers.set(2, exact_file_searcher(lua)?)?;
-    package.set("searchers", searchers)
+    package.set("searchers", searchers)?;
+    lua.set_named_registry_value(PACKAGE_REGISTRY_KEY, package.clone())?;
+    Ok(package)
 }
 
-fn package_table(lua: &Lua) -> mlua::Result<Table> {
-    lua.globals().get("package")
+fn module_cache(lua: &Lua) -> mlua::Result<Table> {
+    if let Ok(loaded) = lua.named_registry_value::<Table>(LOADED_REGISTRY_KEY) {
+        return Ok(loaded);
+    }
+    let loaded = lua.create_table()?;
+    lua.set_named_registry_value(LOADED_REGISTRY_KEY, loaded.clone())?;
+    Ok(loaded)
+}
+
+fn raw_global_require_error(lua: &Lua) -> mlua::Result<mlua::Function> {
+    lua.create_function(|_, _: LuaValue| {
+        Err::<LuaValue, _>(mlua::Error::runtime(
+            "require is unit-scoped; reached the raw global",
+        ))
+    })
+}
+
+fn protected_global_newindex(lua: &Lua, globals: Table) -> mlua::Result<mlua::Function> {
+    lua.create_function(
+        move |_, (_table, key, value): (Table, LuaValue, LuaValue)| {
+            if let LuaValue::String(key_string) = &key {
+                let key = key_string.to_str()?;
+                if matches!(key.as_ref(), "require" | "package" | "loadfile" | "dofile") {
+                    return Err(mlua::Error::runtime(format!(
+                        "global `{key}` is reserved by fkst unit-scoped loading"
+                    )));
+                }
+            }
+            globals.raw_set(key, value)
+        },
+    )
 }
 
 fn engine_preload_searcher(lua: &Lua) -> mlua::Result<mlua::Function> {
     lua.create_function(|lua, name: String| {
-        let package = package_table(lua)?;
+        let package = private_package_table(lua)?;
         let preload: Table = package.get("preload")?;
         let loader: LuaValue = preload.raw_get(name.as_str())?;
         if matches!(loader, LuaValue::Nil) {
@@ -465,5 +526,215 @@ return {
         assert_eq!(a_first, 1);
         assert_eq!(b_first, 10);
         assert_eq!(a_second, 2);
+    }
+
+    #[test]
+    fn raw_global_require_is_not_a_native_loader() {
+        let temp = workspace();
+        package(temp.path(), "app", &[]);
+        write(
+            &temp.path().join("packages/app/main.lua"),
+            r#"
+local function denied(fn, expected)
+  local ok, err = pcall(fn)
+  assert(not ok, "unexpected success")
+  err = tostring(err)
+  assert(string.find(err, expected, 1, true), err)
+end
+
+denied(function() return require("undeclared") end, "require.denied")
+denied(function() return _ENV.require("undeclared") end, "require.denied")
+denied(function() return _G.require("undeclared") end, "require.denied")
+denied(function() return rawget(_G, "require")("undeclared") end, "require.denied")
+return true
+"#,
+        );
+        let catalog = catalog(temp.path());
+        let lua = Lua::new();
+
+        assert!(load_unit_chunk(
+            &lua,
+            catalog,
+            "app",
+            &temp.path().join("packages/app/main.lua"),
+            "@main.lua",
+            None,
+        )
+        .unwrap()
+        .as_boolean()
+        .unwrap());
+    }
+
+    #[test]
+    fn package_searchers_cannot_be_readded_as_a_filesystem_loader() {
+        let temp = workspace();
+        package(temp.path(), "app", &[]);
+        write(
+            &temp.path().join("packages/app/main.lua"),
+            r#"
+assert(package == nil, "package table is reachable")
+local ok, err = pcall(function()
+  _G.package = {
+    path = "./?.lua",
+    cpath = "./?.so",
+    loaded = {},
+    searchers = {
+      function(name)
+        return function()
+          return { value = "leaked" }
+        end
+      end,
+    },
+  }
+end)
+assert(not ok, "reserved package global was re-added")
+assert(string.find(tostring(err), "global `package` is reserved", 1, true), tostring(err))
+ok, err = pcall(function() return require("undeclared") end)
+assert(not ok, "re-added package.searchers loaded an undeclared module")
+assert(string.find(tostring(err), "require.denied", 1, true), tostring(err))
+rawset(_ENV, "package", {
+  path = "./?.lua",
+  cpath = "./?.so",
+  loaded = {},
+  searchers = {
+    function(name)
+      return function()
+        return { value = "rawset-leaked" }
+      end
+    end,
+  },
+})
+ok, err = pcall(function() return require("undeclared") end)
+assert(not ok, "rawset package.searchers loaded an undeclared module")
+assert(string.find(tostring(err), "require.denied", 1, true), tostring(err))
+assert(loadfile == nil, "loadfile is a filesystem loader bypass")
+assert(dofile == nil, "dofile is a filesystem loader bypass")
+assert(type(load) == "function", "in-memory load should remain available")
+local loaded = assert(load("return require('undeclared')"))
+ok, err = pcall(loaded)
+assert(not ok, "load restored native require")
+assert(string.find(tostring(err), "require is unit-scoped", 1, true), tostring(err))
+return true
+"#,
+        );
+        let catalog = catalog(temp.path());
+        let lua = Lua::new();
+
+        assert!(load_unit_chunk(
+            &lua,
+            catalog,
+            "app",
+            &temp.path().join("packages/app/main.lua"),
+            "@main.lua",
+            None,
+        )
+        .unwrap()
+        .as_boolean()
+        .unwrap());
+    }
+
+    #[test]
+    fn package_loaded_does_not_expose_or_poison_engine_cache() {
+        let temp = workspace();
+        package(temp.path(), "app", &["std"]);
+        library(temp.path(), "std", &[]);
+        write(
+            &temp.path().join("libraries/std/public/state.lua"),
+            r#"return { value = "engine-cache" }"#,
+        );
+        write(
+            &temp.path().join("packages/app/main.lua"),
+            r#"
+local first = require("state")
+assert(package == nil, "package table is reachable")
+local ok = pcall(function()
+  _G.package = { loaded = { state = { value = "poisoned-logical" } } }
+end)
+assert(not ok, "package.loaded was reintroduced")
+local second = require("state")
+assert(first == second, "engine cache was not reused")
+assert(second.value == "engine-cache", second.value)
+return true
+"#,
+        );
+        let catalog = catalog(temp.path());
+        let lua = Lua::new();
+
+        assert!(load_unit_chunk(
+            &lua,
+            catalog,
+            "app",
+            &temp.path().join("packages/app/main.lua"),
+            "@main.lua",
+            None,
+        )
+        .unwrap()
+        .as_boolean()
+        .unwrap());
+    }
+
+    #[test]
+    fn package_loaded_does_not_expose_another_unit_cache_entry() {
+        let temp = workspace();
+        package(temp.path(), "a", &[]);
+        package(temp.path(), "b", &[]);
+        write(
+            &temp.path().join("packages/a/main.lua"),
+            r#"return require("state")"#,
+        );
+        write(
+            &temp.path().join("packages/a/state.lua"),
+            r#"return { value = "a" }"#,
+        );
+        write(
+            &temp.path().join("packages/b/main.lua"),
+            r#"
+local ok, err = pcall(function()
+  return package.loaded["\31fkst:a:state"]
+end)
+assert(not ok, "global package.loaded exposed another unit cache")
+rawset(_ENV, "package", {
+  loaded = {
+    ["\31fkst:b:state"] = { value = "poisoned-b" },
+    ["\31fkst:a:state"] = { value = "poisoned-a" },
+  },
+})
+local state = require("state")
+assert(state.value == "b", state.value)
+return true
+"#,
+        );
+        write(
+            &temp.path().join("packages/b/state.lua"),
+            r#"return { value = "b" }"#,
+        );
+        let catalog = catalog(temp.path());
+        let lua = Lua::new();
+
+        let a_value = load_unit_chunk(
+            &lua,
+            catalog.clone(),
+            "a",
+            &temp.path().join("packages/a/main.lua"),
+            "@a/main.lua",
+            None,
+        )
+        .unwrap()
+        .as_table()
+        .unwrap()
+        .get::<String>("value")
+        .unwrap();
+        assert_eq!(a_value, "a");
+        assert!(load_unit_chunk(
+            &lua,
+            catalog,
+            "b",
+            &temp.path().join("packages/b/main.lua"),
+            "@b/main.lua",
+            None,
+        )
+        .unwrap()
+        .as_boolean()
+        .unwrap());
     }
 }
