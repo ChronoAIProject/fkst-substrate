@@ -539,7 +539,8 @@ root = "."
         let scope = r.unit_catalog().require_scope_for_root(&app_root).unwrap();
         assert_eq!(scope.owner_unit(), "app");
         assert!(scope.resolve("main").is_some());
-        assert!(scope.resolve("fkst.json").is_some());
+        assert!(scope.resolve("std.fkst.json").is_some());
+        assert!(scope.resolve("fkst.json").is_none());
     }
 
     #[test]

@@ -19,6 +19,18 @@ units = ["packages/*", "libraries/*"]
     );
 }
 
+fn write_workspace_by_kind(root: &Path) {
+    fs::create_dir_all(root.join("libraries")).unwrap();
+    write(
+        &root.join("fkst.workspace.toml"),
+        r#"
+[workspace]
+packages = ["packages/*"]
+libraries = ["std", "libraries/*"]
+"#,
+    );
+}
+
 fn write_package(root: &Path, name: &str, libs: &[&str]) {
     let deps = libs
         .iter()
@@ -91,13 +103,14 @@ allow = [{allow}]
 }
 
 #[test]
-fn parses_workspace_unit_and_lock_manifests() {
+fn parses_workspace_unit_lists_and_lock_manifests() {
     let temp = tempfile::tempdir().unwrap();
     write(
         &temp.path().join("fkst.workspace.toml"),
         r#"
 [workspace]
-units = ["packages/*", "libraries/*"]
+packages = ["packages/*"]
+libraries = ["std", "libraries/*"]
 
 [registries]
 workspace = "workspace"
@@ -134,7 +147,10 @@ packages = ["host"]
     let lockfile = Lockfile::parse_file(&temp.path().join("fkst.lock")).unwrap();
     let unit = UnitManifest::parse_file(&temp.path().join("packages/app/fkst.toml")).unwrap();
 
-    assert_eq!(workspace.discovered_units(), &["packages/*", "libraries/*"]);
+    assert_eq!(
+        workspace.discovered_units(),
+        &["packages/*", "std", "libraries/*"]
+    );
     assert_eq!(
         workspace.registries().get("workspace").unwrap(),
         "workspace"
@@ -145,6 +161,17 @@ packages = ["host"]
     assert_eq!(unit.code_root, Path::new("."));
     assert_eq!(unit.lib_deps, vec![LibDep::new("std")]);
     assert_eq!(unit.event_deps, vec![EventDep::new("host")]);
+}
+
+#[test]
+fn parses_legacy_workspace_units() {
+    let temp = tempfile::tempdir().unwrap();
+    write_workspace(temp.path());
+
+    let workspace =
+        WorkspaceManifest::parse_file(&temp.path().join("fkst.workspace.toml")).unwrap();
+
+    assert_eq!(workspace.discovered_units(), &["packages/*", "libraries/*"]);
 }
 
 #[test]
@@ -167,8 +194,94 @@ fn catalog_indexes_owner_and_declared_public_library_modules() {
     let scope = catalog.require_scope_for_unit("app").unwrap();
 
     assert!(scope.resolve("main").is_some());
-    assert!(scope.resolve("fkst.json").is_some());
+    assert!(scope.resolve("std.fkst.json").is_some());
+    assert!(scope.resolve("fkst.json").is_none());
     assert!(scope.resolve("secret").is_none());
+}
+
+#[test]
+fn catalog_prefixes_flat_library_public_modules_with_library_name() {
+    let temp = tempfile::tempdir().unwrap();
+    write_workspace_by_kind(temp.path());
+    write_package(temp.path(), "app", &["std"]);
+    write(&temp.path().join("packages/app/core.lua"), "return {}\n");
+    write(
+        &temp.path().join("std/fkst.toml"),
+        r#"
+kind = "library"
+name = "std"
+
+[code]
+root = "."
+
+[library]
+name = "std"
+stable_id = "std"
+version = "0.1.0"
+
+[exports]
+public = ["std.*"]
+"#,
+    );
+    write(&temp.path().join("std/a.lua"), "return {}\n");
+    write(&temp.path().join("std/init.lua"), "return {}\n");
+    write(&temp.path().join("std/sub/b.lua"), "return {}\n");
+
+    let catalog = UnitCatalog::discover(temp.path()).unwrap().unwrap();
+    let scope = catalog.require_scope_for_unit("app").unwrap();
+    let std_unit = catalog.units().find(|unit| unit.name() == "std").unwrap();
+
+    assert!(scope.resolve("core").is_some());
+    assert!(scope.resolve("std").is_some());
+    assert!(scope.resolve("std.a").is_some());
+    assert!(scope.resolve("std.sub.b").is_some());
+    assert!(scope.resolve("a").is_none());
+    assert!(scope.resolve("std.x").is_none());
+    assert_eq!(
+        std_unit
+            .public_modules()
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>(),
+        vec![
+            "std".to_string(),
+            "std.a".to_string(),
+            "std.sub.b".to_string()
+        ]
+    );
+}
+
+#[test]
+fn catalog_rejects_export_pattern_that_matches_no_prefixed_public_module() {
+    let temp = tempfile::tempdir().unwrap();
+    write_workspace_by_kind(temp.path());
+    write_package(temp.path(), "app", &["std"]);
+    write(&temp.path().join("packages/app/main.lua"), "return {}\n");
+    write(
+        &temp.path().join("std/fkst.toml"),
+        r#"
+kind = "library"
+name = "std"
+
+[code]
+root = "."
+
+[library]
+name = "std"
+stable_id = "std"
+version = "0.1.0"
+
+[exports]
+public = ["other.*"]
+"#,
+    );
+    write(&temp.path().join("std/a.lua"), "return {}\n");
+
+    let err = UnitCatalog::discover(temp.path()).unwrap_err();
+
+    assert!(err
+        .to_string()
+        .contains("export pattern `other.*` matches no public modules"));
 }
 
 #[test]
@@ -201,7 +314,7 @@ fn catalog_skips_legacy_std_symlink() {
 }
 
 #[test]
-fn catalog_rejects_visible_library_module_ambiguity() {
+fn catalog_namespaces_same_physical_module_names_by_library() {
     let temp = tempfile::tempdir().unwrap();
     write_workspace(temp.path());
     write_package(temp.path(), "app", &["alpha", "beta"]);
@@ -210,8 +323,12 @@ fn catalog_rejects_visible_library_module_ambiguity() {
     write_library(temp.path(), "beta");
     write(&temp.path().join("libraries/beta/public/shared.lua"), "");
 
-    let err = UnitCatalog::discover(temp.path()).unwrap_err();
-    assert!(err.to_string().contains("ambiguous module `shared`"));
+    let catalog = UnitCatalog::discover(temp.path()).unwrap().unwrap();
+    let scope = catalog.require_scope_for_unit("app").unwrap();
+
+    assert!(scope.resolve("alpha.shared").is_some());
+    assert!(scope.resolve("beta.shared").is_some());
+    assert!(scope.resolve("shared").is_none());
 }
 
 #[test]

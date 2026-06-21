@@ -57,6 +57,21 @@ units = [{}]
     );
 }
 
+fn workspace_by_kind(root: &Path, packages: &[&str], libraries: &[&str]) {
+    write(
+        &root.join("fkst.workspace.toml"),
+        &format!(
+            r#"
+[workspace]
+packages = [{}]
+libraries = [{}]
+"#,
+            quoted(packages),
+            quoted(libraries)
+        ),
+    );
+}
+
 fn package(root: &Path, name: &str, libs: &[&str], events: &[&str]) {
     write(
         &root.join(format!("packages/{name}/fkst.toml")),
@@ -177,7 +192,7 @@ fn deps_fails_for_undeclared_require_visibility_violation_and_cycle() {
         &[
             "packages/valid",
             "packages/bad",
-            "packages/ambiguous",
+            "packages/two-libs",
             "libraries/std",
             "libraries/restricted",
             "libraries/alpha",
@@ -201,10 +216,14 @@ return { json = json, missing = missing }
 "#,
     );
     write(&temp.path().join("packages/bad/composed.deps"), "valid\n");
-    package(temp.path(), "ambiguous", &["alpha", "beta"], &[]);
+    package(temp.path(), "two-libs", &["alpha", "beta"], &[]);
     write(
-        &temp.path().join("packages/ambiguous/main.lua"),
-        "return {}\n",
+        &temp.path().join("packages/two-libs/main.lua"),
+        r#"
+local alpha = require("alpha.shared")
+local beta = require("beta.shared")
+return { alpha = alpha, beta = beta }
+"#,
     );
     library(temp.path(), "std", &[], None);
     write(
@@ -249,7 +268,6 @@ return { json = json, missing = missing }
         out.contains("bad is not allowed to declare library `restricted`"),
         "{out}"
     );
-    assert!(out.contains("[ambiguous-export]"), "{out}");
     assert!(out.contains("[undeclared-require]"), "{out}");
     assert!(out.contains("bad requires library `std`"), "{out}");
     assert!(out.contains("[missing-export]"), "{out}");
@@ -286,6 +304,85 @@ fn deps_json_output_has_stable_shape() {
     assert_eq!(value["event_edges"].as_array().unwrap().len(), 0);
     assert_eq!(value["failures"].as_array().unwrap().len(), 0);
     assert_eq!(value["warnings"].as_array().unwrap().len(), 0);
+}
+
+#[test]
+fn deps_accepts_workspace_package_and_library_lists_for_flat_library_exports() {
+    let temp = tempfile::tempdir().unwrap();
+    workspace_by_kind(temp.path(), &["packages/app"], &["std"]);
+    package(temp.path(), "app", &["std"], &[]);
+    write(
+        &temp.path().join("packages/app/main.lua"),
+        r#"
+local a = require("std.a")
+local b = require("std.sub.b")
+return { a = a, b = b }
+"#,
+    );
+    write(
+        &temp.path().join("std/fkst.toml"),
+        r#"
+kind = "library"
+name = "std"
+
+[code]
+root = "."
+
+[library]
+name = "std"
+stable_id = "std"
+version = "0.1.0"
+"#,
+    );
+    write(&temp.path().join("std/a.lua"), "return {}\n");
+    write(
+        &temp.path().join("std/sub/b.lua"),
+        r#"return require("std.a")"#,
+    );
+
+    let output = deps(temp.path()).output().unwrap();
+
+    assert_exit(&output, 0);
+    let out = stdout(&output);
+    assert!(out.contains("fkst deps: PASS"), "{out}");
+    assert!(out.contains("public_exports: std.a, std.sub.b"), "{out}");
+}
+
+#[test]
+fn deps_reports_missing_prefixed_flat_library_export() {
+    let temp = tempfile::tempdir().unwrap();
+    workspace_by_kind(temp.path(), &["packages/app"], &["std"]);
+    package(temp.path(), "app", &["std"], &[]);
+    write(
+        &temp.path().join("packages/app/main.lua"),
+        r#"return require("std.x")"#,
+    );
+    write(
+        &temp.path().join("std/fkst.toml"),
+        r#"
+kind = "library"
+name = "std"
+
+[code]
+root = "."
+
+[library]
+name = "std"
+stable_id = "std"
+version = "0.1.0"
+"#,
+    );
+    write(&temp.path().join("std/a.lua"), "return {}\n");
+
+    let output = deps(temp.path()).output().unwrap();
+
+    assert_exit(&output, 1);
+    let out = stdout(&output);
+    assert!(out.contains("[missing-export]"), "{out}");
+    assert!(
+        out.contains("app references missing public export `std.x`"),
+        "{out}"
+    );
 }
 
 #[test]

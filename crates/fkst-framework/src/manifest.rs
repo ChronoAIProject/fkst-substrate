@@ -8,6 +8,14 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
+#[path = "manifest_exports.rs"]
+mod manifest_exports;
+#[path = "manifest_workspace.rs"]
+mod manifest_workspace;
+
+pub(crate) use manifest_exports::Exports;
+pub(crate) use manifest_workspace::WorkspaceManifest;
+
 const WORKSPACE_MANIFEST: &str = "fkst.workspace.toml";
 const UNIT_MANIFEST: &str = "fkst.toml";
 const LOCKFILE: &str = "fkst.lock";
@@ -139,6 +147,7 @@ pub(crate) struct UnitManifest {
     pub(crate) event_deps: Vec<EventDep>,
     pub(crate) library: Option<LibraryMeta>,
     pub(crate) visibility: Visibility,
+    pub(crate) exports: Exports,
 }
 
 impl UnitManifest {
@@ -162,6 +171,8 @@ struct UnitManifestToml {
     library: Option<LibraryMeta>,
     #[serde(default)]
     visibility: Visibility,
+    #[serde(default)]
+    exports: Exports,
 }
 
 impl UnitManifestToml {
@@ -174,6 +185,7 @@ impl UnitManifestToml {
             event_deps: self.event_deps.packages,
             library: self.library,
             visibility: self.visibility,
+            exports: self.exports,
         }
     }
 }
@@ -193,51 +205,6 @@ struct LibDepsToml {
 struct EventDepsToml {
     #[serde(default)]
     packages: Vec<EventDep>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct WorkspaceManifest {
-    discovered_units: Vec<String>,
-    registries: BTreeMap<String, String>,
-}
-
-impl WorkspaceManifest {
-    pub(crate) fn parse_file(path: &Path) -> Result<Self> {
-        let raw = fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
-        toml::from_str::<WorkspaceManifestToml>(&raw)
-            .map(WorkspaceManifestToml::into_manifest)
-            .with_context(|| format!("parse {}", path.display()))
-    }
-
-    pub(crate) fn discovered_units(&self) -> &[String] {
-        &self.discovered_units
-    }
-
-    pub(crate) fn registries(&self) -> &BTreeMap<String, String> {
-        &self.registries
-    }
-}
-
-#[derive(Deserialize)]
-struct WorkspaceManifestToml {
-    workspace: WorkspaceToml,
-    #[serde(default)]
-    registries: BTreeMap<String, String>,
-}
-
-impl WorkspaceManifestToml {
-    fn into_manifest(self) -> WorkspaceManifest {
-        WorkspaceManifest {
-            discovered_units: self.workspace.units,
-            registries: self.registries,
-        }
-    }
-}
-
-#[derive(Deserialize)]
-struct WorkspaceToml {
-    #[serde(default)]
-    units: Vec<String>,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -710,10 +677,10 @@ fn scan_own_modules(unit: &CatalogUnit) -> Result<OwnModuleScan> {
     let private_root = unit.code_root.join("private");
     let has_public = is_real_dir(&public_root)?;
     let has_private = is_real_dir(&private_root)?;
-    let public_modules = if has_public {
-        scan_lua_modules(&public_root)?
+    let raw_public_modules = if has_public {
+        scan_lua_modules_allow_root_init(&public_root)?
     } else if !has_private {
-        scan_lua_modules(&unit.code_root)?
+        scan_lua_modules_allow_root_init(&unit.code_root)?
     } else {
         BTreeMap::new()
     };
@@ -722,7 +689,7 @@ fn scan_own_modules(unit: &CatalogUnit) -> Result<OwnModuleScan> {
     } else {
         BTreeMap::new()
     };
-    for logical in public_modules.keys() {
+    for logical in raw_public_modules.keys() {
         if private_modules.contains_key(logical) {
             bail!(
                 "library `{}` exports duplicate public/private module `{logical}`",
@@ -730,6 +697,12 @@ fn scan_own_modules(unit: &CatalogUnit) -> Result<OwnModuleScan> {
             );
         }
     }
+    let public_modules = prefix_library_public_modules(unit, raw_public_modules)?;
+    manifest_exports::validate_public_export_patterns(
+        unit.library_name(),
+        &unit.manifest.exports.public,
+        &public_modules,
+    )?;
 
     let mut own_modules = BTreeMap::new();
     for (logical, path) in public_modules.iter().chain(private_modules.iter()) {
@@ -748,13 +721,43 @@ fn scan_own_modules(unit: &CatalogUnit) -> Result<OwnModuleScan> {
     })
 }
 
+fn prefix_library_public_modules(unit: &CatalogUnit, modules: ModulePaths) -> Result<ModulePaths> {
+    let mut prefixed = BTreeMap::new();
+    let library_name = unit.library_name();
+    for (logical, path) in modules {
+        let export = if logical.is_empty() {
+            library_name.to_string()
+        } else {
+            format!("{library_name}.{logical}")
+        };
+        insert_path_entry(
+            &mut prefixed,
+            export,
+            path,
+            &format!("library `{}`", unit.name()),
+        )?;
+    }
+    Ok(prefixed)
+}
+
 fn scan_lua_modules(root: &Path) -> Result<ModulePaths> {
     let mut modules = BTreeMap::new();
-    scan_lua_modules_inner(root, root, &mut modules)?;
+    scan_lua_modules_inner(root, root, &mut modules, false)?;
     Ok(modules)
 }
 
-fn scan_lua_modules_inner(root: &Path, dir: &Path, modules: &mut ModulePaths) -> Result<()> {
+fn scan_lua_modules_allow_root_init(root: &Path) -> Result<ModulePaths> {
+    let mut modules = BTreeMap::new();
+    scan_lua_modules_inner(root, root, &mut modules, true)?;
+    Ok(modules)
+}
+
+fn scan_lua_modules_inner(
+    root: &Path,
+    dir: &Path,
+    modules: &mut ModulePaths,
+    allow_root_init: bool,
+) -> Result<()> {
     let mut entries = fs::read_dir(dir)
         .with_context(|| format!("read {}", dir.display()))?
         .collect::<std::result::Result<Vec<_>, _>>()
@@ -769,13 +772,13 @@ fn scan_lua_modules_inner(root: &Path, dir: &Path, modules: &mut ModulePaths) ->
             continue;
         }
         if metadata.is_dir() {
-            scan_lua_modules_inner(root, &path, modules)?;
+            scan_lua_modules_inner(root, &path, modules, allow_root_init)?;
             continue;
         }
         if !metadata.is_file() || path.extension().and_then(|ext| ext.to_str()) != Some("lua") {
             continue;
         }
-        let logical = logical_module_name(root, &path)?;
+        let logical = logical_module_name(root, &path, allow_root_init)?;
         insert_path_entry(
             modules,
             logical,
@@ -787,7 +790,7 @@ fn scan_lua_modules_inner(root: &Path, dir: &Path, modules: &mut ModulePaths) ->
     Ok(())
 }
 
-fn logical_module_name(root: &Path, path: &Path) -> Result<String> {
+fn logical_module_name(root: &Path, path: &Path, allow_root_init: bool) -> Result<String> {
     let relative = path
         .strip_prefix(root)
         .with_context(|| format!("strip {} from {}", root.display(), path.display()))?;
@@ -806,6 +809,9 @@ fn logical_module_name(root: &Path, path: &Path) -> Result<String> {
     };
     if last == "init.lua" {
         if segments.is_empty() {
+            if allow_root_init {
+                return Ok(String::new());
+            }
             bail!(
                 "root init.lua has no logical module name: {}",
                 path.display()

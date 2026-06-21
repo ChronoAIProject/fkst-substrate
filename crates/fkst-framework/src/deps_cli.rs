@@ -122,7 +122,6 @@ fn validate(project_root: &Path) -> Result<DepsReport> {
         &mut warnings,
     );
     validate_cycles(&validation_catalog, &library_names, &mut failures);
-    validate_ambiguous_exports(&validation_catalog, &mut failures);
 
     for unit in validation_catalog.units() {
         let required =
@@ -295,41 +294,6 @@ fn visit_cycle(
     state.insert(library.to_string(), VisitState::Done);
 }
 
-fn validate_ambiguous_exports(catalog: &UnitCatalog, failures: &mut Vec<Diagnostic>) {
-    for unit in catalog.units() {
-        let mut providers: BTreeMap<String, String> = BTreeMap::new();
-        for dep in &unit.manifest().lib_deps {
-            let lib = dep.as_str();
-            let Some(library_unit_name) = catalog.library_unit_name(lib) else {
-                continue;
-            };
-            let Some(library_unit) = catalog
-                .units()
-                .find(|candidate| candidate.name() == library_unit_name)
-            else {
-                continue;
-            };
-            if !unit_allowed_to_declare(unit.name(), library_unit) {
-                continue;
-            }
-            for module in library_unit.public_modules().keys() {
-                if let Some(previous) = providers.insert(module.clone(), lib.to_string()) {
-                    failures.push(Diagnostic::fail(
-                        "ambiguous-export",
-                        Some(unit.name()),
-                        Some(lib),
-                        Some(module),
-                        format!(
-                            "{} sees ambiguous public module `{module}` from libraries `{previous}` and `{lib}`",
-                            unit.name()
-                        ),
-                    ));
-                }
-            }
-        }
-    }
-}
-
 fn validate_actual_requires(
     unit: &CatalogUnit,
     actual: &BTreeSet<String>,
@@ -416,11 +380,15 @@ fn scan_actual_library_requires(
         for module in require_literals(&body) {
             if let Some((library, export)) = module.split_once('.') {
                 if library_names.contains(library) {
-                    required.insert(library.to_string());
+                    let self_library_require = unit.is_library() && unit.library_name() == library;
+                    if !self_library_require {
+                        required.insert(library.to_string());
+                    }
                     validate_public_export_reference(
                         unit.name(),
                         library,
                         export,
+                        &module,
                         catalog,
                         failures,
                     );
@@ -491,6 +459,7 @@ fn validate_public_export_reference(
     unit_name: &str,
     library: &str,
     export: &str,
+    module: &str,
     catalog: &UnitCatalog,
     failures: &mut Vec<Diagnostic>,
 ) {
@@ -503,7 +472,7 @@ fn validate_public_export_reference(
     else {
         return;
     };
-    if !library_unit.public_modules().contains_key(export) {
+    if !library_unit.public_modules().contains_key(module) {
         failures.push(Diagnostic::fail(
             "missing-export",
             Some(unit_name),

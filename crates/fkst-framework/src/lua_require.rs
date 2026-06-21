@@ -296,6 +296,20 @@ units = ["packages/*", "libraries/*"]
         temp
     }
 
+    fn workspace_by_kind() -> TempDir {
+        let temp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(temp.path().join("packages")).unwrap();
+        write(
+            &temp.path().join("fkst.workspace.toml"),
+            r#"
+[workspace]
+packages = ["packages/*"]
+libraries = ["std"]
+"#,
+        );
+        temp
+    }
+
     fn package(root: &Path, name: &str, libs: &[&str]) {
         let deps = libs
             .iter()
@@ -347,6 +361,34 @@ version = "0.1.0"
         );
     }
 
+    fn root_library(root: &Path, name: &str, libs: &[&str]) {
+        let deps = libs
+            .iter()
+            .map(|dep| format!(r#""{dep}""#))
+            .collect::<Vec<_>>()
+            .join(", ");
+        write(
+            &root.join(format!("{name}/fkst.toml")),
+            &format!(
+                r#"
+kind = "library"
+name = "{name}"
+
+[code]
+root = "."
+
+[lib_deps]
+libraries = [{deps}]
+
+[library]
+name = "{name}"
+stable_id = "{name}"
+version = "0.1.0"
+"#
+            ),
+        );
+    }
+
     fn catalog(root: &Path) -> Arc<UnitCatalog> {
         Arc::new(UnitCatalog::discover(root).unwrap().unwrap())
     }
@@ -372,8 +414,10 @@ version = "0.1.0"
 
         let own = resolve(&catalog, "app", "departments.probe.main").unwrap();
         assert_eq!(own.provider_unit, "app");
-        let public = resolve(&catalog, "app", "visible").unwrap();
+        let public = resolve(&catalog, "app", "std.visible").unwrap();
         assert_eq!(public.provider_unit, "std");
+        let bare_public = resolve(&catalog, "app", "visible").unwrap_err();
+        assert!(bare_public.to_string().contains("require.denied"));
         let denied = resolve(&catalog, "app", "secret").unwrap_err();
         assert!(denied.to_string().contains("require.denied"));
     }
@@ -394,10 +438,53 @@ version = "0.1.0"
         );
         let catalog = catalog(temp.path());
 
-        assert!(resolve(&catalog, "app", "a_mod").is_ok());
-        let denied = resolve(&catalog, "app", "b_mod").unwrap_err();
+        assert!(resolve(&catalog, "app", "a.a_mod").is_ok());
+        let denied = resolve(&catalog, "app", "b.b_mod").unwrap_err();
         assert!(denied.to_string().contains("not declared/visible"));
-        assert_eq!(resolve(&catalog, "a", "b_mod").unwrap().provider_unit, "b");
+        assert_eq!(
+            resolve(&catalog, "a", "b.b_mod").unwrap().provider_unit,
+            "b"
+        );
+    }
+
+    #[test]
+    fn flat_library_exports_and_self_requires_use_library_prefixed_names() {
+        let temp = workspace_by_kind();
+        package(temp.path(), "app", &["std"]);
+        write(
+            &temp.path().join("packages/app/main.lua"),
+            r#"
+local a = require("std.a")
+local b = require("std.sub.b")
+local ok, err = pcall(function() return require("std.x") end)
+assert(not ok, "unexpected std.x")
+assert(string.find(tostring(err), "require.denied", 1, true), tostring(err))
+return a.value .. ":" .. b.value
+"#,
+        );
+        root_library(temp.path(), "std", &[]);
+        write(&temp.path().join("std/a.lua"), r#"return { value = "a" }"#);
+        write(
+            &temp.path().join("std/sub/b.lua"),
+            r#"
+local a = require("std.a")
+return { value = "b-" .. a.value }
+"#,
+        );
+        let catalog = catalog(temp.path());
+        let lua = Lua::new();
+
+        let value = load_unit_chunk(
+            &lua,
+            catalog,
+            "app",
+            &temp.path().join("packages/app/main.lua"),
+            "@main.lua",
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(value.as_string().unwrap().to_str().unwrap(), "a:b-a");
     }
 
     #[test]
@@ -407,7 +494,7 @@ version = "0.1.0"
         write(
             &temp.path().join("packages/app/main.lua"),
             r#"
-local tool = require("tool")
+local tool = require("std.tool")
 return tool.value()
 "#,
         );
@@ -450,7 +537,7 @@ return { value = function() return private.value end }
         write(
             &temp.path().join("packages/app/main.lua"),
             r#"
-local tool = require("tool")
+local tool = require("std.tool")
 return tool.lazy()
 "#,
         );
@@ -690,7 +777,7 @@ return true
         write(
             &temp.path().join("packages/app/main.lua"),
             r#"
-local tool = require("tool")
+local tool = require("std.tool")
 return tool.lazy()
 "#,
         );
@@ -808,13 +895,13 @@ return true
         write(
             &temp.path().join("packages/app/main.lua"),
             r#"
-local first = require("state")
+local first = require("std.state")
 assert(package == nil, "package table is reachable")
 local ok = pcall(function()
   _G.package = { loaded = { state = { value = "poisoned-logical" } } }
 end)
 assert(not ok, "package.loaded was reintroduced")
-local second = require("state")
+local second = require("std.state")
 assert(first == second, "engine cache was not reused")
 assert(second.value == "engine-cache", second.value)
 return true
