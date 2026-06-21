@@ -78,6 +78,10 @@ impl EventDep {
     pub(crate) fn new(name: impl Into<String>) -> Self {
         Self { name: name.into() }
     }
+
+    pub(crate) fn as_str(&self) -> &str {
+        &self.name
+    }
 }
 
 impl<'de> Deserialize<'de> for EventDep {
@@ -307,7 +311,39 @@ impl UnitCatalog {
         Self::from_workspace(workspace_root, workspace).map(Some)
     }
 
+    pub(crate) fn discover_for_validation(start: &Path) -> Result<Option<Self>> {
+        let Some(workspace_manifest_path) = find_workspace_manifest(start)? else {
+            return Ok(None);
+        };
+        let workspace_root = workspace_manifest_path
+            .parent()
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "workspace manifest has no parent: {}",
+                    workspace_manifest_path.display()
+                )
+            })?
+            .to_path_buf();
+        let workspace = WorkspaceManifest::parse_file(&workspace_manifest_path)?;
+        Self::from_workspace_for_validation(workspace_root, workspace).map(Some)
+    }
+
     fn from_workspace(workspace_root: PathBuf, workspace: WorkspaceManifest) -> Result<Self> {
+        Self::from_workspace_inner(workspace_root, workspace, true)
+    }
+
+    fn from_workspace_for_validation(
+        workspace_root: PathBuf,
+        workspace: WorkspaceManifest,
+    ) -> Result<Self> {
+        Self::from_workspace_inner(workspace_root, workspace, false)
+    }
+
+    fn from_workspace_inner(
+        workspace_root: PathBuf,
+        workspace: WorkspaceManifest,
+        fail_closed: bool,
+    ) -> Result<Self> {
         let lockfile_path = workspace_root.join(LOCKFILE);
         let lockfile = if lockfile_path.exists() {
             Lockfile::parse_file(&lockfile_path)?
@@ -353,7 +389,11 @@ impl UnitCatalog {
             library_units,
             graph,
         };
-        catalog.build_indexes()?;
+        if fail_closed {
+            catalog.build_indexes()?;
+        } else {
+            catalog.build_partial_indexes_for_validation()?;
+        }
         Ok(catalog)
     }
 
@@ -412,7 +452,27 @@ impl UnitCatalog {
         &self.lockfile
     }
 
+    pub(crate) fn units(&self) -> impl Iterator<Item = &CatalogUnit> {
+        self.units.values()
+    }
+
+    pub(crate) fn library_unit_name(&self, library_name: &str) -> Option<&str> {
+        self.library_units
+            .get(library_name)
+            .map(std::string::String::as_str)
+    }
+
+    pub(crate) fn build_partial_indexes_for_validation(&mut self) -> Result<()> {
+        self.build_own_module_indexes()?;
+        self.build_visible_module_indexes(false)
+    }
+
     fn build_indexes(&mut self) -> Result<()> {
+        self.build_own_module_indexes()?;
+        self.build_visible_module_indexes(true)
+    }
+
+    fn build_own_module_indexes(&mut self) -> Result<()> {
         let unit_names = self.units.keys().cloned().collect::<Vec<_>>();
         for unit_name in &unit_names {
             let scan = scan_own_modules(self.units.get(unit_name).unwrap())?;
@@ -421,7 +481,11 @@ impl UnitCatalog {
             unit.public_modules = scan.public_modules;
             unit.private_modules = scan.private_modules;
         }
+        Ok(())
+    }
 
+    fn build_visible_module_indexes(&mut self, fail_closed: bool) -> Result<()> {
+        let unit_names = self.units.keys().cloned().collect::<Vec<_>>();
         for unit_name in unit_names {
             let mut module_index = BTreeMap::new();
             let own_modules = self.units[&unit_name].own_modules.clone();
@@ -436,29 +500,36 @@ impl UnitCatalog {
 
             let mut visible_library_modules: BTreeMap<String, String> = BTreeMap::new();
             for dep in self.units[&unit_name].manifest.lib_deps.clone() {
-                let library_unit_name = self
-                    .library_units
-                    .get(dep.as_str())
-                    .ok_or_else(|| {
-                        anyhow::anyhow!(
+                let Some(library_unit_name) = self.library_units.get(dep.as_str()).cloned() else {
+                    if fail_closed {
+                        anyhow::bail!(
                             "unit `{unit_name}` declares unknown library `{}`",
                             dep.as_str()
-                        )
-                    })?
-                    .clone();
-                validate_library_visibility(
+                        );
+                    }
+                    continue;
+                };
+                if let Err(err) = validate_library_visibility(
                     unit_name.as_str(),
                     dep.as_str(),
                     &self.units[&library_unit_name],
-                )?;
+                ) {
+                    if fail_closed {
+                        return Err(err);
+                    }
+                    continue;
+                }
                 let public_modules = self.units[&library_unit_name].public_modules.clone();
                 for (logical, path) in public_modules {
                     if let Some(previous_library) =
                         visible_library_modules.insert(logical.clone(), library_unit_name.clone())
                     {
-                        bail!(
-                            "ambiguous module `{logical}` visible to unit `{unit_name}` from libraries `{previous_library}` and `{library_unit_name}`"
-                        );
+                        if fail_closed {
+                            bail!(
+                                "ambiguous module `{logical}` visible to unit `{unit_name}` from libraries `{previous_library}` and `{library_unit_name}`"
+                            );
+                        }
+                        continue;
                     }
                     insert_module_entry(
                         &mut module_index,
@@ -480,7 +551,7 @@ impl UnitCatalog {
 }
 
 #[derive(Clone, Debug)]
-struct CatalogUnit {
+pub(crate) struct CatalogUnit {
     unit_root: PathBuf,
     code_root: PathBuf,
     manifest: UnitManifest,
@@ -503,20 +574,40 @@ impl CatalogUnit {
         })
     }
 
-    fn name(&self) -> &str {
-        &self.manifest.name
-    }
-
-    fn is_library(&self) -> bool {
+    pub(crate) fn is_library(&self) -> bool {
         self.manifest.kind == UnitKind::Library
     }
 
-    fn library_name(&self) -> &str {
+    pub(crate) fn library_name(&self) -> &str {
         self.manifest
             .library
             .as_ref()
             .map(|library| library.name.as_str())
             .unwrap_or(&self.manifest.name)
+    }
+
+    pub(crate) fn name(&self) -> &str {
+        &self.manifest.name
+    }
+
+    pub(crate) fn unit_root(&self) -> &Path {
+        &self.unit_root
+    }
+
+    pub(crate) fn code_root(&self) -> &Path {
+        &self.code_root
+    }
+
+    pub(crate) fn manifest(&self) -> &UnitManifest {
+        &self.manifest
+    }
+
+    pub(crate) fn public_modules(&self) -> &ModulePaths {
+        &self.public_modules
+    }
+
+    pub(crate) fn own_modules(&self) -> &ModulePaths {
+        &self.own_modules
     }
 }
 
@@ -550,7 +641,7 @@ impl UnitGraph {
 }
 
 pub(crate) type ModuleIndex = BTreeMap<String, ModuleEntry>;
-type ModulePaths = BTreeMap<String, PathBuf>;
+pub(crate) type ModulePaths = BTreeMap<String, PathBuf>;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ModuleEntry {

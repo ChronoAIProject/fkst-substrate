@@ -6,6 +6,7 @@
 //! CLI: `fkst-framework supervise --project-root <path> --framework-bin <path>`
 //! CLI: `fkst-framework conformance --project-root <path>`
 //! CLI: `fkst-framework test --project-root <path> [--package-root <path> ...] [--report-json <path>]`
+//! CLI: `fkst-framework deps --project-root <path> [--package-root <path> ...] [--json]`
 //! CLI: `fkst-framework init-package-repo [--ref <substrate-ref>] [--force]`
 //! CLI: `fkst-framework observe --durable-root <path> [--json] [--limit <n>]`
 //! CLI: `fkst-framework --self-test`
@@ -25,6 +26,7 @@ use std::sync::Arc;
 
 mod boundary_resource;
 mod config_registry;
+mod deps_cli;
 mod external_command;
 mod host_conformance;
 mod init_package_repo;
@@ -88,6 +90,7 @@ enum CliCommand {
         args: Vec<String>,
     },
     Test(TestCli),
+    Deps(deps_cli::DepsOptions),
     InitPackageRepo(init_package_repo::InitPackageRepoOptions),
     Observe(observe::ObserveOptions),
     CodexWorker(sdk_codex::CodexWorkerOptions),
@@ -99,7 +102,7 @@ fn parse_args() -> Result<CliCommand> {
     let mut args_iter = args.into_iter();
     let sub = args_iter.next().ok_or_else(|| {
         anyhow::anyhow!(
-            "usage: fkst-framework run <lua> --project-root <path> --package-root <path> [--package-root <path> ...] [--owner-namespace <id>] --event <json> | fkst-framework supervise --project-root <path> --framework-bin <path> [--package-root <path> ...] | fkst-framework conformance --project-root <path> [--package-root <path> ...] | fkst-framework config --project-root <path> [--package-root <path> ...] | fkst-framework boundary-resources | fkst-framework rate-acquire <pool> | fkst-framework rate-exec <pool> -- <program> [args...] | fkst-framework test --project-root <path> [--package-root <path> ...] [--report-json <path>] | fkst-framework init-package-repo [--ref <substrate-ref>] [--force] | fkst-framework observe --durable-root <path> [--json] [--limit <n>] | fkst-framework --self-test"
+            "usage: fkst-framework run <lua> --project-root <path> --package-root <path> [--package-root <path> ...] [--owner-namespace <id>] --event <json> | fkst-framework supervise --project-root <path> --framework-bin <path> [--package-root <path> ...] | fkst-framework conformance --project-root <path> [--package-root <path> ...] | fkst-framework config --project-root <path> [--package-root <path> ...] | fkst-framework boundary-resources | fkst-framework rate-acquire <pool> | fkst-framework rate-exec <pool> -- <program> [args...] | fkst-framework test --project-root <path> [--package-root <path> ...] [--report-json <path>] | fkst-framework deps --project-root <path> [--package-root <path> ...] [--json] | fkst-framework init-package-repo [--ref <substrate-ref>] [--force] | fkst-framework observe --durable-root <path> [--json] [--limit <n>] | fkst-framework --self-test"
         )
     })?;
     if sub == "--self-test" {
@@ -170,6 +173,10 @@ fn parse_args() -> Result<CliCommand> {
     if sub == "test" {
         let rest = args_iter.collect::<Vec<_>>();
         return Ok(CliCommand::Test(parse_test_args(&rest)?));
+    }
+    if sub == "deps" {
+        let rest = args_iter.collect::<Vec<_>>();
+        return Ok(CliCommand::Deps(parse_deps_args(&rest)?));
     }
     if sub == "init-package-repo" {
         let rest = args_iter.collect::<Vec<_>>();
@@ -359,6 +366,44 @@ fn parse_test_args(args: &[String]) -> Result<TestCli> {
         roots: PackageRoots::resolve(root, package_roots)?,
         report_json,
         coverage,
+    })
+}
+
+fn parse_deps_args(args: &[String]) -> Result<deps_cli::DepsOptions> {
+    let mut project_root: Option<PathBuf> = None;
+    let mut package_roots: Vec<PathBuf> = Vec::new();
+    let mut json = false;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--help" | "-h" => {
+                println!(
+                    "usage: fkst-framework deps --project-root <root> [--package-root <root> ...] [--json]"
+                );
+                std::process::exit(0);
+            }
+            "--project-root" => {
+                if project_root.is_some() {
+                    anyhow::bail!("duplicate --project-root");
+                }
+                i += 1;
+                project_root = Some(next_value(args, i, "--project-root")?.into());
+            }
+            "--package-root" => {
+                i += 1;
+                package_roots.push(next_value(args, i, "--package-root")?.into());
+            }
+            "--json" => json = true,
+            other => anyhow::bail!("unknown deps argument: {}", other),
+        }
+        i += 1;
+    }
+
+    let project_root = project_root.ok_or_else(|| anyhow::anyhow!("missing --project-root"))?;
+    Ok(deps_cli::DepsOptions {
+        project_root,
+        package_roots,
+        json,
     })
 }
 
@@ -698,6 +743,7 @@ fn run() -> Result<i32> {
         CliCommand::Test(options) => {
             test_runner::run_tests(options.roots, options.report_json, options.coverage)
         }
+        CliCommand::Deps(options) => deps_cli::run(options),
         CliCommand::InitPackageRepo(options) => init_package_repo::run(options),
         CliCommand::Observe(options) => observe::run(options),
         CliCommand::CodexWorker(options) => sdk_codex::run_codex_worker(options),
