@@ -49,6 +49,7 @@ mod sdk_i18n;
 mod sdk_json;
 mod sdk_log;
 mod sdk_mark;
+mod sdk_restricted_lua;
 mod sdk_strings;
 mod self_test;
 mod spec_queues;
