@@ -41,6 +41,7 @@ const CODEX_STATUS_RECENT_LIMIT: usize = 50;
 const CODEX_OUTPUT_TAIL_MAX_LINES: usize = 40;
 const CODEX_OUTPUT_TAIL_MAX_BYTES: usize = 4096;
 const CODEX_STATUS_LOG_PREFIX: &str = "CODEX_STATUS:";
+const CODEX_EFFECT_LOG_PREFIX: &str = "CODEX_EFFECT:";
 const CODEX_ADOPTION_DIR: &str = "codex-adoption";
 const CODEX_ADOPTION_STATUS_INTENT: &str = "intent";
 const CODEX_ADOPTION_STATUS_RUNNING: &str = "running";
@@ -66,6 +67,7 @@ struct CodexRequest {
     dept: Option<String>,
     started_at_ms: u64,
     adoption_status_path: Option<PathBuf>,
+    effect_key: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -460,6 +462,7 @@ fn codex_request_from_opts(opts: Table, runtime_dept: Option<String>) -> CodexRe
         dept,
         started_at_ms,
         adoption_status_path: None,
+        effect_key: None,
     }
 }
 
@@ -855,7 +858,10 @@ fn recover_completed_adoption_result_from_disk(paths: &CodexAdoptionPaths) -> an
     if let Some(result) = read_adoption_result_record_from_disk(&paths.result)? {
         return promote_completed_adoption_result(paths, result);
     }
-    recover_completed_adoption_effect_by_key(paths)
+    if recover_completed_adoption_effect_by_key(paths)? {
+        return Ok(true);
+    }
+    recover_completed_external_codex_effect_by_key(paths)
 }
 
 fn promote_completed_adoption_result(
@@ -887,6 +893,32 @@ fn recover_completed_adoption_effect_by_key(paths: &CodexAdoptionPaths) -> anyho
     let Some(effect) = read_adoption_effect_record_from_disk(&paths.effect)? else {
         return Ok(false);
     };
+    promote_completed_adoption_effect(paths, effect)
+}
+
+fn recover_completed_external_codex_effect_by_key(
+    paths: &CodexAdoptionPaths,
+) -> anyhow::Result<bool> {
+    let Some(record) = read_adoption_record_from_disk(&paths.status)? else {
+        return Ok(false);
+    };
+    if record.status == CODEX_ADOPTION_STATUS_COMPLETED
+        || record.key != paths.key
+        || adoption_effect_alive(&record)
+    {
+        return Ok(false);
+    }
+    let Some(effect) = read_codex_effect_record_from_log(Path::new(&record.log_path), &paths.key)?
+    else {
+        return Ok(false);
+    };
+    promote_completed_adoption_effect(paths, effect)
+}
+
+fn promote_completed_adoption_effect(
+    paths: &CodexAdoptionPaths,
+    effect: CodexAdoptionEffectRecord,
+) -> anyhow::Result<bool> {
     if effect.effect_key != paths.key {
         anyhow::bail!(
             "codex adoption effect key mismatch: expected {} got {}",
@@ -924,6 +956,30 @@ fn read_adoption_effect_record_from_disk(
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(err) => Err(err.into()),
     }
+}
+
+fn read_codex_effect_record_from_log(
+    log_path: &Path,
+    effect_key: &str,
+) -> anyhow::Result<Option<CodexAdoptionEffectRecord>> {
+    let body = match std::fs::read_to_string(log_path) {
+        Ok(body) => body,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err.into()),
+    };
+    let mut matched = None;
+    for line in body.lines() {
+        let Some(json) = line.strip_prefix(CODEX_EFFECT_LOG_PREFIX) else {
+            continue;
+        };
+        let Ok(record) = serde_json::from_str::<CodexAdoptionEffectRecord>(json) else {
+            continue;
+        };
+        if record.effect_key == effect_key {
+            matched = Some(record);
+        }
+    }
+    Ok(matched)
 }
 
 fn read_adoption_record(path: &Path) -> Result<Option<CodexAdoptionRecord>> {
@@ -1285,6 +1341,7 @@ pub(crate) fn run_codex_worker(options: CodexWorkerOptions) -> anyhow::Result<i3
         dept: options.dept.clone(),
         started_at_ms: options.started_at_ms,
         adoption_status_path: Some(options.status_file.clone()),
+        effect_key: Some(options.key.clone()),
     };
     let config = ConfigContext::from_host_root(&options.host_root)?;
     let mut adoption = CodexAdoptionRecord {
@@ -1725,6 +1782,25 @@ fn append_codex_status_log(log_path: &Path, record: &CodexStatusRecord) -> anyho
     Ok(())
 }
 
+fn append_codex_effect_log(
+    log_path: &Path,
+    record: &CodexAdoptionEffectRecord,
+) -> anyhow::Result<()> {
+    if let Some(parent) = log_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log_path)?;
+    writeln!(
+        file,
+        "{CODEX_EFFECT_LOG_PREFIX}{}",
+        serde_json::to_string(record)?
+    )?;
+    Ok(())
+}
+
 fn read_codex_status_records(host_root: &Path) -> anyhow::Result<Vec<CodexStatusRecord>> {
     let _ = host_root;
     let log_dir = runtime_log_dir().join("codex");
@@ -2008,25 +2084,28 @@ fn wait_for_codex_child(
         } => {
             if exit_code == 0 {
                 if let Err(message) = stdin_result {
-                    return logged_failure(
+                    let result = logged_failure(
                         request, cmd_line, "stdin", message, stdout, stderr, exit_code,
                     );
+                    return codex_result_with_effect_receipt(request, result);
                 }
             }
-            write_codex_log(
-                &request.log_path,
-                &stdout,
-                &stderr,
-                exit_code,
-                cmd_line,
-                request.timeout_seconds,
-            );
-            CodexResult::success(
+            let result = CodexResult::success(
                 stdout,
                 stderr,
                 exit_code,
                 request.log_path.to_string_lossy().into_owned(),
-            )
+            );
+            let result = codex_result_with_effect_receipt(request, result);
+            write_codex_log(
+                &request.log_path,
+                &result.stdout,
+                &result.stderr,
+                result.exit_code,
+                cmd_line,
+                request.timeout_seconds,
+            );
+            result
         }
         CodexWaitOutcome::Failed {
             kind,
@@ -2034,8 +2113,42 @@ fn wait_for_codex_child(
             stdout,
             stderr,
             exit_code,
-        } => logged_failure(request, cmd_line, kind, message, stdout, stderr, exit_code),
+        } => {
+            let result =
+                logged_failure(request, cmd_line, kind, message, stdout, stderr, exit_code);
+            codex_result_with_effect_receipt(request, result)
+        }
     }
+}
+
+fn codex_result_with_effect_receipt(request: &CodexRequest, result: CodexResult) -> CodexResult {
+    if let Err(err) = write_codex_effect_receipt(request, &result) {
+        return CodexResult::failure(
+            "effect_receipt",
+            format!("codex effect receipt write failed: {err}"),
+            result.stdout,
+            result.stderr,
+            -1,
+            result.log_path,
+        );
+    }
+    result
+}
+
+fn write_codex_effect_receipt(request: &CodexRequest, result: &CodexResult) -> anyhow::Result<()> {
+    let Some(effect_key) = request.effect_key.as_deref() else {
+        return Ok(());
+    };
+    let receipt = CodexAdoptionEffectRecord {
+        effect_key: effect_key.to_string(),
+        ended_at_ms: unix_duration().as_millis() as u64,
+        stdout: result.stdout.clone(),
+        stderr: result.stderr.clone(),
+        exit_code: result.exit_code,
+        error_kind: result.error_kind.clone(),
+        error: result.error.clone(),
+    };
+    append_codex_effect_log(&request.log_path, &receipt)
 }
 
 fn wait_codex_with_timeout_and_tail(
@@ -2616,7 +2729,12 @@ fn write_codex_log(
         },
         done_at = unix_seconds_to_iso8601(unix_duration().as_secs()),
     );
-    if let Err(err) = std::fs::write(path, content) {
+    if let Err(err) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .and_then(|mut file| file.write_all(content.as_bytes()))
+    {
         eprintln!(
             "WARN: codex log write failed path={} error={err}",
             path.display()
