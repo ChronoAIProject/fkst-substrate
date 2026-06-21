@@ -382,6 +382,7 @@ local M = {}
 M.spec = {
   consumes = { "jobs" },
   produces = { "host.render" },
+  published_seam = { "jobs" },
   ephemeral = { "jobs" },
   retry = false,
 }
@@ -398,6 +399,7 @@ local M = {}
 M.spec = {
   consumes = { "render" },
   produces = { "snapshot" },
+  published_seam = { "render" },
   ephemeral = { "render" },
   stall_window = "7s",
   graph_json = true,

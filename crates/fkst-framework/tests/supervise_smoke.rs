@@ -640,6 +640,7 @@ return M
 local M = {{}}
 M.spec = {{
   consumes = {{ "proposal" }},
+  published_seam = {{ "proposal" }},
   ephemeral = {{ "proposal" }},
   stall_window = "5s",
 }}

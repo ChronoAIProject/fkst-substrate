@@ -163,6 +163,7 @@ source -> fanout -> route -> spawn -> RAISED
 M.spec = {
   consumes = {...},
   produces = {...},
+  published_seam = {...},
   fanout = {...},
   ephemeral = {...},
   stall_window = "30s",
@@ -170,7 +171,7 @@ M.spec = {
 }
 ```
 
-`M.spec.retry` 可省略、设为 `false`，或设为 table；`retry=true` 当前被拒绝。`M.spec.stall_window` 是可靠投递 lease 与续租窗口，不是 framework child 无输出 kill deadline。当前没有 `M.spec` 级别的 per-dept codex timeout knob；codex timeout 是每次 `spawn_codex_sync(opts)` / `spawn_codex(opts)` 的 `opts.timeout`，默认 3600 秒。全局 codex 并发上限来自 `FKST_CODEX_PERMIT_SLOTS` / `codex_permit_slots`，不是 per-dept timeout。
+`M.spec.published_seam` declares consumed queues that this package exposes as public sibling entry points. Graph scan requires each entry to be owned and consumed by the declaring Department, and requires every sibling Department or Raiser `produces` target to be either an own-package queue or one of these published entries. `M.spec.retry` 可省略、设为 `false`，或设为 table；`retry=true` 当前被拒绝。`M.spec.stall_window` 是可靠投递 lease 与续租窗口，不是 framework child 无输出 kill deadline。当前没有 `M.spec` 级别的 per-dept codex timeout knob；codex timeout 是每次 `spawn_codex_sync(opts)` / `spawn_codex(opts)` 的 `opts.timeout`，默认 3600 秒。全局 codex 并发上限来自 `FKST_CODEX_PERMIT_SLOTS` / `codex_permit_slots`，不是 per-dept timeout。
 
 Department 收到的事件形状是：
 
@@ -251,7 +252,7 @@ department-non-empty
 schema-validation
 ```
 
-`graph-scan` 会执行 package root / host root 扫描、`package.lua` removed surface 拒绝、`M.spec` unknown fields 拒绝、`retry` 解析、namespace 解析、queue 归一化和 owner-scoped `package.path`。每个 graph root 用 fresh Lua state，package owner 只看自己的 root；host owner 可看 host + packages；`--package-root` 不是跨包 `require` 授权。
+`graph-scan` 会执行 package root / host root 扫描、`package.lua` removed surface 拒绝、`M.spec` unknown fields 拒绝、`retry` 解析、`published_seam` capability validation、namespace 解析、queue 归一化和 owner-scoped `package.path`。每个 graph root 用 fresh Lua state，package owner 只看自己的 root；host owner 可看 host + packages；`--package-root` 不是跨包 `require` 授权。
 
 `locale-catalogs` validates each graph root's `locales/` directory when present. It requires `en.lua` as the reference if any locale catalog exists, requires every non-`en` catalog to cover all `en` keys, and rejects decode-helper-hidden literals or machine protocol tokens in catalogs.
 
@@ -273,6 +274,7 @@ schema-validation
 | owner-scoped `package.path` 与 package-root require isolation | engine graph scan / run / test-mode runner |
 | `M.spec` unknown fields 拒绝 | engine graph scan |
 | `M.spec.consumes` / `produces` / `fanout` queue 解析 | engine graph scan |
+| `M.spec.published_seam` 必须引用本 package consumed queue；sibling Department / Raiser `produces` 只能指向 own queues 或 sibling published seam | engine graph scan |
 | `M.spec.ephemeral` 必须引用 consumed queue | engine schema validation |
 | `M.spec.retry` 只能 nil / false / table，`retry=true` 拒绝 | engine graph scan |
 | `retry.max_attempts > 0`，`base` / `cap` 是正 `s/m/h` duration 且 `cap >= base` | engine schema validation |
