@@ -52,6 +52,7 @@ cache_expire(key)
 truncate_utf8(s, max_bytes)
 graph_json()
 t(key[, vars])
+restricted_lua_load(opts)
 git_log_count(grep, since)
 git_log_grep(grep, since)
 count_worktrees()
@@ -72,6 +73,8 @@ now()
 `exec_sync` and `exec_argv` are two distinct subprocess capabilities, not two ways to run the same thing. `exec_sync(cmd_or_opts)` lowers a command string to `/bin/sh -c` and is the genuine-shell primitive (env expansion, redirection, `&&`, builtins); its rate pool derives from the first shell word. `exec_argv({argv = {program, args...}, cwd?, env?, timeout?, read_coalesce?})` runs the program directly via `argv` with no shell — no Lua-side quoting, no shell injection — and is the egress that `gh`/`git` adapters (`std.github`/`std.git`) must use; its rate pool derives from `argv[1]`'s program basename. `exec_argv` rejects a `cmd` string and a `rate_pool` field. Both share the same mock/cassette/read-coalescing/rate/audit machinery and return `{stdout, stderr, exit_code, timed_out?, error_class?}`.
 
 `t(key[, vars])` implements key-based localization using the current owner root only. It reads `locales/<locale>.lua`, where `<locale>` comes from `FKST_OUTPUT_LANG`, and falls back to `locales/en.lua` when the requested locale or key is missing. `vars` is an optional table of scalar values interpolated into `{name}` placeholders. Catalogs are plain flat Lua tables with stable string keys and literal UTF-8 string values; they are package content, not engine policy.
+
+`restricted_lua_load({ source, bindings?, mode?, name? })` is a host-owned restricted loader for small declarative Lua sources. It evaluates `source` in a fresh Lua state with an empty `_ENV`; callers grant plain data or function capabilities explicitly through `bindings`. `mode` defaults to `"text"` and bytecode is accepted only with `mode = "bytecode"`. The chunk cannot reach ambient `require`, `load`, `loadstring`, `_G`, `debug`, `package`, raw table primitives, metatable access, `io`, `os`, coroutine primitives, `string.dump`, or value-metatable paths such as `("").dump`. Returned data and bridged function arguments / returns must be plain nil / boolean / number / string / table values; executable or VM-owned values fail closed with structured `restricted_lua` errors.
 
 `locales/*.lua` is the sanctioned home for non-English prose literals. Source files outside `locales/` still follow the English-source rule. Machine protocol tokens, marker names, verdict sentinels and AI provenance sentinels are code, not prose; they must not appear in catalog keys or values. Conformance checks catalog completeness against `en`, rejects decode-helper-hidden literals in `locales/`, and rejects machine tokens in catalogs.
 

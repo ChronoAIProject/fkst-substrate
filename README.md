@@ -149,6 +149,8 @@ production Lua SDK 还包含 `cache_set(key, value[, ttl_seconds])`、`cache_get
 
 production Lua SDK 包含 `graph_json() -> string`。它是显式授权的只读 composed graph introspection：只有当前 Department 的 `M.spec.graph_json = true` 时可调用。调用时按当前 fixed package roots input set 与 host root 重新扫描并验证 graph，返回稳定排序的 `fkst.graph.v1` JSON string，供 package/host 渲染 topology view。输出包含 raiser / queue / department nodes、消息流 edges、department `consumes` / `produces` / `ephemeral` / `stall_window` / materialized `retry` metadata；node `id` 与 edge endpoint 使用 `kind:canonical_name` 形态；不包含 runtime state、queue capacity、`lua` path 或 `owner_root`。
 
+The production Lua SDK includes `restricted_lua_load({ source, bindings?, mode?, name? })`. It is a host-owned restricted loader for small declarative Lua sources: it evaluates `source` in a fresh Lua state with an empty `_ENV`, defaults to text-only loading, and accepts bytecode only with `mode = "bytecode"`. Callers grant plain data or function capabilities explicitly through `bindings`; ambient `require`, `load`, `_G`, `debug`, `package`, raw/metatable primitives, `io`, `os`, coroutine APIs, `string.dump`, and `("").dump` are unreachable. Returned values must be plain nil / boolean / number / string / table data, and errors use `restricted_lua ...` classifications.
+
 ## 安装与更新
 
 `scripts/install.sh` 是 operator 便利脚本，和 `scripts/verify.sh` 同级，不是 engine surface：它只生成本机 operator 配置,不改 SPEC、conformance、supervisor 或任何二进制默认值。更新走独立的 `fkst-update` 二进制(见下)。

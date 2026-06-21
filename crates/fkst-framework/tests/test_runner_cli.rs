@@ -642,10 +642,30 @@ fn test_runner_runs_minimal_package_sanity_tests() {
         "stdout: {out}"
     );
     assert!(
+        out.contains("PASS tests/sanity_test.lua::test_restricted_lua_load_returns_plain_data"),
+        "stdout: {out}"
+    );
+    assert!(
+        out.contains(
+            "PASS tests/sanity_test.lua::test_restricted_lua_load_blocks_ambient_capabilities"
+        ),
+        "stdout: {out}"
+    );
+    assert!(
+        out.contains("PASS tests/sanity_test.lua::test_restricted_lua_load_uses_explicit_bindings"),
+        "stdout: {out}"
+    );
+    assert!(
+        out.contains(
+            "PASS tests/sanity_test.lua::test_restricted_lua_load_rejects_bytecode_by_default"
+        ),
+        "stdout: {out}"
+    );
+    assert!(
         out.contains("PASS tests/run_department_test.lua::test_run_department_captures_raises"),
         "stdout: {out}"
     );
-    assert!(out.contains("6 passed, 0 failed"), "stdout: {out}");
+    assert!(out.contains("10 passed, 0 failed"), "stdout: {out}");
 }
 
 #[test]
