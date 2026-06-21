@@ -392,6 +392,10 @@ impl UnitCatalog {
         self.units.get(unit_name).map(|unit| &unit.module_index)
     }
 
+    pub(crate) fn contains_unit(&self, unit_name: &str) -> bool {
+        self.units.contains_key(unit_name)
+    }
+
     pub(crate) fn graph(&self) -> &UnitGraph {
         &self.graph
     }

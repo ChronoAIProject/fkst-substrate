@@ -435,6 +435,25 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(temp.path().join("departments/worker")).unwrap();
         std::fs::write(
+            temp.path().join("fkst.workspace.toml"),
+            r#"
+[workspace]
+units = ["."]
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            temp.path().join("fkst.toml"),
+            r#"
+kind = "package"
+name = "pkg"
+
+[code]
+root = "."
+"#,
+        )
+        .unwrap();
+        std::fs::write(
             temp.path().join("fkst.env"),
             "FKST_QUEUE_CAPACITY=8\nFKST_DEPARTMENT_DEFAULT_STALL_WINDOW=30s\nFKST_CODEX_PERMIT_SLOTS=1\n",
         )

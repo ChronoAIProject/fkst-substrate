@@ -2,6 +2,10 @@ use std::fs;
 use std::path::PathBuf;
 use std::process::{Command, Output};
 
+mod support;
+
+use support::manifest_fixture::{write_single_package_workspace, write_workspace_for_roots};
+
 const RUNTIME_ROOT_ENV: &str = "FKST_RUNTIME_ROOT";
 
 fn framework_bin() -> &'static str {
@@ -63,6 +67,7 @@ fn combined_log(output: &Output) -> String {
 }
 
 fn write_minimal_host(root: &std::path::Path) {
+    write_single_package_workspace(root);
     fs::create_dir_all(root.join("departments/hello")).unwrap();
     fs::create_dir_all(root.join("raisers")).unwrap();
     write_host_defaults(root);
@@ -92,6 +97,7 @@ fn write_host_defaults(root: &std::path::Path) {
 }
 
 fn write_package_raiser(root: &std::path::Path) {
+    write_single_package_workspace(root);
     write_host_defaults(root);
     fs::create_dir_all(root.join("raisers")).unwrap();
     fs::write(
@@ -102,6 +108,7 @@ fn write_package_raiser(root: &std::path::Path) {
 }
 
 fn write_host_department(root: &std::path::Path) {
+    write_single_package_workspace(root);
     fs::create_dir_all(root.join("departments/hello")).unwrap();
     fs::write(
         root.join("departments/hello/main.lua"),
@@ -116,6 +123,7 @@ return M
 }
 
 fn write_package_consumer(root: &std::path::Path, queue: &str) {
+    write_single_package_workspace(root);
     fs::create_dir_all(root.join("departments/consumer")).unwrap();
     fs::write(
         root.join("departments/consumer/main.lua"),
@@ -132,6 +140,7 @@ return M
 }
 
 fn write_package_producer(root: &std::path::Path, queue: &str) {
+    write_single_package_workspace(root);
     fs::create_dir_all(root.join("departments/producer")).unwrap();
     fs::write(
         root.join("departments/producer/main.lua"),
@@ -282,7 +291,7 @@ fn locale_catalogs_reject_machine_tokens() {
 }
 
 #[test]
-fn package_root_flag_supplies_standard_assets_for_host_department() {
+fn package_root_flag_supplies_graph_root_for_host_department() {
     let package = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
     write_package_raiser(package.path());
     let package_namespace = package.path().file_name().unwrap().to_string_lossy();
@@ -300,6 +309,7 @@ return M
         ),
     )
     .unwrap();
+    write_workspace_for_roots(host.path(), &[package.path()]);
 
     let args = [
         std::ffi::OsStr::new("--project-root"),
@@ -324,6 +334,7 @@ fn package_consensus_dead_letter_consumer_proves_no_producer_gap_closed() {
     write_package_consumer(&missing_producer_package, "proposal");
     let missing_producer_host = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
     write_host_defaults(missing_producer_host.path());
+    write_workspace_for_roots(missing_producer_host.path(), &[&missing_producer_package]);
 
     let missing_producer_args = [
         std::ffi::OsStr::new("--project-root"),
@@ -368,6 +379,7 @@ return M
     .unwrap();
     let host = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
     write_host_defaults(host.path());
+    write_workspace_for_roots(host.path(), &[&package]);
 
     let args = [
         std::ffi::OsStr::new("--project-root"),
@@ -422,6 +434,7 @@ fn composed_graph_sibling_producer_satisfies_consumed_queue() {
     write_package_producer(&producer_package, "consensus.proposal");
     let host = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
     write_host_defaults(host.path());
+    write_workspace_for_roots(host.path(), &[&consumer_package, &producer_package]);
 
     let args = [
         std::ffi::OsStr::new("--project-root"),
@@ -451,6 +464,7 @@ fn composed_graph_consumed_queue_without_any_producer_fails() {
     write_package_consumer(&consumer_package, "proposal");
     let host = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
     write_host_defaults(host.path());
+    write_workspace_for_roots(host.path(), &[&consumer_package, &sibling_package]);
 
     let args = [
         std::ffi::OsStr::new("--project-root"),
@@ -641,6 +655,7 @@ fn host_failures_exit_one_with_check_ids() {
     let missing_departments = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
     fs::create_dir_all(missing_departments.path().join("raisers")).unwrap();
     write_host_defaults(missing_departments.path());
+    write_single_package_workspace(missing_departments.path());
     let args = [
         std::ffi::OsStr::new("--project-root"),
         path_arg(missing_departments.path()),
@@ -655,6 +670,7 @@ fn host_failures_exit_one_with_check_ids() {
     fs::create_dir_all(empty_graph.path().join("departments/empty")).unwrap();
     fs::create_dir_all(empty_graph.path().join("raisers")).unwrap();
     write_host_defaults(empty_graph.path());
+    write_single_package_workspace(empty_graph.path());
     let args = [
         std::ffi::OsStr::new("--project-root"),
         path_arg(empty_graph.path()),
@@ -667,6 +683,7 @@ fn host_failures_exit_one_with_check_ids() {
     let schema_invalid = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
     fs::create_dir_all(schema_invalid.path().join("departments/bad")).unwrap();
     write_host_defaults(schema_invalid.path());
+    write_single_package_workspace(schema_invalid.path());
     fs::write(
         schema_invalid.path().join("departments/bad/main.lua"),
         r#"

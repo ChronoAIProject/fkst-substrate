@@ -1,5 +1,9 @@
 use std::process::{Command, Output};
 
+mod support;
+
+use support::manifest_fixture::write_workspace_for_roots;
+
 fn framework_bin() -> &'static str {
     env!("CARGO_BIN_EXE_fkst-framework")
 }
@@ -52,6 +56,7 @@ fn stderr(output: &Output) -> String {
 fn config_reads_host_fkst_env_from_project_root_when_cwd_differs() {
     let host = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
     let cwd = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
+    write_workspace_for_roots(host.path(), &[host.path()]);
     std::fs::write(
         host.path().join("fkst.env"),
         "FKST_QUEUE_CAPACITY=31\nFKST_DEPARTMENT_DEFAULT_STALL_WINDOW=7m\nFKST_CODEX_PERMIT_SLOTS=9\nFKST_CANDIDATE_PREFIX=host-rc\nFKST_CANDIDATE_FROM_SEP=__from__\n",
@@ -89,6 +94,7 @@ fn config_reads_host_fkst_env_from_project_root_when_cwd_differs() {
 fn config_rejects_invalid_rate_pool_definition() {
     let host = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
     let cwd = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
+    write_workspace_for_roots(host.path(), &[host.path()]);
 
     let output = config_command(cwd.path())
         .arg("--project-root")
@@ -139,6 +145,7 @@ fn boundary_resources_lists_mediated_resource_registry() {
 fn config_env_overrides_host_fkst_env() {
     let host = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
     let cwd = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
+    write_workspace_for_roots(host.path(), &[host.path()]);
     std::fs::write(host.path().join("fkst.env"), "FKST_QUEUE_CAPACITY=31\n").unwrap();
 
     let output = config_command(cwd.path())
@@ -162,6 +169,7 @@ fn config_accepts_repeated_package_root_flags_over_package_roots_env() {
     let package_a = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
     let package_b = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
     let cwd = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
+    write_workspace_for_roots(host.path(), &[package_a.path(), package_b.path()]);
     let joined_env = std::env::join_paths([package_b.path()]).unwrap();
 
     let output = config_command(cwd.path())
@@ -184,6 +192,7 @@ fn config_uses_package_roots_env_and_rejects_plural_singular_conflict() {
     let package_a = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
     let package_b = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
     let cwd = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
+    write_workspace_for_roots(host.path(), &[package_a.path(), package_b.path()]);
     let joined = std::env::join_paths([package_a.path(), package_b.path()]).unwrap();
 
     let output = config_command(cwd.path())
@@ -247,6 +256,7 @@ fn config_single_package_entrypoints_are_equivalent() {
     let host = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
     let package = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
     let cwd = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
+    write_workspace_for_roots(host.path(), &[package.path()]);
 
     let flag = config_command(cwd.path())
         .arg("--project-root")
@@ -280,6 +290,7 @@ fn config_single_package_entrypoints_are_equivalent() {
 fn config_operational_defaults_and_missing_host_facts_are_reported() {
     let host = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
     let cwd = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
+    write_workspace_for_roots(host.path(), &[host.path()]);
 
     let output = config_command(cwd.path())
         .arg("--project-root")

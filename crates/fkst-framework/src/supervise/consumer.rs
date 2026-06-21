@@ -1130,7 +1130,7 @@ mod tests {
     use std::collections::BTreeMap;
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
     use tempfile::TempDir;
     use tokio::time::timeout;
 
@@ -1176,6 +1176,94 @@ mod tests {
     fn write_executable(path: &Path, body: &str) {
         fs::write(path, format!("#!/bin/sh\n{body}\n")).unwrap();
         fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    fn write_single_package_workspace(root: &Path) {
+        write_package_manifest(root, &unit_name(root));
+        write_workspace_manifest(root, &[root]);
+    }
+
+    fn write_composed_workspace(host: &Path, package_roots: &[&Path]) {
+        write_package_manifest(host, "host");
+        for package_root in package_roots {
+            write_package_manifest(package_root, &unit_name(package_root));
+        }
+        let mut roots = Vec::with_capacity(package_roots.len() + 1);
+        roots.push(host);
+        roots.extend(package_roots.iter().copied());
+        write_workspace_manifest(host, &roots);
+    }
+
+    fn write_package_manifest(root: &Path, name: &str) {
+        fs::write(
+            root.join("fkst.toml"),
+            format!(
+                r#"
+kind = "package"
+name = "{name}"
+
+[code]
+root = "."
+"#
+            ),
+        )
+        .unwrap();
+    }
+
+    fn write_workspace_manifest(workspace_root: &Path, unit_roots: &[&Path]) {
+        let units = unit_roots
+            .iter()
+            .map(|root| {
+                let relative = relative_unit_path(workspace_root, root);
+                format!(r#""{}""#, relative.display())
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        fs::write(
+            workspace_root.join("fkst.workspace.toml"),
+            format!(
+                r#"
+[workspace]
+units = [{units}]
+"#
+            ),
+        )
+        .unwrap();
+    }
+
+    fn relative_unit_path(workspace_root: &Path, unit_root: &Path) -> PathBuf {
+        let workspace_root = workspace_root.canonicalize().unwrap();
+        let unit_root = unit_root.canonicalize().unwrap();
+        if unit_root == workspace_root {
+            return PathBuf::from(".");
+        }
+        if let Ok(relative) = unit_root.strip_prefix(&workspace_root) {
+            return relative.to_path_buf();
+        }
+        if let Some(parent) = workspace_root.parent() {
+            if let Ok(sibling) = unit_root.strip_prefix(parent) {
+                let mut relative = PathBuf::from("..");
+                relative.push(sibling);
+                return relative;
+            }
+        }
+        panic!(
+            "test unit root {} is not relative to workspace {}",
+            unit_root.display(),
+            workspace_root.display()
+        );
+    }
+
+    fn unit_name(root: &Path) -> String {
+        root.file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("pkg")
+            .bytes()
+            .map(|byte| match byte {
+                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'_' | b'-' => byte as char,
+                _ => '_',
+            })
+            .collect()
     }
 
     fn durable_decl(root: &Path, dept: &str, stall_window: &str) -> DepartmentDecl {
@@ -1423,6 +1511,7 @@ mod tests {
         fs::create_dir_all(&host).unwrap();
         fs::create_dir_all(&github_devloop).unwrap();
         fs::create_dir_all(&consensus).unwrap();
+        write_composed_workspace(&host, &[&github_devloop, &consensus]);
         let roots =
             PackageRoots::resolve(&host, vec![github_devloop.clone(), consensus.clone()]).unwrap();
         let decl = DepartmentDecl {
@@ -1458,6 +1547,7 @@ mod tests {
     fn spawn_args_keeps_folded_single_package_root_form() {
         let temp = TempDir::new().unwrap();
         fs::create_dir_all(temp.path()).unwrap();
+        write_single_package_workspace(temp.path());
         let roots = PackageRoots::resolve(temp.path(), vec![temp.path().to_path_buf()]).unwrap();
         let owner_namespace = package_namespace(temp.path());
         let decl = DepartmentDecl {
@@ -1692,6 +1782,7 @@ mod tests {
                 release.display()
             ),
         );
+        write_single_package_workspace(temp.path());
         let roots = PackageRoots::resolve(temp.path(), vec![temp.path().to_path_buf()]).unwrap();
         let decl = DepartmentDecl {
             lua: "departments/worker/main.lua".into(),
@@ -1855,6 +1946,7 @@ mod tests {
                 release.display()
             ),
         );
+        write_single_package_workspace(temp.path());
         let roots = PackageRoots::resolve(temp.path(), vec![temp.path().to_path_buf()]).unwrap();
         let decl = DepartmentDecl {
             lua: "departments/worker/main.lua".into(),
@@ -1972,6 +2064,7 @@ mod tests {
                 release.display()
             ),
         );
+        write_single_package_workspace(temp.path());
         let roots = PackageRoots::resolve(temp.path(), vec![temp.path().to_path_buf()]).unwrap();
         let decl_a = durable_decl(temp.path(), "dept_a", "30s");
         let decl_b = durable_decl(temp.path(), "dept_b", "30s");
@@ -2074,6 +2167,7 @@ mod tests {
                 release.display()
             ),
         );
+        write_single_package_workspace(temp.path());
         let roots = PackageRoots::resolve(temp.path(), vec![temp.path().to_path_buf()]).unwrap();
         let decl = durable_decl(temp.path(), "worker", "1ms");
         let router = durable_router(store.clone(), &[("worker", decl.clone())]);

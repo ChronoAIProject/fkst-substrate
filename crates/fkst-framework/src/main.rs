@@ -21,6 +21,7 @@ use path_resolver::PackageRoots;
 use serde_json::Value as JsonValue;
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 mod boundary_resource;
 mod config_registry;
@@ -28,6 +29,7 @@ mod external_command;
 mod host_conformance;
 mod init_package_repo;
 mod lua_coverage;
+mod lua_require;
 mod manifest;
 mod mlua_init;
 mod observe;
@@ -461,12 +463,22 @@ fn run_pipeline(
         .ok_or_else(|| anyhow::anyhow!("unknown owner namespace `{owner_namespace}`"))?;
     provenance::install_run(owner_root, &owner_namespace);
     provenance::emit_code_provenance_line();
-    let require_roots = roots.require_roots_for_owner(owner_root);
+    let catalog = roots.unit_catalog().clone();
+    let owner_unit = catalog
+        .unit_name_for_root(owner_root)?
+        .ok_or_else(|| anyhow::anyhow!("no manifest unit owns {}", owner_root.display()))?;
+    let catalog = Arc::new(catalog);
     let graph_json_authorized =
         sdk_graph::department_authorized(&roots, owner_root, &lua_path).unwrap_or(false);
-    let declared_produces =
-        department_declared_resolved_produces(&roots, owner_root, &owner_namespace, &lua_path)
-            .with_context(|| format!("resolve raise authority for {}", lua_path.display()))?;
+    let declared_produces = department_declared_resolved_produces(
+        &roots,
+        owner_root,
+        &owner_namespace,
+        &lua_path,
+        catalog.clone(),
+        &owner_unit,
+    )
+    .with_context(|| format!("resolve raise authority for {}", lua_path.display()))?;
 
     mlua_init::register_framework_sdk(
         &lua,
@@ -488,7 +500,10 @@ fn run_pipeline(
         &lua,
         &lua_path,
         &event,
-        require_roots.iter().map(|root| root.as_path()),
+        catalog,
+        &owner_unit,
+        owner_root,
+        None,
     ) {
         Ok(()) => 0,
         Err(e) => {
@@ -510,18 +525,19 @@ fn department_declared_resolved_produces(
     owner_root: &Path,
     owner_namespace: &str,
     lua_path: &Path,
+    catalog: Arc<manifest::UnitCatalog>,
+    owner_unit: &str,
 ) -> Result<BTreeSet<String>> {
     let lua_path = lua_path
         .canonicalize()
         .with_context(|| format!("canonicalize {}", lua_path.display()))?;
-    let require_roots = roots.require_roots_for_owner(owner_root);
-    let package_path = mlua_init::package_roots_path(require_roots.iter().map(PathBuf::as_path));
     spec_queues::declared_resolved_produces(
         roots,
         owner_namespace,
         owner_root,
         &lua_path,
-        &package_path,
+        catalog,
+        owner_unit,
         &mlua_init::LuaChunkCache::default(),
     )
     .map_err(anyhow::Error::from)

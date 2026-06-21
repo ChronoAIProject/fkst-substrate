@@ -17,6 +17,7 @@ mod spawner;
 mod support;
 
 use spawner::{spawn_framework, SpawnResult};
+use support::manifest_fixture::{write_single_package_workspace, write_workspace_for_roots};
 use support::process_sandbox::ProcessSandbox;
 
 static SUPERVISE_SMOKE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -145,7 +146,7 @@ fn supervise_dispatches_file_watch_event_to_department() {
         root.join("departments/recorder/main.lua"),
         r#"
 local M = {}
-M.spec = { consumes = {"files"}, stall_window = "5s" }
+M.spec = { consumes = {"files"}, ephemeral = {"files"}, stall_window = "5s" }
 function pipeline(event)
   local f = assert(io.open("seen.txt", "w"))
   f:write(event.payload.path or "")
@@ -164,6 +165,7 @@ return M
     )
     .unwrap();
     fs::write(root.join("input.txt"), "ready").unwrap();
+    write_single_package_workspace(root);
 
     let fake = root.join("fkst-framework");
     write_executable(
@@ -237,6 +239,7 @@ return M
         ),
     )
     .unwrap();
+    write_single_package_workspace(root);
 
     let mut child = Command::new(env!("CARGO_BIN_EXE_fkst-framework"))
         .current_dir(root)
@@ -339,6 +342,7 @@ exit 0
             supervise_pid.display()
         ),
     );
+    write_single_package_workspace(root);
 
     let status = Command::new(&launcher)
         .current_dir(root)
@@ -394,15 +398,16 @@ fn supervise_env_package_root_reaches_child_framework() {
     let runtime_root = host.join(".fkst/runtime");
     let fact = host.join("package-root-fact.txt");
     write_graph_defaults(&package);
-    fs::create_dir_all(package.join("fkst")).unwrap();
+    write_fkst_env(&host);
+    fs::create_dir_all(host.join("fkst")).unwrap();
     fs::create_dir_all(package.join("raisers")).unwrap();
     fs::create_dir_all(host.join("departments/host_worker")).unwrap();
     fs::write(package.join("input.txt"), "ready").unwrap();
     fs::write(
-        package.join("fkst/standard_asset.lua"),
+        host.join("fkst/standard_asset.lua"),
         r#"
 return {
-  marker = function() return "package-standard-marker" end,
+  marker = function() return "host-standard-marker" end,
   stall_window = function() return "5s" end,
 }
 "#,
@@ -422,7 +427,7 @@ return {
             r#"
 local standard = require("fkst.standard_asset")
 local M = {{}}
-M.spec = {{ consumes = {{"{}.standard_input"}}, stall_window = standard.stall_window() }}
+M.spec = {{ consumes = {{"{}.standard_input"}}, ephemeral = {{"{}.standard_input"}}, stall_window = standard.stall_window() }}
 function pipeline(event)
   local f = assert(io.open({}, "w"))
   f:write("marker=" .. standard.marker() .. "\n")
@@ -432,10 +437,12 @@ end
 return M
 "#,
             namespace(&package),
+            namespace(&package),
             lua_string(&fact)
         ),
     )
     .unwrap();
+    write_workspace_for_roots(&host, &[&package]);
 
     let mut child = Command::new(env!("CARGO_BIN_EXE_fkst-framework"))
         .current_dir(&host)
@@ -452,7 +459,7 @@ return M
 
     let body = wait_for_file_containing(
         &fact,
-        "marker=package-standard-marker",
+        "marker=host-standard-marker",
         Duration::from_secs(10),
     )
     .unwrap_or_else(|| {
@@ -470,7 +477,7 @@ return M
         "supervise should exit successfully after SIGTERM"
     );
     assert!(
-        body.contains("marker=package-standard-marker\n"),
+        body.contains("marker=host-standard-marker\n"),
         "body={body}"
     );
     let input_path = package.join("input.txt").canonicalize().unwrap();
@@ -547,6 +554,7 @@ return M
         ),
     )
     .unwrap();
+    write_single_package_workspace(root);
 
     let mut child = Command::new(env!("CARGO_BIN_EXE_fkst-framework"))
         .current_dir(root)
@@ -655,6 +663,7 @@ return M
         ),
     )
     .unwrap();
+    write_workspace_for_roots(&host, &[&producer_pkg, &consumer_pkg]);
 
     let mut child = Command::new(env!("CARGO_BIN_EXE_fkst-framework"))
         .current_dir(&host)

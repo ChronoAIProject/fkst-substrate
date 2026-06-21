@@ -1,6 +1,6 @@
 //! Resolve fixed package roots, host graph inputs, and package-local names.
 
-use crate::manifest::{ManifestRequireScope, UnitCatalog};
+use crate::manifest::UnitCatalog;
 use anyhow::{bail, Context, Result};
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -15,20 +15,13 @@ const REJECTED_PACKAGE_ROOT_ENVS: &[&str] = &[
     "FKST_GRAPH_ROOTS",
 ];
 
-/// Build the Lua search path for one graph root.
-pub(crate) fn package_root_path(package_root: &Path) -> String {
-    let root = package_root.display();
-    format!("{root}/?.lua;{root}/?/init.lua;{root}/?/main.lua")
-}
-
 #[derive(Clone, Debug)]
 pub(crate) struct PackageRoots {
     package_roots: Vec<PathBuf>,
     host_root: PathBuf,
     package_namespaces: Vec<String>,
     run_host_owner: bool,
-    #[allow(dead_code)]
-    catalog: Option<UnitCatalog>,
+    catalog: UnitCatalog,
 }
 
 impl PackageRoots {
@@ -116,7 +109,9 @@ impl PackageRoots {
                 );
             }
         }
-        let catalog = UnitCatalog::discover(&host_root)?;
+        let catalog = UnitCatalog::discover(&host_root)?.ok_or_else(|| {
+            anyhow::anyhow!("manifest catalog is required: missing fkst.workspace.toml")
+        })?;
         Ok(Self {
             package_roots,
             host_root,
@@ -126,43 +121,8 @@ impl PackageRoots {
         })
     }
 
-    pub(crate) fn require_roots_for_owner(&self, owner_root: &Path) -> Vec<PathBuf> {
-        if owner_root == self.host_root {
-            if !self.run_host_owner
-                && self
-                    .package_roots
-                    .iter()
-                    .any(|root| root == &self.host_root)
-            {
-                return vec![self.host_root.clone()];
-            }
-            let mut roots = vec![self.host_root.clone()];
-            roots.extend(
-                self.package_roots
-                    .iter()
-                    .filter(|root| *root != &self.host_root)
-                    .cloned(),
-            );
-            return roots;
-        }
-        vec![owner_root.to_path_buf()]
-    }
-
-    #[allow(dead_code)]
-    pub(crate) fn require_scope_for(&self, owner_root: &Path) -> Result<RequireScope> {
-        if let Some(catalog) = &self.catalog {
-            return Ok(RequireScope::Manifest(
-                catalog.require_scope_for_root(owner_root)?,
-            ));
-        }
-        Ok(RequireScope::Legacy {
-            roots: self.require_roots_for_owner(owner_root),
-        })
-    }
-
-    #[allow(dead_code)]
-    pub(crate) fn unit_catalog(&self) -> Option<&UnitCatalog> {
-        self.catalog.as_ref()
+    pub(crate) fn unit_catalog(&self) -> &UnitCatalog {
+        &self.catalog
     }
 
     pub(crate) fn graph_roots(&self) -> Vec<GraphRoot> {
@@ -229,13 +189,6 @@ impl PackageRoots {
                 }
             })
     }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-#[allow(dead_code)]
-pub(crate) enum RequireScope {
-    Legacy { roots: Vec<PathBuf> },
-    Manifest(ManifestRequireScope),
 }
 
 #[derive(Clone, Debug)]
@@ -489,6 +442,25 @@ mod tests {
     use super::*;
 
     fn roots(package_roots: &[&str], host_root: &str) -> PackageRoots {
+        let temp = tempfile::tempdir().unwrap();
+        write(
+            &temp.path().join("fkst.workspace.toml"),
+            r#"
+[workspace]
+units = ["."]
+"#,
+        );
+        write(
+            &temp.path().join("fkst.toml"),
+            r#"
+kind = "package"
+name = "dummy"
+
+[code]
+root = "."
+"#,
+        );
+        let catalog = UnitCatalog::discover(temp.path()).unwrap().unwrap();
         PackageRoots {
             package_roots: package_roots.iter().map(PathBuf::from).collect(),
             host_root: PathBuf::from(host_root),
@@ -503,7 +475,7 @@ mod tests {
                 })
                 .collect(),
             run_host_owner: false,
-            catalog: None,
+            catalog,
         }
     }
 
@@ -514,79 +486,19 @@ mod tests {
         std::fs::write(path, body).unwrap();
     }
 
-    // A package department resolves require() against its own package root only,
-    // even when other package roots are present: package-private modules such as
-    // `core` must never leak across packages via the spawn require-root set.
     #[test]
-    fn package_owner_require_roots_are_its_own_root_only() {
-        let r = roots(&["/pkg/a", "/pkg/b"], "/host");
-        assert_eq!(
-            r.require_roots_for_owner(Path::new("/pkg/a")),
-            vec![PathBuf::from("/pkg/a")]
-        );
-        assert_eq!(
-            r.require_roots_for_owner(Path::new("/pkg/b")),
-            vec![PathBuf::from("/pkg/b")]
-        );
-    }
-
-    // A host department is the composition layer: it resolves standard assets
-    // (`fkst.*`) from every package root, with the host root first.
-    #[test]
-    fn host_owner_require_roots_are_host_then_all_package_roots() {
-        let r = roots(&["/pkg/a", "/pkg/b"], "/host");
-        assert_eq!(
-            r.require_roots_for_owner(Path::new("/host")),
-            vec![
-                PathBuf::from("/host"),
-                PathBuf::from("/pkg/a"),
-                PathBuf::from("/pkg/b"),
-            ]
-        );
-    }
-
-    // Single package + host: host gets [host, package], package gets [package];
-    // this matches the standard-asset contract while keeping the package sealed.
-    #[test]
-    fn single_package_require_roots_match_standard_asset_contract() {
-        let r = roots(&["/pkg"], "/host");
-        assert_eq!(
-            r.require_roots_for_owner(Path::new("/host")),
-            vec![PathBuf::from("/host"), PathBuf::from("/pkg")]
-        );
-        assert_eq!(
-            r.require_roots_for_owner(Path::new("/pkg")),
-            vec![PathBuf::from("/pkg")]
-        );
-    }
-
-    // When the package root folds into the host root (package == host), the
-    // single combined root is the only require root.
-    #[test]
-    fn package_and_host_fold_yields_single_root() {
-        let r = roots(&["/combined"], "/combined");
-        assert_eq!(
-            r.require_roots_for_owner(Path::new("/combined")),
-            vec![PathBuf::from("/combined")]
-        );
-    }
-
-    #[test]
-    fn missing_workspace_manifest_yields_legacy_require_scope() {
+    fn missing_workspace_manifest_fails_closed() {
         let temp = tempfile::tempdir().unwrap();
-        let r = PackageRoots::resolve(temp.path(), vec![temp.path().to_path_buf()]).unwrap();
+        let err = PackageRoots::resolve(temp.path(), vec![temp.path().to_path_buf()]).unwrap_err();
 
-        assert!(r.unit_catalog().is_none());
-        assert_eq!(
-            r.require_scope_for(r.host_root()).unwrap(),
-            RequireScope::Legacy {
-                roots: vec![r.host_root().to_path_buf()]
-            }
+        assert!(
+            err.to_string().contains("manifest catalog is required"),
+            "{err:#}"
         );
     }
 
     #[test]
-    fn workspace_manifest_yields_manifest_require_scope() {
+    fn workspace_manifest_yields_catalog() {
         let temp = tempfile::tempdir().unwrap();
         write(
             &temp.path().join("fkst.workspace.toml"),
@@ -624,10 +536,7 @@ root = "."
         let app_root = temp.path().join("packages/app");
         let r = PackageRoots::resolve(temp.path(), vec![app_root.clone()]).unwrap();
 
-        assert!(r.unit_catalog().is_some());
-        let RequireScope::Manifest(scope) = r.require_scope_for(&app_root).unwrap() else {
-            panic!("expected manifest require scope");
-        };
+        let scope = r.unit_catalog().require_scope_for_root(&app_root).unwrap();
         assert_eq!(scope.owner_unit(), "app");
         assert!(scope.resolve("main").is_some());
         assert!(scope.resolve("fkst.json").is_some());
@@ -639,6 +548,23 @@ root = "."
             .prefix("repo.with.dot")
             .tempdir()
             .unwrap();
+        write(
+            &temp.path().join("fkst.workspace.toml"),
+            r#"
+[workspace]
+units = ["."]
+"#,
+        );
+        write(
+            &temp.path().join("fkst.toml"),
+            r#"
+kind = "package"
+name = "app"
+
+[code]
+root = "."
+"#,
+        );
 
         let r = PackageRoots::resolve(temp.path(), vec![temp.path().to_path_buf()]).unwrap();
         let resolver = r.name_resolver();

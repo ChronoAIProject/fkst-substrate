@@ -11,6 +11,7 @@ use crate::external_command::{
     MockCommandState,
 };
 use crate::lua_coverage::LuaCoverage;
+use crate::manifest::UnitCatalog;
 use crate::path_resolver::PackageRoots;
 use crate::raise::RaiseBuffer;
 
@@ -21,7 +22,7 @@ pub(crate) fn run_tests(
 ) -> Result<i32> {
     let files = discover_test_files(&roots)?;
     let _supervisor_pid_guard = TestModeSupervisorPidGuard::remove();
-    let cache = TestRunCache::new(roots.clone());
+    let cache = TestRunCache::new(roots.clone())?;
     let coverage = coverage_dir
         .as_ref()
         .map(|_| {
@@ -43,8 +44,6 @@ pub(crate) fn run_tests(
         let relpath = display_path(&file.path, &file.owner_root);
         let mock_commands = MockCommandState::new();
         let lua = crate::mlua_init::new_lua();
-        crate::mlua_init::set_package_roots_path(&lua, [file.owner_root.as_path()])
-            .with_context(|| format!("set package.path for tests in {}", relpath))?;
         crate::mlua_init::register_framework_sdk_with_runner(
             &lua,
             RaiseBuffer::new(),
@@ -75,8 +74,17 @@ pub(crate) fn run_tests(
                 .install(&lua)
                 .with_context(|| format!("install coverage hook for {}", relpath))?;
         }
+        let owner_unit = cache
+            .owner_unit_for_root(&file.owner_root)
+            .with_context(|| format!("resolve owner unit for {}", relpath))?;
 
-        match load_test_table(&lua, &file.path, &file.owner_root) {
+        match load_test_table(
+            &lua,
+            &file.path,
+            &file.owner_root,
+            cache.catalog(),
+            &owner_unit,
+        ) {
             Ok(tests) => {
                 for (name, func) in tests {
                     mock_commands
@@ -301,14 +309,25 @@ fn is_test_file(path: &Path) -> bool {
         .is_some_and(|name| name.ends_with("_test.lua"))
 }
 
-fn load_test_table(lua: &Lua, file: &Path, owner_root: &Path) -> Result<Vec<(String, Function)>> {
-    let src = std::fs::read_to_string(file).with_context(|| format!("read {}", file.display()))?;
-    let chunk = lua
-        .load(&src)
-        .set_name(crate::lua_coverage::chunk_name(file, owner_root));
-    let table: Table = chunk
-        .eval()
-        .with_context(|| format!("eval {}", file.display()))?;
+fn load_test_table(
+    lua: &Lua,
+    file: &Path,
+    owner_root: &Path,
+    catalog: Arc<UnitCatalog>,
+    owner_unit: &str,
+) -> Result<Vec<(String, Function)>> {
+    let value = crate::lua_require::load_unit_chunk(
+        lua,
+        catalog,
+        owner_unit,
+        file,
+        crate::lua_coverage::chunk_name(file, owner_root),
+        None,
+    )
+    .with_context(|| format!("eval {}", file.display()))?;
+    let Value::Table(table) = value else {
+        anyhow::bail!("{} did not return a table", file.display());
+    };
     let mut tests = BTreeMap::<String, Function>::new();
     for pair in table.pairs::<String, Value>() {
         let (name, value) = pair?;
@@ -555,7 +574,7 @@ fn run_department(
     let lua_path = resolve_department_path(owner_root, &path);
     let event_json: serde_json::Value = lua.from_value(event)?;
     let _guard = DeptRunEnvGuard::apply(opts)?;
-    let require_roots = cache.require_roots_for_owner(owner_root)?;
+    let owner_unit = cache.owner_unit_for_root(owner_root)?;
     let graph_json_authorized =
         crate::sdk_graph::department_authorized(roots, owner_root, &lua_path).unwrap_or(false);
     let qualified_consumes = cache.declared_qualified_consumes(owner_root, &lua_path)?;
@@ -568,11 +587,9 @@ fn run_department(
     .map_err(mlua::Error::external)?;
     let declared_produces =
         cache.declared_resolved_produces(owner_root, owner_namespace, &lua_path)?;
-    let package_path = cache.package_path_string(&require_roots)?;
 
     let dept_lua = crate::mlua_init::new_lua();
     let raise_buf = RaiseBuffer::new();
-    crate::mlua_init::set_package_path_string(&dept_lua, &package_path)?;
     crate::mlua_init::register_framework_sdk_with_runner(
         &dept_lua,
         raise_buf.clone(),
@@ -604,6 +621,8 @@ fn run_department(
         &event_json,
         chunk_cache,
         owner_root,
+        cache.catalog(),
+        &owner_unit,
     ) {
         Ok(()) => 0,
         Err(err) => {
@@ -631,14 +650,14 @@ fn run_department(
 #[derive(Clone)]
 struct TestRunCache {
     roots: PackageRoots,
+    catalog: Arc<UnitCatalog>,
     inner: Arc<Mutex<TestRunCacheInner>>,
     lua_chunks: crate::mlua_init::LuaChunkCache,
 }
 
 #[derive(Default)]
 struct TestRunCacheInner {
-    require_roots: BTreeMap<PathBuf, Vec<PathBuf>>,
-    package_paths: BTreeMap<Vec<PathBuf>, String>,
+    owner_units: BTreeMap<PathBuf, String>,
     declared_produces: BTreeMap<PathBuf, BTreeSet<String>>,
     declared_consumes: BTreeMap<PathBuf, BTreeSet<String>>,
     #[cfg(test)]
@@ -648,55 +667,48 @@ struct TestRunCacheInner {
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct TestRunCacheStats {
-    require_roots_misses: usize,
-    package_path_misses: usize,
+    owner_unit_misses: usize,
     declared_produces_misses: usize,
     declared_consumes_misses: usize,
 }
 
 impl TestRunCache {
-    fn new(roots: PackageRoots) -> Self {
-        Self {
+    fn new(roots: PackageRoots) -> Result<Self> {
+        let catalog = roots.unit_catalog().clone();
+        Ok(Self {
             roots,
+            catalog: Arc::new(catalog),
             inner: Arc::new(Mutex::new(TestRunCacheInner::default())),
             lua_chunks: crate::mlua_init::LuaChunkCache::default(),
-        }
+        })
     }
 
-    fn require_roots_for_owner(&self, owner_root: &Path) -> mlua::Result<Vec<PathBuf>> {
+    fn catalog(&self) -> Arc<UnitCatalog> {
+        self.catalog.clone()
+    }
+
+    fn owner_unit_for_root(&self, owner_root: &Path) -> mlua::Result<String> {
         let owner_root = owner_root.canonicalize().map_err(mlua::Error::external)?;
         let mut inner = self
             .inner
             .lock()
             .map_err(|_| mlua::Error::runtime("test run cache lock poisoned"))?;
-        if let Some(roots) = inner.require_roots.get(&owner_root) {
-            return Ok(roots.clone());
+        if let Some(unit) = inner.owner_units.get(&owner_root) {
+            return Ok(unit.clone());
         }
         #[cfg(test)]
         {
-            inner.stats.require_roots_misses += 1;
+            inner.stats.owner_unit_misses += 1;
         }
-        let roots = self.roots.require_roots_for_owner(&owner_root);
-        inner.require_roots.insert(owner_root, roots.clone());
-        Ok(roots)
-    }
-
-    fn package_path_string(&self, require_roots: &[PathBuf]) -> mlua::Result<String> {
-        let key = require_roots.to_vec();
-        let mut inner = self
-            .inner
-            .lock()
-            .map_err(|_| mlua::Error::runtime("test run cache lock poisoned"))?;
-        if let Some(path) = inner.package_paths.get(&key) {
-            return Ok(path.clone());
-        }
-        #[cfg(test)]
-        {
-            inner.stats.package_path_misses += 1;
-        }
-        let path = crate::mlua_init::package_roots_path(require_roots.iter().map(PathBuf::as_path));
-        inner.package_paths.insert(key, path.clone());
-        Ok(path)
+        let unit = self
+            .catalog
+            .unit_name_for_root(&owner_root)
+            .map_err(mlua::Error::external)?
+            .ok_or_else(|| {
+                mlua::Error::external(format!("no manifest unit owns {}", owner_root.display()))
+            })?;
+        inner.owner_units.insert(owner_root, unit.clone());
+        Ok(unit)
     }
 
     fn declared_resolved_produces(
@@ -715,14 +727,14 @@ impl TestRunCache {
                 return Ok(produces.clone());
             }
         }
-        let require_roots = self.require_roots_for_owner(owner_root)?;
-        let package_path = self.package_path_string(&require_roots)?;
+        let owner_unit = self.owner_unit_for_root(owner_root)?;
         let produces = crate::spec_queues::declared_resolved_produces(
             &self.roots,
             owner_namespace,
             owner_root,
             &lua_path,
-            &package_path,
+            self.catalog(),
+            &owner_unit,
             self.lua_chunk_cache(),
         )?;
         let mut inner = self
@@ -752,12 +764,12 @@ impl TestRunCache {
                 return Ok(consumes.clone());
             }
         }
-        let require_roots = self.require_roots_for_owner(owner_root)?;
-        let package_path = self.package_path_string(&require_roots)?;
+        let owner_unit = self.owner_unit_for_root(owner_root)?;
         let consumes = declared_qualified_consumes(
             owner_root,
             &lua_path,
-            &package_path,
+            self.catalog(),
+            &owner_unit,
             self.lua_chunk_cache(),
         )?;
         let mut inner = self
@@ -785,13 +797,15 @@ impl TestRunCache {
 fn declared_qualified_consumes(
     owner_root: &Path,
     lua_path: &Path,
-    package_path: &str,
+    catalog: Arc<UnitCatalog>,
+    owner_unit: &str,
     chunk_cache: &crate::mlua_init::LuaChunkCache,
 ) -> mlua::Result<BTreeSet<String>> {
     crate::spec_queues::declared_qualified_spec_queues(
         owner_root,
         lua_path,
-        package_path,
+        catalog,
+        owner_unit,
         chunk_cache,
         "consumes",
     )
@@ -1013,6 +1027,33 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
+    fn write(path: &Path, body: &str) {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(path, body).unwrap();
+    }
+
+    fn write_package_manifest(root: &Path) {
+        write(
+            &root.join("fkst.workspace.toml"),
+            r#"
+[workspace]
+units = ["."]
+"#,
+        );
+        write(
+            &root.join("fkst.toml"),
+            r#"
+kind = "package"
+name = "pkg"
+
+[code]
+root = "."
+"#,
+        );
+    }
+
     fn table_len(table: Table) -> usize {
         table.pairs::<Value, Value>().count()
     }
@@ -1020,6 +1061,7 @@ mod tests {
     #[test]
     fn run_department_cache_reuses_derivations_and_preserves_isolation() {
         let temp = TempDir::new().unwrap();
+        write_package_manifest(temp.path());
         let dept_dir = temp.path().join("departments/worker");
         std::fs::create_dir_all(&dept_dir).unwrap();
         std::fs::write(
@@ -1054,7 +1096,7 @@ mod tests {
         let roots = PackageRoots::resolve(temp.path(), vec![temp.path().to_path_buf()]).unwrap();
         let owner_root = temp.path().canonicalize().unwrap();
         let owner_namespace = roots.sole_package_namespace().unwrap().to_string();
-        let cache = TestRunCache::new(roots.clone());
+        let cache = TestRunCache::new(roots.clone()).unwrap();
         let mock_commands = MockCommandState::new();
         let outer_lua = crate::mlua_init::new_lua();
 
@@ -1130,8 +1172,7 @@ mod tests {
         assert_eq!(
             cache.stats(),
             TestRunCacheStats {
-                require_roots_misses: 1,
-                package_path_misses: 1,
+                owner_unit_misses: 1,
                 declared_produces_misses: 1,
                 declared_consumes_misses: 1,
             }

@@ -10,7 +10,8 @@ use std::time::SystemTime;
 
 use crate::config_registry::ConfigContext;
 use crate::external_command::MockCommandState;
-use crate::path_resolver::{package_root_path, NameResolver, PackageRoots};
+use crate::manifest::UnitCatalog;
+use crate::path_resolver::{NameResolver, PackageRoots};
 use crate::raise::{RaiseAuthority, RaiseBuffer};
 
 /// Create a Lua state with stdlib enabled.
@@ -100,31 +101,6 @@ pub fn json_to_lua(lua: &Lua, v: &JsonValue) -> mlua::Result<LuaValue> {
     lua.to_value(v)
 }
 
-/// Build the Lua search path for fixed graph roots in lookup order.
-pub(crate) fn package_roots_path<'a>(roots: impl IntoIterator<Item = &'a Path>) -> String {
-    roots
-        .into_iter()
-        .map(package_root_path)
-        .collect::<Vec<_>>()
-        .join(";")
-}
-
-pub(crate) fn set_package_roots_path<'a>(
-    lua: &Lua,
-    package_roots: impl IntoIterator<Item = &'a Path>,
-) -> mlua::Result<()> {
-    let roots_path = package_roots_path(package_roots);
-    set_package_path_string(lua, &roots_path)
-}
-
-pub(crate) fn set_package_path_string(lua: &Lua, roots_path: &str) -> mlua::Result<()> {
-    lua.load(format!(
-        "package.path = {:?}; package.cpath = \"\"",
-        roots_path
-    ))
-    .exec()
-}
-
 #[derive(Clone, Default)]
 pub(crate) struct LuaChunkCache {
     chunks: Arc<Mutex<BTreeMap<CachedChunkKey, Vec<u8>>>>,
@@ -149,6 +125,21 @@ impl LuaChunkCache {
         lua.load(bytecode.as_slice())
             .set_name(path.to_string_lossy())
             .eval()
+            .with_context(|| format!("eval {}", path.display()))
+    }
+
+    pub(crate) fn eval_cached_chunk_with_env(
+        &self,
+        lua: &Lua,
+        path: &Path,
+        owner_root: &Path,
+        env: mlua::Table,
+    ) -> Result<LuaValue> {
+        let bytecode = self.bytecode_for(path, owner_root)?;
+        lua.load(bytecode.as_slice())
+            .set_name(crate::lua_coverage::chunk_name(path, owner_root))
+            .set_environment(env)
+            .call(())
             .with_context(|| format!("eval {}", path.display()))
     }
 
@@ -230,37 +221,48 @@ fn run_dept_with_package_root(
     event: &JsonValue,
     package_root: &Path,
 ) -> Result<()> {
-    run_dept_with_require_roots(lua, lua_path, event, [package_root])
+    let catalog = UnitCatalog::discover(package_root)?
+        .ok_or_else(|| anyhow::anyhow!("manifest catalog is required for department runner"))?;
+    let owner_unit = catalog
+        .unit_name_for_root(package_root)?
+        .ok_or_else(|| anyhow::anyhow!("no manifest unit owns {}", package_root.display()))?;
+    run_dept_with_require_roots(
+        lua,
+        lua_path,
+        event,
+        Arc::new(catalog),
+        &owner_unit,
+        package_root,
+        None,
+    )
 }
 
-pub fn run_dept_with_require_roots<'a>(
+pub fn run_dept_with_require_roots(
     lua: &Lua,
     lua_path: &Path,
     event: &JsonValue,
-    package_roots: impl IntoIterator<Item = &'a Path>,
+    catalog: Arc<UnitCatalog>,
+    owner_unit: &str,
+    owner_root: &Path,
+    cache: Option<&LuaChunkCache>,
 ) -> Result<()> {
-    let package_roots = package_roots.into_iter().collect::<Vec<_>>();
-    let owner_root = package_roots
-        .first()
-        .copied()
-        .ok_or_else(|| anyhow::anyhow!("department runner requires at least one package root"))?;
-    let roots_label = package_roots
-        .iter()
-        .map(|root| root.display().to_string())
-        .collect::<Vec<_>>()
-        .join(";");
-    set_package_roots_path(lua, package_roots.iter().copied())
-        .with_context(|| format!("set package.path for {}", roots_label))?;
-    run_dept_with_package_path_chunk_cache_and_name_root(lua, lua_path, event, None, owner_root)
+    run_dept_with_package_path_chunk_cache_and_name_root(
+        lua, lua_path, event, cache, owner_root, catalog, owner_unit,
+    )
 }
 
 pub(crate) fn run_dept_with_package_path_and_chunk_cache(
     lua: &Lua,
     lua_path: &Path,
     event: &JsonValue,
+    catalog: Arc<UnitCatalog>,
+    owner_unit: &str,
+    owner_root: &Path,
     cache: Option<&LuaChunkCache>,
 ) -> Result<()> {
-    run_dept_with_package_path_chunk_cache_and_name_root(lua, lua_path, event, cache, lua_path)
+    run_dept_with_package_path_chunk_cache_and_name_root(
+        lua, lua_path, event, cache, owner_root, catalog, owner_unit,
+    )
 }
 
 pub(crate) fn run_dept_with_package_path_chunk_cache_and_name_root(
@@ -269,24 +271,33 @@ pub(crate) fn run_dept_with_package_path_chunk_cache_and_name_root(
     event: &JsonValue,
     cache: Option<&LuaChunkCache>,
     owner_root: &Path,
+    catalog: Arc<UnitCatalog>,
+    owner_unit: &str,
 ) -> Result<()> {
-    if let Some(cache) = cache {
-        cache.load_cached_chunk_with_name(lua, lua_path, owner_root)?;
+    let env = crate::lua_require::install_scoped_require(lua, catalog.clone(), owner_unit)
+        .context("install scoped require")?;
+    let module = if let Some(cache) = cache {
+        cache.eval_cached_chunk_with_env(lua, lua_path, owner_root, env)?
     } else {
-        let src = std::fs::read_to_string(lua_path)
-            .with_context(|| format!("read {}", lua_path.display()))?;
-        let chunk = lua
-            .load(&src)
-            .set_name(crate::lua_coverage::chunk_name(lua_path, owner_root));
-        chunk
-            .exec()
-            .with_context(|| format!("exec {}", lua_path.display()))?;
-    }
+        crate::lua_require::load_unit_chunk(
+            lua,
+            catalog,
+            owner_unit,
+            lua_path,
+            crate::lua_coverage::chunk_name(lua_path, owner_root),
+            None,
+        )
+        .with_context(|| format!("exec {}", lua_path.display()))?
+    };
 
-    let pipeline: mlua::Function = lua
-        .globals()
-        .get("pipeline")
-        .context("lua file did not define global `pipeline` function")?;
+    let pipeline: mlua::Function = match module {
+        LuaValue::Table(table) => table
+            .get::<Option<mlua::Function>>("pipeline")?
+            .map(Ok)
+            .unwrap_or_else(|| lua.globals().get("pipeline")),
+        _ => lua.globals().get("pipeline"),
+    }
+    .context("lua file did not define global `pipeline` function")?;
     let event_lua = json_to_lua(lua, event).context("json -> lua event conversion")?;
     lua.globals()
         .set("event", event_lua.clone())
@@ -300,14 +311,34 @@ pub(crate) fn run_dept_with_package_path_chunk_cache_and_name_root(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write;
     use std::time::{Duration, UNIX_EPOCH};
-    use tempfile::{NamedTempFile, TempDir};
+    use tempfile::TempDir;
 
-    fn write_lua(s: &str) -> NamedTempFile {
-        let mut f = NamedTempFile::new().unwrap();
-        f.write_all(s.as_bytes()).unwrap();
-        f
+    fn write(path: &Path, body: &str) {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(path, body).unwrap();
+    }
+
+    fn write_package_manifest(root: &Path) {
+        write(
+            &root.join("fkst.workspace.toml"),
+            r#"
+[workspace]
+units = ["."]
+"#,
+        );
+        write(
+            &root.join("fkst.toml"),
+            r#"
+kind = "package"
+name = "pkg"
+
+[code]
+root = "."
+"#,
+        );
     }
 
     fn force_mtime(path: &Path, millis_since_epoch: u64) {
@@ -318,8 +349,12 @@ mod tests {
     #[test]
     fn run_dept_calls_pipeline() {
         let lua = new_lua();
+        let dir = TempDir::new().unwrap();
         // Use a Lua global side channel to verify pipeline was called.
-        let f = write_lua(
+        let main = dir.path().join("main.lua");
+        write_package_manifest(dir.path());
+        write(
+            &main,
             r#"
             called = 0
             function pipeline(event)
@@ -328,14 +363,8 @@ mod tests {
             end
         "#,
         );
-        let package_root = f.path().parent().unwrap();
-        run_dept_with_package_root(
-            &lua,
-            f.path(),
-            &serde_json::json!({"foo": "bar"}),
-            package_root,
-        )
-        .unwrap();
+        run_dept_with_package_root(&lua, &main, &serde_json::json!({"foo": "bar"}), dir.path())
+            .unwrap();
         let called: i64 = lua.globals().get("called").unwrap();
         assert_eq!(called, 1);
     }
@@ -343,9 +372,11 @@ mod tests {
     #[test]
     fn missing_pipeline_returns_err() {
         let lua = new_lua();
-        let f = write_lua("x = 1\n");
-        let package_root = f.path().parent().unwrap();
-        let err = run_dept_with_package_root(&lua, f.path(), &serde_json::json!({}), package_root)
+        let dir = TempDir::new().unwrap();
+        write_package_manifest(dir.path());
+        let main = dir.path().join("main.lua");
+        write(&main, "x = 1\n");
+        let err = run_dept_with_package_root(&lua, &main, &serde_json::json!({}), dir.path())
             .unwrap_err();
         assert!(format!("{}", err).contains("pipeline"));
     }
@@ -353,9 +384,11 @@ mod tests {
     #[test]
     fn lua_syntax_error_returns_err() {
         let lua = new_lua();
-        let f = write_lua("this is = not valid {{ lua");
-        let package_root = f.path().parent().unwrap();
-        let err = run_dept_with_package_root(&lua, f.path(), &serde_json::json!({}), package_root)
+        let dir = TempDir::new().unwrap();
+        write_package_manifest(dir.path());
+        let main = dir.path().join("main.lua");
+        write(&main, "this is = not valid {{ lua");
+        let err = run_dept_with_package_root(&lua, &main, &serde_json::json!({}), dir.path())
             .unwrap_err();
         assert!(format!("{}", err).contains("exec"));
     }
@@ -392,15 +425,13 @@ mod tests {
     #[test]
     fn run_dept_loads_package_root_modules() {
         let dir = TempDir::new().unwrap();
-        std::fs::create_dir_all(dir.path().join("departments/demo")).unwrap();
-        std::fs::create_dir_all(dir.path().join("fkst")).unwrap();
-        std::fs::write(
-            dir.path().join("fkst/example.lua"),
+        write_package_manifest(dir.path());
+        write(
+            &dir.path().join("fkst/example.lua"),
             r#"return { value = function() return "ok" end }"#,
-        )
-        .unwrap();
+        );
         let main = dir.path().join("departments/demo/main.lua");
-        std::fs::write(
+        write(
             &main,
             r#"
             local example = require("fkst.example")
@@ -408,8 +439,7 @@ mod tests {
                 called = example.value()
             end
         "#,
-        )
-        .unwrap();
+        );
 
         let lua = new_lua();
         run_dept_with_package_root(&lua, &main, &serde_json::json!({}), dir.path()).unwrap();
@@ -420,17 +450,16 @@ mod tests {
     #[test]
     fn run_dept_names_loaded_chunk_relative_to_package_root() {
         let dir = TempDir::new().unwrap();
-        std::fs::create_dir_all(dir.path().join("departments/demo")).unwrap();
+        write_package_manifest(dir.path());
         let main = dir.path().join("departments/demo/main.lua");
-        std::fs::write(
+        write(
             &main,
             r#"
             function pipeline(event)
                 called = true
             end
         "#,
-        )
-        .unwrap();
+        );
 
         let lua = new_lua();
         let sources = Arc::new(Mutex::new(Vec::<String>::new()));
@@ -443,7 +472,7 @@ mod tests {
             }
             Ok(mlua::VmState::Continue)
         });
-        run_dept_with_require_roots(&lua, &main, &serde_json::json!({}), [dir.path()]).unwrap();
+        run_dept_with_package_root(&lua, &main, &serde_json::json!({}), dir.path()).unwrap();
         let called: bool = lua.globals().get("called").unwrap();
         let sources = sources.lock().unwrap();
 
@@ -461,32 +490,15 @@ mod tests {
     }
 
     #[test]
-    fn set_package_root_path_replaces_existing_search_path() {
+    fn scoped_require_resolves_module_main_lua() {
         let dir = TempDir::new().unwrap();
-        let lua = new_lua();
-        lua.load(r#"package.path = "prior/?.lua""#).exec().unwrap();
-
-        set_package_roots_path(&lua, [dir.path()]).unwrap();
-
-        let package: mlua::Table = lua.globals().get("package").unwrap();
-        let path: String = package.get("path").unwrap();
-        let cpath: String = package.get("cpath").unwrap();
-        assert_eq!(path, package_root_path(dir.path()));
-        assert_eq!(cpath, "");
-    }
-
-    #[test]
-    fn package_root_path_resolves_module_main_lua() {
-        let dir = TempDir::new().unwrap();
-        std::fs::create_dir_all(dir.path().join("departments/demo")).unwrap();
-        std::fs::create_dir_all(dir.path().join("core")).unwrap();
-        std::fs::write(
-            dir.path().join("core/main.lua"),
+        write_package_manifest(dir.path());
+        write(
+            &dir.path().join("core/init.lua"),
             r#"return { marker = "from-main" }"#,
-        )
-        .unwrap();
+        );
         let main = dir.path().join("departments/demo/main.lua");
-        std::fs::write(
+        write(
             &main,
             r#"
             local core = require("core")
@@ -494,8 +506,7 @@ mod tests {
                 called = core.marker
             end
         "#,
-        )
-        .unwrap();
+        );
 
         let lua = new_lua();
         run_dept_with_package_root(&lua, &main, &serde_json::json!({}), dir.path()).unwrap();
@@ -508,10 +519,10 @@ mod tests {
         let _env_lock = crate::test_env::ENV_LOCK.lock().unwrap();
         let owner = TempDir::new().unwrap();
         let cwd = TempDir::new().unwrap();
-        std::fs::create_dir_all(owner.path().join("departments/demo")).unwrap();
-        std::fs::write(cwd.path().join("core.lua"), r#"return { value = "cwd" }"#).unwrap();
+        write_package_manifest(owner.path());
+        write(&cwd.path().join("core.lua"), r#"return { value = "cwd" }"#);
         let main = owner.path().join("departments/demo/main.lua");
-        std::fs::write(
+        write(
             &main,
             r#"
             local core = require("core")
@@ -519,8 +530,7 @@ mod tests {
                 called = core.value
             end
         "#,
-        )
-        .unwrap();
+        );
 
         let prior_cwd = std::env::current_dir().unwrap();
         std::env::set_current_dir(cwd.path()).unwrap();
@@ -536,6 +546,6 @@ mod tests {
         std::env::set_current_dir(prior_cwd).unwrap();
 
         let msg = format!("{err:#}");
-        assert!(msg.contains("module 'core' not found"), "{msg}");
+        assert!(msg.contains("require.denied"), "{msg}");
     }
 }
