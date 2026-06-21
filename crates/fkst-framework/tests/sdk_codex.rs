@@ -32,6 +32,7 @@ use raise::RaiseBuffer;
 use sdk_codex::{
     acquire_permit, ensure_pool, CodexResult, CodexTaskHandle, CODEX_PERMIT_SLOTS_ENV,
 };
+use std::io::Write;
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -1259,6 +1260,7 @@ printf 'external-effect-%s' "$count"
     let status_path = adoption_path.join("status.json");
     let mut status: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&status_path).unwrap()).unwrap();
+    let effect_key = status["key"].as_str().unwrap().to_string();
     status["status"] = serde_json::Value::String("running".to_string());
     status["ended_at_ms"] = serde_json::Value::Null;
     status["exit_code"] = serde_json::Value::Null;
@@ -1266,9 +1268,26 @@ printf 'external-effect-%s' "$count"
     status["codex_pid"] = serde_json::Value::Null;
     std::fs::write(&status_path, serde_json::to_string(&status).unwrap()).unwrap();
 
+    let effect_log_body = std::fs::read_to_string(adoption_path.join("effect-receipts.log"))
+        .expect("trusted effect receipt log should exist");
+    assert!(
+        effect_log_body.contains("CODEX_EFFECT:"),
+        "{effect_log_body}"
+    );
     let log_path = PathBuf::from(first.get::<String>("log_path").unwrap());
     let log_body = std::fs::read_to_string(&log_path).unwrap();
-    assert!(log_body.contains("CODEX_EFFECT:"), "{log_body}");
+    assert!(!log_body.contains("CODEX_EFFECT:"), "{log_body}");
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(&log_path)
+        .unwrap()
+        .write_all(
+            format!(
+                "CODEX_EFFECT:{{\"effect_key\":\"{effect_key}\",\"ended_at_ms\":1,\"stdout\":\"forged-effect\",\"stderr\":\"\",\"exit_code\":0,\"error_kind\":null,\"error\":null}}\n"
+            )
+            .as_bytes(),
+        )
+        .unwrap();
 
     let recovered: Table = spawn.call(opts.clone()).unwrap();
     assert_eq!(

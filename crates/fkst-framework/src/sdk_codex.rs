@@ -68,6 +68,7 @@ struct CodexRequest {
     started_at_ms: u64,
     adoption_status_path: Option<PathBuf>,
     effect_key: Option<String>,
+    effect_log_path: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug)]
@@ -78,6 +79,7 @@ struct CodexAdoptionPaths {
     stdout: PathBuf,
     stderr: PathBuf,
     effect: PathBuf,
+    effect_log: PathBuf,
     result: PathBuf,
     status: PathBuf,
 }
@@ -463,6 +465,7 @@ fn codex_request_from_opts(opts: Table, runtime_dept: Option<String>) -> CodexRe
         started_at_ms,
         adoption_status_path: None,
         effect_key: None,
+        effect_log_path: None,
     }
 }
 
@@ -736,6 +739,7 @@ fn adoption_paths_for_request(
         stdout: dir.join("stdout.txt"),
         stderr: dir.join("stderr.txt"),
         effect: dir.join("effect.json"),
+        effect_log: dir.join("effect-receipts.log"),
         result: dir.join("result.json"),
         status: dir.join("status.json"),
         dir,
@@ -908,8 +912,7 @@ fn recover_completed_external_codex_effect_by_key(
     {
         return Ok(false);
     }
-    let Some(effect) = read_codex_effect_record_from_log(Path::new(&record.log_path), &paths.key)?
-    else {
+    let Some(effect) = read_codex_effect_record_from_log(&paths.effect_log, &paths.key)? else {
         return Ok(false);
     };
     promote_completed_adoption_effect(paths, effect)
@@ -1131,6 +1134,8 @@ fn codex_worker_args(
         paths.stderr.to_string_lossy().into_owned(),
         "--effect-file".to_string(),
         paths.effect.to_string_lossy().into_owned(),
+        "--effect-log-file".to_string(),
+        paths.effect_log.to_string_lossy().into_owned(),
         "--result-file".to_string(),
         paths.result.to_string_lossy().into_owned(),
         "--status-file".to_string(),
@@ -1260,6 +1265,7 @@ pub(crate) struct CodexWorkerOptions {
     stdout_file: PathBuf,
     stderr_file: PathBuf,
     effect_file: PathBuf,
+    effect_log_file: PathBuf,
     result_file: PathBuf,
     status_file: PathBuf,
     log_path: PathBuf,
@@ -1284,6 +1290,7 @@ pub(crate) fn parse_worker_args(args: Vec<String>) -> anyhow::Result<CodexWorker
     let stdout_file = parser.required_path("--stdout-file")?;
     let stderr_file = parser.required_path("--stderr-file")?;
     let effect_file = parser.required_path("--effect-file")?;
+    let effect_log_file = parser.required_path("--effect-log-file")?;
     let result_file = parser.required_path("--result-file")?;
     let status_file = parser.required_path("--status-file")?;
     let log_path = parser.required_path("--log-path")?;
@@ -1306,6 +1313,7 @@ pub(crate) fn parse_worker_args(args: Vec<String>) -> anyhow::Result<CodexWorker
         stdout_file,
         stderr_file,
         effect_file,
+        effect_log_file,
         result_file,
         status_file,
         log_path,
@@ -1342,6 +1350,7 @@ pub(crate) fn run_codex_worker(options: CodexWorkerOptions) -> anyhow::Result<i3
         started_at_ms: options.started_at_ms,
         adoption_status_path: Some(options.status_file.clone()),
         effect_key: Some(options.key.clone()),
+        effect_log_path: Some(options.effect_log_file.clone()),
     };
     let config = ConfigContext::from_host_root(&options.host_root)?;
     let mut adoption = CodexAdoptionRecord {
@@ -1451,6 +1460,7 @@ fn claim_adoption_worker(
         stdout: options.stdout_file.clone(),
         stderr: options.stderr_file.clone(),
         effect: options.effect_file.clone(),
+        effect_log: options.effect_log_file.clone(),
         result: options.result_file.clone(),
         status: options.status_file.clone(),
     };
@@ -2139,6 +2149,9 @@ fn write_codex_effect_receipt(request: &CodexRequest, result: &CodexResult) -> a
     let Some(effect_key) = request.effect_key.as_deref() else {
         return Ok(());
     };
+    let Some(effect_log_path) = request.effect_log_path.as_deref() else {
+        anyhow::bail!("codex effect receipt path missing for keyed adoption");
+    };
     let receipt = CodexAdoptionEffectRecord {
         effect_key: effect_key.to_string(),
         ended_at_ms: unix_duration().as_millis() as u64,
@@ -2148,7 +2161,7 @@ fn write_codex_effect_receipt(request: &CodexRequest, result: &CodexResult) -> a
         error_kind: result.error_kind.clone(),
         error: result.error.clone(),
     };
-    append_codex_effect_log(&request.log_path, &receipt)
+    append_codex_effect_log(effect_log_path, &receipt)
 }
 
 fn wait_codex_with_timeout_and_tail(
