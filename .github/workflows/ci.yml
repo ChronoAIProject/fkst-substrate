@@ -41,7 +41,11 @@ jobs:
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@cargo-llvm-cov
       - name: Generate LCOV coverage
-        run: cargo llvm-cov --workspace --lcov --output-path lcov.info
+        # Serial test execution: several substrate tests share concurrency-sensitive
+        # resources (the codex permit pool flock, git-submodule fixtures); under the
+        # slower llvm-cov-instrumented binaries they race in parallel. --test-threads=1
+        # makes the coverage run deterministic. (The verify gate runs separately.)
+        run: cargo llvm-cov --workspace --lcov --output-path lcov.info -- --test-threads=1
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@v5
         with:
