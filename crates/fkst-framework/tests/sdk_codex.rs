@@ -177,6 +177,58 @@ fn lua_opts(lua: &Lua, prompt: &str) -> Table {
     opts
 }
 
+fn adoption_status_values(root: &Path) -> Vec<String> {
+    let adoption_dir = root.join(".fkst/runtime/logs/codex-adoption");
+    let mut statuses = Vec::new();
+    if !adoption_dir.exists() {
+        return statuses;
+    }
+    for entry in std::fs::read_dir(adoption_dir).unwrap() {
+        let path = entry.unwrap().path().join("status.json");
+        if !path.exists() {
+            continue;
+        }
+        let body = std::fs::read_to_string(path).unwrap();
+        let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+        statuses.push(json["status"].as_str().unwrap().to_string());
+    }
+    statuses.sort();
+    statuses
+}
+
+fn adoption_status_records(root: &Path) -> Vec<serde_json::Value> {
+    let adoption_dir = root.join(".fkst/runtime/logs/codex-adoption");
+    let mut records = Vec::new();
+    if !adoption_dir.exists() {
+        return records;
+    }
+    for entry in std::fs::read_dir(adoption_dir).unwrap() {
+        let path = entry.unwrap().path().join("status.json");
+        if !path.exists() {
+            continue;
+        }
+        let body = std::fs::read_to_string(path).unwrap();
+        records.push(serde_json::from_str(&body).unwrap());
+    }
+    records
+}
+
+fn wait_for_adoption_status(root: &Path, expected: &str) {
+    for _ in 0..100 {
+        if adoption_status_values(root)
+            .iter()
+            .any(|status| status == expected)
+        {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    panic!(
+        "timed out waiting for adoption status {expected}; got {:?}",
+        adoption_status_values(root)
+    );
+}
+
 fn framework_bin() -> &'static str {
     env!("CARGO_BIN_EXE_fkst-framework")
 }
@@ -843,6 +895,243 @@ printf 'result-%s' "$count"
 
 #[cfg(unix)]
 #[test]
+fn spawn_codex_sync_publishes_visible_intent_before_adoption_worker_spawn() {
+    let tmp = tempfile::tempdir().unwrap();
+    let bin_dir = tmp.path().join("bin");
+    let worktree = tmp.path().join("wt");
+    let capture_dir = tmp.path().join("capture");
+    let intent_gate = tmp.path().join("intent.gate");
+    std::fs::create_dir_all(&worktree).unwrap();
+    std::fs::create_dir_all(&capture_dir).unwrap();
+    std::fs::write(&intent_gate, "hold").unwrap();
+    install_codex_script(
+        &bin_dir,
+        r#"#!/bin/sh
+cat >/dev/null
+printf 'spawned' > "$CAPTURE_DIR/spawned"
+printf 'intent-ok'
+"#,
+    );
+
+    let mut sandbox = ProcessSandbox::new();
+    sandbox.enter_cwd(tmp.path()).runtime_root(".fkst/runtime");
+    sandbox.prepend_path(&bin_dir);
+    sandbox.set_env("CAPTURE_DIR", capture_dir.to_string_lossy().into_owned());
+    sandbox.set_env(CODEX_WORKER_BIN_ENV, framework_bin());
+    sandbox.set_env(
+        "FKST_TEST_AFTER_ADOPTION_INTENT",
+        intent_gate.to_string_lossy().into_owned(),
+    );
+    sandbox.runtime_log_dir(tmp.path().join("runtime"));
+    let (_lock, _guard) = sandbox.enter();
+
+    let worktree_arg = worktree.to_string_lossy().into_owned();
+    let (result_tx, result_rx) = std::sync::mpsc::channel();
+    let worker_thread = std::thread::spawn(move || {
+        let lua = Lua::new();
+        register(&lua).unwrap();
+        let spawn: mlua::Function = lua.globals().get("spawn_codex_sync").unwrap();
+        let opts = lua_opts(&lua, "intent-before-spawn");
+        opts.set("worktree", worktree_arg).unwrap();
+        opts.set("dedup_key", "visible-intent").unwrap();
+        let result: Table = spawn.call(opts).unwrap();
+        result_tx
+            .send(result.get::<String>("stdout").unwrap())
+            .unwrap();
+    });
+
+    wait_for_adoption_status(tmp.path(), "intent");
+    assert!(
+        !capture_dir.join("spawned").exists(),
+        "codex must not spawn before the visible intent barrier"
+    );
+    let records = adoption_status_records(tmp.path());
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0]["dedup_key"], "visible-intent");
+    assert!(records[0]["worker_pid"].is_null());
+    assert!(records[0]["codex_pid"].is_null());
+
+    let lua = Lua::new();
+    register(&lua).unwrap();
+    let status_fn: mlua::Function = codex_runs_fn(&lua);
+    let status: Table = status_fn.call(()).unwrap();
+    assert_eq!(table_len(&status, "recent"), 0);
+    let running: Table = status.get("running").unwrap();
+    assert_eq!(running.raw_len(), 1);
+    let active: Table = running.get(1).unwrap();
+    assert_eq!(active.get::<String>("status").unwrap(), "running");
+    assert_eq!(
+        active.get::<String>("proposal_id_or_key").unwrap(),
+        "visible-intent"
+    );
+
+    std::fs::remove_file(&intent_gate).unwrap();
+    assert_eq!(
+        recv_result(&result_rx, "visible intent adopted result"),
+        "intent-ok"
+    );
+    worker_thread.join().unwrap();
+    assert_eq!(
+        std::fs::read_to_string(capture_dir.join("spawned")).unwrap(),
+        "spawned"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn spawn_codex_sync_redrives_stale_visible_intent_once() {
+    let tmp = tempfile::tempdir().unwrap();
+    let bin_dir = tmp.path().join("bin");
+    let worktree = tmp.path().join("wt");
+    let capture_dir = tmp.path().join("capture");
+    std::fs::create_dir_all(&worktree).unwrap();
+    std::fs::create_dir_all(&capture_dir).unwrap();
+    install_codex_script(
+        &bin_dir,
+        r#"#!/bin/sh
+cat >/dev/null
+count_file="$CAPTURE_DIR/spawns"
+count=0
+if [ -f "$count_file" ]; then
+  count=$(cat "$count_file")
+fi
+count=$((count + 1))
+printf '%s' "$count" > "$count_file"
+printf 'redrive-%s' "$count"
+"#,
+    );
+
+    let worktree_arg = worktree.to_string_lossy().into_owned();
+    {
+        let mut sandbox = ProcessSandbox::new();
+        sandbox.enter_cwd(tmp.path()).runtime_root(".fkst/runtime");
+        sandbox.prepend_path(&bin_dir);
+        sandbox.set_env("CAPTURE_DIR", capture_dir.to_string_lossy().into_owned());
+        sandbox.set_env(CODEX_WORKER_BIN_ENV, framework_bin());
+        sandbox.set_env("FKST_TEST_FAIL_AFTER_ADOPTION_INTENT", "1");
+        sandbox.runtime_log_dir(tmp.path().join("runtime"));
+        let (_lock, _guard) = sandbox.enter();
+
+        let lua = Lua::new();
+        register(&lua).unwrap();
+        let spawn: mlua::Function = lua.globals().get("spawn_codex_sync").unwrap();
+        let opts = lua_opts(&lua, "stale-intent");
+        opts.set("worktree", worktree_arg.clone()).unwrap();
+        opts.set("dedup_key", "stale-visible-intent").unwrap();
+        let err = spawn.call::<Table>(opts).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("FKST_TEST_FAIL_AFTER_ADOPTION_INTENT requested failure"),
+            "{err}"
+        );
+        assert_eq!(adoption_status_values(tmp.path()), vec!["intent"]);
+        assert!(!capture_dir.join("spawns").exists());
+    }
+
+    let mut sandbox = ProcessSandbox::new();
+    sandbox.enter_cwd(tmp.path()).runtime_root(".fkst/runtime");
+    sandbox.prepend_path(&bin_dir);
+    sandbox.set_env("CAPTURE_DIR", capture_dir.to_string_lossy().into_owned());
+    sandbox.set_env(CODEX_WORKER_BIN_ENV, framework_bin());
+    sandbox.runtime_log_dir(tmp.path().join("runtime"));
+    let (_lock, _guard) = sandbox.enter();
+
+    let lua = Lua::new();
+    register(&lua).unwrap();
+    let spawn: mlua::Function = lua.globals().get("spawn_codex_sync").unwrap();
+    let opts = lua_opts(&lua, "stale-intent");
+    opts.set("worktree", worktree_arg).unwrap();
+    opts.set("dedup_key", "stale-visible-intent").unwrap();
+    let result: Table = spawn.call(opts.clone()).unwrap();
+    assert_eq!(result.get::<String>("stdout").unwrap(), "redrive-1");
+    let second: Table = spawn.call(opts).unwrap();
+    assert_eq!(second.get::<String>("stdout").unwrap(), "redrive-1");
+    assert_eq!(
+        std::fs::read_to_string(capture_dir.join("spawns")).unwrap(),
+        "1"
+    );
+    let records = adoption_status_records(tmp.path());
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0]["status"], "completed");
+    assert_eq!(records[0]["exit_code"], 0);
+}
+
+#[cfg(unix)]
+#[test]
+fn spawn_codex_sync_recovers_result_marker_without_repeating_effect() {
+    let tmp = tempfile::tempdir().unwrap();
+    let bin_dir = tmp.path().join("bin");
+    let worktree = tmp.path().join("wt");
+    let capture_dir = tmp.path().join("capture");
+    std::fs::create_dir_all(&worktree).unwrap();
+    std::fs::create_dir_all(&capture_dir).unwrap();
+    install_codex_script(
+        &bin_dir,
+        r#"#!/bin/sh
+cat >/dev/null
+count_file="$CAPTURE_DIR/spawns"
+count=0
+if [ -f "$count_file" ]; then
+  count=$(cat "$count_file")
+fi
+count=$((count + 1))
+printf '%s' "$count" > "$count_file"
+printf 'recovered-%s' "$count"
+"#,
+    );
+
+    let mut sandbox = ProcessSandbox::new();
+    sandbox.enter_cwd(tmp.path()).runtime_root(".fkst/runtime");
+    sandbox.prepend_path(&bin_dir);
+    sandbox.set_env("CAPTURE_DIR", capture_dir.to_string_lossy().into_owned());
+    sandbox.set_env(CODEX_WORKER_BIN_ENV, framework_bin());
+    sandbox.runtime_log_dir(tmp.path().join("runtime"));
+    let (_lock, _guard) = sandbox.enter();
+
+    let lua = Lua::new();
+    register(&lua).unwrap();
+    let spawn: mlua::Function = lua.globals().get("spawn_codex_sync").unwrap();
+    let worktree_arg = worktree.to_string_lossy().into_owned();
+    let opts = lua_opts(&lua, "result-marker");
+    opts.set("worktree", worktree_arg.clone()).unwrap();
+    opts.set("dedup_key", "recover-visible-result").unwrap();
+    let first: Table = spawn.call(opts.clone()).unwrap();
+    assert_eq!(first.get::<String>("stdout").unwrap(), "recovered-1");
+    assert_eq!(
+        std::fs::read_to_string(capture_dir.join("spawns")).unwrap(),
+        "1"
+    );
+    let adoption_dir = tmp.path().join(".fkst/runtime/logs/codex-adoption");
+    let status_path = std::fs::read_dir(&adoption_dir)
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path()
+        .join("status.json");
+    let mut status: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&status_path).unwrap()).unwrap();
+    status["status"] = serde_json::Value::String("running".to_string());
+    status["ended_at_ms"] = serde_json::Value::Null;
+    status["exit_code"] = serde_json::Value::Null;
+    std::fs::write(&status_path, serde_json::to_string(&status).unwrap()).unwrap();
+
+    let recovered: Table = spawn.call(opts.clone()).unwrap();
+    assert_eq!(recovered.get::<String>("stdout").unwrap(), "recovered-1");
+    let second: Table = spawn.call(opts).unwrap();
+    assert_eq!(second.get::<String>("stdout").unwrap(), "recovered-1");
+    assert_eq!(
+        std::fs::read_to_string(capture_dir.join("spawns")).unwrap(),
+        "1"
+    );
+    let records = adoption_status_records(tmp.path());
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0]["status"], "completed");
+    assert_eq!(records[0]["exit_code"], 0);
+}
+
+#[cfg(unix)]
+#[test]
 fn spawn_codex_sync_adopts_running_worktree_result_without_respawn() {
     let tmp = tempfile::tempdir().unwrap();
     let bin_dir = tmp.path().join("bin");
@@ -925,6 +1214,115 @@ printf 'adopted-%s' "$count"
         recv_result(&second_rx, "second adopted result"),
         "adopted-1"
     );
+    first_thread.join().unwrap();
+    second_thread.join().unwrap();
+    assert_eq!(
+        std::fs::read_to_string(capture_dir.join("spawns")).unwrap(),
+        "1"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn spawn_codex_sync_racing_stale_intent_performs_effect_once() {
+    let tmp = tempfile::tempdir().unwrap();
+    let bin_dir = tmp.path().join("bin");
+    let worktree = tmp.path().join("wt");
+    let capture_dir = tmp.path().join("capture");
+    let started_fifo = tmp.path().join("started.fifo");
+    let release_fifo = tmp.path().join("release.fifo");
+    std::fs::create_dir_all(&worktree).unwrap();
+    std::fs::create_dir_all(&capture_dir).unwrap();
+    make_fifo(&started_fifo);
+    make_fifo(&release_fifo);
+    install_codex_script(
+        &bin_dir,
+        r#"#!/bin/sh
+cat >/dev/null
+count_file="$CAPTURE_DIR/spawns"
+count=0
+if [ -f "$count_file" ]; then
+  count=$(cat "$count_file")
+fi
+count=$((count + 1))
+printf '%s' "$count" > "$count_file"
+printf 'started' > "$STARTED_FIFO"
+read _ < "$RELEASE_FIFO"
+printf 'race-%s' "$count"
+"#,
+    );
+
+    let worktree_arg = worktree.to_string_lossy().into_owned();
+    {
+        let mut sandbox = ProcessSandbox::new();
+        sandbox.enter_cwd(tmp.path()).runtime_root(".fkst/runtime");
+        sandbox.prepend_path(&bin_dir);
+        sandbox.set_env("CAPTURE_DIR", capture_dir.to_string_lossy().into_owned());
+        sandbox.set_env(CODEX_WORKER_BIN_ENV, framework_bin());
+        sandbox.set_env("FKST_TEST_FAIL_AFTER_ADOPTION_INTENT", "1");
+        sandbox.runtime_log_dir(tmp.path().join("runtime"));
+        let (_lock, _guard) = sandbox.enter();
+
+        let lua = Lua::new();
+        register(&lua).unwrap();
+        let spawn: mlua::Function = lua.globals().get("spawn_codex_sync").unwrap();
+        let opts = lua_opts(&lua, "race-intent");
+        opts.set("worktree", worktree_arg.clone()).unwrap();
+        opts.set("dedup_key", "race-visible-intent").unwrap();
+        assert!(spawn.call::<Table>(opts).is_err());
+        assert_eq!(adoption_status_values(tmp.path()), vec!["intent"]);
+    }
+
+    let mut sandbox = ProcessSandbox::new();
+    sandbox.enter_cwd(tmp.path()).runtime_root(".fkst/runtime");
+    sandbox.prepend_path(&bin_dir);
+    sandbox.set_env("CAPTURE_DIR", capture_dir.to_string_lossy().into_owned());
+    sandbox.set_env("STARTED_FIFO", started_fifo.to_string_lossy().into_owned());
+    sandbox.set_env("RELEASE_FIFO", release_fifo.to_string_lossy().into_owned());
+    sandbox.set_env(CODEX_WORKER_BIN_ENV, framework_bin());
+    sandbox.runtime_log_dir(tmp.path().join("runtime"));
+    let (_lock, _guard) = sandbox.enter();
+
+    let (first_tx, first_rx) = std::sync::mpsc::channel();
+    let first_thread = std::thread::spawn({
+        let worktree_arg = worktree_arg.clone();
+        move || {
+            let lua = Lua::new();
+            register(&lua).unwrap();
+            let spawn: mlua::Function = lua.globals().get("spawn_codex_sync").unwrap();
+            let opts = lua_opts(&lua, "race-intent");
+            opts.set("worktree", worktree_arg).unwrap();
+            opts.set("dedup_key", "race-visible-intent").unwrap();
+            let result: Table = spawn.call(opts).unwrap();
+            first_tx
+                .send(result.get::<String>("stdout").unwrap())
+                .unwrap();
+        }
+    });
+
+    assert_eq!(read_fifo(&started_fifo), "started");
+    let (second_tx, second_rx) = std::sync::mpsc::channel();
+    let second_thread = std::thread::spawn(move || {
+        let lua = Lua::new();
+        register(&lua).unwrap();
+        let spawn: mlua::Function = lua.globals().get("spawn_codex_sync").unwrap();
+        let opts = lua_opts(&lua, "race-intent");
+        opts.set("worktree", worktree_arg).unwrap();
+        opts.set("dedup_key", "race-visible-intent").unwrap();
+        let result: Table = spawn.call(opts).unwrap();
+        second_tx
+            .send(result.get::<String>("stdout").unwrap())
+            .unwrap();
+    });
+
+    std::thread::sleep(Duration::from_millis(250));
+    assert_eq!(
+        std::fs::read_to_string(capture_dir.join("spawns")).unwrap(),
+        "1"
+    );
+    write_fifo(&release_fifo, "go\n");
+    assert_eq!(recv_result(&first_rx, "first race result"), "race-1");
+    assert_eq!(recv_result(&second_rx, "second race result"), "race-1");
     first_thread.join().unwrap();
     second_thread.join().unwrap();
     assert_eq!(

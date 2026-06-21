@@ -42,6 +42,9 @@ const CODEX_OUTPUT_TAIL_MAX_LINES: usize = 40;
 const CODEX_OUTPUT_TAIL_MAX_BYTES: usize = 4096;
 const CODEX_STATUS_LOG_PREFIX: &str = "CODEX_STATUS:";
 const CODEX_ADOPTION_DIR: &str = "codex-adoption";
+const CODEX_ADOPTION_STATUS_INTENT: &str = "intent";
+const CODEX_ADOPTION_STATUS_RUNNING: &str = "running";
+const CODEX_ADOPTION_STATUS_COMPLETED: &str = "completed";
 const CODEX_ADOPTION_POLL: Duration = Duration::from_millis(100);
 const CODEX_ADOPTION_TIMEOUT_GRACE: Duration = Duration::from_secs(2);
 static NEXT_PIPELINE_OWNER_ID: AtomicU64 = AtomicU64::new(1);
@@ -72,6 +75,7 @@ struct CodexAdoptionPaths {
     prompt: PathBuf,
     stdout: PathBuf,
     stderr: PathBuf,
+    result: PathBuf,
     status: PathBuf,
 }
 
@@ -127,6 +131,14 @@ struct CodexAdoptionRecord {
     exit_code: Option<i32>,
     log_path: String,
     cmd_line: String,
+    error_kind: Option<String>,
+    error: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct CodexAdoptionResultRecord {
+    ended_at_ms: u64,
+    exit_code: i32,
     error_kind: Option<String>,
     error: Option<String>,
 }
@@ -620,8 +632,14 @@ fn run_adoptable_codex_request(
         drop(lock_file);
         return Ok(result);
     }
-    let running = read_adoption_record(&paths.status)?
-        .filter(|record| record.status == "running" && adoption_worker_alive(&record));
+    if let Some(result) = recover_completed_adoption_result(&paths)? {
+        drop(lock_file);
+        return Ok(result);
+    }
+    let existing = read_adoption_record(&paths.status)?;
+    let running = existing.as_ref().filter(|record| {
+        record.status == CODEX_ADOPTION_STATUS_RUNNING && adoption_effect_alive(record)
+    });
     if running.is_none() {
         start_adoption_worker(&request, &paths, host_root, config)?;
     }
@@ -702,6 +720,7 @@ fn adoption_paths_for_request(
         prompt: dir.join("prompt.txt"),
         stdout: dir.join("stdout.txt"),
         stderr: dir.join("stderr.txt"),
+        result: dir.join("result.json"),
         status: dir.join("status.json"),
         dir,
     }))
@@ -777,7 +796,7 @@ fn read_completed_adoption_result(paths: &CodexAdoptionPaths) -> Result<Option<C
     let Some(record) = read_adoption_record(&paths.status)? else {
         return Ok(None);
     };
-    if record.status != "completed" {
+    if record.status != CODEX_ADOPTION_STATUS_COMPLETED {
         return Ok(None);
     }
     let stdout = read_optional_string(&paths.stdout).map_err(mlua::Error::external)?;
@@ -810,13 +829,42 @@ fn read_completed_adoption_result(paths: &CodexAdoptionPaths) -> Result<Option<C
     )))
 }
 
-fn read_adoption_record(path: &Path) -> Result<Option<CodexAdoptionRecord>> {
+fn recover_completed_adoption_result(paths: &CodexAdoptionPaths) -> Result<Option<CodexResult>> {
+    let Some(result) = read_adoption_result_record(&paths.result)? else {
+        return Ok(None);
+    };
+    let Some(mut record) = read_adoption_record(&paths.status)? else {
+        return Ok(None);
+    };
+    record.status = CODEX_ADOPTION_STATUS_COMPLETED.to_string();
+    record.ended_at_ms = Some(result.ended_at_ms);
+    record.exit_code = Some(result.exit_code);
+    record.error_kind = result.error_kind;
+    record.error = result.error;
+    write_visible_adoption_record(&paths.status, &record, CODEX_ADOPTION_STATUS_COMPLETED)
+        .map_err(mlua::Error::external)?;
+    read_completed_adoption_result(paths)
+}
+
+fn read_adoption_result_record(path: &Path) -> Result<Option<CodexAdoptionResultRecord>> {
     match std::fs::read_to_string(path) {
         Ok(body) => serde_json::from_str(&body)
             .map(Some)
             .map_err(mlua::Error::external),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(err) => Err(mlua::Error::external(err)),
+    }
+}
+
+fn read_adoption_record(path: &Path) -> Result<Option<CodexAdoptionRecord>> {
+    read_adoption_record_from_disk(path).map_err(mlua::Error::external)
+}
+
+fn read_adoption_record_from_disk(path: &Path) -> anyhow::Result<Option<CodexAdoptionRecord>> {
+    match std::fs::read_to_string(path) {
+        Ok(body) => serde_json::from_str(&body).map(Some).map_err(Into::into),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(err.into()),
     }
 }
 
@@ -833,6 +881,10 @@ fn adoption_worker_alive(record: &CodexAdoptionRecord) -> bool {
         return false;
     };
     process_exists(pid)
+}
+
+fn adoption_effect_alive(record: &CodexAdoptionRecord) -> bool {
+    record.worker_pid.is_some_and(process_exists) || record.codex_pid.is_some_and(process_exists)
 }
 
 #[cfg(unix)]
@@ -860,7 +912,14 @@ fn start_adoption_worker(
     config: &ConfigContext,
 ) -> Result<()> {
     ensure_pool_with_context(host_root, config)?;
-    std::fs::write(&paths.prompt, &request.prompt).map_err(mlua::Error::external)?;
+    std::fs::create_dir_all(&paths.dir).map_err(mlua::Error::external)?;
+    write_atomic(&paths.prompt, request.prompt.as_bytes()).map_err(mlua::Error::external)?;
+    let intent =
+        adoption_record_from_request(request, paths, CODEX_ADOPTION_STATUS_INTENT, None, None);
+    write_visible_adoption_record(&paths.status, &intent, CODEX_ADOPTION_STATUS_INTENT)
+        .map_err(mlua::Error::external)?;
+    wait_for_test_hook("FKST_TEST_AFTER_ADOPTION_INTENT");
+    fail_for_test_hook("FKST_TEST_FAIL_AFTER_ADOPTION_INTENT")?;
     let worker_bin = codex_worker_bin().map_err(mlua::Error::external)?;
     let args = codex_worker_args(request, paths, host_root);
     let mut command = Command::new(&worker_bin);
@@ -871,7 +930,22 @@ fn start_adoption_worker(
     #[cfg(unix)]
     command.process_group(0);
     let child = command.spawn().map_err(mlua::Error::external)?;
-    let record = CodexAdoptionRecord {
+    let mut running = intent;
+    running.status = CODEX_ADOPTION_STATUS_RUNNING.to_string();
+    running.worker_pid = Some(child.id());
+    drop(child);
+    promote_visible_adoption_running(&paths.status, &running).map_err(mlua::Error::external)?;
+    Ok(())
+}
+
+fn adoption_record_from_request(
+    request: &CodexRequest,
+    paths: &CodexAdoptionPaths,
+    status: &str,
+    worker_pid: Option<u32>,
+    codex_pid: Option<u32>,
+) -> CodexAdoptionRecord {
+    CodexAdoptionRecord {
         key: paths.key.clone(),
         run_id: request.run_id.clone(),
         role: request.role.clone(),
@@ -879,23 +953,18 @@ fn start_adoption_worker(
         dept: request.dept.clone(),
         proposal_id: request.proposal_id.clone(),
         dedup_key: request.dedup_key.clone(),
-        status: "running".to_string(),
+        status: status.to_string(),
         started_at_ms: request.started_at_ms,
         ended_at_ms: None,
         timeout_seconds: request.timeout_seconds,
-        worker_pid: Some(child.id()),
-        codex_pid: None,
+        worker_pid,
+        codex_pid,
         exit_code: None,
         log_path: request.log_path.to_string_lossy().into_owned(),
         cmd_line: command_line_for_request(request),
         error_kind: None,
         error: None,
-    };
-    drop(child);
-    if read_adoption_record(&paths.status)?.is_none() {
-        write_adoption_record(&paths.status, &record).map_err(mlua::Error::external)?;
     }
-    Ok(())
 }
 
 fn codex_worker_bin() -> anyhow::Result<PathBuf> {
@@ -934,6 +1003,8 @@ fn codex_worker_args(
         paths.stdout.to_string_lossy().into_owned(),
         "--stderr-file".to_string(),
         paths.stderr.to_string_lossy().into_owned(),
+        "--result-file".to_string(),
+        paths.result.to_string_lossy().into_owned(),
         "--status-file".to_string(),
         paths.status.to_string_lossy().into_owned(),
         "--log-path".to_string(),
@@ -990,6 +1061,9 @@ fn wait_for_adoption_result(
         if let Some(result) = read_completed_adoption_result(paths)? {
             return Ok(result);
         }
+        if let Some(result) = recover_completed_adoption_result(paths)? {
+            return Ok(result);
+        }
         if Instant::now() >= deadline {
             if let Some(record) = read_adoption_record(&paths.status)? {
                 kill_adoption_worker_group(&record);
@@ -1041,7 +1115,8 @@ fn write_adoption_child_pid(request: &CodexRequest, child_pid: u32) {
         return;
     };
     record.codex_pid = Some(child_pid);
-    if let Err(err) = write_adoption_record(path, &record) {
+    let expected_status = record.status.clone();
+    if let Err(err) = write_visible_adoption_record(path, &record, &expected_status) {
         eprintln!(
             "WARN: codex adoption child pid write failed run_id={} error={err}",
             request.run_id
@@ -1056,6 +1131,7 @@ pub(crate) struct CodexWorkerOptions {
     prompt_file: PathBuf,
     stdout_file: PathBuf,
     stderr_file: PathBuf,
+    result_file: PathBuf,
     status_file: PathBuf,
     log_path: PathBuf,
     run_id: String,
@@ -1078,6 +1154,7 @@ pub(crate) fn parse_worker_args(args: Vec<String>) -> anyhow::Result<CodexWorker
     let prompt_file = parser.required_path("--prompt-file")?;
     let stdout_file = parser.required_path("--stdout-file")?;
     let stderr_file = parser.required_path("--stderr-file")?;
+    let result_file = parser.required_path("--result-file")?;
     let status_file = parser.required_path("--status-file")?;
     let log_path = parser.required_path("--log-path")?;
     let run_id = parser.required_string("--run-id")?;
@@ -1098,6 +1175,7 @@ pub(crate) fn parse_worker_args(args: Vec<String>) -> anyhow::Result<CodexWorker
         prompt_file,
         stdout_file,
         stderr_file,
+        result_file,
         status_file,
         log_path,
         run_id,
@@ -1134,17 +1212,15 @@ pub(crate) fn run_codex_worker(options: CodexWorkerOptions) -> anyhow::Result<i3
         adoption_status_path: Some(options.status_file.clone()),
     };
     let config = ConfigContext::from_host_root(&options.host_root)?;
-    let mut status = CodexStatusRecord::from_request(&request, None);
-    write_codex_status(&request.log_path, &status);
     let mut adoption = CodexAdoptionRecord {
-        key: options.key,
-        run_id: options.run_id,
+        key: options.key.clone(),
+        run_id: options.run_id.clone(),
         role: options.role.clone(),
         label: options.label.clone(),
         dept: options.dept.clone(),
         proposal_id: options.proposal_id.clone(),
         dedup_key: options.dedup_key.clone(),
-        status: "running".to_string(),
+        status: CODEX_ADOPTION_STATUS_RUNNING.to_string(),
         started_at_ms: options.started_at_ms,
         ended_at_ms: None,
         timeout_seconds: options.timeout_seconds,
@@ -1156,7 +1232,11 @@ pub(crate) fn run_codex_worker(options: CodexWorkerOptions) -> anyhow::Result<i3
         error_kind: None,
         error: None,
     };
-    write_adoption_record(&options.status_file, &adoption)?;
+    if !claim_adoption_worker(&options, &mut adoption)? {
+        return Ok(0);
+    }
+    let mut status = CodexStatusRecord::from_request(&request, None);
+    write_codex_status(&request.log_path, &status);
 
     let result = match acquire_permit_with_context(&options.host_root, &config) {
         Ok(permit) => {
@@ -1183,15 +1263,69 @@ pub(crate) fn run_codex_worker(options: CodexWorkerOptions) -> anyhow::Result<i3
 
     write_atomic(&options.stdout_file, result.stdout.as_bytes())?;
     write_atomic(&options.stderr_file, result.stderr.as_bytes())?;
-    adoption.status = "completed".to_string();
-    adoption.ended_at_ms = Some(unix_duration().as_millis() as u64);
+    let ended_at_ms = unix_duration().as_millis() as u64;
+    write_adoption_result_record(
+        &options.result_file,
+        &CodexAdoptionResultRecord {
+            ended_at_ms,
+            exit_code: result.exit_code,
+            error_kind: result.error_kind.clone(),
+            error: result.error.clone(),
+        },
+    )?;
+    adoption.status = CODEX_ADOPTION_STATUS_COMPLETED.to_string();
+    adoption.ended_at_ms = Some(ended_at_ms);
     adoption.exit_code = Some(result.exit_code);
     adoption.error_kind = result.error_kind.clone();
     adoption.error = result.error.clone();
-    write_adoption_record(&options.status_file, &adoption)?;
+    write_visible_adoption_record(
+        &options.status_file,
+        &adoption,
+        CODEX_ADOPTION_STATUS_COMPLETED,
+    )?;
     status.finish(result.exit_code);
     write_codex_status(Path::new(&result.log_path), &status);
     Ok(0)
+}
+
+fn claim_adoption_worker(
+    options: &CodexWorkerOptions,
+    adoption: &mut CodexAdoptionRecord,
+) -> anyhow::Result<bool> {
+    let lock_path = options.work_dir.join("run.lock");
+    let lock_file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(lock_path)?;
+    flock(lock_file.as_raw_fd(), FlockArg::LockExclusive).map_err(anyhow::Error::from)?;
+    let current_pid = std::process::id();
+    let existing = read_adoption_record_from_disk(&options.status_file)?;
+    if existing
+        .as_ref()
+        .is_some_and(|record| record.status == CODEX_ADOPTION_STATUS_COMPLETED)
+    {
+        drop(lock_file);
+        return Ok(false);
+    }
+    if existing.as_ref().is_some_and(|record| {
+        record.status == CODEX_ADOPTION_STATUS_RUNNING
+            && record.worker_pid != Some(current_pid)
+            && adoption_effect_alive(record)
+    }) {
+        drop(lock_file);
+        return Ok(false);
+    }
+    adoption.worker_pid = Some(current_pid);
+    adoption.status = CODEX_ADOPTION_STATUS_RUNNING.to_string();
+    write_visible_adoption_record(
+        &options.status_file,
+        adoption,
+        CODEX_ADOPTION_STATUS_RUNNING,
+    )?;
+    drop(lock_file);
+    Ok(true)
 }
 
 struct WorkerArgParser {
@@ -1239,6 +1373,51 @@ fn write_adoption_record(path: &Path, record: &CodexAdoptionRecord) -> anyhow::R
     write_atomic(path, serde_json::to_string(record)?.as_bytes())
 }
 
+fn write_adoption_result_record(
+    path: &Path,
+    record: &CodexAdoptionResultRecord,
+) -> anyhow::Result<()> {
+    write_atomic(path, serde_json::to_string(record)?.as_bytes())
+}
+
+fn write_visible_adoption_record(
+    path: &Path,
+    record: &CodexAdoptionRecord,
+    expected_status: &str,
+) -> anyhow::Result<()> {
+    write_adoption_record(path, record)?;
+    let visible = read_adoption_record_from_disk(path)?
+        .ok_or_else(|| anyhow::anyhow!("codex adoption record not visible after write"))?;
+    if visible.key != record.key {
+        anyhow::bail!(
+            "codex adoption record key mismatch after write: expected {} got {}",
+            record.key,
+            visible.key
+        );
+    }
+    if visible.status != expected_status {
+        anyhow::bail!(
+            "codex adoption record status mismatch after write: expected {} got {}",
+            expected_status,
+            visible.status
+        );
+    }
+    Ok(())
+}
+
+fn promote_visible_adoption_running(
+    path: &Path,
+    record: &CodexAdoptionRecord,
+) -> anyhow::Result<()> {
+    if read_adoption_record_from_disk(path)?
+        .as_ref()
+        .is_some_and(|record| record.status == CODEX_ADOPTION_STATUS_COMPLETED)
+    {
+        return Ok(());
+    }
+    write_visible_adoption_record(path, record, CODEX_ADOPTION_STATUS_RUNNING)
+}
+
 fn write_atomic(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -1250,6 +1429,37 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
     ));
     std::fs::write(&tmp, bytes)?;
     std::fs::rename(tmp, path)?;
+    Ok(())
+}
+
+#[cfg(test)]
+fn wait_for_test_hook(env: &str) {
+    let Some(path) = std::env::var_os(env).filter(|value| !value.is_empty()) else {
+        return;
+    };
+    while Path::new(&path).exists() {
+        std::thread::sleep(CODEX_ADOPTION_POLL);
+    }
+}
+
+#[cfg(not(test))]
+fn wait_for_test_hook(_env: &str) {}
+
+#[cfg(test)]
+fn fail_for_test_hook(env: &str) -> Result<()> {
+    if std::env::var_os(env)
+        .filter(|value| !value.is_empty())
+        .is_some()
+    {
+        return Err(mlua::Error::external(format!(
+            "{env} requested failure after adoption intent"
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(not(test))]
+fn fail_for_test_hook(_env: &str) -> Result<()> {
     Ok(())
 }
 
@@ -1472,11 +1682,7 @@ fn read_adoption_status_records(host_root: &Path) -> anyhow::Result<Vec<CodexSta
 fn codex_status_record_from_adoption(record: CodexAdoptionRecord) -> CodexStatusRecord {
     let ended_at_ms = record.ended_at_ms;
     let exit_code = adoption_status_exit_code(&record);
-    let status = if record.status == "running" && adoption_worker_alive(&record) {
-        "running".to_string()
-    } else {
-        "completed".to_string()
-    };
+    let status = adoption_status_for_observe(&record).to_string();
     CodexStatusRecord {
         run_id: record.run_id,
         role: record.role,
@@ -1501,10 +1707,21 @@ fn codex_status_record_from_adoption(record: CodexAdoptionRecord) -> CodexStatus
 }
 
 fn adoption_status_exit_code(record: &CodexAdoptionRecord) -> Option<i32> {
-    if record.status == "running" && adoption_worker_alive(record) {
+    if adoption_status_for_observe(record) == CODEX_ADOPTION_STATUS_RUNNING {
         None
     } else {
         Some(record.exit_code.unwrap_or(-1))
+    }
+}
+
+fn adoption_status_for_observe(record: &CodexAdoptionRecord) -> &'static str {
+    match record.status.as_str() {
+        CODEX_ADOPTION_STATUS_COMPLETED => "completed",
+        CODEX_ADOPTION_STATUS_INTENT => CODEX_ADOPTION_STATUS_RUNNING,
+        CODEX_ADOPTION_STATUS_RUNNING if adoption_effect_alive(record) => {
+            CODEX_ADOPTION_STATUS_RUNNING
+        }
+        _ => "completed",
     }
 }
 
