@@ -6,7 +6,9 @@ use std::process::{Command, Output};
 
 mod support;
 
-use support::manifest_fixture::{write_package_manifest, write_workspace};
+use support::manifest_fixture::{
+    write_package_manifest, write_single_package_workspace, write_workspace,
+};
 
 fn framework_bin() -> &'static str {
     env!("CARGO_BIN_EXE_fkst-framework")
@@ -38,6 +40,7 @@ fn copy_dir(src: &Path, dst: &Path) {
 fn copy_minimal_package(host: &Path) {
     let package = repo_root().join("examples/minimal-package");
     copy_dir(&package, host);
+    write_single_package_workspace(host);
 }
 
 fn write_runtime_touch_package(package: &Path) {

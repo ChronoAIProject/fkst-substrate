@@ -4,6 +4,10 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
+mod support;
+
+use support::manifest_fixture::write_single_package_workspace;
+
 fn framework_bin() -> &'static str {
     env!("CARGO_BIN_EXE_fkst-framework")
 }
@@ -34,6 +38,7 @@ fn copy_dir(src: &Path, dst: &Path) {
 fn copy_codex_package(host: &Path) {
     let package = repo_root().join("examples/codex-package");
     copy_dir(&package, host);
+    write_single_package_workspace(host);
 }
 
 fn run_conformance(host: &Path, runtime: &Path) -> Output {
