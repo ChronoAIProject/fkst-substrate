@@ -3,7 +3,7 @@
 Status: in-implementation (2026-06-22). Derived via sshx triplet (minimal/structural/delete) + ChatGPT Pro, converged.
 
 ## Goal
-Implement the engine side of ADR 0001: a unit (`package` | `library`) declares its code dependencies in a per-unit `fkst.toml`; the engine enforces declared require-scope (a unit may `require` only its own modules + the PUBLIC exports of libraries it DIRECTLY declares; undeclared/ambiguous = fail-closed). Replaces the per-package `std` symlink as the *authority*, with a legacy fallback during migration.
+Implement the engine side of ADR 0001: a unit (`package` | `library`) declares its code dependencies in a per-unit `fkst.toml`; the engine enforces declared require-scope (a unit may `require` only its own modules + the PUBLIC exports of libraries it DIRECTLY declares; undeclared/ambiguous = fail-closed). Replaces the per-package `std` symlink entirely. This is a CLEAN BREAKING change developed on an isolated branch — NO backward-compat / dual-mode / legacy fallback (per repo doctrine «不要历史兼容性，删就删干净»). The engine simply requires + enforces manifests; ALL fixtures + the real workspace adopt the new model; migration = merge the complete, tested change.
 
 ## Resolver design (the hard part — per ChatGPT Pro)
 - **Per-unit `_ENV`-bound `require` closure**, NOT a package.searchers entry and NOT manifest-generated package.path. Lua checks `package.loaded[name]` BEFORE searchers, so a bare searcher cannot isolate cross-scope cache; package.path order hides ambiguity and over-exposes files. Bind `require` lexically per unit via mlua `Chunk::set_environment` (a proxy `_ENV` whose `require = require_for(unit)`, metatable `__index/__newindex = shared_globals`); lexical (not a dynamic current-unit stack) because a library function may `require` lazily after its loader returned.
@@ -30,10 +30,11 @@ Per-unit `fkst.toml`: `kind = "package"|"library"`, `name`, `[code] root`, `[lib
 - **C. `fkst-framework deps` validator**: NEW `deps_cli.rs` (~450: render+validate DAG acyclic, declared lib exists, visibility, exports exist, no ambiguous, no orphan, declared lib_deps == actual require literals via a small Rust scanner = G-STD-DEP equivalent, event_deps == composed.deps).
 
 ## Packages side (fkst-packages)
-All units get `fkst.toml`; `std` declared as a library (kind=library, all-public, visibility=public); `event_deps` mirrored from `composed.deps`; `lib_deps` from G-STD-DEP-derived actual usage. **Symlinks + composed.deps KEPT during migration.**
+All units get `fkst.toml`; `std` declared as a library (kind=library, all-public, visibility=public); `event_deps` mirrored from `composed.deps`; `lib_deps` from G-STD-DEP-derived actual usage. **Per-package `std` symlink REMOVED** (replaced by manifest+resolver); composed.deps may stay as the source `event_deps` mirrors until G-rules retarget. Restructure `std` to the library layout (all-public).
 
-## Migration / merge-together (substrate FIRST, packages SECOND, same window)
-1. Land substrate (engine reads manifests if a complete workspace is present, else legacy symlink behavior; enforce only when complete). 2. Land packages (manifests added). Because the engine has legacy fallback, neither order breaks a running supervise; enforce mode activates once the workspace is complete. dogfood BIN builds from substrate dev.
+## Migration / merge-together (clean break, test-then-migrate)
+No dual-mode. Build the complete clean change on the two branches; ALL tests (engine fixtures + package conformance/tests) pass on the NEW model (manifests everywhere, symlinks removed). THEN migrate as one coordinated step: merge packages-with-manifests first (old engine ignores the new files; symlinks still present so old engine still works for the brief window), then merge substrate-new-engine (reads manifests; index-build does not follow symlinks), then a final symlink-removal lands with/after. The point: zero permanent compat code in the engine; the only "ordering" is the deliberate migration sequence, not a runtime fallback.
+
 
 ## OUT of scope (clean follow-ups)
 - **Devloop extraction** (`std.devloop_*` → `devloop` library): BLOCKED on the `std.devloop_prompts → require("prompts.*")` DI inversion (library→consumer-private boundary violation) + loning's zone. Do DI first, then extract using the now-working primitive.
