@@ -75,12 +75,13 @@ pub(crate) fn unit_environment(
     install_enforced_globals(lua)?;
     let env = lua.create_table()?;
     let require = scoped_require_for(lua, catalog, unit_id.to_string())?;
-    env.set("require", require)?;
-    env.set("_G", env.clone())?;
 
     let metatable = lua.create_table()?;
     let globals = lua.globals();
-    metatable.set("__index", globals.clone())?;
+    metatable.set(
+        "__index",
+        unit_environment_index(lua, globals.clone(), require)?,
+    )?;
     metatable.set("__newindex", protected_global_newindex(lua, globals)?)?;
     metatable.set("__metatable", "fkst unit environment")?;
     env.set_metatable(Some(metatable));
@@ -206,12 +207,34 @@ fn raw_global_require_error(lua: &Lua) -> mlua::Result<mlua::Function> {
     })
 }
 
+fn unit_environment_index(
+    lua: &Lua,
+    globals: Table,
+    require: mlua::Function,
+) -> mlua::Result<mlua::Function> {
+    lua.create_function(move |_, (table, key): (Table, LuaValue)| {
+        if let LuaValue::String(key_string) = &key {
+            let key = key_string.to_str()?;
+            match key.as_ref() {
+                "require" => return Ok(LuaValue::Function(require.clone())),
+                "_G" => return Ok(LuaValue::Table(table)),
+                "package" => return Ok(LuaValue::Nil),
+                _ => {}
+            }
+        }
+        globals.raw_get(key)
+    })
+}
+
 fn protected_global_newindex(lua: &Lua, globals: Table) -> mlua::Result<mlua::Function> {
     lua.create_function(
         move |_, (_table, key, value): (Table, LuaValue, LuaValue)| {
             if let LuaValue::String(key_string) = &key {
                 let key = key_string.to_str()?;
-                if matches!(key.as_ref(), "require" | "package" | "loadfile" | "dofile") {
+                if matches!(
+                    key.as_ref(),
+                    "require" | "_G" | "package" | "loadfile" | "dofile"
+                ) {
                     return Err(mlua::Error::runtime(format!(
                         "global `{key}` is reserved by fkst unit-scoped loading"
                     )));
@@ -545,7 +568,7 @@ end
 denied(function() return require("undeclared") end, "require.denied")
 denied(function() return _ENV.require("undeclared") end, "require.denied")
 denied(function() return _G.require("undeclared") end, "require.denied")
-denied(function() return rawget(_G, "require")("undeclared") end, "require.denied")
+assert(rawget(_G, "require") == nil, "unit environment has raw require slot")
 return true
 "#,
         );
@@ -563,6 +586,146 @@ return true
         .unwrap()
         .as_boolean()
         .unwrap());
+    }
+
+    #[test]
+    fn in_memory_load_uses_hardened_base_environment() {
+        let temp = workspace();
+        package(temp.path(), "app", &[]);
+        write(
+            &temp.path().join("packages/app/main.lua"),
+            r#"
+local loaded = assert(load("return require"))
+local loaded_require = loaded()
+assert(type(loaded_require) == "function", type(loaded_require))
+local ok, err = pcall(loaded_require, "undeclared")
+assert(not ok, "load returned a native require")
+assert(string.find(tostring(err), "require is unit-scoped", 1, true), tostring(err))
+return true
+"#,
+        );
+        let catalog = catalog(temp.path());
+        let lua = Lua::new();
+
+        assert!(load_unit_chunk(
+            &lua,
+            catalog,
+            "app",
+            &temp.path().join("packages/app/main.lua"),
+            "@main.lua",
+            None,
+        )
+        .unwrap()
+        .as_boolean()
+        .unwrap());
+    }
+
+    #[test]
+    fn safe_lua_constructor_does_not_load_debug_library() {
+        let temp = workspace();
+        package(temp.path(), "app", &[]);
+        write(
+            &temp.path().join("packages/app/main.lua"),
+            r#"
+assert(debug == nil, "debug library is loaded")
+return true
+"#,
+        );
+        let catalog = catalog(temp.path());
+        let lua = Lua::new();
+
+        assert!(load_unit_chunk(
+            &lua,
+            catalog,
+            "app",
+            &temp.path().join("packages/app/main.lua"),
+            "@main.lua",
+            None,
+        )
+        .unwrap()
+        .as_boolean()
+        .unwrap());
+    }
+
+    #[test]
+    fn unit_environment_rejects_reserved_global_clobbering() {
+        let temp = workspace();
+        package(temp.path(), "app", &[]);
+        write(
+            &temp.path().join("packages/app/main.lua"),
+            r#"
+local function denied(fn, expected)
+  local ok, err = pcall(fn)
+  assert(not ok, "unexpected success")
+  err = tostring(err)
+  assert(string.find(err, expected, 1, true), err)
+end
+
+denied(function() _G.require = function() end end, "global `require` is reserved")
+denied(function() _G.package = {} end, "global `package` is reserved")
+denied(function() _G._G = {} end, "global `_G` is reserved")
+return true
+"#,
+        );
+        let catalog = catalog(temp.path());
+        let lua = Lua::new();
+
+        assert!(load_unit_chunk(
+            &lua,
+            catalog,
+            "app",
+            &temp.path().join("packages/app/main.lua"),
+            "@main.lua",
+            None,
+        )
+        .unwrap()
+        .as_boolean()
+        .unwrap());
+    }
+
+    #[test]
+    fn lazy_library_function_keeps_library_scoped_require_from_metatable() {
+        let temp = workspace();
+        package(temp.path(), "app", &["std"]);
+        write(
+            &temp.path().join("packages/app/main.lua"),
+            r#"
+local tool = require("tool")
+return tool.lazy()
+"#,
+        );
+        library(temp.path(), "std", &[]);
+        write(
+            &temp.path().join("libraries/std/public/tool.lua"),
+            r#"
+local M = {}
+function M.lazy()
+  return require("secret").value
+end
+return M
+"#,
+        );
+        write(
+            &temp.path().join("libraries/std/private/secret.lua"),
+            r#"return { value = "metatable-lexical-provider-private" }"#,
+        );
+        let catalog = catalog(temp.path());
+        let lua = Lua::new();
+
+        let value = load_unit_chunk(
+            &lua,
+            catalog,
+            "app",
+            &temp.path().join("packages/app/main.lua"),
+            "@main.lua",
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(
+            value.as_string().unwrap().to_str().unwrap(),
+            "metatable-lexical-provider-private"
+        );
     }
 
     #[test]
