@@ -33,6 +33,9 @@ mod init_package_repo;
 mod lua_coverage;
 mod lua_require;
 mod manifest;
+mod manifest_external;
+mod manifest_hash;
+mod manifest_modules;
 mod mlua_init;
 mod observe;
 mod path_resolver;
@@ -374,15 +377,19 @@ fn parse_deps_args(args: &[String]) -> Result<deps_cli::DepsOptions> {
     let mut project_root: Option<PathBuf> = None;
     let mut package_roots: Vec<PathBuf> = Vec::new();
     let mut json = false;
+    let mut mode = deps_cli::DepsMode::Check;
+    let mut locked = false;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
             "--help" | "-h" => {
                 println!(
-                    "usage: fkst-framework deps --project-root <root> [--package-root <root> ...] [--json]"
+                    "usage: fkst-framework deps [lock|fetch] --project-root <root> [--package-root <root> ...] [--json] [--locked]"
                 );
                 std::process::exit(0);
             }
+            "lock" => mode = deps_cli::DepsMode::Lock,
+            "fetch" => mode = deps_cli::DepsMode::Fetch,
             "--project-root" => {
                 if project_root.is_some() {
                     anyhow::bail!("duplicate --project-root");
@@ -394,6 +401,7 @@ fn parse_deps_args(args: &[String]) -> Result<deps_cli::DepsOptions> {
                 i += 1;
                 package_roots.push(next_value(args, i, "--package-root")?.into());
             }
+            "--locked" => locked = true,
             "--json" => json = true,
             other => anyhow::bail!("unknown deps argument: {}", other),
         }
@@ -405,6 +413,8 @@ fn parse_deps_args(args: &[String]) -> Result<deps_cli::DepsOptions> {
         project_root,
         package_roots,
         json,
+        mode,
+        locked,
     })
 }
 

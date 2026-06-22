@@ -8,6 +8,7 @@ use std::path::Path;
 pub(crate) struct WorkspaceManifest {
     discovered_units: Vec<String>,
     registries: BTreeMap<String, String>,
+    external_sources: Vec<ExternalSourceDecl>,
 }
 
 impl WorkspaceManifest {
@@ -25,6 +26,20 @@ impl WorkspaceManifest {
     pub(crate) fn registries(&self) -> &BTreeMap<String, String> {
         &self.registries
     }
+
+    pub(crate) fn external_sources(&self) -> &[ExternalSourceDecl] {
+        &self.external_sources
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+pub(crate) struct ExternalSourceDecl {
+    pub(crate) id: String,
+    pub(crate) git: String,
+    pub(crate) rev: Option<String>,
+    pub(crate) tag: Option<String>,
+    #[serde(default)]
+    pub(crate) libraries: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -32,6 +47,8 @@ struct WorkspaceManifestToml {
     workspace: WorkspaceToml,
     #[serde(default)]
     registries: BTreeMap<String, String>,
+    #[serde(default)]
+    external_sources: Vec<ExternalSourceDecl>,
 }
 
 impl WorkspaceManifestToml {
@@ -42,6 +59,7 @@ impl WorkspaceManifestToml {
         WorkspaceManifest {
             discovered_units,
             registries: self.registries,
+            external_sources: self.external_sources,
         }
     }
 }

@@ -8,6 +8,12 @@ mod config_registry;
 mod external_command;
 #[path = "../src/manifest.rs"]
 mod manifest;
+#[path = "../src/manifest_external.rs"]
+mod manifest_external;
+#[path = "../src/manifest_hash.rs"]
+mod manifest_hash;
+#[path = "../src/manifest_modules.rs"]
+mod manifest_modules;
 #[path = "../src/path_resolver.rs"]
 mod path_resolver;
 #[path = "../src/process_tree.rs"]
