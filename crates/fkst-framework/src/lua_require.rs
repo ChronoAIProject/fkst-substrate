@@ -117,7 +117,11 @@ fn scoped_require_for(
 ) -> mlua::Result<mlua::Function> {
     lua.create_function(move |lua, module: String| {
         let entry = resolve(&catalog, &caller_unit, &module).map_err(mlua::Error::external)?;
-        let cache_key = canonical_cache_key(&entry.provider_unit, &module);
+        let cache_key = canonical_cache_key(
+            entry.provider_source.as_deref(),
+            &entry.provider_unit,
+            &module,
+        );
         let loaded = module_cache(lua)?;
         let cached: LuaValue = loaded.raw_get(cache_key.as_str())?;
         if !matches!(cached, LuaValue::Nil) {
@@ -143,8 +147,11 @@ fn scoped_require_for(
     })
 }
 
-fn canonical_cache_key(provider_unit: &str, module: &str) -> String {
-    format!("{CACHE_KEY_PREFIX}{provider_unit}:{module}")
+fn canonical_cache_key(provider_source: Option<&str>, provider_unit: &str, module: &str) -> String {
+    match provider_source {
+        Some(source) => format!("{CACHE_KEY_PREFIX}{source}:{provider_unit}:{module}"),
+        None => format!("{CACHE_KEY_PREFIX}{provider_unit}:{module}"),
+    }
 }
 
 fn env_registry_key(unit_id: &str) -> String {

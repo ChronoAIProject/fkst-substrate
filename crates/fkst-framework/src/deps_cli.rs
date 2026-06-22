@@ -1,6 +1,7 @@
 //! Dependency graph validator for manifest workspaces.
 
 use crate::manifest::{CatalogUnit, UnitCatalog, UnitKind, Visibility};
+use crate::manifest_external::{lock_external_sources, Lockfile};
 use anyhow::{Context, Result};
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
@@ -12,6 +13,15 @@ pub(crate) struct DepsOptions {
     pub(crate) project_root: PathBuf,
     pub(crate) package_roots: Vec<PathBuf>,
     pub(crate) json: bool,
+    pub(crate) mode: DepsMode,
+    pub(crate) locked: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum DepsMode {
+    Check,
+    Lock,
+    Fetch,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -94,7 +104,12 @@ impl Diagnostic {
 pub(crate) fn run(options: DepsOptions) -> Result<i32> {
     let project_root = canonical_dir(&options.project_root, "--project-root")?;
     let package_roots = canonical_dirs(options.package_roots, "--package-root")?;
-    let report = validate(&project_root, &package_roots)?;
+    let lockfile = match options.mode {
+        DepsMode::Check => None,
+        DepsMode::Lock => Some(write_lockfile(&project_root)?),
+        DepsMode::Fetch => Some(read_lockfile(&project_root)?),
+    };
+    let report = validate(&project_root, &package_roots, lockfile, options.locked)?;
     if options.json {
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
@@ -103,8 +118,34 @@ pub(crate) fn run(options: DepsOptions) -> Result<i32> {
     Ok(if report.ok { 0 } else { 1 })
 }
 
-fn validate(project_root: &Path, package_roots: &[PathBuf]) -> Result<DepsReport> {
-    let validation_catalogs = validation_catalogs(project_root, package_roots)?;
+fn write_lockfile(project_root: &Path) -> Result<Lockfile> {
+    let workspace =
+        crate::manifest::WorkspaceManifest::parse_file(&project_root.join("fkst.workspace.toml"))?;
+    let lockfile = lock_external_sources(project_root, workspace.external_sources())?;
+    lockfile.write_file(&project_root.join("fkst.lock"))?;
+    Ok(lockfile)
+}
+
+fn read_lockfile(project_root: &Path) -> Result<Lockfile> {
+    let path = project_root.join("fkst.lock");
+    if !path.exists() {
+        anyhow::bail!("fkst.lock is required for deps fetch");
+    }
+    let lockfile = Lockfile::parse_file(&path)?;
+    let workspace =
+        crate::manifest::WorkspaceManifest::parse_file(&project_root.join("fkst.workspace.toml"))?;
+    let _ =
+        crate::manifest_external::fetch_locked_sources(workspace.external_sources(), &lockfile)?;
+    Ok(lockfile)
+}
+
+fn validate(
+    project_root: &Path,
+    package_roots: &[PathBuf],
+    lockfile: Option<Lockfile>,
+    locked: bool,
+) -> Result<DepsReport> {
+    let validation_catalogs = validation_catalogs(project_root, package_roots, lockfile, locked)?;
     let mut failures = Vec::new();
     let mut warnings = Vec::new();
     let mut units = Vec::new();
@@ -131,10 +172,33 @@ fn validate(project_root: &Path, package_roots: &[PathBuf]) -> Result<DepsReport
     Ok(report)
 }
 
-fn validation_catalogs(project_root: &Path, package_roots: &[PathBuf]) -> Result<Vec<UnitCatalog>> {
-    let host_catalog = UnitCatalog::discover_for_validation(project_root)?.ok_or_else(|| {
-        anyhow::anyhow!("manifest catalog is required: missing fkst.workspace.toml")
-    })?;
+fn validation_catalogs(
+    project_root: &Path,
+    package_roots: &[PathBuf],
+    lockfile: Option<Lockfile>,
+    locked: bool,
+) -> Result<Vec<UnitCatalog>> {
+    let host_catalog = match lockfile {
+        Some(lockfile) => {
+            UnitCatalog::discover_with_lock(project_root, lockfile)?.ok_or_else(|| {
+                anyhow::anyhow!("manifest catalog is required: missing fkst.workspace.toml")
+            })?
+        }
+        None if locked => {
+            let path = project_root.join("fkst.lock");
+            let lockfile = if path.exists() {
+                Lockfile::parse_file(&path)?
+            } else {
+                Lockfile::default()
+            };
+            UnitCatalog::discover_with_lock(project_root, lockfile)?.ok_or_else(|| {
+                anyhow::anyhow!("manifest catalog is required: missing fkst.workspace.toml")
+            })?
+        }
+        None => UnitCatalog::discover_for_validation(project_root)?.ok_or_else(|| {
+            anyhow::anyhow!("manifest catalog is required: missing fkst.workspace.toml")
+        })?,
+    };
     let mut catalogs = Vec::new();
     let mut seen_workspace_roots = BTreeSet::new();
     seen_workspace_roots.insert(host_catalog.workspace_root().to_path_buf());
@@ -179,7 +243,7 @@ fn validate_catalog(
         let required =
             scan_actual_library_requires(unit, &validation_catalog, &library_names, failures)?;
         validate_actual_requires(unit, &required, &library_names, failures, warnings);
-        actual_requires.insert(unit.name().to_string(), required);
+        actual_requires.insert(unit.catalog_name().to_string(), required);
         validate_composed_deps(unit, failures)?;
     }
 
@@ -210,9 +274,10 @@ fn validate_declared_libs(
                 ));
                 continue;
             };
-            let Some(library_unit) = catalog.units().find(|candidate| {
-                candidate.name() == library_unit_name && candidate.library_name() == lib
-            }) else {
+            let Some(library_unit) = catalog
+                .units()
+                .find(|candidate| candidate.catalog_name() == library_unit_name)
+            else {
                 failures.push(Diagnostic::fail(
                     "missing-lib",
                     Some(unit.name()),
@@ -505,7 +570,7 @@ fn validate_public_export_reference(
     };
     let Some(library_unit) = catalog
         .units()
-        .find(|candidate| candidate.name() == library_unit_name)
+        .find(|candidate| candidate.catalog_name() == library_unit_name)
     else {
         return;
     };
@@ -622,7 +687,7 @@ fn unit_reports(
                 .map(|dep| dep.as_str().to_string())
                 .collect(),
             actual_lib_requires: actual_requires
-                .get(unit.name())
+                .get(unit.catalog_name())
                 .cloned()
                 .unwrap_or_default()
                 .into_iter()

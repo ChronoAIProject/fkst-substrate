@@ -137,6 +137,410 @@ fn deps(root: &Path) -> Command {
     cmd
 }
 
+fn git(root: &Path, args: &[&str]) -> String {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(args)
+        .output()
+        .unwrap();
+    assert_exit(&output, 0);
+    String::from_utf8_lossy(&output.stdout).trim().to_string()
+}
+
+fn git_checked(root: &Path, args: &[&str]) {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(args)
+        .output()
+        .unwrap();
+    assert_exit(&output, 0);
+}
+
+fn init_external_library_repo(root: &Path, visibility: Option<&[&str]>) -> String {
+    workspace(root, &["libraries/contract"]);
+    library(root, "contract", &[], visibility);
+    write(
+        &root.join("libraries/contract/public/api.lua"),
+        r#"return { value = "external-contract" }"#,
+    );
+    write(
+        &root.join("libraries/contract/private/secret.lua"),
+        r#"return { value = "private-contract" }"#,
+    );
+    let init = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .arg("init")
+        .output()
+        .unwrap();
+    assert_exit(&init, 0);
+    git(root, &["config", "user.email", "fkst-test@example.invalid"]);
+    git(root, &["config", "user.name", "fkst test"]);
+    git(root, &["add", "."]);
+    git(root, &["commit", "-m", "Add external contract library"]);
+    git(root, &["rev-parse", "HEAD"])
+}
+
+fn consumer_workspace_with_external_source(
+    root: &Path,
+    source_root: &Path,
+    rev: &str,
+    allowlist: &[&str],
+    package_libs: &[&str],
+) {
+    write(
+        &root.join("fkst.workspace.toml"),
+        &format!(
+            r#"
+[workspace]
+units = ["packages/app"]
+
+[[external_sources]]
+id = "fkst-platform"
+git = "{}"
+rev = "{rev}"
+libraries = [{}]
+"#,
+            source_root.display(),
+            quoted(allowlist)
+        ),
+    );
+    package(root, "app", package_libs, &[]);
+    write(
+        &root.join("packages/app/departments/probe/main.lua"),
+        r#"
+local contract = require("contract.api")
+return {
+  spec = { consumes = { "tick" }, produces = {} },
+  pipeline = function(event)
+    assert(contract.value == "external-contract", contract.value)
+  end,
+}
+"#,
+    );
+}
+
+fn consumer_workspace_with_external_tag(
+    root: &Path,
+    source_root: &Path,
+    tag: &str,
+    allowlist: &[&str],
+    package_libs: &[&str],
+) {
+    write(
+        &root.join("fkst.workspace.toml"),
+        &format!(
+            r#"
+[workspace]
+units = ["packages/app"]
+
+[[external_sources]]
+id = "fkst-platform"
+git = "{}"
+tag = "{tag}"
+libraries = [{}]
+"#,
+            source_root.display(),
+            quoted(allowlist)
+        ),
+    );
+    package(root, "app", package_libs, &[]);
+    write(
+        &root.join("packages/app/main.lua"),
+        r#"return require("contract.api")"#,
+    );
+}
+
+fn run_department(root: &Path, cache: &Path) -> Command {
+    let mut cmd = command();
+    cmd.arg("run")
+        .arg(root.join("packages/app/departments/probe/main.lua"))
+        .arg("--project-root")
+        .arg(root)
+        .arg("--package-root")
+        .arg(root.join("packages/app"))
+        .arg("--event")
+        .arg(r#"{"queue":"tick","payload":{}}"#)
+        .env("FKST_CACHE_ROOT", cache)
+        .env("FKST_RUNTIME_ROOT", root.join(".fkst/runtime"));
+    cmd
+}
+
+#[test]
+fn cross_repo_deps_lock_writes_hashes_and_locked_catalog_resolves_external_library() {
+    let temp = tempfile::tempdir().unwrap();
+    let cache = temp.path().join("cache");
+    let source = temp.path().join("source");
+    let consumer = temp.path().join("consumer");
+    let rev = init_external_library_repo(&source, None);
+    consumer_workspace_with_external_source(&consumer, &source, &rev, &["contract"], &["contract"]);
+
+    let lock_output = deps(&consumer)
+        .arg("lock")
+        .env("FKST_CACHE_ROOT", &cache)
+        .output()
+        .unwrap();
+
+    assert_exit(&lock_output, 0);
+    let lock = fs::read_to_string(consumer.join("fkst.lock")).unwrap();
+    assert!(lock.contains("[[external_source]]"), "{lock}");
+    assert!(lock.contains(r#"id = "fkst-platform""#), "{lock}");
+    assert!(lock.contains(&format!(r#"rev = "{rev}""#)), "{lock}");
+    assert!(lock.contains("tree_sha256 = \"sha256-"), "{lock}");
+    assert!(lock.contains("exports_sha256 = \"sha256-"), "{lock}");
+
+    let locked_output = deps(&consumer)
+        .arg("--locked")
+        .env("FKST_CACHE_ROOT", &cache)
+        .output()
+        .unwrap();
+
+    assert_exit(&locked_output, 0);
+    let out = stdout(&locked_output);
+    assert!(out.contains("fkst deps: PASS"), "{out}");
+    assert!(out.contains("app -> contract"), "{out}");
+
+    let run_output = run_department(&consumer, &cache).output().unwrap();
+
+    assert_exit(&run_output, 0);
+    assert!(
+        !stderr(&run_output).contains("startup error"),
+        "stderr: {}",
+        stderr(&run_output)
+    );
+}
+
+#[test]
+fn cross_repo_unlocked_external_source_fails_closed_until_lock_is_written() {
+    let temp = tempfile::tempdir().unwrap();
+    let cache = temp.path().join("cache");
+    let source = temp.path().join("source");
+    let consumer = temp.path().join("consumer");
+    let rev = init_external_library_repo(&source, None);
+    consumer_workspace_with_external_source(&consumer, &source, &rev, &["contract"], &["contract"]);
+
+    let output = deps(&consumer)
+        .arg("--locked")
+        .env("FKST_CACHE_ROOT", &cache)
+        .output()
+        .unwrap();
+
+    assert_exit(&output, 2);
+    let err = stderr(&output);
+    assert!(
+        err.contains("external source `fkst-platform` is missing from fkst.lock"),
+        "{err}"
+    );
+}
+
+#[test]
+fn cross_repo_non_allowlisted_or_non_visible_library_is_denied() {
+    let temp = tempfile::tempdir().unwrap();
+    let cache = temp.path().join("cache");
+    let source = temp.path().join("source");
+    let non_allowlisted = temp.path().join("non-allowlisted");
+    let non_visible = temp.path().join("non-visible");
+    workspace(&source, &["libraries/contract", "libraries/other"]);
+    library(&source, "contract", &[], Some(&["other-app"]));
+    write(
+        &source.join("libraries/contract/public/api.lua"),
+        r#"return { value = "external-contract" }"#,
+    );
+    library(&source, "other", &[], None);
+    write(
+        &source.join("libraries/other/public/api.lua"),
+        "return {}\n",
+    );
+    let init = Command::new("git")
+        .arg("-C")
+        .arg(&source)
+        .arg("init")
+        .output()
+        .unwrap();
+    assert_exit(&init, 0);
+    git(
+        &source,
+        &["config", "user.email", "fkst-test@example.invalid"],
+    );
+    git(&source, &["config", "user.name", "fkst test"]);
+    git(&source, &["add", "."]);
+    git(
+        &source,
+        &["commit", "-m", "Add restricted external libraries"],
+    );
+    let rev = git(&source, &["rev-parse", "HEAD"]);
+
+    consumer_workspace_with_external_source(
+        &non_allowlisted,
+        &source,
+        &rev,
+        &["other"],
+        &["contract"],
+    );
+    let output = deps(&non_allowlisted)
+        .arg("lock")
+        .env("FKST_CACHE_ROOT", &cache)
+        .output()
+        .unwrap();
+    assert_exit(&output, 2);
+    let err = stderr(&output);
+    assert!(
+        err.contains("external source `fkst-platform` does not allow library `contract`"),
+        "{err}"
+    );
+
+    consumer_workspace_with_external_source(
+        &non_visible,
+        &source,
+        &rev,
+        &["contract"],
+        &["contract"],
+    );
+    let output = deps(&non_visible)
+        .arg("lock")
+        .env("FKST_CACHE_ROOT", &cache)
+        .output()
+        .unwrap();
+    assert_exit(&output, 2);
+    let err = stderr(&output);
+    assert!(
+        err.contains("unit `app` is not allowed to declare library `contract`"),
+        "{err}"
+    );
+}
+
+#[test]
+fn cross_repo_locked_tree_hash_mismatch_fails_closed() {
+    let temp = tempfile::tempdir().unwrap();
+    let cache = temp.path().join("cache");
+    let source = temp.path().join("source");
+    let consumer = temp.path().join("consumer");
+    let rev = init_external_library_repo(&source, None);
+    consumer_workspace_with_external_source(&consumer, &source, &rev, &["contract"], &["contract"]);
+    let output = deps(&consumer)
+        .arg("lock")
+        .env("FKST_CACHE_ROOT", &cache)
+        .output()
+        .unwrap();
+    assert_exit(&output, 0);
+    let lock_path = consumer.join("fkst.lock");
+    let mut lock = fs::read_to_string(&lock_path).unwrap();
+    let marker = "tree_sha256 = \"sha256-";
+    let idx = lock.find(marker).unwrap() + marker.len();
+    let replacement = if lock.as_bytes()[idx] == b'0' {
+        "1"
+    } else {
+        "0"
+    };
+    lock.replace_range(idx..idx + 1, replacement);
+    fs::write(&lock_path, lock).unwrap();
+
+    let output = deps(&consumer)
+        .arg("--locked")
+        .env("FKST_CACHE_ROOT", &cache)
+        .output()
+        .unwrap();
+
+    assert_exit(&output, 2);
+    let err = stderr(&output);
+    assert!(err.contains("tree hash mismatch"), "{err}");
+}
+
+#[test]
+fn cross_repo_stale_lock_missing_allowlisted_library_fails_closed() {
+    // A stale/tampered lock that omits a manifest-allowlisted external library
+    // must fail closed under --locked. Otherwise the external provider is never
+    // cataloged, the duplicate-name fail-closed check never fires, and an
+    // internal library of the same name would be silently selected (violating
+    // "no workspace-internal-wins precedence"). Regression guard for the
+    // lock-allowlist-completeness check in validate_lock_matches_manifest.
+    let temp = tempfile::tempdir().unwrap();
+    let cache = temp.path().join("cache");
+    let source = temp.path().join("source");
+    let consumer = temp.path().join("consumer");
+    let rev = init_external_library_repo(&source, None);
+    // Lock with an allowlist containing only `contract`.
+    consumer_workspace_with_external_source(&consumer, &source, &rev, &["contract"], &["contract"]);
+    let output = deps(&consumer)
+        .arg("lock")
+        .env("FKST_CACHE_ROOT", &cache)
+        .output()
+        .unwrap();
+    assert_exit(&output, 0);
+    // Widen the manifest allowlist to include a library absent from the lock,
+    // leaving the lock from the previous step unchanged.
+    consumer_workspace_with_external_source(
+        &consumer,
+        &source,
+        &rev,
+        &["contract", "ghost"],
+        &["contract"],
+    );
+    let output = deps(&consumer)
+        .arg("--locked")
+        .env("FKST_CACHE_ROOT", &cache)
+        .output()
+        .unwrap();
+    assert_exit(&output, 2);
+    let err = stderr(&output);
+    assert!(
+        err.contains(
+            "library `ghost` is allowed by the workspace manifest but missing from fkst.lock"
+        ),
+        "{err}"
+    );
+}
+
+#[test]
+fn cross_repo_moved_tag_does_not_change_locked_build() {
+    let temp = tempfile::tempdir().unwrap();
+    let cache = temp.path().join("cache");
+    let source = temp.path().join("source");
+    let consumer = temp.path().join("consumer");
+    let rev1 = init_external_library_repo(&source, None);
+    git_checked(&source, &["tag", "-f", "contract-release", &rev1]);
+    consumer_workspace_with_external_tag(
+        &consumer,
+        &source,
+        "contract-release",
+        &["contract"],
+        &["contract"],
+    );
+    let output = deps(&consumer)
+        .arg("lock")
+        .env("FKST_CACHE_ROOT", &cache)
+        .output()
+        .unwrap();
+    assert_exit(&output, 0);
+    let locked_before = fs::read_to_string(consumer.join("fkst.lock")).unwrap();
+    assert!(
+        locked_before.contains(&format!(r#"rev = "{rev1}""#)),
+        "{locked_before}"
+    );
+
+    write(
+        &source.join("libraries/contract/public/api.lua"),
+        r#"return { value = "moved-tag-contract" }"#,
+    );
+    git_checked(&source, &["add", "."]);
+    git_checked(&source, &["commit", "-m", "Move contract tag target"]);
+    let rev2 = git(&source, &["rev-parse", "HEAD"]);
+    assert_ne!(rev1, rev2);
+    git_checked(&source, &["tag", "-f", "contract-release", &rev2]);
+
+    let output = deps(&consumer)
+        .arg("--locked")
+        .env("FKST_CACHE_ROOT", &cache)
+        .output()
+        .unwrap();
+
+    assert_exit(&output, 0);
+    let locked_after = fs::read_to_string(consumer.join("fkst.lock")).unwrap();
+    assert_eq!(locked_before, locked_after);
+}
+
 #[test]
 fn deps_passes_valid_workspace_and_reports_warnings() {
     let temp = tempfile::tempdir().unwrap();
@@ -447,8 +851,9 @@ fn deps_help_prints_usage() {
     assert_exit(&output, 0);
     let out = stdout(&output);
     assert!(
-        out.contains("fkst-framework deps --project-root <root>"),
+        out.contains("fkst-framework deps [lock|fetch] --project-root <root>"),
         "{out}"
     );
     assert!(out.contains("--json"), "{out}");
+    assert!(out.contains("--locked"), "{out}");
 }
