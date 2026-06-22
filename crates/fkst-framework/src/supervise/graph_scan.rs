@@ -6,8 +6,9 @@
 //! Each department exposes `M.spec = { consumes, produces, fanout, stall_window }`
 //! at module top level. Queues are auto-derived from the union of department
 //! and raiser consumes+produces, with fanout coming only from Department
-//! `M.spec.fanout`. `M.spec.graph_json` authorizes composed graph introspection.
-//! Host graph defaults are read before graph materialization.
+//! `M.spec.fanout`. `M.spec.published_seam` marks consumed queues as public
+//! sibling entry points. `M.spec.graph_json` authorizes composed graph
+//! introspection. Host graph defaults are read before graph materialization.
 
 use anyhow::{anyhow, bail, Context, Result};
 use fkst_common::built_in_provider::{built_in_provider_for_queue, BUILT_IN_DEAD_LETTER_PROVIDER};
@@ -34,6 +35,8 @@ struct DeptSpec {
     produces: Vec<String>,
     #[serde(default)]
     fanout: Vec<String>,
+    #[serde(default)]
+    published_seam: Vec<String>,
     #[serde(default)]
     ephemeral: Vec<String>,
     #[serde(default)]
@@ -135,6 +138,7 @@ pub fn load_roots(roots: &PackageRoots) -> Result<Config> {
     let mut departments: BTreeMap<String, DepartmentDecl> = BTreeMap::new();
     let mut raisers: BTreeMap<String, RaiserDecl> = BTreeMap::new();
     let mut department_fanout: HashMap<String, Vec<String>> = HashMap::new();
+    let mut department_published_seam: HashMap<String, Vec<String>> = HashMap::new();
 
     for graph_root in &graph_roots {
         let lua = Lua::new();
@@ -153,6 +157,7 @@ pub fn load_roots(roots: &PackageRoots) -> Result<Config> {
             &defaults,
             &mut departments,
             &mut department_fanout,
+            &mut department_published_seam,
         )?;
         scan_raisers(
             &lua,
@@ -164,6 +169,7 @@ pub fn load_roots(roots: &PackageRoots) -> Result<Config> {
         )?;
     }
 
+    validate_cross_package_produces(&departments, &raisers, &department_published_seam)?;
     let queues = derive_queues(&departments, &raisers, &department_fanout, &defaults)?;
 
     Ok(Config {
@@ -202,6 +208,7 @@ fn scan_departments(
     defaults: &HostGraphDefaults,
     departments: &mut BTreeMap<String, DepartmentDecl>,
     department_fanout: &mut HashMap<String, Vec<String>>,
+    department_published_seam: &mut HashMap<String, Vec<String>>,
 ) -> Result<()> {
     let repo_root = &graph_root.root;
     let dept_dir = repo_root.join("departments");
@@ -239,6 +246,10 @@ fn scan_departments(
             .with_context(|| format!("validate `{}.spec.produces`", name))?;
         let fanout = resolve_queues(resolver, &graph_root.namespace, spec.fanout)
             .with_context(|| format!("resolve `{}.spec.fanout`", name))?;
+        let published_seam = resolve_queues(resolver, &graph_root.namespace, spec.published_seam)
+            .with_context(|| format!("resolve `{}.spec.published_seam`", name))?;
+        validate_published_seam(&published_seam, &consumes, &graph_root.namespace, &name)
+            .with_context(|| format!("validate `{}.spec.published_seam`", name))?;
         let ephemeral = resolve_queues(subscribe_resolver, &graph_root.namespace, spec.ephemeral)
             .with_context(|| format!("resolve `{}.spec.ephemeral`", name))?;
         let retry = materialize_retry(&retry, defaults, &consumes)
@@ -268,7 +279,8 @@ fn scan_departments(
             },
             &config_path,
         )?;
-        department_fanout.insert(canonical_name, fanout);
+        department_fanout.insert(canonical_name.clone(), fanout);
+        department_published_seam.insert(canonical_name, published_seam);
     }
 
     Ok(())
@@ -410,6 +422,82 @@ fn reject_engine_dead_letter_produces(produces: &[String], department_name: &str
         );
     }
     Ok(())
+}
+
+fn validate_published_seam(
+    published_seam: &[String],
+    consumes: &[String],
+    owner_namespace: &str,
+    department_name: &str,
+) -> Result<()> {
+    for queue in published_seam {
+        if !consumes.iter().any(|consumed| consumed == queue) {
+            bail!(
+                "department `{}` publishes queue `{}` in M.spec.published_seam but does not consume it",
+                department_name,
+                queue
+            );
+        }
+        if !queue_owned_by_namespace(queue, owner_namespace) {
+            bail!(
+                "department `{}` publishes queue `{}` in M.spec.published_seam but the queue is not owned by namespace `{}`",
+                department_name,
+                queue,
+                owner_namespace
+            );
+        }
+    }
+    Ok(())
+}
+
+fn validate_cross_package_produces(
+    departments: &BTreeMap<String, DepartmentDecl>,
+    raisers: &BTreeMap<String, RaiserDecl>,
+    department_published_seam: &HashMap<String, Vec<String>>,
+) -> Result<()> {
+    let mut published_seam = HashSet::new();
+    for queues in department_published_seam.values() {
+        published_seam.extend(queues.iter().cloned());
+    }
+
+    for (name, dept) in departments {
+        for queue in &dept.produces {
+            if queue_owned_by_namespace(queue, &dept.owner_namespace)
+                || published_seam.contains(queue)
+            {
+                continue;
+            }
+            bail!(
+                "department `{}` produces sibling queue `{}` which is not published by that package in M.spec.published_seam",
+                name,
+                queue
+            );
+        }
+    }
+    for (name, raiser) in raisers {
+        let queue = raiser_produces(raiser);
+        let owner_namespace = declaration_namespace(name).unwrap_or("");
+        if queue_owned_by_namespace(queue, owner_namespace) || published_seam.contains(queue) {
+            continue;
+        }
+        bail!(
+            "raiser `{}` produces sibling queue `{}` which is not published by that package in M.spec.published_seam",
+            name,
+            queue
+        );
+    }
+    Ok(())
+}
+
+fn queue_owned_by_namespace(queue: &str, owner_namespace: &str) -> bool {
+    match queue.split_once('.') {
+        Some((namespace, _)) => namespace == owner_namespace,
+        None => true,
+    }
+}
+
+fn declaration_namespace(name: &str) -> Option<&str> {
+    name.split_once('.').map(|(namespace, _)| namespace)
 }
 
 fn resolve_queues(

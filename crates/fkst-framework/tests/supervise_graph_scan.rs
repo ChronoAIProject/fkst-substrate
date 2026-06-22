@@ -940,6 +940,179 @@ fn multiple_package_roots_and_host_form_one_graph() {
 }
 
 #[test]
+fn cross_package_produces_must_target_published_sibling_seam() {
+    let _root = EnvGuard::set("FKST_RUNTIME_ROOT", ".fkst/runtime");
+    let root = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
+    let consumer_package = root.path().join("consensus");
+    let producer_package = root.path().join("github-devloop");
+    fs::create_dir_all(&consumer_package).unwrap();
+    fs::create_dir_all(&producer_package).unwrap();
+    write_host_defaults(&consumer_package, "100\n", "30m\n", "20\n");
+    write_host_defaults(&producer_package, "100\n", "30m\n", "20\n");
+    fs::create_dir_all(consumer_package.join("departments/consumer")).unwrap();
+    fs::write(
+        consumer_package.join("departments/consumer/main.lua"),
+        r#"
+local M = {}
+M.spec = {
+  consumes = {"proposal", "internal_phase"},
+  published_seam = {"proposal"},
+  stall_window = "30s",
+}
+function pipeline(_) end
+return M
+"#,
+    )
+    .unwrap();
+    fs::create_dir_all(producer_package.join("departments/producer")).unwrap();
+    fs::write(
+        producer_package.join("departments/producer/main.lua"),
+        r#"
+local M = {}
+M.spec = {
+  produces = {"consensus.proposal"},
+  stall_window = "30s",
+}
+function pipeline(_) end
+return M
+"#,
+    )
+    .unwrap();
+    let host = write_repo(&[], &[]);
+    write_workspace_for_roots(
+        host.path(),
+        &[consumer_package.as_path(), producer_package.as_path()],
+    );
+    let roots = PackageRoots::resolve(
+        host.path(),
+        vec![consumer_package.clone(), producer_package.clone()],
+    )
+    .unwrap();
+    let cfg = graph_scan::load_roots(&roots).unwrap();
+    assert!(cfg.queue.contains_key("consensus.proposal"));
+
+    fs::write(
+        producer_package.join("departments/producer/main.lua"),
+        r#"
+local M = {}
+M.spec = {
+  produces = {"consensus.internal_phase"},
+  stall_window = "30s",
+}
+function pipeline(_) end
+return M
+"#,
+    )
+    .unwrap();
+    let err = graph_scan::load_roots(&roots).unwrap_err();
+    let msg = format!("{err:#}");
+
+    assert!(
+        msg.contains("department `github-devloop.producer` produces sibling queue `consensus.internal_phase`"),
+        "got: {msg}"
+    );
+    assert!(msg.contains("M.spec.published_seam"), "got: {msg}");
+}
+
+#[test]
+fn published_seam_must_be_consumed_by_declaring_department() {
+    let _root = EnvGuard::set("FKST_RUNTIME_ROOT", ".fkst/runtime");
+    let root = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
+    let package = root.path().join("consensus");
+    fs::create_dir_all(package.join("departments/consumer")).unwrap();
+    write_host_defaults(&package, "100\n", "30m\n", "20\n");
+    fs::write(
+        package.join("departments/consumer/main.lua"),
+        r#"
+local M = {}
+M.spec = {
+  consumes = {"proposal"},
+  published_seam = {"internal_phase"},
+  stall_window = "30s",
+}
+function pipeline(_) end
+return M
+"#,
+    )
+    .unwrap();
+    let host = write_repo(&[], &[]);
+    write_workspace_for_roots(host.path(), &[package.as_path()]);
+    let roots = PackageRoots::resolve(host.path(), vec![package]).unwrap();
+
+    let err = graph_scan::load_roots(&roots).unwrap_err();
+    let msg = format!("{err:#}");
+
+    assert!(
+        msg.contains("validate `consumer.spec.published_seam`"),
+        "got: {msg}"
+    );
+    assert!(
+        msg.contains("publishes queue `consensus.internal_phase`"),
+        "got: {msg}"
+    );
+    assert!(msg.contains("does not consume it"), "got: {msg}");
+}
+
+#[test]
+fn cross_package_raiser_produces_must_target_published_sibling_seam() {
+    let _root = EnvGuard::set("FKST_RUNTIME_ROOT", ".fkst/runtime");
+    let root = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
+    let consumer_package = root.path().join("consensus");
+    let producer_package = root.path().join("github-devloop");
+    fs::create_dir_all(consumer_package.join("departments/consumer")).unwrap();
+    fs::create_dir_all(producer_package.join("raisers")).unwrap();
+    write_host_defaults(&consumer_package, "100\n", "30m\n", "20\n");
+    write_host_defaults(&producer_package, "100\n", "30m\n", "20\n");
+    fs::write(
+        consumer_package.join("departments/consumer/main.lua"),
+        r#"
+local M = {}
+M.spec = {
+  consumes = {"proposal", "internal_phase"},
+  published_seam = {"proposal"},
+  stall_window = "30s",
+}
+function pipeline(_) end
+return M
+"#,
+    )
+    .unwrap();
+    fs::write(
+        producer_package.join("raisers/input.lua"),
+        r#"return { type = "cron", interval = "10s", produces = "consensus.proposal" }"#,
+    )
+    .unwrap();
+    let host = write_repo(&[], &[]);
+    write_workspace_for_roots(
+        host.path(),
+        &[consumer_package.as_path(), producer_package.as_path()],
+    );
+    let roots = PackageRoots::resolve(
+        host.path(),
+        vec![consumer_package.clone(), producer_package.clone()],
+    )
+    .unwrap();
+    let cfg = graph_scan::load_roots(&roots).unwrap();
+    assert!(cfg.queue.contains_key("consensus.proposal"));
+
+    fs::write(
+        producer_package.join("raisers/input.lua"),
+        r#"return { type = "cron", interval = "10s", produces = "consensus.internal_phase" }"#,
+    )
+    .unwrap();
+    let err = graph_scan::load_roots(&roots).unwrap_err();
+    let msg = format!("{err:#}");
+
+    assert!(
+        msg.contains(
+            "raiser `github-devloop.input` produces sibling queue `consensus.internal_phase`"
+        ),
+        "got: {msg}"
+    );
+    assert!(msg.contains("M.spec.published_seam"), "got: {msg}");
+}
+
+#[test]
 fn host_department_uses_host_asset_in_multi_package_graph() {
     let _root = EnvGuard::set("FKST_RUNTIME_ROOT", ".fkst/runtime");
     let package_a = write_repo(

@@ -123,14 +123,23 @@ return M
 }
 
 fn write_package_consumer(root: &std::path::Path, queue: &str) {
+    write_package_consumer_with_published_seam(root, queue, false);
+}
+
+fn write_package_consumer_with_published_seam(root: &std::path::Path, queue: &str, publish: bool) {
     write_single_package_workspace(root);
     fs::create_dir_all(root.join("departments/consumer")).unwrap();
+    let published_seam = if publish {
+        format!(r#", published_seam = {{"{queue}"}}"#)
+    } else {
+        String::new()
+    };
     fs::write(
         root.join("departments/consumer/main.lua"),
         format!(
             r#"
 local M = {{}}
-M.spec = {{ consumes = {{"{queue}"}}, stall_window = "30s" }}
+M.spec = {{ consumes = {{"{queue}"}}{published_seam}, stall_window = "30s" }}
 function pipeline(_) end
 return M
 "#
@@ -430,7 +439,7 @@ fn composed_graph_sibling_producer_satisfies_consumed_queue() {
     fs::create_dir_all(&producer_package).unwrap();
     write_host_defaults(&consumer_package);
     write_host_defaults(&producer_package);
-    write_package_consumer(&consumer_package, "proposal");
+    write_package_consumer_with_published_seam(&consumer_package, "proposal", true);
     write_package_producer(&producer_package, "consensus.proposal");
     let host = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
     write_host_defaults(host.path());
@@ -450,6 +459,41 @@ fn composed_graph_sibling_producer_satisfies_consumed_queue() {
     let log = combined_log(&output);
     assert!(log.contains("PASS schema-validation"), "{log}");
     assert!(!log.contains("no producer"), "{log}");
+}
+
+#[test]
+fn composed_graph_sibling_producer_to_unpublished_queue_fails_graph_scan() {
+    let root = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
+    let consumer_package = root.path().join("consensus");
+    let producer_package = root.path().join("github-devloop");
+    fs::create_dir_all(&consumer_package).unwrap();
+    fs::create_dir_all(&producer_package).unwrap();
+    write_host_defaults(&consumer_package);
+    write_host_defaults(&producer_package);
+    write_package_consumer(&consumer_package, "proposal");
+    write_package_producer(&producer_package, "consensus.proposal");
+    let host = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
+    write_host_defaults(host.path());
+    write_workspace_for_roots(host.path(), &[&consumer_package, &producer_package]);
+
+    let args = [
+        std::ffi::OsStr::new("--project-root"),
+        path_arg(host.path()),
+        std::ffi::OsStr::new("--package-root"),
+        path_arg(&consumer_package),
+        std::ffi::OsStr::new("--package-root"),
+        path_arg(&producer_package),
+    ];
+    let output = run_conformance(&args, host.path());
+
+    assert_exit(&output, 1);
+    let log = combined_log(&output);
+    assert!(log.contains("FAIL graph-scan"), "{log}");
+    assert!(
+        log.contains("produces sibling queue `consensus.proposal`"),
+        "{log}"
+    );
+    assert!(log.contains("M.spec.published_seam"), "{log}");
 }
 
 #[test]

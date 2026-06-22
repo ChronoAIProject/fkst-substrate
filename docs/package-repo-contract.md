@@ -52,6 +52,7 @@ cache_expire(key)
 truncate_utf8(s, max_bytes)
 graph_json()
 t(key[, vars])
+restricted_lua_load(opts)
 git_log_count(grep, since)
 git_log_grep(grep, since)
 count_worktrees()
@@ -72,6 +73,8 @@ now()
 `exec_sync` and `exec_argv` are two distinct subprocess capabilities, not two ways to run the same thing. `exec_sync(cmd_or_opts)` lowers a command string to `/bin/sh -c` and is the genuine-shell primitive (env expansion, redirection, `&&`, builtins); its rate pool derives from the first shell word. `exec_argv({argv = {program, args...}, cwd?, env?, timeout?, read_coalesce?})` runs the program directly via `argv` with no shell — no Lua-side quoting, no shell injection — and is the egress that `gh`/`git` adapters (`std.github`/`std.git`) must use; its rate pool derives from `argv[1]`'s program basename. `exec_argv` rejects a `cmd` string and a `rate_pool` field. Both share the same mock/cassette/read-coalescing/rate/audit machinery and return `{stdout, stderr, exit_code, timed_out?, error_class?}`.
 
 `t(key[, vars])` implements key-based localization using the current owner root only. It reads `locales/<locale>.lua`, where `<locale>` comes from `FKST_OUTPUT_LANG`, and falls back to `locales/en.lua` when the requested locale or key is missing. `vars` is an optional table of scalar values interpolated into `{name}` placeholders. Catalogs are plain flat Lua tables with stable string keys and literal UTF-8 string values; they are package content, not engine policy.
+
+`restricted_lua_load({ source, bindings?, mode?, name? })` is a host-owned restricted loader for small declarative Lua sources. It evaluates `source` in a fresh Lua state with an empty `_ENV`; callers grant plain data or function capabilities explicitly through `bindings`. `mode` defaults to `"text"` and bytecode is accepted only with `mode = "bytecode"`. The chunk cannot reach ambient `require`, `load`, `loadstring`, `_G`, `debug`, `package`, raw table primitives, metatable access, `io`, `os`, coroutine primitives, `string.dump`, or value-metatable paths such as `("").dump`. Returned data and bridged function arguments / returns must be plain nil / boolean / number / string / table values; executable or VM-owned values fail closed with structured `restricted_lua` errors.
 
 `locales/*.lua` is the sanctioned home for non-English prose literals. Source files outside `locales/` still follow the English-source rule. Machine protocol tokens, marker names, verdict sentinels and AI provenance sentinels are code, not prose; they must not appear in catalog keys or values. Conformance checks catalog completeness against `en`, rejects decode-helper-hidden literals in `locales/`, and rejects machine tokens in catalogs.
 
@@ -163,6 +166,7 @@ source -> fanout -> route -> spawn -> RAISED
 M.spec = {
   consumes = {...},
   produces = {...},
+  published_seam = {...},
   fanout = {...},
   ephemeral = {...},
   stall_window = "30s",
@@ -170,7 +174,7 @@ M.spec = {
 }
 ```
 
-`M.spec.retry` 可省略、设为 `false`，或设为 table；`retry=true` 当前被拒绝。`M.spec.stall_window` 是可靠投递 lease 与续租窗口，不是 framework child 无输出 kill deadline。当前没有 `M.spec` 级别的 per-dept codex timeout knob；codex timeout 是每次 `spawn_codex_sync(opts)` / `spawn_codex(opts)` 的 `opts.timeout`，默认 3600 秒。全局 codex 并发上限来自 `FKST_CODEX_PERMIT_SLOTS` / `codex_permit_slots`，不是 per-dept timeout。
+`M.spec.published_seam` declares consumed queues that this package exposes as public sibling entry points. Graph scan requires each entry to be owned and consumed by the declaring Department, and requires every sibling Department or Raiser `produces` target to be either an own-package queue or one of these published entries. `M.spec.retry` 可省略、设为 `false`，或设为 table；`retry=true` 当前被拒绝。`M.spec.stall_window` 是可靠投递 lease 与续租窗口，不是 framework child 无输出 kill deadline。当前没有 `M.spec` 级别的 per-dept codex timeout knob；codex timeout 是每次 `spawn_codex_sync(opts)` / `spawn_codex(opts)` 的 `opts.timeout`，默认 3600 秒。全局 codex 并发上限来自 `FKST_CODEX_PERMIT_SLOTS` / `codex_permit_slots`，不是 per-dept timeout。
 
 Department 收到的事件形状是：
 
@@ -251,7 +255,7 @@ department-non-empty
 schema-validation
 ```
 
-`graph-scan` 会执行 package root / host root 扫描、`package.lua` removed surface 拒绝、`M.spec` unknown fields 拒绝、`retry` 解析、namespace 解析、queue 归一化和 owner-scoped `package.path`。每个 graph root 用 fresh Lua state，package owner 只看自己的 root；host owner 可看 host + packages；`--package-root` 不是跨包 `require` 授权。
+`graph-scan` 会执行 package root / host root 扫描、`package.lua` removed surface 拒绝、`M.spec` unknown fields 拒绝、`retry` 解析、`published_seam` capability validation、namespace 解析、queue 归一化和 owner-scoped `package.path`。每个 graph root 用 fresh Lua state，package owner 只看自己的 root；host owner 可看 host + packages；`--package-root` 不是跨包 `require` 授权。
 
 `locale-catalogs` validates each graph root's `locales/` directory when present. It requires `en.lua` as the reference if any locale catalog exists, requires every non-`en` catalog to cover all `en` keys, and rejects decode-helper-hidden literals or machine protocol tokens in catalogs.
 
@@ -273,6 +277,7 @@ schema-validation
 | owner-scoped `package.path` 与 package-root require isolation | engine graph scan / run / test-mode runner |
 | `M.spec` unknown fields 拒绝 | engine graph scan |
 | `M.spec.consumes` / `produces` / `fanout` queue 解析 | engine graph scan |
+| `M.spec.published_seam` 必须引用本 package consumed queue；sibling Department / Raiser `produces` 只能指向 own queues 或 sibling published seam | engine graph scan |
 | `M.spec.ephemeral` 必须引用 consumed queue | engine schema validation |
 | `M.spec.retry` 只能 nil / false / table，`retry=true` 拒绝 | engine graph scan |
 | `retry.max_attempts > 0`，`base` / `cap` 是正 `s/m/h` duration 且 `cap >= base` | engine schema validation |
