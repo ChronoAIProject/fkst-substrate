@@ -1,0 +1,9 @@
+
+kind = "package"
+name = "minimal-package"
+
+[code]
+root = "."
+
+[lib_deps]
+libraries = []
