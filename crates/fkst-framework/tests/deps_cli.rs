@@ -386,6 +386,61 @@ version = "0.1.0"
 }
 
 #[test]
+fn deps_validates_explicit_external_package_catalog() {
+    let temp = tempfile::Builder::new()
+        .prefix("deps-external")
+        .tempdir()
+        .unwrap();
+    let host = temp.path().join("host");
+    let external = temp.path().join("platform");
+    let external_package = external.join("packages/platform-pkg");
+    fs::create_dir_all(&host).unwrap();
+    fs::create_dir_all(&external_package).unwrap();
+    workspace(&host, &[]);
+    workspace(
+        &external,
+        &["packages/platform-pkg", "libraries/std", "libraries/extra"],
+    );
+    package(&external, "platform-pkg", &[], &["declared"]);
+    write(
+        &external_package.join("main.lua"),
+        r#"
+local json = require("std.fkst.json")
+return json
+"#,
+    );
+    write(&external_package.join("composed.deps"), "actual\n");
+    library(&external, "std", &[], None);
+    write(
+        &external.join("libraries/std/public/fkst/json.lua"),
+        "return {}\n",
+    );
+    library(&external, "extra", &[], None);
+    write(
+        &external.join("libraries/extra/public/tool.lua"),
+        "return {}\n",
+    );
+
+    let output = deps(&host)
+        .arg("--package-root")
+        .arg(&external_package)
+        .output()
+        .unwrap();
+
+    assert_exit(&output, 1);
+    let out = stdout(&output);
+    assert!(out.contains("fkst deps: FAIL"), "{out}");
+    assert!(out.contains("platform-pkg requires library `std`"), "{out}");
+    assert!(out.contains("[event-deps]"), "{out}");
+    assert!(
+        out.contains(
+            r#"platform-pkg event_deps {"declared"} do not match composed.deps {"actual"}"#
+        ),
+        "{out}"
+    );
+}
+
+#[test]
 fn deps_help_prints_usage() {
     let output = command().arg("deps").arg("--help").output().unwrap();
 

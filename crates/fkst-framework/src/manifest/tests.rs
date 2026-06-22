@@ -363,6 +363,66 @@ fn catalog_rejects_file_and_init_module_collision() {
 }
 
 #[test]
+fn workspace_unit_pattern_must_not_escape_workspace_root() {
+    let temp = tempfile::tempdir().unwrap();
+    let host = temp.path().join("host");
+    let external = temp.path().join("external/pkg");
+    write(
+        &host.join("fkst.workspace.toml"),
+        r#"
+[workspace]
+units = ["../external/pkg"]
+"#,
+    );
+    write(
+        &external.join("fkst.toml"),
+        r#"
+kind = "package"
+name = "external-pkg"
+
+[code]
+root = "."
+"#,
+    );
+
+    let err = UnitCatalog::discover(&host).unwrap_err();
+    let msg = format!("{err:#}");
+
+    assert!(msg.contains("must not contain `..`"), "{msg}");
+}
+
+#[test]
+fn unit_code_root_must_not_escape_workspace_root() {
+    let temp = tempfile::tempdir().unwrap();
+    write(
+        &temp.path().join("fkst.workspace.toml"),
+        r#"
+[workspace]
+units = ["packages/app"]
+"#,
+    );
+    write(
+        &temp.path().join("packages/app/fkst.toml"),
+        r#"
+kind = "package"
+name = "app"
+
+[code]
+root = "../../../outside"
+"#,
+    );
+    fs::create_dir_all(temp.path().parent().unwrap().join("outside")).unwrap();
+
+    let err = UnitCatalog::discover(temp.path()).unwrap_err();
+    let msg = format!("{err:#}");
+
+    assert!(
+        msg.contains("code root") && msg.contains("must stay under workspace root"),
+        "{msg}"
+    );
+}
+
+#[test]
 fn missing_workspace_manifest_returns_no_catalog() {
     let temp = tempfile::tempdir().unwrap();
 

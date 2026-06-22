@@ -189,11 +189,11 @@ fn config_accepts_repeated_package_root_flags_over_package_roots_env() {
 #[test]
 fn config_uses_package_roots_env_and_rejects_plural_singular_conflict() {
     let host = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
-    let package_a = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
-    let package_b = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
+    let package_a = host.path().join("packages/a");
+    let package_b = host.path().join("packages/b");
     let cwd = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
-    write_workspace_for_roots(host.path(), &[package_a.path(), package_b.path()]);
-    let joined = std::env::join_paths([package_a.path(), package_b.path()]).unwrap();
+    write_workspace_for_roots(host.path(), &[&package_a, &package_b]);
+    let joined = std::env::join_paths([&package_a, &package_b]).unwrap();
 
     let output = config_command(cwd.path())
         .arg("--project-root")
@@ -207,7 +207,7 @@ fn config_uses_package_roots_env_and_rejects_plural_singular_conflict() {
         .arg("--project-root")
         .arg(host.path())
         .env("FKST_PACKAGE_ROOTS", joined)
-        .env("FKST_PACKAGE_ROOT", package_a.path())
+        .env("FKST_PACKAGE_ROOT", &package_a)
         .output()
         .unwrap();
     assert_exit(&conflict, 2);
@@ -215,6 +215,29 @@ fn config_uses_package_roots_env_and_rejects_plural_singular_conflict() {
     assert!(err.contains("FKST_PACKAGE_ROOTS"), "{err}");
     assert!(err.contains("FKST_PACKAGE_ROOT"), "{err}");
     assert!(err.contains("mutually exclusive"), "{err}");
+}
+
+#[test]
+fn config_rejects_env_external_package_root() {
+    let host = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
+    let package = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
+    let cwd = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
+    write_workspace_for_roots(host.path(), &[package.path()]);
+
+    let output = config_command(cwd.path())
+        .arg("--project-root")
+        .arg(host.path())
+        .env(
+            "FKST_PACKAGE_ROOTS",
+            std::env::join_paths([package.path()]).unwrap(),
+        )
+        .output()
+        .unwrap();
+
+    assert_exit(&output, 2);
+    let err = stderr(&output);
+    assert!(err.contains("external package root"), "{err}");
+    assert!(err.contains("requires explicit --package-root"), "{err}");
 }
 
 #[test]
@@ -254,28 +277,28 @@ fn config_rejects_duplicate_package_roots_after_canonicalization() {
 #[test]
 fn config_single_package_entrypoints_are_equivalent() {
     let host = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
-    let package = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
+    let package = host.path().join("packages/app");
     let cwd = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
-    write_workspace_for_roots(host.path(), &[package.path()]);
+    write_workspace_for_roots(host.path(), &[&package]);
 
     let flag = config_command(cwd.path())
         .arg("--project-root")
         .arg(host.path())
         .arg("--package-root")
-        .arg(package.path())
+        .arg(&package)
         .output()
         .unwrap();
     let singular = config_command(cwd.path())
         .arg("--project-root")
         .arg(host.path())
-        .env("FKST_PACKAGE_ROOT", package.path())
+        .env("FKST_PACKAGE_ROOT", &package)
         .output()
         .unwrap();
     let package_is_host = config_command(cwd.path())
         .arg("--project-root")
-        .arg(package.path())
+        .arg(&package)
         .arg("--package-root")
-        .arg(package.path())
+        .arg(&package)
         .output()
         .unwrap();
 

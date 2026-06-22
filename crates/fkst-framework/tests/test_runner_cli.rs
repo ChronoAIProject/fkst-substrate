@@ -2432,14 +2432,10 @@ fn run_rejects_package_roots_env_even_with_singular_env() {
 #[test]
 fn run_single_package_entrypoints_are_equivalent() {
     let host = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
-    let package = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
-    fs::create_dir_all(package.path().join("departments/probe")).unwrap();
-    fs::write(
-        package.path().join("core.lua"),
-        r#"return { value = "owner" }"#,
-    )
-    .unwrap();
-    let probe = package.path().join("departments/probe/main.lua");
+    let package = host.path().join("packages/app");
+    fs::create_dir_all(package.join("departments/probe")).unwrap();
+    fs::write(package.join("core.lua"), r#"return { value = "owner" }"#).unwrap();
+    let probe = package.join("departments/probe/main.lua");
     fs::write(
         &probe,
         r#"
@@ -2454,25 +2450,25 @@ return M
     )
     .unwrap();
 
-    write_workspace_for_roots(host.path(), &[package.path()]);
+    write_workspace_for_roots(host.path(), &[&package]);
     let flag = run_command(host.path(), &probe)
         .arg("--package-root")
-        .arg(package.path())
+        .arg(&package)
         .arg("--owner-namespace")
-        .arg(namespace(package.path()))
+        .arg(namespace(&package))
         .output()
         .unwrap();
     let singular = run_command(host.path(), &probe)
         .arg("--owner-namespace")
-        .arg(namespace(package.path()))
-        .env("FKST_PACKAGE_ROOT", package.path())
+        .arg(namespace(&package))
+        .env("FKST_PACKAGE_ROOT", &package)
         .output()
         .unwrap();
-    let package_is_host = run_command(package.path(), &probe)
+    let package_is_host = run_command(&package, &probe)
         .arg("--package-root")
-        .arg(package.path())
+        .arg(&package)
         .arg("--owner-namespace")
-        .arg(namespace(package.path()))
+        .arg(namespace(&package))
         .output()
         .unwrap();
 

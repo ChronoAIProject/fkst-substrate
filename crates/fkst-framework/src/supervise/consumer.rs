@@ -1190,8 +1190,16 @@ mod tests {
         }
         let mut roots = Vec::with_capacity(package_roots.len() + 1);
         roots.push(host);
-        roots.extend(package_roots.iter().copied());
+        roots.extend(
+            package_roots
+                .iter()
+                .copied()
+                .filter(|package_root| package_root.starts_with(host)),
+        );
         write_workspace_manifest(host, &roots);
+        for package_root in package_roots {
+            write_workspace_manifest(package_root, &[*package_root]);
+        }
     }
 
     fn write_package_manifest(root: &Path, name: &str) {

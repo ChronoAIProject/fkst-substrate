@@ -102,6 +102,9 @@ impl PackageRoots {
     ) -> Result<Self> {
         let package_roots_are_explicit = package_roots.explicit;
         let package_roots = package_roots.roots;
+        if !package_roots_are_explicit {
+            reject_env_external_package_roots(&host_root, &package_roots)?;
+        }
         let package_namespaces = package_namespaces(&host_root, &package_roots, run_host_owner)?;
         let host_is_folded = package_roots.iter().any(|root| root == &host_root);
         // Package basenames become queue/dept qualifiers only when more than one
@@ -127,7 +130,7 @@ impl PackageRoots {
             anyhow::anyhow!("manifest catalog is required: missing fkst.workspace.toml")
         })?;
         let external_catalogs = if package_roots_are_explicit {
-            external_package_catalogs(&host_root, &package_roots, &catalog)?
+            external_package_catalogs(&host_root, &package_roots)?
         } else {
             BTreeMap::new()
         };
@@ -327,17 +330,25 @@ fn reject_duplicate_roots(roots: &[PathBuf]) -> Result<()> {
     Ok(())
 }
 
+fn reject_env_external_package_roots(host_root: &Path, package_roots: &[PathBuf]) -> Result<()> {
+    for package_root in package_roots {
+        if package_root != host_root && !is_under(package_root, host_root) {
+            bail!(
+                "external package root {} requires explicit --package-root",
+                package_root.display()
+            );
+        }
+    }
+    Ok(())
+}
+
 fn external_package_catalogs(
     host_root: &Path,
     package_roots: &[PathBuf],
-    host_catalog: &UnitCatalog,
 ) -> Result<BTreeMap<PathBuf, UnitCatalog>> {
     let mut catalogs = BTreeMap::new();
     for package_root in package_roots {
         if package_root == host_root || is_under(package_root, host_root) {
-            continue;
-        }
-        if host_catalog.unit_name_for_root(package_root)?.is_some() {
             continue;
         }
         let catalog = UnitCatalog::discover(package_root)?.ok_or_else(|| {
@@ -725,5 +736,48 @@ root = "."
         assert!(resolver.resolve("pkg", "bad.name.extra").is_err());
         assert!(resolver.resolve("pkg", "bad name").is_err());
         assert!(resolver.resolve("pkg", ".q").is_err());
+    }
+
+    #[test]
+    fn host_workspace_unit_pattern_must_not_escape_project_root() {
+        let root = tempfile::Builder::new()
+            .prefix("host-claim-external")
+            .tempdir()
+            .unwrap();
+        let host = root.path().join("host");
+        let external = root.path().join("external/pkg");
+        std::fs::create_dir_all(&external).unwrap();
+        write(
+            &host.join("fkst.workspace.toml"),
+            r#"
+[workspace]
+units = [".", "../external/pkg"]
+"#,
+        );
+        write(
+            &host.join("fkst.toml"),
+            r#"
+kind = "package"
+name = "host"
+
+[code]
+root = "."
+"#,
+        );
+        write(
+            &external.join("fkst.toml"),
+            r#"
+kind = "package"
+name = "external-pkg"
+
+[code]
+root = "."
+"#,
+        );
+
+        let err = PackageRoots::resolve(&host, vec![external.clone()]).unwrap_err();
+        let msg = format!("{err:#}");
+
+        assert!(msg.contains("must not contain `..`"), "{msg}");
     }
 }

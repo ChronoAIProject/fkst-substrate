@@ -322,6 +322,7 @@ impl UnitCatalog {
         let mut library_units = BTreeMap::new();
 
         for unit_root in unit_roots {
+            ensure_catalog_path_under_workspace(&workspace_root, &unit_root, "unit root")?;
             let manifest_path = unit_root.join(UNIT_MANIFEST);
             let manifest = UnitManifest::parse_file(&manifest_path)?;
             validate_manifest_name(&manifest.name)
@@ -330,6 +331,7 @@ impl UnitCatalog {
                 bail!("duplicate unit name `{}`", manifest.name);
             }
             let code_root = canonical_unit_code_root(&unit_root, &manifest)?;
+            ensure_catalog_path_under_workspace(&workspace_root, &code_root, "code root")?;
             let unit = CatalogUnit::new(unit_root, code_root, manifest)?;
             if unit.is_library() {
                 let library_name = unit.library_name().to_string();
@@ -881,6 +883,21 @@ fn canonical_unit_code_root(unit_root: &Path, manifest: &UnitManifest) -> Result
     Ok(canonical)
 }
 
+fn ensure_catalog_path_under_workspace(
+    workspace_root: &Path,
+    path: &Path,
+    label: &str,
+) -> Result<()> {
+    if path != workspace_root && !path.starts_with(workspace_root) {
+        bail!(
+            "{label} {} must stay under workspace root {}",
+            path.display(),
+            workspace_root.display()
+        );
+    }
+    Ok(())
+}
+
 fn validate_library_visibility(
     consumer_unit: &str,
     declared_library: &str,
@@ -909,6 +926,9 @@ fn collect_glob(workspace_root: &Path, pattern: &str, roots: &mut BTreeSet<PathB
         bail!("workspace unit pattern `{pattern}` must be a relative path");
     }
     let segments = pattern.split('/').collect::<Vec<_>>();
+    if segments.iter().any(|segment| *segment == "..") {
+        bail!("workspace unit pattern `{pattern}` must not contain `..`");
+    }
     collect_glob_inner(workspace_root, &segments, roots)
 }
 
