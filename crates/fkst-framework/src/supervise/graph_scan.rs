@@ -132,7 +132,6 @@ pub fn load_roots(roots: &PackageRoots) -> Result<Config> {
     }
 
     let defaults = HostGraphDefaults::load(roots)?;
-    let catalog = Arc::new(roots.unit_catalog().clone());
     let resolver = roots.name_resolver();
     let subscribe_resolver = resolver.clone().add_recorded_only_queue(FAILURE_FACT_QUEUE);
     let mut departments: BTreeMap<String, DepartmentDecl> = BTreeMap::new();
@@ -144,7 +143,7 @@ pub fn load_roots(roots: &PackageRoots) -> Result<Config> {
         let lua = Lua::new();
         register_spec_eval_pure_primitives(&lua, &graph_root.root)
             .context("register graph-scan pure primitives")?;
-        let owner_unit = match catalog.unit_name_for_root(&graph_root.root)? {
+        let owner_unit = match roots.unit_name_for_owner_root(&graph_root.root)? {
             Some(unit) => unit,
             None => {
                 // A graph root with no owning manifest unit is valid ONLY as a pure
@@ -165,6 +164,7 @@ pub fn load_roots(roots: &PackageRoots) -> Result<Config> {
                 ));
             }
         };
+        let catalog = Arc::new(roots.catalog_for_owner_root(&graph_root.root)?.clone());
         scan_departments(
             &lua,
             graph_root,

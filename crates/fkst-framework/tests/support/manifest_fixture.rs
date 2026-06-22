@@ -57,7 +57,12 @@ pub fn write_workspace_for_roots(host_root: &Path, package_roots: &[&Path]) {
     }
     let mut roots = Vec::with_capacity(package_roots.len() + 1);
     roots.push(host_root);
-    roots.extend(package_roots.iter().copied());
+    roots.extend(
+        package_roots
+            .iter()
+            .copied()
+            .filter(|package_root| package_root.starts_with(host_root)),
+    );
     write_workspace(host_root, &roots);
     for package_root in package_roots {
         write_workspace(package_root, &[*package_root]);

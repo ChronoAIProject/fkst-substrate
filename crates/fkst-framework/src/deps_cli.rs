@@ -93,10 +93,8 @@ impl Diagnostic {
 
 pub(crate) fn run(options: DepsOptions) -> Result<i32> {
     let project_root = canonical_dir(&options.project_root, "--project-root")?;
-    for package_root in &options.package_roots {
-        let _ = canonical_dir(package_root, "--package-root")?;
-    }
-    let report = validate(&project_root)?;
+    let package_roots = canonical_dirs(options.package_roots, "--package-root")?;
+    let report = validate(&project_root, &package_roots)?;
     if options.json {
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
@@ -105,44 +103,25 @@ pub(crate) fn run(options: DepsOptions) -> Result<i32> {
     Ok(if report.ok { 0 } else { 1 })
 }
 
-fn validate(project_root: &Path) -> Result<DepsReport> {
-    let validation_catalog =
-        UnitCatalog::discover_for_validation(project_root)?.ok_or_else(|| {
-            anyhow::anyhow!("manifest catalog is required: missing fkst.workspace.toml")
-        })?;
+fn validate(project_root: &Path, package_roots: &[PathBuf]) -> Result<DepsReport> {
+    let validation_catalogs = validation_catalogs(project_root, package_roots)?;
     let mut failures = Vec::new();
     let mut warnings = Vec::new();
-    let library_names = library_names(&validation_catalog);
-    let mut actual_requires: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    let mut units = Vec::new();
+    let mut lib_edges = Vec::new();
+    let mut event_edges = Vec::new();
 
-    validate_declared_libs(
-        &validation_catalog,
-        &library_names,
-        &mut failures,
-        &mut warnings,
-    );
-    validate_cycles(&validation_catalog, &library_names, &mut failures);
-
-    for unit in validation_catalog.units() {
-        let required =
-            scan_actual_library_requires(unit, &validation_catalog, &library_names, &mut failures)?;
-        validate_actual_requires(
-            unit,
-            &required,
-            &library_names,
-            &mut failures,
-            &mut warnings,
-        );
-        actual_requires.insert(unit.name().to_string(), required);
-        validate_composed_deps(unit, &mut failures)?;
+    for validation_catalog in &validation_catalogs {
+        let (mut catalog_units, mut catalog_lib_edges, mut catalog_event_edges) =
+            validate_catalog(validation_catalog, &mut failures, &mut warnings)?;
+        units.append(&mut catalog_units);
+        lib_edges.append(&mut catalog_lib_edges);
+        event_edges.append(&mut catalog_event_edges);
     }
 
-    let units = unit_reports(&validation_catalog, &actual_requires);
-    let lib_edges = lib_edges(&validation_catalog);
-    let event_edges = event_edges(&validation_catalog);
     let report = DepsReport {
         ok: failures.is_empty(),
-        workspace_root: validation_catalog.workspace_root().display().to_string(),
+        workspace_root: project_root.display().to_string(),
         units,
         lib_edges,
         event_edges,
@@ -150,6 +129,64 @@ fn validate(project_root: &Path) -> Result<DepsReport> {
         warnings,
     };
     Ok(report)
+}
+
+fn validation_catalogs(project_root: &Path, package_roots: &[PathBuf]) -> Result<Vec<UnitCatalog>> {
+    let host_catalog = UnitCatalog::discover_for_validation(project_root)?.ok_or_else(|| {
+        anyhow::anyhow!("manifest catalog is required: missing fkst.workspace.toml")
+    })?;
+    let mut catalogs = Vec::new();
+    let mut seen_workspace_roots = BTreeSet::new();
+    seen_workspace_roots.insert(host_catalog.workspace_root().to_path_buf());
+    for package_root in package_roots {
+        if package_root == project_root || is_under(package_root, project_root) {
+            if host_catalog.unit_name_for_root(package_root)?.is_none() {
+                anyhow::bail!("no manifest unit owns {}", package_root.display());
+            }
+            continue;
+        }
+
+        let catalog = UnitCatalog::discover_for_validation(package_root)?.ok_or_else(|| {
+            anyhow::anyhow!(
+                "manifest catalog is required for external package root {}",
+                package_root.display()
+            )
+        })?;
+        if catalog.unit_name_for_root(package_root)?.is_none() {
+            anyhow::bail!("no manifest unit owns {}", package_root.display());
+        }
+        if seen_workspace_roots.insert(catalog.workspace_root().to_path_buf()) {
+            catalogs.push(catalog);
+        }
+    }
+
+    catalogs.insert(0, host_catalog);
+    Ok(catalogs)
+}
+
+fn validate_catalog(
+    validation_catalog: &UnitCatalog,
+    failures: &mut Vec<Diagnostic>,
+    warnings: &mut Vec<Diagnostic>,
+) -> Result<(Vec<UnitReport>, Vec<EdgeReport>, Vec<EdgeReport>)> {
+    let library_names = library_names(&validation_catalog);
+    let mut actual_requires: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+
+    validate_declared_libs(&validation_catalog, &library_names, failures, warnings);
+    validate_cycles(&validation_catalog, &library_names, failures);
+
+    for unit in validation_catalog.units() {
+        let required =
+            scan_actual_library_requires(unit, &validation_catalog, &library_names, failures)?;
+        validate_actual_requires(unit, &required, &library_names, failures, warnings);
+        actual_requires.insert(unit.name().to_string(), required);
+        validate_composed_deps(unit, failures)?;
+    }
+
+    let units = unit_reports(&validation_catalog, &actual_requires);
+    let lib_edges = lib_edges(&validation_catalog);
+    let event_edges = event_edges(&validation_catalog);
+    Ok((units, lib_edges, event_edges))
 }
 
 fn validate_declared_libs(
@@ -677,4 +714,21 @@ fn canonical_dir(path: &Path, label: &str) -> Result<PathBuf> {
         anyhow::bail!("{label} is not a directory: {}", canonical.display());
     }
     Ok(canonical)
+}
+
+fn canonical_dirs(roots: Vec<PathBuf>, label: &str) -> Result<Vec<PathBuf>> {
+    let mut canonical_roots = Vec::with_capacity(roots.len());
+    let mut seen = BTreeSet::new();
+    for root in roots {
+        let canonical = canonical_dir(&root, label)?;
+        if !seen.insert(canonical.clone()) {
+            anyhow::bail!("duplicate package root: {}", canonical.display());
+        }
+        canonical_roots.push(canonical);
+    }
+    Ok(canonical_roots)
+}
+
+fn is_under(path: &Path, root: &Path) -> bool {
+    path != root && path.starts_with(root)
 }

@@ -42,7 +42,7 @@ fn strip_clean_suffix(path: &Path, suffix: &Path) -> Option<PathBuf> {
 }
 
 fn git_stdout<const N: usize>(host_root: &Path, args: [&str; N]) -> Option<String> {
-    Command::new("git")
+    Command::new(git_program())
         .arg("-C")
         .arg(host_root)
         .args(args)
@@ -51,6 +51,29 @@ fn git_stdout<const N: usize>(host_root: &Path, args: [&str; N]) -> Option<Strin
         .filter(|output| output.status.success())
         .and_then(|output| String::from_utf8(output.stdout).ok())
         .map(|stdout| stdout.trim().to_string())
+}
+
+#[cfg(not(test))]
+fn git_program() -> PathBuf {
+    PathBuf::from("git")
+}
+
+#[cfg(test)]
+fn git_program() -> PathBuf {
+    static GIT_BIN: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    GIT_BIN
+        .get_or_init(|| {
+            [
+                "/usr/bin/git",
+                "/opt/homebrew/bin/git",
+                "/usr/local/bin/git",
+            ]
+            .into_iter()
+            .map(PathBuf::from)
+            .find(|path| path.is_file())
+            .expect("test host must provide git at a standard absolute path")
+        })
+        .clone()
 }
 
 #[cfg(test)]
@@ -90,7 +113,7 @@ mod tests {
 
     #[test]
     fn relative_runtime_root_anchors_to_git_submodule_toplevel() {
-        let root = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
+        let root = tempfile::tempdir().unwrap();
         let repo = root.path().join("repo");
         let submodule_source = root.path().join("submodule-source");
         let submodule = repo.join("vendor/submodule");
@@ -114,7 +137,7 @@ mod tests {
         fs::create_dir_all(&package).unwrap();
 
         assert_eq!(
-            stable_host_root(&package),
+            fs::canonicalize(stable_host_root(&package)).unwrap(),
             fs::canonicalize(&submodule).unwrap()
         );
         assert!(submodule.join(".git").is_file());
@@ -141,7 +164,7 @@ mod tests {
     }
 
     fn git<const N: usize>(repo: &Path, args: [&str; N]) {
-        let output = Command::new("git")
+        let output = Command::new(git_program())
             .arg("-C")
             .arg(repo)
             .args(args)

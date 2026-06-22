@@ -389,7 +389,7 @@ exit 0
 }
 
 #[test]
-fn supervise_env_package_root_reaches_child_framework() {
+fn supervise_explicit_package_root_reaches_child_framework() {
     let _lock = supervise_smoke_lock();
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();
@@ -449,9 +449,10 @@ return M
         .arg("supervise")
         .arg("--project-root")
         .arg(&host)
+        .arg("--package-root")
+        .arg(&package)
         .arg("--framework-bin")
         .arg(env!("CARGO_BIN_EXE_fkst-framework"))
-        .env("FKST_PACKAGE_ROOT", &package)
         .env("FKST_RUNTIME_ROOT", &runtime_root)
         .env("FKST_DURABLE_ROOT", host.join(".fkst/durable"))
         .spawn()

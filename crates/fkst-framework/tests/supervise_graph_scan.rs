@@ -30,7 +30,8 @@ use std::fs;
 use std::path::PathBuf;
 use std::sync::{Mutex, MutexGuard, OnceLock};
 use support::manifest_fixture::{
-    write_single_package_workspace, write_workspace, write_workspace_for_roots,
+    write_library_manifest, write_package_manifest, write_single_package_workspace,
+    write_workspace, write_workspace_for_roots,
 };
 use tempfile::TempDir;
 
@@ -211,6 +212,166 @@ fn write_package_helper(root: &std::path::Path) {
         r#"return { stall_window = function() return "45s" end }"#,
     )
     .unwrap();
+}
+
+#[test]
+fn external_explicit_package_root_uses_its_own_manifest_catalog() {
+    let root = tempfile::Builder::new()
+        .prefix("external-manifest")
+        .tempdir()
+        .unwrap();
+    let host = root.path().join("host");
+    let external_workspace = root.path().join("platform");
+    let external_package = external_workspace.join("packages/platform-pkg");
+    let external_std = external_workspace.join("std");
+    fs::create_dir_all(&host).unwrap();
+    fs::create_dir_all(&external_package).unwrap();
+    fs::create_dir_all(&external_std).unwrap();
+    write_workspace(&host, &[]);
+    write_workspace(&external_workspace, &[&external_package, &external_std]);
+    write_package_manifest(&external_package, "platform-pkg", &["std"]);
+    write_library_manifest(&external_std, "std", &[]);
+    write_host_defaults(&host, "100\n", "30m\n", "20\n");
+
+    fs::create_dir_all(external_std.join("public")).unwrap();
+    fs::write(
+        external_std.join("public/tool.lua"),
+        r#"return { stall_window = function() return "45s" end }"#,
+    )
+    .unwrap();
+    fs::create_dir_all(external_package.join("departments/worker")).unwrap();
+    fs::write(
+        external_package.join("departments/worker/main.lua"),
+        r#"
+local tool = require("std.tool")
+local M = {}
+M.spec = { consumes = {"tick"}, stall_window = tool.stall_window() }
+function pipeline(_) end
+return M
+"#,
+    )
+    .unwrap();
+    fs::create_dir_all(external_package.join("raisers")).unwrap();
+    fs::write(
+        external_package.join("raisers/input.lua"),
+        r#"return { type = "cron", interval = "10s", produces = "tick" }"#,
+    )
+    .unwrap();
+
+    let _env_lock = env_lock();
+    let _runtime = EnvGuard::set(RUNTIME_ROOT_ENV, root.path().join("runtime"));
+    let roots = PackageRoots::resolve(&host, vec![external_package.clone()]).unwrap();
+    let cfg = graph_scan::load_roots(&roots).unwrap();
+
+    assert!(cfg.department.contains_key("platform-pkg.worker"));
+    assert!(cfg.raiser.contains_key("platform-pkg.input"));
+    assert!(cfg.queue.contains_key("platform-pkg.tick"));
+}
+
+#[test]
+fn host_manifest_claim_does_not_make_external_package_use_host_catalog() {
+    let root = tempfile::Builder::new()
+        .prefix("external-host-claim")
+        .tempdir()
+        .unwrap();
+    let host = root.path().join("host");
+    let external_workspace = root.path().join("platform");
+    let external_package = external_workspace.join("packages/platform-pkg");
+    let host_std = host.join("libraries/std");
+    let external_std = external_workspace.join("libraries/std");
+    fs::create_dir_all(&host_std).unwrap();
+    fs::create_dir_all(&external_package).unwrap();
+    fs::create_dir_all(&external_std).unwrap();
+    fs::write(
+        host.join("fkst.workspace.toml"),
+        r#"
+[workspace]
+units = [".", "libraries/std", "../platform/packages/platform-pkg"]
+"#,
+    )
+    .unwrap();
+    write_package_manifest(&host, "host", &[]);
+    write_library_manifest(&host_std, "std", &[]);
+    write_workspace(&external_workspace, &[&external_package, &external_std]);
+    write_package_manifest(&external_package, "platform-pkg", &["std"]);
+    write_library_manifest(&external_std, "std", &[]);
+    write_host_defaults(&host, "100\n", "30m\n", "20\n");
+
+    fs::create_dir_all(host_std.join("public")).unwrap();
+    fs::write(
+        host_std.join("public/marker.lua"),
+        r#"return { marker = "host" }"#,
+    )
+    .unwrap();
+    fs::create_dir_all(external_std.join("public")).unwrap();
+    fs::write(
+        external_std.join("public/marker.lua"),
+        r#"return { marker = "external" }"#,
+    )
+    .unwrap();
+    fs::create_dir_all(external_package.join("departments/worker")).unwrap();
+    fs::write(
+        external_package.join("departments/worker/main.lua"),
+        r#"
+local marker = require("std.marker")
+if marker.marker ~= "external" then
+  error("wrong catalog marker: " .. tostring(marker.marker))
+end
+local M = {}
+M.spec = { consumes = {"tick"}, stall_window = "30s" }
+function pipeline(_) end
+return M
+"#,
+    )
+    .unwrap();
+
+    let _env_lock = env_lock();
+    let _runtime = EnvGuard::set(RUNTIME_ROOT_ENV, root.path().join("runtime"));
+    let err = PackageRoots::resolve(&host, vec![external_package.clone()]).unwrap_err();
+    assert!(
+        format!("{err:#}").contains("must not contain `..`"),
+        "{err:#}"
+    );
+
+    write_workspace(&host, &[&host, &host_std]);
+    let roots = PackageRoots::resolve(&host, vec![external_package.clone()]).unwrap();
+    let cfg = graph_scan::load_roots(&roots).unwrap();
+
+    assert!(cfg.department.contains_key("platform-pkg.worker"));
+}
+
+#[test]
+fn internal_explicit_package_root_still_requires_host_manifest_ownership() {
+    let root = tempfile::Builder::new()
+        .prefix("internal-manifest")
+        .tempdir()
+        .unwrap();
+    let host = root.path().join("host");
+    let internal_package = host.join("packages/internal-pkg");
+    fs::create_dir_all(&internal_package).unwrap();
+    write_workspace(&host, &[]);
+    write_package_manifest(&internal_package, "internal-pkg", &[]);
+    write_host_defaults(&host, "100\n", "30m\n", "20\n");
+    fs::create_dir_all(internal_package.join("departments/worker")).unwrap();
+    fs::write(
+        internal_package.join("departments/worker/main.lua"),
+        r#"
+local M = {}
+M.spec = { consumes = {"tick"}, stall_window = "30s" }
+function pipeline(_) end
+return M
+"#,
+    )
+    .unwrap();
+
+    let _env_lock = env_lock();
+    let _runtime = EnvGuard::set(RUNTIME_ROOT_ENV, root.path().join("runtime"));
+    let roots = PackageRoots::resolve(&host, vec![internal_package.clone()]).unwrap();
+    let err = graph_scan::load_roots(&roots).unwrap_err();
+
+    let msg = err.to_string();
+    assert!(msg.contains("no manifest unit owns"), "{err:#}");
+    assert!(msg.contains("internal-pkg"), "{err:#}");
 }
 
 #[test]
@@ -1174,41 +1335,41 @@ fn host_container_root_without_own_unit_starts() {
     // <repo>`. graph_scan must skip a host container that owns no unit and has no
     // own departments/raisers, while still scanning the package units.
     let _root = EnvGuard::set("FKST_RUNTIME_ROOT", ".fkst/runtime");
-    let package_a = write_repo(
-        &[("alpha", &dept(r#""tick_a""#, r#""done_a""#))],
-        &[(
-            "tick_a",
-            r#"return { type = "cron", interval = "10s", produces = "tick_a" }"#,
-        )],
-    );
-    let package_b = write_repo(
-        &[],
-        &[(
-            "tick_b",
-            r#"return { type = "cron", interval = "20s", produces = "tick_b" }"#,
-        )],
-    );
     // Host is a pure container: a workspace catalog listing the package units, but
     // NO host fkst.toml (so the host root owns no unit) and no host departments.
     let host = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
-    write_host_defaults(host.path(), "100\n", "30m\n", "20\n");
-    write_workspace(host.path(), &[package_a.path(), package_b.path()]);
-    let roots = PackageRoots::resolve(
-        host.path(),
-        vec![
-            package_a.path().to_path_buf(),
-            package_b.path().to_path_buf(),
-        ],
+    let package_a = host.path().join("packages/a");
+    let package_b = host.path().join("packages/b");
+    fs::create_dir_all(package_a.join("departments/alpha")).unwrap();
+    fs::write(
+        package_a.join("departments/alpha/main.lua"),
+        dept(r#""tick_a""#, r#""done_a""#),
     )
     .unwrap();
+    fs::create_dir_all(package_a.join("raisers")).unwrap();
+    fs::write(
+        package_a.join("raisers/tick_a.lua"),
+        r#"return { type = "cron", interval = "10s", produces = "tick_a" }"#,
+    )
+    .unwrap();
+    fs::create_dir_all(package_b.join("raisers")).unwrap();
+    fs::write(
+        package_b.join("raisers/tick_b.lua"),
+        r#"return { type = "cron", interval = "20s", produces = "tick_b" }"#,
+    )
+    .unwrap();
+    write_package_manifest(&package_a, "a", &[]);
+    write_package_manifest(&package_b, "b", &[]);
+    write_host_defaults(host.path(), "100\n", "30m\n", "20\n");
+    write_workspace(host.path(), &[&package_a, &package_b]);
+    let roots =
+        PackageRoots::resolve(host.path(), vec![package_a.clone(), package_b.clone()]).unwrap();
 
     let cfg = graph_scan::load_roots(&roots).unwrap();
 
-    assert!(cfg
-        .department
-        .contains_key(&q(package_a.path(), "alpha")));
-    assert!(cfg.raiser.contains_key(&q(package_a.path(), "tick_a")));
-    assert!(cfg.raiser.contains_key(&q(package_b.path(), "tick_b")));
+    assert!(cfg.department.contains_key("a.alpha"));
+    assert!(cfg.raiser.contains_key("a.tick_a"));
+    assert!(cfg.raiser.contains_key("b.tick_b"));
     validate(&cfg, host.path()).unwrap();
 }
 
@@ -1445,33 +1606,33 @@ fn same_raiser_name_across_package_roots_is_namespaced() {
 #[test]
 fn package_root_env_is_used_when_flag_is_absent() {
     let _root = EnvGuard::set("FKST_RUNTIME_ROOT", ".fkst/runtime");
-    let package = write_repo(
-        &[],
-        &[(
-            "standard_tick",
-            r#"return { type = "cron", interval = "10s", produces = "standard_tick" }"#,
-        )],
-    );
-    let host = write_repo(
-        &[(
-            "host_worker",
-            &dept(&format!(r#""{}""#, q(package.path(), "standard_tick")), ""),
-        )],
-        &[],
-    );
-    write_workspace_for_roots(host.path(), &[package.path()]);
-    let _env = EnvGuard::set(PACKAGE_ROOT_ENV, package.path());
+    let host = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
+    let package = host.path().join("packages/pkg");
+    write_package_manifest(host.path(), "host", &[]);
+    fs::create_dir_all(package.join("raisers")).unwrap();
+    fs::write(
+        package.join("raisers/standard_tick.lua"),
+        r#"return { type = "cron", interval = "10s", produces = "standard_tick" }"#,
+    )
+    .unwrap();
+    fs::create_dir_all(host.path().join("departments/host_worker")).unwrap();
+    fs::write(
+        host.path().join("departments/host_worker/main.lua"),
+        dept(r#""pkg.standard_tick""#, ""),
+    )
+    .unwrap();
+    write_package_manifest(&package, "pkg", &[]);
+    write_host_defaults(host.path(), "100\n", "30m\n", "20\n");
+    write_workspace_for_roots(host.path(), &[&package]);
+    let _env = EnvGuard::set(PACKAGE_ROOT_ENV, &package);
 
     let _plural_env = EnvGuard::unset(PACKAGE_ROOTS_ENV);
     let roots = PackageRoots::resolve(host.path(), Vec::new()).unwrap();
-    assert_eq!(
-        roots.package_roots()[0],
-        package.path().canonicalize().unwrap()
-    );
+    assert_eq!(roots.package_roots()[0], package.canonicalize().unwrap());
     assert_eq!(roots.host_root(), host.path().canonicalize().unwrap());
     let cfg = graph_scan::load_roots(&roots).unwrap();
 
-    assert!(cfg.raiser.contains_key(&q(package.path(), "standard_tick")));
+    assert!(cfg.raiser.contains_key("pkg.standard_tick"));
     assert!(cfg.department.contains_key("host.host_worker"));
 }
 

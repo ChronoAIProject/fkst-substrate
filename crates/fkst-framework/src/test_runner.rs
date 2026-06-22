@@ -82,7 +82,7 @@ pub(crate) fn run_tests(
             &lua,
             &file.path,
             &file.owner_root,
-            cache.catalog(),
+            cache.catalog_for_root(&file.owner_root)?,
             &owner_unit,
         ) {
             Ok(tests) => {
@@ -621,7 +621,7 @@ fn run_department(
         &event_json,
         chunk_cache,
         owner_root,
-        cache.catalog(),
+        cache.catalog_for_root(owner_root)?,
         &owner_unit,
     ) {
         Ok(()) => 0,
@@ -650,7 +650,6 @@ fn run_department(
 #[derive(Clone)]
 struct TestRunCache {
     roots: PackageRoots,
-    catalog: Arc<UnitCatalog>,
     inner: Arc<Mutex<TestRunCacheInner>>,
     lua_chunks: crate::mlua_init::LuaChunkCache,
 }
@@ -674,21 +673,25 @@ struct TestRunCacheStats {
 
 impl TestRunCache {
     fn new(roots: PackageRoots) -> Result<Self> {
-        let catalog = roots.unit_catalog().clone();
         Ok(Self {
             roots,
-            catalog: Arc::new(catalog),
             inner: Arc::new(Mutex::new(TestRunCacheInner::default())),
             lua_chunks: crate::mlua_init::LuaChunkCache::default(),
         })
     }
 
-    fn catalog(&self) -> Arc<UnitCatalog> {
-        self.catalog.clone()
+    fn catalog_for_root(&self, owner_root: &Path) -> mlua::Result<Arc<UnitCatalog>> {
+        Ok(Arc::new(
+            self.roots
+                .catalog_for_owner_root(owner_root)
+                .map_err(mlua::Error::external)?
+                .clone(),
+        ))
     }
 
     fn owner_unit_for_root(&self, owner_root: &Path) -> mlua::Result<String> {
         let owner_root = owner_root.canonicalize().map_err(mlua::Error::external)?;
+        #[cfg_attr(not(test), allow(unused_mut))]
         let mut inner = self
             .inner
             .lock()
@@ -700,13 +703,20 @@ impl TestRunCache {
         {
             inner.stats.owner_unit_misses += 1;
         }
+        drop(inner);
         let unit = self
-            .catalog
+            .roots
+            .catalog_for_owner_root(&owner_root)
+            .map_err(mlua::Error::external)?
             .unit_name_for_root(&owner_root)
             .map_err(mlua::Error::external)?
             .ok_or_else(|| {
                 mlua::Error::external(format!("no manifest unit owns {}", owner_root.display()))
             })?;
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|_| mlua::Error::runtime("test run cache lock poisoned"))?;
         inner.owner_units.insert(owner_root, unit.clone());
         Ok(unit)
     }
@@ -733,7 +743,7 @@ impl TestRunCache {
             owner_namespace,
             owner_root,
             &lua_path,
-            self.catalog(),
+            self.catalog_for_root(owner_root)?,
             &owner_unit,
             self.lua_chunk_cache(),
         )?;
@@ -768,7 +778,7 @@ impl TestRunCache {
         let consumes = declared_qualified_consumes(
             owner_root,
             &lua_path,
-            self.catalog(),
+            self.catalog_for_root(owner_root)?,
             &owner_unit,
             self.lua_chunk_cache(),
         )?;
