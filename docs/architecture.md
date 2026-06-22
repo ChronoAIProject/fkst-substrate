@@ -291,6 +291,7 @@ engine 维护 durable 在途 delivery state，但它不是实体业务真相、a
 | `cache_get(key)` | `sdk_cache.rs`，best-effort scratch KV 读取，缺失 / 过期 / malformed / unreadable 返回 nil |
 | `cache_expire(key)` | `sdk_cache.rs`，best-effort scratch KV 显式删除，缺失视为成功 |
 | `graph_json()` | `sdk_graph.rs`，只读 composed graph JSON snapshot |
+| `restricted_lua_load(opts)` | `sdk_restricted_lua.rs`, fresh Lua state restricted source loader |
 | `git_log_count(grep, since)` | `sdk_git.rs`，调用 `git log --grep --since --oneline` |
 | `git_log_grep(grep, since)` | `sdk_git.rs`，调用 `git log --format=%H` |
 | `count_worktrees()` | `sdk_git.rs`，解析 `git worktree list --porcelain` |
@@ -301,6 +302,8 @@ engine 维护 durable 在途 delivery state，但它不是实体业务真相、a
 | `now()` | `sdk_basic.rs`，Unix seconds |
 
 `json` surface 只包含 `json.decode`，不包含 `json.encode` 或 `json.array`。`json.decode` 产生的 JSON array table 会带有 `LuaSerdeExt` 可识别的数组标记，因此 `json.decode("[]")` 经 `raise` 仍是 `[]`；裸 `{}` 经 `raise` 是 `{}`。非空 sequence 序列化为 JSON array，非空 map 序列化为 JSON object。
+
+`restricted_lua_load({ source, bindings?, mode?, name? })` evaluates small declarative Lua sources in a fresh restricted Lua state. The restricted chunk receives an empty `_ENV` plus caller-supplied `bindings`, defaults to text-only loading, and accepts bytecode only with explicit `mode = "bytecode"`. Ambient VM capabilities such as `require`, `load`, `_G`, `debug`, `package`, raw table primitives, metatable access, `io`, `os`, coroutine APIs, `string.dump`, and `("").dump` are unreachable. Results are copied back only as plain nil / boolean / number / string / table data; compile/runtime failures and non-plain returns fail closed with structured `restricted_lua` errors.
 
 `graph_json()` 是显式授权的只读 topology introspection。只有当前 Department 的 `M.spec.graph_json = true` 时可调用；未声明授权时调用失败。它按当前 fixed package roots input set 与 host root 重新扫描并验证 composed graph，返回 `fkst.graph.v1` JSON string。schema 包含 `nodes` 与 `edges`：raiser nodes 带 `source`，queue nodes 带 `fanout`，department nodes 带 `consumes`、`produces`、`ephemeral`、`stall_window` 与 materialized `retry` metadata；edges 表示 raiser→queue、queue→department 和 department→queue。node `id` 与 edge endpoint 使用 `kind:canonical_name` 形态，避免同名 raiser / queue / department 在图渲染时碰撞。输出排序稳定，不包含 `lua` path、`owner_root`、queue capacity 或 runtime state。
 
