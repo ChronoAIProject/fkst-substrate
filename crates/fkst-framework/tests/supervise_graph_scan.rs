@@ -29,7 +29,9 @@ use path_resolver::PackageRoots;
 use std::fs;
 use std::path::PathBuf;
 use std::sync::{Mutex, MutexGuard, OnceLock};
-use support::manifest_fixture::{write_single_package_workspace, write_workspace_for_roots};
+use support::manifest_fixture::{
+    write_single_package_workspace, write_workspace, write_workspace_for_roots,
+};
 use tempfile::TempDir;
 
 const RUNTIME_ROOT_ENV: &str = "FKST_RUNTIME_ROOT";
@@ -1157,6 +1159,56 @@ return M
     let cfg = graph_scan::load_roots(&roots).unwrap();
 
     assert_eq!(cfg.department["host.host_worker"].stall_window, "45s");
+    validate(&cfg, host.path()).unwrap();
+}
+
+#[test]
+fn host_container_root_without_own_unit_starts() {
+    // Regression: a workspace ROOT used as `--project-root` that owns no manifest
+    // unit (a nested-package repo where `packages/*` are the units and the repo
+    // root is a pure container with no departments/raisers of its own) must NOT
+    // fail graph scan. The production dogfood launches `supervise --project-root
+    // <repo> --package-root <repo>/packages/*`, so this is the real startup path.
+    // The conformance harness had masked it by passing a package root as
+    // --project-root; only a live supervise surfaced `no manifest unit owns
+    // <repo>`. graph_scan must skip a host container that owns no unit and has no
+    // own departments/raisers, while still scanning the package units.
+    let _root = EnvGuard::set("FKST_RUNTIME_ROOT", ".fkst/runtime");
+    let package_a = write_repo(
+        &[("alpha", &dept(r#""tick_a""#, r#""done_a""#))],
+        &[(
+            "tick_a",
+            r#"return { type = "cron", interval = "10s", produces = "tick_a" }"#,
+        )],
+    );
+    let package_b = write_repo(
+        &[],
+        &[(
+            "tick_b",
+            r#"return { type = "cron", interval = "20s", produces = "tick_b" }"#,
+        )],
+    );
+    // Host is a pure container: a workspace catalog listing the package units, but
+    // NO host fkst.toml (so the host root owns no unit) and no host departments.
+    let host = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
+    write_host_defaults(host.path(), "100\n", "30m\n", "20\n");
+    write_workspace(host.path(), &[package_a.path(), package_b.path()]);
+    let roots = PackageRoots::resolve(
+        host.path(),
+        vec![
+            package_a.path().to_path_buf(),
+            package_b.path().to_path_buf(),
+        ],
+    )
+    .unwrap();
+
+    let cfg = graph_scan::load_roots(&roots).unwrap();
+
+    assert!(cfg
+        .department
+        .contains_key(&q(package_a.path(), "alpha")));
+    assert!(cfg.raiser.contains_key(&q(package_a.path(), "tick_a")));
+    assert!(cfg.raiser.contains_key(&q(package_b.path(), "tick_b")));
     validate(&cfg, host.path()).unwrap();
 }
 

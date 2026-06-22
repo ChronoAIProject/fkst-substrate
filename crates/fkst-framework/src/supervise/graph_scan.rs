@@ -144,9 +144,27 @@ pub fn load_roots(roots: &PackageRoots) -> Result<Config> {
         let lua = Lua::new();
         register_spec_eval_pure_primitives(&lua, &graph_root.root)
             .context("register graph-scan pure primitives")?;
-        let owner_unit = catalog
-            .unit_name_for_root(&graph_root.root)?
-            .ok_or_else(|| anyhow!("no manifest unit owns {}", graph_root.root.display()))?;
+        let owner_unit = match catalog.unit_name_for_root(&graph_root.root)? {
+            Some(unit) => unit,
+            None => {
+                // A graph root with no owning manifest unit is valid ONLY as a pure
+                // host container: the workspace root of a nested-package repo
+                // (`--project-root <repo>` with `--package-root <repo>/packages/*`),
+                // which carries no departments/raisers of its own. Such a root
+                // contributes nothing to the graph, so skip it. Any other root
+                // (a package root, or a host that actually declares departments or
+                // raisers) must be an owned unit — keep failing closed.
+                let has_own_graph = graph_root.root.join("departments").is_dir()
+                    || graph_root.root.join("raisers").is_dir();
+                if matches!(graph_root.kind, GraphRootKind::Host) && !has_own_graph {
+                    continue;
+                }
+                return Err(anyhow!(
+                    "no manifest unit owns {}",
+                    graph_root.root.display()
+                ));
+            }
+        };
         scan_departments(
             &lua,
             graph_root,
