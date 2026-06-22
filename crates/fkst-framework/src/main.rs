@@ -509,7 +509,7 @@ fn run_pipeline(
         .ok_or_else(|| anyhow::anyhow!("unknown owner namespace `{owner_namespace}`"))?;
     provenance::install_run(owner_root, &owner_namespace);
     provenance::emit_code_provenance_line();
-    let catalog = roots.unit_catalog().clone();
+    let catalog = roots.catalog_for_owner_root(owner_root)?.clone();
     let owner_unit = catalog
         .unit_name_for_root(owner_root)?
         .ok_or_else(|| anyhow::anyhow!("no manifest unit owns {}", owner_root.display()))?;

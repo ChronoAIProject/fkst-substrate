@@ -30,7 +30,8 @@ use std::fs;
 use std::path::PathBuf;
 use std::sync::{Mutex, MutexGuard, OnceLock};
 use support::manifest_fixture::{
-    write_single_package_workspace, write_workspace, write_workspace_for_roots,
+    write_library_manifest, write_package_manifest, write_single_package_workspace,
+    write_workspace, write_workspace_for_roots,
 };
 use tempfile::TempDir;
 
@@ -211,6 +212,94 @@ fn write_package_helper(root: &std::path::Path) {
         r#"return { stall_window = function() return "45s" end }"#,
     )
     .unwrap();
+}
+
+#[test]
+fn external_explicit_package_root_uses_its_own_manifest_catalog() {
+    let root = tempfile::Builder::new()
+        .prefix("external-manifest")
+        .tempdir()
+        .unwrap();
+    let host = root.path().join("host");
+    let external_workspace = root.path().join("platform");
+    let external_package = external_workspace.join("packages/platform-pkg");
+    let external_std = external_workspace.join("std");
+    fs::create_dir_all(&host).unwrap();
+    fs::create_dir_all(&external_package).unwrap();
+    fs::create_dir_all(&external_std).unwrap();
+    write_workspace(&host, &[]);
+    write_workspace(&external_workspace, &[&external_package, &external_std]);
+    write_package_manifest(&external_package, "platform-pkg", &["std"]);
+    write_library_manifest(&external_std, "std", &[]);
+    write_host_defaults(&host, "100\n", "30m\n", "20\n");
+
+    fs::create_dir_all(external_std.join("public")).unwrap();
+    fs::write(
+        external_std.join("public/tool.lua"),
+        r#"return { stall_window = function() return "45s" end }"#,
+    )
+    .unwrap();
+    fs::create_dir_all(external_package.join("departments/worker")).unwrap();
+    fs::write(
+        external_package.join("departments/worker/main.lua"),
+        r#"
+local tool = require("std.tool")
+local M = {}
+M.spec = { consumes = {"tick"}, stall_window = tool.stall_window() }
+function pipeline(_) end
+return M
+"#,
+    )
+    .unwrap();
+    fs::create_dir_all(external_package.join("raisers")).unwrap();
+    fs::write(
+        external_package.join("raisers/input.lua"),
+        r#"return { type = "cron", interval = "10s", produces = "tick" }"#,
+    )
+    .unwrap();
+
+    let _env_lock = env_lock();
+    let _runtime = EnvGuard::set(RUNTIME_ROOT_ENV, root.path().join("runtime"));
+    let roots = PackageRoots::resolve(&host, vec![external_package.clone()]).unwrap();
+    let cfg = graph_scan::load_roots(&roots).unwrap();
+
+    assert!(cfg.department.contains_key("platform-pkg.worker"));
+    assert!(cfg.raiser.contains_key("platform-pkg.input"));
+    assert!(cfg.queue.contains_key("platform-pkg.tick"));
+}
+
+#[test]
+fn internal_explicit_package_root_still_requires_host_manifest_ownership() {
+    let root = tempfile::Builder::new()
+        .prefix("internal-manifest")
+        .tempdir()
+        .unwrap();
+    let host = root.path().join("host");
+    let internal_package = host.join("packages/internal-pkg");
+    fs::create_dir_all(&internal_package).unwrap();
+    write_workspace(&host, &[]);
+    write_package_manifest(&internal_package, "internal-pkg", &[]);
+    write_host_defaults(&host, "100\n", "30m\n", "20\n");
+    fs::create_dir_all(internal_package.join("departments/worker")).unwrap();
+    fs::write(
+        internal_package.join("departments/worker/main.lua"),
+        r#"
+local M = {}
+M.spec = { consumes = {"tick"}, stall_window = "30s" }
+function pipeline(_) end
+return M
+"#,
+    )
+    .unwrap();
+
+    let _env_lock = env_lock();
+    let _runtime = EnvGuard::set(RUNTIME_ROOT_ENV, root.path().join("runtime"));
+    let roots = PackageRoots::resolve(&host, vec![internal_package.clone()]).unwrap();
+    let err = graph_scan::load_roots(&roots).unwrap_err();
+
+    let msg = err.to_string();
+    assert!(msg.contains("no manifest unit owns"), "{err:#}");
+    assert!(msg.contains("internal-pkg"), "{err:#}");
 }
 
 #[test]
@@ -1204,9 +1293,7 @@ fn host_container_root_without_own_unit_starts() {
 
     let cfg = graph_scan::load_roots(&roots).unwrap();
 
-    assert!(cfg
-        .department
-        .contains_key(&q(package_a.path(), "alpha")));
+    assert!(cfg.department.contains_key(&q(package_a.path(), "alpha")));
     assert!(cfg.raiser.contains_key(&q(package_a.path(), "tick_a")));
     assert!(cfg.raiser.contains_key(&q(package_b.path(), "tick_b")));
     validate(&cfg, host.path()).unwrap();

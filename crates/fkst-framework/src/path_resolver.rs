@@ -2,6 +2,7 @@
 
 use crate::manifest::UnitCatalog;
 use anyhow::{bail, Context, Result};
+use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
@@ -22,6 +23,7 @@ pub(crate) struct PackageRoots {
     package_namespaces: Vec<String>,
     run_host_owner: bool,
     catalog: UnitCatalog,
+    external_catalogs: BTreeMap<PathBuf, UnitCatalog>,
 }
 
 impl PackageRoots {
@@ -32,9 +34,15 @@ impl PackageRoots {
         reject_removed_package_root_envs()?;
         let host_root = canonical_dir(host_root.as_ref(), "--project-root")?;
         let package_roots = if explicit_package_roots.is_empty() {
-            roots_from_env()?
+            PackageRootInput {
+                roots: roots_from_env()?,
+                explicit: false,
+            }
         } else {
-            canonical_dirs(explicit_package_roots, "--package-root")?
+            PackageRootInput {
+                roots: canonical_dirs(explicit_package_roots, "--package-root")?,
+                explicit: true,
+            }
         };
         Self::from_canonical(host_root, package_roots, false)
     }
@@ -50,17 +58,21 @@ impl PackageRoots {
         let host_root = canonical_dir(host_root.as_ref(), "--project-root")?;
         let package_roots = if explicit_package_roots.is_empty() {
             match std::env::var_os(PACKAGE_ROOT_ENV) {
-                Some(root) if !root.is_empty() => {
-                    vec![canonical_dir(Path::new(&root), PACKAGE_ROOT_ENV)?]
-                }
+                Some(root) if !root.is_empty() => PackageRootInput {
+                    roots: vec![canonical_dir(Path::new(&root), PACKAGE_ROOT_ENV)?],
+                    explicit: false,
+                },
                 Some(_) => bail!("{PACKAGE_ROOT_ENV} must not be empty"),
                 None => bail!("{PACKAGE_ROOT_ENV} or --package-root is required"),
             }
         } else {
-            canonical_dirs(explicit_package_roots, "--package-root")?
+            PackageRootInput {
+                roots: canonical_dirs(explicit_package_roots, "--package-root")?,
+                explicit: true,
+            }
         };
-        let run_host_owner =
-            package_roots.len() > 1 && package_roots.iter().any(|root| root == &host_root);
+        let run_host_owner = package_roots.roots.len() > 1
+            && package_roots.roots.iter().any(|root| root == &host_root);
         Self::from_canonical(host_root, package_roots, run_host_owner)
     }
 
@@ -85,9 +97,11 @@ impl PackageRoots {
 
     fn from_canonical(
         host_root: PathBuf,
-        package_roots: Vec<PathBuf>,
+        package_roots: PackageRootInput,
         run_host_owner: bool,
     ) -> Result<Self> {
+        let package_roots_are_explicit = package_roots.explicit;
+        let package_roots = package_roots.roots;
         let package_namespaces = package_namespaces(&host_root, &package_roots, run_host_owner)?;
         let host_is_folded = package_roots.iter().any(|root| root == &host_root);
         // Package basenames become queue/dept qualifiers only when more than one
@@ -112,17 +126,38 @@ impl PackageRoots {
         let catalog = UnitCatalog::discover(&host_root)?.ok_or_else(|| {
             anyhow::anyhow!("manifest catalog is required: missing fkst.workspace.toml")
         })?;
+        let external_catalogs = if package_roots_are_explicit {
+            external_package_catalogs(&host_root, &package_roots, &catalog)?
+        } else {
+            BTreeMap::new()
+        };
         Ok(Self {
             package_roots,
             host_root,
             package_namespaces,
             run_host_owner,
             catalog,
+            external_catalogs,
         })
     }
 
     pub(crate) fn unit_catalog(&self) -> &UnitCatalog {
         &self.catalog
+    }
+
+    pub(crate) fn catalog_for_owner_root(&self, owner_root: &Path) -> Result<&UnitCatalog> {
+        let canonical = owner_root
+            .canonicalize()
+            .with_context(|| format!("canonicalize {}", owner_root.display()))?;
+        if let Some(catalog) = self.external_catalogs.get(&canonical) {
+            return Ok(catalog);
+        }
+        Ok(&self.catalog)
+    }
+
+    pub(crate) fn unit_name_for_owner_root(&self, owner_root: &Path) -> Result<Option<String>> {
+        self.catalog_for_owner_root(owner_root)?
+            .unit_name_for_root(owner_root)
     }
 
     pub(crate) fn graph_roots(&self) -> Vec<GraphRoot> {
@@ -189,6 +224,11 @@ impl PackageRoots {
                 }
             })
     }
+}
+
+struct PackageRootInput {
+    roots: Vec<PathBuf>,
+    explicit: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -285,6 +325,37 @@ fn reject_duplicate_roots(roots: &[PathBuf]) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn external_package_catalogs(
+    host_root: &Path,
+    package_roots: &[PathBuf],
+    host_catalog: &UnitCatalog,
+) -> Result<BTreeMap<PathBuf, UnitCatalog>> {
+    let mut catalogs = BTreeMap::new();
+    for package_root in package_roots {
+        if package_root == host_root || is_under(package_root, host_root) {
+            continue;
+        }
+        if host_catalog.unit_name_for_root(package_root)?.is_some() {
+            continue;
+        }
+        let catalog = UnitCatalog::discover(package_root)?.ok_or_else(|| {
+            anyhow::anyhow!(
+                "manifest catalog is required for external package root {}",
+                package_root.display()
+            )
+        })?;
+        if catalog.unit_name_for_root(package_root)?.is_none() {
+            bail!("no manifest unit owns {}", package_root.display());
+        }
+        catalogs.insert(package_root.clone(), catalog);
+    }
+    Ok(catalogs)
+}
+
+fn is_under(path: &Path, root: &Path) -> bool {
+    path != root && path.starts_with(root)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -476,6 +547,7 @@ root = "."
                 .collect(),
             run_host_owner: false,
             catalog,
+            external_catalogs: BTreeMap::new(),
         }
     }
 

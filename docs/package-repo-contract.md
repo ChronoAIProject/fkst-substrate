@@ -6,7 +6,7 @@
 
 ## 1. 什么是 fkst package-repo
 
-一个 fkst package-repo 提供一个或多个 package root。package root 是引擎扫描与运行 Lua graph 的输入目录；它不是 Rust crate，不需要 manifest，也没有 package dependency resolver。标准布局如下：
+一个 fkst package-repo 提供一个或多个 package root。package root 是引擎扫描与运行 Lua graph 的输入目录；它不是 Rust crate。当前 library-dependency contract 要求每个 package root 是 `fkst.workspace.toml` 发现的 manifest unit；显式传入且位于 `--project-root` 外部的 platform package root 使用自身向上发现的 workspace catalog，而不是由 host workspace 拥有。标准布局如下：
 
 ```text
 <PACKAGE_ROOT>/
@@ -268,6 +268,7 @@ schema-validation
 | Contract rule | Enforcement |
 |---|---|
 | package root 来自可重复 `--package-root`、`FKST_PACKAGE_ROOTS` 或 `FKST_PACKAGE_ROOT` | engine `PackageRoots::resolve` / `resolve_run` |
+| package root 必须由 manifest catalog 拥有；显式外部 `--package-root` 使用自身 workspace catalog，内部 root 使用 host workspace catalog | engine path resolver / graph scan / run / test runner |
 | `FKST_PACKAGE_ROOTS` 与 `FKST_PACKAGE_ROOT` 无显式 `--package-root` 时互斥 | engine path resolver |
 | `run` 不接受 `FKST_PACKAGE_ROOTS` env | engine `resolve_run` |
 | package basename / Department / Raiser / queue segment name 字符集 | engine graph scan / path resolver |
@@ -306,7 +307,14 @@ schema-validation
 
 ## 10. 站起一个新 package-repo
 
-新 package-repo 应把 package root 通过 `--package-root <path>` 显式传给 engine；需要组合多个 package 时重复传 `--package-root`，不要发明 manifest、dependency resolver 或跨包 `require`。
+新 package-repo 应把 package root 通过 `--package-root <path>` 显式传给 engine；需要组合多个 package 时重复传 `--package-root`。每个 package root 需要有 `fkst.toml` 并被某个 `fkst.workspace.toml` catalog 发现；host repo 如果没有自有 Lua unit，可以使用最小 `fkst.workspace.toml`：
+
+```toml
+[workspace]
+units = []
+```
+
+不要发明额外 dependency resolver 或跨包 `require`。
 
 版本固定方式是 git source-ref pin：tag 或 SHA。当前契约不是 semver-published SDK，也不是多 binary distribution matrix。package-repo 的 wrapper 可以 pin fkst-substrate 的 tag/SHA，构建或引用对应 `fkst-framework`，再运行：
 
