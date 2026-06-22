@@ -4,6 +4,7 @@ use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
+use std::os::unix::ffi::OsStringExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -558,16 +559,36 @@ fn available_library_names(checkout_root: &Path) -> Result<BTreeSet<String>> {
     Ok(names)
 }
 
+// A tree-hash entry is either a regular file (hashed by content) or a symlink
+// (hashed by its target path, git-style). Symlinks are recorded — not rejected
+// nor dereferenced — so a real source repo with benign symlinks (e.g. a root
+// `AGENTS.md` -> `CLAUDE.md`) can be locked, while a retargeted symlink still
+// changes the hash. The module index is no-follow, so symlinks stay inert at
+// load time; recording the target here is integrity, not a dereference.
+enum HashEntry {
+    File(PathBuf),
+    Symlink(Vec<u8>),
+}
+
 pub(crate) fn tree_sha256(root: &Path) -> Result<String> {
     let mut files = Vec::new();
     collect_hash_files(root, root, &mut files)?;
     let mut data = Vec::new();
-    for (relative, path) in files {
+    for (relative, entry) in files {
         data.extend_from_slice(relative.as_bytes());
         data.push(0);
-        data.extend_from_slice(
-            &fs::read(&path).with_context(|| format!("read {}", path.display()))?,
-        );
+        match entry {
+            HashEntry::File(path) => {
+                data.push(b'f');
+                data.extend_from_slice(
+                    &fs::read(&path).with_context(|| format!("read {}", path.display()))?,
+                );
+            }
+            HashEntry::Symlink(target) => {
+                data.push(b'l');
+                data.extend_from_slice(&target);
+            }
+        }
         data.push(0);
     }
     Ok(sha256_hex(&data))
@@ -590,7 +611,7 @@ fn prefixed_exports_sha256(unit_root: &Path) -> Result<String> {
     Ok(format!("sha256-{}", exports_sha256(unit_root)?))
 }
 
-fn collect_hash_files(root: &Path, dir: &Path, files: &mut Vec<(String, PathBuf)>) -> Result<()> {
+fn collect_hash_files(root: &Path, dir: &Path, files: &mut Vec<(String, HashEntry)>) -> Result<()> {
     let mut entries = fs::read_dir(dir)
         .with_context(|| format!("read {}", dir.display()))?
         .collect::<std::result::Result<Vec<_>, _>>()
@@ -604,19 +625,26 @@ fn collect_hash_files(root: &Path, dir: &Path, files: &mut Vec<(String, PathBuf)
         }
         let metadata =
             fs::symlink_metadata(&path).with_context(|| format!("stat {}", path.display()))?;
-        if metadata.file_type().is_symlink() {
-            bail!("external source hash rejects symlink {}", path.display());
-        }
-        if metadata.is_dir() {
+        let file_type = metadata.file_type();
+        if file_type.is_dir() {
             collect_hash_files(root, &path, files)?;
-        } else if metadata.is_file() {
-            let relative = path
-                .strip_prefix(root)
-                .with_context(|| format!("strip {} from {}", root.display(), path.display()))?
-                .to_string_lossy()
-                .replace('\\', "/");
-            files.push((relative, path));
+            continue;
         }
+        let relative = path
+            .strip_prefix(root)
+            .with_context(|| format!("strip {} from {}", root.display(), path.display()))?
+            .to_string_lossy()
+            .replace('\\', "/");
+        if file_type.is_symlink() {
+            // Record the link target (NOT the dereferenced content): integrity
+            // without following the link out of the cache.
+            let target =
+                fs::read_link(&path).with_context(|| format!("readlink {}", path.display()))?;
+            files.push((relative, HashEntry::Symlink(target.into_os_string().into_vec())));
+        } else if file_type.is_file() {
+            files.push((relative, HashEntry::File(path)));
+        }
+        // Other node types (fifo/socket/device) are ignored, as before.
     }
     Ok(())
 }

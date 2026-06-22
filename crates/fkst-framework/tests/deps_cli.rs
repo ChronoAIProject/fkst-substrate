@@ -494,6 +494,43 @@ fn cross_repo_stale_lock_missing_allowlisted_library_fails_closed() {
 }
 
 #[test]
+fn cross_repo_source_with_benign_symlink_locks_and_resolves() {
+    // A real source repo can contain benign symlinks (e.g. a root AGENTS.md ->
+    // CLAUDE.md). The tree hash must record a symlink by its target — neither
+    // reject it nor dereference it — so the source locks and resolves. The
+    // module index stays no-follow, so the symlink is inert at load time.
+    // Regression for the dogfood-caught reject-symlink bug.
+    let temp = tempfile::tempdir().unwrap();
+    let cache = temp.path().join("cache");
+    let source = temp.path().join("source");
+    let consumer = temp.path().join("consumer");
+    let _ = init_external_library_repo(&source, None);
+    write(&source.join("CLAUDE.md"), "doc body\n");
+    std::os::unix::fs::symlink("CLAUDE.md", source.join("AGENTS.md")).unwrap();
+    git(&source, &["add", "."]);
+    git(&source, &["commit", "-m", "Add a benign root symlink"]);
+    let rev = git(&source, &["rev-parse", "HEAD"]);
+    consumer_workspace_with_external_source(&consumer, &source, &rev, &["contract"], &["contract"]);
+
+    let lock_output = deps(&consumer)
+        .arg("lock")
+        .env("FKST_CACHE_ROOT", &cache)
+        .output()
+        .unwrap();
+    assert_exit(&lock_output, 0);
+
+    let locked_output = deps(&consumer)
+        .arg("--locked")
+        .env("FKST_CACHE_ROOT", &cache)
+        .output()
+        .unwrap();
+    assert_exit(&locked_output, 0);
+    let out = stdout(&locked_output);
+    assert!(out.contains("fkst deps: PASS"), "{out}");
+    assert!(out.contains("app -> contract"), "{out}");
+}
+
+#[test]
 fn cross_repo_moved_tag_does_not_change_locked_build() {
     let temp = tempfile::tempdir().unwrap();
     let cache = temp.path().join("cache");
