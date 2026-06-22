@@ -1,0 +1,8 @@
+[workspace]
+# fkst-substrate is the engine repo; when dogfooded as a github-devloop project-root it loads
+# the platform trio + any host packages via --package-root (explicit external roots are cataloged
+# from their own source manifest), so this repo declares no in-repo Lua units of its own.
+units = []
+
+[registries]
+workspace = "workspace"
