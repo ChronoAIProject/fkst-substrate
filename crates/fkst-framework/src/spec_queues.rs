@@ -2,16 +2,25 @@ use crate::path_resolver::PackageRoots;
 use mlua::{Table, Value};
 use std::collections::BTreeSet;
 use std::path::Path;
+use std::sync::Arc;
 
 pub(crate) fn declared_resolved_produces(
     roots: &PackageRoots,
     owner_namespace: &str,
     owner_root: &Path,
     lua_path: &Path,
-    package_path: &str,
+    catalog: Arc<crate::manifest::UnitCatalog>,
+    owner_unit: &str,
     chunk_cache: &crate::mlua_init::LuaChunkCache,
 ) -> mlua::Result<BTreeSet<String>> {
-    let raw = declared_spec_queues(owner_root, lua_path, package_path, chunk_cache, "produces")?;
+    let raw = declared_spec_queues(
+        owner_root,
+        lua_path,
+        catalog,
+        owner_unit,
+        chunk_cache,
+        "produces",
+    )?;
     let resolver = roots.name_resolver().with_recorded_only_queues(
         raw.iter()
             .filter(|queue| queue.contains('.'))
@@ -30,11 +39,19 @@ pub(crate) fn declared_resolved_produces(
 pub(crate) fn declared_qualified_spec_queues(
     owner_root: &Path,
     lua_path: &Path,
-    package_path: &str,
+    catalog: Arc<crate::manifest::UnitCatalog>,
+    owner_unit: &str,
     chunk_cache: &crate::mlua_init::LuaChunkCache,
     field: &str,
 ) -> mlua::Result<BTreeSet<String>> {
-    let raw = declared_spec_queues(owner_root, lua_path, package_path, chunk_cache, field)?;
+    let raw = declared_spec_queues(
+        owner_root,
+        lua_path,
+        catalog,
+        owner_unit,
+        chunk_cache,
+        field,
+    )?;
     Ok(raw
         .into_iter()
         .filter(|queue| queue.contains('.'))
@@ -44,7 +61,8 @@ pub(crate) fn declared_qualified_spec_queues(
 fn declared_spec_queues(
     owner_root: &Path,
     lua_path: &Path,
-    package_path: &str,
+    catalog: Arc<crate::manifest::UnitCatalog>,
+    owner_unit: &str,
     chunk_cache: &crate::mlua_init::LuaChunkCache,
     field: &str,
 ) -> mlua::Result<BTreeSet<String>> {
@@ -53,8 +71,8 @@ fn declared_spec_queues(
     }
 
     let lua = crate::mlua_init::new_lua();
-    crate::mlua_init::set_package_path_string(&lua, package_path)?;
-    let value = match chunk_cache.eval_cached_chunk(&lua, lua_path) {
+    let env = crate::lua_require::unit_environment(&lua, catalog, owner_unit)?;
+    let value = match chunk_cache.eval_cached_chunk_with_env(&lua, lua_path, owner_root, env) {
         Ok(value) => value,
         Err(_) => return Ok(BTreeSet::new()),
     };

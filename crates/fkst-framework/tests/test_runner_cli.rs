@@ -3,6 +3,10 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
+mod support;
+
+use support::manifest_fixture::{write_single_package_workspace, write_workspace_for_roots};
+
 fn framework_bin() -> &'static str {
     env!("CARGO_BIN_EXE_fkst-framework")
 }
@@ -41,6 +45,11 @@ fn copy_codex_package(host: &Path) {
 }
 
 fn run_lua_tests(host: &Path, package: &Path) -> Output {
+    if host == package {
+        write_single_package_workspace(host);
+    } else {
+        write_workspace_for_roots(host, &[package]);
+    }
     framework_command()
         .arg("test")
         .arg("--project-root")
@@ -54,6 +63,7 @@ fn run_lua_tests(host: &Path, package: &Path) -> Output {
 }
 
 fn run_lua_tests_with_packages(host: &Path, packages: &[&Path]) -> Output {
+    write_workspace_for_roots(host, packages);
     let mut cmd = framework_command();
     cmd.arg("test").arg("--project-root").arg(host);
     for package in packages {
@@ -66,6 +76,11 @@ fn run_lua_tests_with_packages(host: &Path, packages: &[&Path]) -> Output {
 }
 
 fn run_lua_tests_with_report(host: &Path, package: &Path, report: &Path) -> Output {
+    if host == package {
+        write_single_package_workspace(host);
+    } else {
+        write_workspace_for_roots(host, &[package]);
+    }
     framework_command()
         .arg("test")
         .arg("--project-root")
@@ -85,6 +100,7 @@ fn run_lua_tests_with_packages_and_report(
     packages: &[&Path],
     report: &Path,
 ) -> Output {
+    write_workspace_for_roots(host, packages);
     let mut cmd = framework_command();
     cmd.arg("test").arg("--project-root").arg(host);
     for package in packages {
@@ -99,6 +115,11 @@ fn run_lua_tests_with_packages_and_report(
 }
 
 fn run_lua_tests_with_coverage(host: &Path, package: &Path, coverage: &Path) -> Output {
+    if host == package {
+        write_single_package_workspace(host);
+    } else {
+        write_workspace_for_roots(host, &[package]);
+    }
     framework_command()
         .arg("test")
         .arg("--project-root")
@@ -179,6 +200,7 @@ return M
     )
     .unwrap();
 
+    write_workspace_for_roots(&host, &[&owner, &sibling]);
     let output = run_command(&host, &probe)
         .arg("--package-root")
         .arg(&owner)
@@ -220,6 +242,7 @@ return M
     )
     .unwrap();
 
+    write_single_package_workspace(&package);
     let output = run_command(&package, &probe)
         .arg("--package-root")
         .arg(&package)
@@ -270,6 +293,7 @@ return M
     )
     .unwrap();
 
+    write_workspace_for_roots(&host, &[&owner]);
     let output = run_command(&host, &probe)
         .arg("--package-root")
         .arg(&owner)
@@ -311,7 +335,8 @@ M.spec = { produces = { "checked" } }
 function pipeline(event)
   local ok, err = pcall(require, "sibling_only")
   assert(not ok, "sibling module leaked into owner package.path")
-  assert(string.find(err, "module 'sibling_only' not found", 1, true), err)
+  err = tostring(err)
+  assert(string.find(err, "require.denied", 1, true), err)
   raise("checked", { isolated = true })
 end
 return M
@@ -319,6 +344,7 @@ return M
     )
     .unwrap();
 
+    write_workspace_for_roots(&host, &[&owner, &sibling]);
     let output = run_command(&host, &probe)
         .arg("--package-root")
         .arg(&owner)
@@ -422,6 +448,7 @@ return M
     )
     .unwrap();
 
+    write_workspace_for_roots(&host, &[&alpha, &beta]);
     let output = run_command(&host, &dashboard)
         .arg("--package-root")
         .arg(&alpha)
@@ -562,6 +589,7 @@ return M
     )
     .unwrap();
 
+    write_single_package_workspace(&host);
     let output = run_command(&host, &host.join("departments/dashboard/main.lua"))
         .arg("--package-root")
         .arg(&host)
@@ -795,14 +823,15 @@ return {{
 }
 
 #[test]
-fn test_runner_host_department_uses_package_standard_asset() {
+fn test_runner_host_department_uses_host_asset_with_package_graph_root() {
     let host = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
     let package = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
 
-    fs::create_dir_all(package.path().join("fkst")).unwrap();
+    fs::create_dir_all(package.path()).unwrap();
+    fs::create_dir_all(host.path().join("fkst")).unwrap();
     fs::write(
-        package.path().join("fkst/standard_asset.lua"),
-        r#"return { value = function() return "from-package" end }"#,
+        host.path().join("fkst/standard_asset.lua"),
+        r#"return { value = function() return "from-host" end }"#,
     )
     .unwrap();
     fs::create_dir_all(host.path().join("departments/probe")).unwrap();
@@ -825,11 +854,11 @@ return M
         r#"
 local t = fkst.test
 return {
-  test_run_department_uses_package_standard_asset = function()
+  test_run_department_uses_host_standard_asset = function()
     local result = fkst.test.run_department("departments/probe/main.lua", { payload = {} })
     t.eq(result.exit_code, 0)
     t.eq(result.raises[1].queue, "host.seen")
-    t.eq(result.raises[1].payload.value, "from-package")
+    t.eq(result.raises[1].payload.value, "from-host")
   end,
 }
 "#,
@@ -847,7 +876,7 @@ return {
     let out = stdout(&output);
     assert!(
         out.contains(
-            "PASS tests/host_department_test.lua::test_run_department_uses_package_standard_asset"
+            "PASS tests/host_department_test.lua::test_run_department_uses_host_standard_asset"
         ),
         "stdout: {out}"
     );
@@ -2166,6 +2195,7 @@ end
     )
     .unwrap();
 
+    write_single_package_workspace(host.path());
     let output = framework_command()
         .arg("run")
         .arg(&probe)
@@ -2211,6 +2241,7 @@ return M
     )
     .unwrap();
 
+    write_workspace_for_roots(host.path(), &[package.path()]);
     let output = framework_command()
         .arg("run")
         .arg(&probe)
@@ -2235,7 +2266,8 @@ return M
         stderr(&output)
     );
     let err = stderr(&output);
-    assert!(err.contains("module 'core' not found"), "{err}");
+    assert!(err.contains("require.denied"), "{err}");
+    assert!(err.contains("not declared/visible"), "{err}");
 }
 
 #[test]
@@ -2257,6 +2289,7 @@ return M
     )
     .unwrap();
 
+    write_single_package_workspace(host.path());
     let auth = framework_command()
         .arg("run")
         .arg(&probe)
@@ -2313,11 +2346,16 @@ return M
 }
 
 #[test]
-fn run_accepts_host_owner_with_multiple_package_root_flags_as_require_roots() {
+fn run_accepts_host_owner_with_multiple_package_root_flags_as_graph_roots() {
     let host = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
     let package_a = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
     let package_b = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
     fs::create_dir_all(host.path().join("departments/probe")).unwrap();
+    fs::write(
+        host.path().join("core.lua"),
+        r#"return { value = "from-host" }"#,
+    )
+    .unwrap();
     fs::write(
         package_b.path().join("core.lua"),
         r#"return { value = "from-package-b" }"#,
@@ -2338,6 +2376,7 @@ return M
     )
     .unwrap();
 
+    write_workspace_for_roots(host.path(), &[package_a.path(), package_b.path()]);
     let output = run_command(host.path(), &probe)
         .arg("--package-root")
         .arg(host.path())
@@ -2357,6 +2396,8 @@ return M
         stdout(&output),
         stderr(&output)
     );
+    let raises = raised_entries(&output);
+    assert_eq!(raises[0]["payload"]["value"], "from-host");
 }
 
 #[test]
@@ -2413,6 +2454,7 @@ return M
     )
     .unwrap();
 
+    write_workspace_for_roots(host.path(), &[package.path()]);
     let flag = run_command(host.path(), &probe)
         .arg("--package-root")
         .arg(package.path())

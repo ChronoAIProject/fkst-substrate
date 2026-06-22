@@ -10,6 +10,11 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
 
+#[path = "../../fkst-framework/tests/support/manifest_fixture.rs"]
+mod manifest_fixture;
+
+use manifest_fixture::write_single_package_workspace;
+
 const RUNTIME_ROOT_ENV: &str = "FKST_RUNTIME_ROOT";
 const PACKAGE_ROOT_ENV: &str = "FKST_PACKAGE_ROOT";
 const DURABLE_ROOT_ENV: &str = "FKST_DURABLE_ROOT";
@@ -44,6 +49,7 @@ local M = {}
 M.spec = {
     consumes = { "release_probe" },
     produces = { "release_probe_done" },
+    ephemeral = { "release_probe" },
     stall_window = "5s",
 }
 
@@ -71,6 +77,7 @@ local M = {{}}
 
 M.spec = {{
     consumes = {{ "release_probe_done" }},
+    ephemeral = {{ "release_probe_done" }},
     stall_window = "5s",
 }}
 
@@ -434,6 +441,7 @@ fn supervisor_framework_completes_release_probe_raised_cycle() {
     write_release_probe(&root);
     write_release_sink(&root, &witness);
     write_release_raiser(&root);
+    write_single_package_workspace(&root);
 
     let probe_file = probe_dir.join("probe.md");
     fs::write(&probe_file, "# release probe\n").unwrap();

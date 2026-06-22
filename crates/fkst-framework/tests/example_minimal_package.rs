@@ -4,6 +4,12 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
+mod support;
+
+use support::manifest_fixture::{
+    write_package_manifest, write_single_package_workspace, write_workspace,
+};
+
 fn framework_bin() -> &'static str {
     env!("CARGO_BIN_EXE_fkst-framework")
 }
@@ -34,6 +40,7 @@ fn copy_dir(src: &Path, dst: &Path) {
 fn copy_minimal_package(host: &Path) {
     let package = repo_root().join("examples/minimal-package");
     copy_dir(&package, host);
+    write_single_package_workspace(host);
 }
 
 fn write_runtime_touch_package(package: &Path) {
@@ -122,6 +129,8 @@ fn relative_runtime_root_anchors_to_git_root_not_package_project_root() {
     fs::create_dir_all(&package).unwrap();
     git(&repo, ["init"]);
     write_runtime_touch_package(&package);
+    write_package_manifest(&package, "pkg", &[]);
+    write_workspace(&repo, &[&package]);
 
     let output = Command::new(framework_bin())
         .arg("run")

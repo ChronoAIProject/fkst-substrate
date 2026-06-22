@@ -4,6 +4,10 @@
 mod config_registry;
 #[path = "../src/supervise/graph_scan.rs"]
 mod graph_scan;
+#[path = "../src/lua_require.rs"]
+mod lua_require;
+#[path = "../src/manifest.rs"]
+mod manifest;
 #[path = "../src/path_resolver.rs"]
 mod path_resolver;
 #[path = "../src/provenance.rs"]
@@ -16,6 +20,7 @@ mod sdk_i18n;
 mod sdk_log;
 #[path = "../src/sdk_strings.rs"]
 mod sdk_strings;
+mod support;
 
 use fkst_common::config::RaiserDecl;
 use fkst_common::validation::validate;
@@ -24,6 +29,9 @@ use path_resolver::PackageRoots;
 use std::fs;
 use std::path::PathBuf;
 use std::sync::{Mutex, MutexGuard, OnceLock};
+use support::manifest_fixture::{
+    write_single_package_workspace, write_workspace, write_workspace_for_roots,
+};
 use tempfile::TempDir;
 
 const RUNTIME_ROOT_ENV: &str = "FKST_RUNTIME_ROOT";
@@ -119,6 +127,7 @@ fn write_host_defaults(root: &std::path::Path, queue: &str, stall_window: &str, 
 
 fn write_repo(depts: &[(&str, &str)], raisers: &[(&str, &str)]) -> TempDir {
     let dir = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
+    write_single_package_workspace(dir.path());
     write_host_defaults(dir.path(), "100\n", "30m\n", "20\n");
     let depts_root = dir.path().join("departments");
     for (name, content) in depts {
@@ -538,6 +547,7 @@ return M
     )
     .unwrap();
 
+    write_single_package_workspace(dir.path());
     let cfg = load(dir.path()).unwrap();
 
     assert_eq!(cfg.queue.get("tick").unwrap().capacity, 16);
@@ -609,6 +619,7 @@ return M
     )
     .unwrap();
 
+    write_single_package_workspace(dir.path());
     let cfg = load(dir.path()).unwrap();
 
     assert_eq!(cfg.queue.get("tick").unwrap().capacity, 31);
@@ -731,6 +742,7 @@ return M
         r#"return { type = "cron", interval = "10s", produces = "tick" }"#,
     )
     .unwrap();
+    write_single_package_workspace(dir.path());
 
     let cfg = load(dir.path()).unwrap();
 
@@ -856,6 +868,7 @@ return M
     let host = write_repo(&[("host_worker", &host_worker)], &[]);
     write_package_helper(host.path());
 
+    write_workspace_for_roots(host.path(), &[package.path()]);
     let roots = PackageRoots::resolve(host.path(), vec![package.path().to_path_buf()]).unwrap();
     let cfg = graph_scan::load_roots(&roots).unwrap();
 
@@ -905,6 +918,7 @@ fn multiple_package_roots_and_host_form_one_graph() {
         &[],
     );
 
+    write_workspace_for_roots(host.path(), &[package_a.path(), package_b.path()]);
     let roots = PackageRoots::resolve(
         host.path(),
         vec![
@@ -967,6 +981,10 @@ return M
     )
     .unwrap();
     let host = write_repo(&[], &[]);
+    write_workspace_for_roots(
+        host.path(),
+        &[consumer_package.as_path(), producer_package.as_path()],
+    );
     let roots = PackageRoots::resolve(
         host.path(),
         vec![consumer_package.clone(), producer_package.clone()],
@@ -1020,6 +1038,7 @@ return M
     )
     .unwrap();
     let host = write_repo(&[], &[]);
+    write_workspace_for_roots(host.path(), &[package.as_path()]);
     let roots = PackageRoots::resolve(host.path(), vec![package]).unwrap();
 
     let err = graph_scan::load_roots(&roots).unwrap_err();
@@ -1066,6 +1085,10 @@ return M
     )
     .unwrap();
     let host = write_repo(&[], &[]);
+    write_workspace_for_roots(
+        host.path(),
+        &[consumer_package.as_path(), producer_package.as_path()],
+    );
     let roots = PackageRoots::resolve(
         host.path(),
         vec![consumer_package.clone(), producer_package.clone()],
@@ -1092,7 +1115,7 @@ return M
 }
 
 #[test]
-fn host_department_uses_package_standard_asset_in_multi_package_graph() {
+fn host_department_uses_host_asset_in_multi_package_graph() {
     let _root = EnvGuard::set("FKST_RUNTIME_ROOT", ".fkst/runtime");
     let package_a = write_repo(
         &[],
@@ -1101,12 +1124,6 @@ fn host_department_uses_package_standard_asset_in_multi_package_graph() {
             r#"return { type = "cron", interval = "10s", produces = "tick_a" }"#,
         )],
     );
-    fs::create_dir_all(package_a.path().join("fkst")).unwrap();
-    fs::write(
-        package_a.path().join("fkst/standard_asset.lua"),
-        r#"return { stall_window = function() return "45s" end }"#,
-    )
-    .unwrap();
     let package_b = write_repo(
         &[],
         &[(
@@ -1123,7 +1140,14 @@ return M
 "#
     .replace("PACKAGE_NS", &ns(package_a.path()));
     let host = write_repo(&[("host_worker", &host_worker)], &[]);
+    fs::create_dir_all(host.path().join("fkst")).unwrap();
+    fs::write(
+        host.path().join("fkst/standard_asset.lua"),
+        r#"return { stall_window = function() return "45s" end }"#,
+    )
+    .unwrap();
 
+    write_workspace_for_roots(host.path(), &[package_a.path(), package_b.path()]);
     let roots = PackageRoots::resolve(
         host.path(),
         vec![
@@ -1135,6 +1159,56 @@ return M
     let cfg = graph_scan::load_roots(&roots).unwrap();
 
     assert_eq!(cfg.department["host.host_worker"].stall_window, "45s");
+    validate(&cfg, host.path()).unwrap();
+}
+
+#[test]
+fn host_container_root_without_own_unit_starts() {
+    // Regression: a workspace ROOT used as `--project-root` that owns no manifest
+    // unit (a nested-package repo where `packages/*` are the units and the repo
+    // root is a pure container with no departments/raisers of its own) must NOT
+    // fail graph scan. The production dogfood launches `supervise --project-root
+    // <repo> --package-root <repo>/packages/*`, so this is the real startup path.
+    // The conformance harness had masked it by passing a package root as
+    // --project-root; only a live supervise surfaced `no manifest unit owns
+    // <repo>`. graph_scan must skip a host container that owns no unit and has no
+    // own departments/raisers, while still scanning the package units.
+    let _root = EnvGuard::set("FKST_RUNTIME_ROOT", ".fkst/runtime");
+    let package_a = write_repo(
+        &[("alpha", &dept(r#""tick_a""#, r#""done_a""#))],
+        &[(
+            "tick_a",
+            r#"return { type = "cron", interval = "10s", produces = "tick_a" }"#,
+        )],
+    );
+    let package_b = write_repo(
+        &[],
+        &[(
+            "tick_b",
+            r#"return { type = "cron", interval = "20s", produces = "tick_b" }"#,
+        )],
+    );
+    // Host is a pure container: a workspace catalog listing the package units, but
+    // NO host fkst.toml (so the host root owns no unit) and no host departments.
+    let host = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
+    write_host_defaults(host.path(), "100\n", "30m\n", "20\n");
+    write_workspace(host.path(), &[package_a.path(), package_b.path()]);
+    let roots = PackageRoots::resolve(
+        host.path(),
+        vec![
+            package_a.path().to_path_buf(),
+            package_b.path().to_path_buf(),
+        ],
+    )
+    .unwrap();
+
+    let cfg = graph_scan::load_roots(&roots).unwrap();
+
+    assert!(cfg
+        .department
+        .contains_key(&q(package_a.path(), "alpha")));
+    assert!(cfg.raiser.contains_key(&q(package_a.path(), "tick_a")));
+    assert!(cfg.raiser.contains_key(&q(package_b.path(), "tick_b")));
     validate(&cfg, host.path()).unwrap();
 }
 
@@ -1164,6 +1238,7 @@ return M
     )
     .unwrap();
     let host = write_repo(&[], &[]);
+    write_workspace_for_roots(host.path(), &[package_a.path(), package_b.path()]);
     let roots = PackageRoots::resolve(
         host.path(),
         vec![
@@ -1176,7 +1251,8 @@ return M
     let err = graph_scan::load_roots(&roots).unwrap_err();
     let msg = format!("{err:#}");
 
-    assert!(msg.contains("module 'core' not found"), "got: {msg}");
+    assert!(msg.contains("require.denied"), "got: {msg}");
+    assert!(msg.contains("not declared/visible"), "got: {msg}");
     assert!(!msg.contains("b_done"), "got: {msg}");
 }
 
@@ -1227,6 +1303,7 @@ return M
     .unwrap();
     let host = write_repo(&[], &[]);
 
+    write_workspace_for_roots(host.path(), &[package_a.path(), package_b.path()]);
     let roots = PackageRoots::resolve(
         host.path(),
         vec![
@@ -1279,6 +1356,7 @@ return M
         r#"return { queue = function() return "cwd_done" end }"#,
     )
     .unwrap();
+    write_workspace_for_roots(host.path(), &[package.path()]);
     let roots = PackageRoots::resolve(host.path(), vec![package.path().to_path_buf()]).unwrap();
 
     let prior_cwd = std::env::current_dir().unwrap();
@@ -1287,7 +1365,8 @@ return M
     std::env::set_current_dir(prior_cwd).unwrap();
     let msg = format!("{err:#}");
 
-    assert!(msg.contains("module 'core' not found"), "got: {msg}");
+    assert!(msg.contains("require.denied"), "got: {msg}");
+    assert!(msg.contains("not declared/visible"), "got: {msg}");
     assert!(
         !msg.contains("host_done") && !msg.contains("cwd_done"),
         "got: {msg}"
@@ -1312,6 +1391,7 @@ fn same_department_name_across_package_roots_is_namespaced() {
         )],
     );
     let host = write_repo(&[], &[]);
+    write_workspace_for_roots(host.path(), &[package_a.path(), package_b.path()]);
     let roots = PackageRoots::resolve(
         host.path(),
         vec![
@@ -1346,6 +1426,7 @@ fn same_raiser_name_across_package_roots_is_namespaced() {
         )],
     );
     let host = write_repo(&[], &[]);
+    write_workspace_for_roots(host.path(), &[package_a.path(), package_b.path()]);
     let roots = PackageRoots::resolve(
         host.path(),
         vec![
@@ -1378,6 +1459,7 @@ fn package_root_env_is_used_when_flag_is_absent() {
         )],
         &[],
     );
+    write_workspace_for_roots(host.path(), &[package.path()]);
     let _env = EnvGuard::set(PACKAGE_ROOT_ENV, package.path());
 
     let _plural_env = EnvGuard::unset(PACKAGE_ROOTS_ENV);
@@ -1484,6 +1566,7 @@ fn folded_single_package_same_namespace_qualified_queue_stays_flat() {
         format!(r#"return {{ type = "cron", interval = "10s", produces = "{namespace}.tick" }}"#),
     )
     .unwrap();
+    write_single_package_workspace(dir.path());
     let roots = PackageRoots::resolve(dir.path(), vec![dir.path().to_path_buf()]).unwrap();
     let cfg = graph_scan::load_roots(&roots).unwrap();
 
@@ -1514,6 +1597,7 @@ fn same_department_name_across_package_and_host_is_namespaced() {
             r#"return { type = "cron", interval = "10s", produces = "tick" }"#,
         )],
     );
+    write_workspace_for_roots(host.path(), &[package.path()]);
     let roots = PackageRoots::resolve(host.path(), vec![package.path().to_path_buf()]).unwrap();
 
     let cfg = graph_scan::load_roots(&roots).unwrap();
@@ -1638,6 +1722,7 @@ fn skips_dept_without_main_lua() {
     let dir = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
     write_host_defaults(dir.path(), "100\n", "30m\n", "20\n");
     fs::create_dir_all(dir.path().join("departments/empty")).unwrap();
+    write_single_package_workspace(dir.path());
     let cfg = load(dir.path()).unwrap();
     assert!(cfg.department.is_empty());
 }

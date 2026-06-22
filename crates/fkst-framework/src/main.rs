@@ -6,6 +6,7 @@
 //! CLI: `fkst-framework supervise --project-root <path> --framework-bin <path>`
 //! CLI: `fkst-framework conformance --project-root <path>`
 //! CLI: `fkst-framework test --project-root <path> [--package-root <path> ...] [--report-json <path>]`
+//! CLI: `fkst-framework deps --project-root <path> [--package-root <path> ...] [--json]`
 //! CLI: `fkst-framework init-package-repo [--ref <substrate-ref>] [--force]`
 //! CLI: `fkst-framework observe --durable-root <path> [--json] [--limit <n>]`
 //! CLI: `fkst-framework --self-test`
@@ -21,13 +22,17 @@ use path_resolver::PackageRoots;
 use serde_json::Value as JsonValue;
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 mod boundary_resource;
 mod config_registry;
+mod deps_cli;
 mod external_command;
 mod host_conformance;
 mod init_package_repo;
 mod lua_coverage;
+mod lua_require;
+mod manifest;
 mod mlua_init;
 mod observe;
 mod path_resolver;
@@ -86,6 +91,7 @@ enum CliCommand {
         args: Vec<String>,
     },
     Test(TestCli),
+    Deps(deps_cli::DepsOptions),
     InitPackageRepo(init_package_repo::InitPackageRepoOptions),
     Observe(observe::ObserveOptions),
     CodexWorker(sdk_codex::CodexWorkerOptions),
@@ -97,7 +103,7 @@ fn parse_args() -> Result<CliCommand> {
     let mut args_iter = args.into_iter();
     let sub = args_iter.next().ok_or_else(|| {
         anyhow::anyhow!(
-            "usage: fkst-framework run <lua> --project-root <path> --package-root <path> [--package-root <path> ...] [--owner-namespace <id>] --event <json> | fkst-framework supervise --project-root <path> --framework-bin <path> [--package-root <path> ...] | fkst-framework conformance --project-root <path> [--package-root <path> ...] | fkst-framework config --project-root <path> [--package-root <path> ...] | fkst-framework boundary-resources | fkst-framework rate-acquire <pool> | fkst-framework rate-exec <pool> -- <program> [args...] | fkst-framework test --project-root <path> [--package-root <path> ...] [--report-json <path>] | fkst-framework init-package-repo [--ref <substrate-ref>] [--force] | fkst-framework observe --durable-root <path> [--json] [--limit <n>] | fkst-framework --self-test"
+            "usage: fkst-framework run <lua> --project-root <path> --package-root <path> [--package-root <path> ...] [--owner-namespace <id>] --event <json> | fkst-framework supervise --project-root <path> --framework-bin <path> [--package-root <path> ...] | fkst-framework conformance --project-root <path> [--package-root <path> ...] | fkst-framework config --project-root <path> [--package-root <path> ...] | fkst-framework boundary-resources | fkst-framework rate-acquire <pool> | fkst-framework rate-exec <pool> -- <program> [args...] | fkst-framework test --project-root <path> [--package-root <path> ...] [--report-json <path>] | fkst-framework deps --project-root <path> [--package-root <path> ...] [--json] | fkst-framework init-package-repo [--ref <substrate-ref>] [--force] | fkst-framework observe --durable-root <path> [--json] [--limit <n>] | fkst-framework --self-test"
         )
     })?;
     if sub == "--self-test" {
@@ -168,6 +174,10 @@ fn parse_args() -> Result<CliCommand> {
     if sub == "test" {
         let rest = args_iter.collect::<Vec<_>>();
         return Ok(CliCommand::Test(parse_test_args(&rest)?));
+    }
+    if sub == "deps" {
+        let rest = args_iter.collect::<Vec<_>>();
+        return Ok(CliCommand::Deps(parse_deps_args(&rest)?));
     }
     if sub == "init-package-repo" {
         let rest = args_iter.collect::<Vec<_>>();
@@ -360,6 +370,44 @@ fn parse_test_args(args: &[String]) -> Result<TestCli> {
     })
 }
 
+fn parse_deps_args(args: &[String]) -> Result<deps_cli::DepsOptions> {
+    let mut project_root: Option<PathBuf> = None;
+    let mut package_roots: Vec<PathBuf> = Vec::new();
+    let mut json = false;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--help" | "-h" => {
+                println!(
+                    "usage: fkst-framework deps --project-root <root> [--package-root <root> ...] [--json]"
+                );
+                std::process::exit(0);
+            }
+            "--project-root" => {
+                if project_root.is_some() {
+                    anyhow::bail!("duplicate --project-root");
+                }
+                i += 1;
+                project_root = Some(next_value(args, i, "--project-root")?.into());
+            }
+            "--package-root" => {
+                i += 1;
+                package_roots.push(next_value(args, i, "--package-root")?.into());
+            }
+            "--json" => json = true,
+            other => anyhow::bail!("unknown deps argument: {}", other),
+        }
+        i += 1;
+    }
+
+    let project_root = project_root.ok_or_else(|| anyhow::anyhow!("missing --project-root"))?;
+    Ok(deps_cli::DepsOptions {
+        project_root,
+        package_roots,
+        json,
+    })
+}
+
 fn parse_self_test_args(args: &[String]) -> Result<SelfTestCli> {
     let mut coverage: Option<PathBuf> = None;
     let mut i = 0;
@@ -461,12 +509,22 @@ fn run_pipeline(
         .ok_or_else(|| anyhow::anyhow!("unknown owner namespace `{owner_namespace}`"))?;
     provenance::install_run(owner_root, &owner_namespace);
     provenance::emit_code_provenance_line();
-    let require_roots = roots.require_roots_for_owner(owner_root);
+    let catalog = roots.unit_catalog().clone();
+    let owner_unit = catalog
+        .unit_name_for_root(owner_root)?
+        .ok_or_else(|| anyhow::anyhow!("no manifest unit owns {}", owner_root.display()))?;
+    let catalog = Arc::new(catalog);
     let graph_json_authorized =
         sdk_graph::department_authorized(&roots, owner_root, &lua_path).unwrap_or(false);
-    let declared_produces =
-        department_declared_resolved_produces(&roots, owner_root, &owner_namespace, &lua_path)
-            .with_context(|| format!("resolve raise authority for {}", lua_path.display()))?;
+    let declared_produces = department_declared_resolved_produces(
+        &roots,
+        owner_root,
+        &owner_namespace,
+        &lua_path,
+        catalog.clone(),
+        &owner_unit,
+    )
+    .with_context(|| format!("resolve raise authority for {}", lua_path.display()))?;
 
     mlua_init::register_framework_sdk(
         &lua,
@@ -488,7 +546,10 @@ fn run_pipeline(
         &lua,
         &lua_path,
         &event,
-        require_roots.iter().map(|root| root.as_path()),
+        catalog,
+        &owner_unit,
+        owner_root,
+        None,
     ) {
         Ok(()) => 0,
         Err(e) => {
@@ -510,18 +571,19 @@ fn department_declared_resolved_produces(
     owner_root: &Path,
     owner_namespace: &str,
     lua_path: &Path,
+    catalog: Arc<manifest::UnitCatalog>,
+    owner_unit: &str,
 ) -> Result<BTreeSet<String>> {
     let lua_path = lua_path
         .canonicalize()
         .with_context(|| format!("canonicalize {}", lua_path.display()))?;
-    let require_roots = roots.require_roots_for_owner(owner_root);
-    let package_path = mlua_init::package_roots_path(require_roots.iter().map(PathBuf::as_path));
     spec_queues::declared_resolved_produces(
         roots,
         owner_namespace,
         owner_root,
         &lua_path,
-        &package_path,
+        catalog,
+        owner_unit,
         &mlua_init::LuaChunkCache::default(),
     )
     .map_err(anyhow::Error::from)
@@ -682,6 +744,7 @@ fn run() -> Result<i32> {
         CliCommand::Test(options) => {
             test_runner::run_tests(options.roots, options.report_json, options.coverage)
         }
+        CliCommand::Deps(options) => deps_cli::run(options),
         CliCommand::InitPackageRepo(options) => init_package_repo::run(options),
         CliCommand::Observe(options) => observe::run(options),
         CliCommand::CodexWorker(options) => sdk_codex::run_codex_worker(options),

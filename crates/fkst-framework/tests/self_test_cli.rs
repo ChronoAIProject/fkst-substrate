@@ -1,6 +1,10 @@
 use std::path::Path;
 use std::process::Command;
 
+mod support;
+
+use support::manifest_fixture::write_single_package_workspace;
+
 fn framework_bin() -> &'static str {
     env!("CARGO_BIN_EXE_fkst-framework")
 }
@@ -165,6 +169,7 @@ return {
     )
     .unwrap();
     let coverage_dir = tmp.path().join("coverage");
+    write_single_package_workspace(tmp.path());
 
     let output = Command::new(framework_bin())
         .arg("--self-test")
@@ -216,6 +221,7 @@ end
 "#,
     )
     .unwrap();
+    write_single_package_workspace(tmp.path());
 
     let output = Command::new(framework_bin())
         .arg("run")
@@ -275,6 +281,7 @@ return M
         ),
     )
     .unwrap();
+    write_single_package_workspace(&host);
 
     let runtime_root = root.path().join("runtime");
     let output = Command::new(framework_bin())

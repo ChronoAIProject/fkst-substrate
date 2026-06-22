@@ -17,10 +17,11 @@ use mlua::{Lua, LuaSerdeExt, Table, Value as LuaValue};
 use serde::Deserialize;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use crate::config_registry::{ConfigContext, ConfigKey, ConfigValueType};
 use crate::path_resolver::{
-    package_root_path, validate_name_segment, GraphRoot, GraphRootKind, NameResolver, PackageRoots,
+    validate_name_segment, GraphRoot, GraphRootKind, NameResolver, PackageRoots,
 };
 const FAILURE_FACT_QUEUE: &str = "fkst.failure_fact";
 
@@ -131,6 +132,7 @@ pub fn load_roots(roots: &PackageRoots) -> Result<Config> {
     }
 
     let defaults = HostGraphDefaults::load(roots)?;
+    let catalog = Arc::new(roots.unit_catalog().clone());
     let resolver = roots.name_resolver();
     let subscribe_resolver = resolver.clone().add_recorded_only_queue(FAILURE_FACT_QUEUE);
     let mut departments: BTreeMap<String, DepartmentDecl> = BTreeMap::new();
@@ -142,11 +144,32 @@ pub fn load_roots(roots: &PackageRoots) -> Result<Config> {
         let lua = Lua::new();
         register_spec_eval_pure_primitives(&lua, &graph_root.root)
             .context("register graph-scan pure primitives")?;
-        let require_roots = roots.require_roots_for_owner(&graph_root.root);
+        let owner_unit = match catalog.unit_name_for_root(&graph_root.root)? {
+            Some(unit) => unit,
+            None => {
+                // A graph root with no owning manifest unit is valid ONLY as a pure
+                // host container: the workspace root of a nested-package repo
+                // (`--project-root <repo>` with `--package-root <repo>/packages/*`),
+                // which carries no departments/raisers of its own. Such a root
+                // contributes nothing to the graph, so skip it. Any other root
+                // (a package root, or a host that actually declares departments or
+                // raisers) must be an owned unit — keep failing closed.
+                let has_own_graph = graph_root.root.join("departments").is_dir()
+                    || graph_root.root.join("raisers").is_dir();
+                if matches!(graph_root.kind, GraphRootKind::Host) && !has_own_graph {
+                    continue;
+                }
+                return Err(anyhow!(
+                    "no manifest unit owns {}",
+                    graph_root.root.display()
+                ));
+            }
+        };
         scan_departments(
             &lua,
             graph_root,
-            &require_roots,
+            catalog.clone(),
+            &owner_unit,
             &resolver,
             &subscribe_resolver,
             &defaults,
@@ -154,7 +177,14 @@ pub fn load_roots(roots: &PackageRoots) -> Result<Config> {
             &mut department_fanout,
             &mut department_published_seam,
         )?;
-        scan_raisers(&lua, graph_root, &require_roots, &resolver, &mut raisers)?;
+        scan_raisers(
+            &lua,
+            graph_root,
+            catalog.clone(),
+            &owner_unit,
+            &resolver,
+            &mut raisers,
+        )?;
     }
 
     validate_cross_package_produces(&departments, &raisers, &department_published_seam)?;
@@ -189,7 +219,8 @@ fn register_spec_eval_pure_primitives(lua: &Lua, owner_root: &Path) -> mlua::Res
 fn scan_departments(
     lua: &Lua,
     graph_root: &GraphRoot,
-    require_roots: &[PathBuf],
+    catalog: Arc<crate::manifest::UnitCatalog>,
+    owner_unit: &str,
     resolver: &NameResolver,
     subscribe_resolver: &NameResolver,
     defaults: &HostGraphDefaults,
@@ -212,7 +243,7 @@ fn scan_departments(
             continue;
         }
 
-        let module = eval_lua_file(lua, require_roots, &main_lua)
+        let module = eval_lua_file(lua, catalog.clone(), owner_unit, &main_lua)
             .with_context(|| format!("eval department `{}` from {}", name, main_lua.display()))?;
         let spec_tbl: Table = module
             .get("spec")
@@ -322,7 +353,8 @@ fn materialize_retry(
 fn scan_raisers(
     lua: &Lua,
     graph_root: &GraphRoot,
-    require_roots: &[PathBuf],
+    catalog: Arc<crate::manifest::UnitCatalog>,
+    owner_unit: &str,
     resolver: &NameResolver,
     raisers: &mut BTreeMap<String, RaiserDecl>,
 ) -> Result<()> {
@@ -342,7 +374,7 @@ fn scan_raisers(
             .into_owned();
         validate_name_segment("raiser name", &stem)
             .with_context(|| format!("validate raiser `{}`", stem))?;
-        let val = eval_lua_value(lua, require_roots, &path)
+        let val = eval_lua_value(lua, catalog.clone(), owner_unit, &path)
             .with_context(|| format!("eval raiser `{}` from {}", stem, path.display()))?;
         let r: RaiserDecl = lua
             .from_value(val)
@@ -595,38 +627,33 @@ fn reject_runtime_file_watch_glob(raiser: &RaiserDecl) -> Result<()> {
     Ok(())
 }
 
-fn eval_lua_file(lua: &Lua, require_roots: &[PathBuf], path: &Path) -> Result<Table> {
-    match eval_lua_value(lua, require_roots, path)? {
+fn eval_lua_file(
+    lua: &Lua,
+    catalog: Arc<crate::manifest::UnitCatalog>,
+    owner_unit: &str,
+    path: &Path,
+) -> Result<Table> {
+    match eval_lua_value(lua, catalog, owner_unit, path)? {
         LuaValue::Table(t) => Ok(t),
         _ => Err(anyhow!("{} did not return a table", path.display())),
     }
 }
 
-fn eval_lua_value(lua: &Lua, require_roots: &[PathBuf], path: &Path) -> Result<LuaValue> {
-    let source =
-        std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
-    set_package_roots_path(lua, require_roots.iter().map(PathBuf::as_path))?;
-    lua.load(&source)
-        .set_name(path.display().to_string())
-        .eval()
-        .with_context(|| format!("eval {}", path.display()))
-}
-
-fn set_package_roots_path<'a>(
+fn eval_lua_value(
     lua: &Lua,
-    package_roots: impl IntoIterator<Item = &'a Path>,
-) -> Result<()> {
-    let roots_path = package_roots
-        .into_iter()
-        .map(package_root_path)
-        .collect::<Vec<_>>()
-        .join(";");
-    lua.load(format!(
-        "package.path = {:?}; package.cpath = \"\"",
-        roots_path
-    ))
-    .exec()
-    .context("set package.path")
+    catalog: Arc<crate::manifest::UnitCatalog>,
+    owner_unit: &str,
+    path: &Path,
+) -> Result<LuaValue> {
+    crate::lua_require::load_unit_chunk(
+        lua,
+        catalog,
+        owner_unit,
+        path,
+        format!("@{}", path.display()),
+        None,
+    )
+    .with_context(|| format!("eval {}", path.display()))
 }
 
 fn sorted_dirs(root: &Path) -> Result<Vec<PathBuf>> {

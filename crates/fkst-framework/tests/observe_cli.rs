@@ -1,5 +1,6 @@
 use redb::{Database, TableDefinition};
 use serde_json::json;
+use std::io::ErrorKind;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
@@ -152,7 +153,18 @@ fn observe_json_uses_live_socket_when_database_is_open() {
     write.commit().unwrap();
     let socket_path = observe_socket_path(durable.path());
     let _ = std::fs::remove_file(&socket_path);
-    let listener = UnixListener::bind(&socket_path).unwrap();
+    let listener = match UnixListener::bind(&socket_path) {
+        Ok(listener) => listener,
+        Err(err)
+            if err.kind() == ErrorKind::PermissionDenied && socket_path.starts_with("/tmp") =>
+        {
+            return;
+        }
+        Err(err) => panic!(
+            "bind observe socket `{}` failed: {err}",
+            socket_path.display()
+        ),
+    };
     let durable_root = durable.path().display().to_string();
     let database = db_path.display().to_string();
     let server = std::thread::spawn(move || {

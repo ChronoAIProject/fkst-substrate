@@ -1,0 +1,5 @@
+kind = "package"
+name = "codex-package"
+
+[code]
+root = "."
