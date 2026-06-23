@@ -103,9 +103,7 @@ fn run_graph(
     let journal = SupervisorJournal::disabled();
     for step_index in 0..opts.max_steps {
         let Some(record) = lease_next_record(&store, TEST_OBSERVED_AT_MS)? else {
-            trace.status = "quiescent".to_string();
-            trace.final_state = final_state(&store)?;
-            return trace_table(lua, trace);
+            return quiescent_trace_table(lua, &store, trace);
         };
         let dept = cfg
             .department
@@ -157,6 +155,9 @@ fn run_graph(
         )
         .map_err(mlua::Error::external)?;
         trace.steps.push(step);
+        if final_state(&store)?.pending == 0 {
+            return quiescent_trace_table(lua, &store, trace);
+        }
     }
 
     let pending = final_state(&store)?;
@@ -164,6 +165,16 @@ fn run_graph(
         "run_graph exceeded max_steps={} with pending={}",
         opts.max_steps, pending.pending
     )))
+}
+
+fn quiescent_trace_table(
+    lua: &Lua,
+    store: &DeliveryStore,
+    mut trace: RunGraphTrace,
+) -> mlua::Result<Table> {
+    trace.status = "quiescent".to_string();
+    trace.final_state = final_state(store)?;
+    trace_table(lua, trace)
 }
 
 fn initial_emission(

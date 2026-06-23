@@ -287,6 +287,85 @@ return {
 }
 
 #[test]
+fn run_graph_exact_step_cap_returns_quiescent_when_no_pending_deliveries_remain() {
+    let host = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
+    let package = tempfile::Builder::new()
+        .prefix("exactcap")
+        .tempdir()
+        .unwrap();
+    let ns = namespace(package.path());
+
+    write_department(
+        package.path(),
+        "first",
+        r#"
+local M = {}
+M.spec = {
+  consumes = { "start" },
+  produces = { "done" },
+}
+function M.pipeline(event)
+  raise("done", { seed = event.payload.seed })
+end
+return M
+"#,
+    );
+    write_department(
+        package.path(),
+        "done",
+        r#"
+local M = {}
+M.spec = {
+  consumes = { "done" },
+  produces = {},
+}
+function M.pipeline(event)
+  assert(event.payload.seed == "exact", "expected exact seed")
+end
+return M
+"#,
+    );
+    fs::create_dir_all(package.path().join("tests")).unwrap();
+    fs::write(
+        package.path().join("tests/run_graph_exact_cap_test.lua"),
+        r#"
+local t = fkst.test
+return {
+  test_run_graph_exact_step_cap_returns_quiescent = function()
+    local trace = t.run_graph({
+      queue = "PLACEHOLDER.start",
+      payload = { seed = "exact" },
+      source_ref = { kind = "external", reference = "unit/exact-cap" },
+    }, { max_steps = 2 })
+    t.eq(trace.status, "quiescent")
+    t.eq(#trace.steps, 2)
+    t.eq(trace.final.pending, 0)
+  end,
+}
+"#
+        .replace("PLACEHOLDER", &ns),
+    )
+    .unwrap();
+
+    let output = run_lua_tests_with_packages(host.path(), &[package.path()]);
+
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}",
+        stdout(&output),
+        stderr(&output)
+    );
+    let out = stdout(&output);
+    assert!(
+        out.contains(
+            "PASS tests/run_graph_exact_cap_test.lua::test_run_graph_exact_step_cap_returns_quiescent"
+        ),
+        "stdout: {out}"
+    );
+    assert!(out.contains("1 passed, 0 failed"), "stdout: {out}");
+}
+
+#[test]
 fn run_graph_can_fire_declared_source_to_start_graph() {
     let host = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
     let package = tempfile::Builder::new().prefix("source").tempdir().unwrap();
