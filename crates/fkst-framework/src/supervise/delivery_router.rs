@@ -26,6 +26,7 @@ pub(crate) struct DeliveryRouter {
     subscriptions: Arc<BTreeMap<String, Vec<Subscription>>>,
     reliable_wakes: Arc<Mutex<BTreeMap<String, mpsc::Sender<()>>>>,
     journal: SupervisorJournal,
+    clock: Arc<dyn Fn() -> u64 + Send + Sync>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -55,12 +56,23 @@ impl DeliveryRouter {
         store: Option<Arc<DeliveryStore>>,
         journal: Option<SupervisorJournal>,
     ) -> Self {
+        Self::new_with_clock(cfg, fanout, store, journal, Arc::new(now_unix_millis))
+    }
+
+    pub(crate) fn new_with_clock(
+        cfg: &Config,
+        fanout: Fanout,
+        store: Option<Arc<DeliveryStore>>,
+        journal: Option<SupervisorJournal>,
+        clock: Arc<dyn Fn() -> u64 + Send + Sync>,
+    ) -> Self {
         Self {
             fanout,
             store,
             subscriptions: Arc::new(subscriptions(cfg)),
             reliable_wakes: Arc::new(Mutex::new(BTreeMap::new())),
             journal: journal.unwrap_or_else(SupervisorJournal::disabled),
+            clock,
         }
     }
 
@@ -141,7 +153,7 @@ impl DeliveryRouter {
                     collapse_by_dedup_id: delivery_identity.collapse_by_dedup_id,
                     lease_generation: 0,
                     lease_until_ms: None,
-                    not_before_ms: now_unix_millis(),
+                    not_before_ms: (self.clock)(),
                     last_error_excerpt: None,
                 };
                 store

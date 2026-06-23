@@ -69,6 +69,7 @@ mod test_fire_raiser;
 mod test_runner;
 #[cfg(test)]
 mod test_runner_unit;
+mod test_runtime;
 
 #[cfg(test)]
 mod test_env {

@@ -457,6 +457,15 @@ fn register_test_sdk(
     })?;
     crate::test_fire_raiser::register(
         lua,
+        cache.clone(),
+        roots.clone(),
+        owner_namespace.clone(),
+        mock_commands.clone(),
+        coverage.clone(),
+        &test,
+    )?;
+    crate::test_runtime::register(
+        lua,
         cache,
         roots,
         owner_namespace,

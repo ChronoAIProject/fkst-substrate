@@ -1091,6 +1091,50 @@ struct CompletedDelivery {
     failure: Option<DeliveryFailure>,
 }
 
+pub(crate) struct TestDurableCompletion {
+    pub(crate) exit_code: i32,
+    pub(crate) error: Option<String>,
+    pub(crate) raises: Vec<Event>,
+}
+
+pub(crate) fn finish_test_durable_record(
+    store: &DeliveryStore,
+    router: &DeliveryRouter,
+    retry_policy: Option<&RetryPolicy>,
+    record: DeliveryRecord,
+    completion: TestDurableCompletion,
+    journal: &SupervisorJournal,
+) -> anyhow::Result<()> {
+    let done = if completion.exit_code == 0 {
+        let failure = publish_test_raised_events(router, completion.raises, &record)
+            .err()
+            .map(|err| DeliveryFailure::permanent(format!("raised publish error: {err}")));
+        CompletedDelivery { record, failure }
+    } else {
+        CompletedDelivery {
+            record,
+            failure: Some(DeliveryFailure {
+                message: completion
+                    .error
+                    .unwrap_or_else(|| format!("exit={}", completion.exit_code)),
+                replayable: completion.exit_code == 124,
+            }),
+        }
+    };
+    let dept = done.record.dept.clone();
+    finish_durable_record(&dept, Some(store), router, retry_policy, done, journal);
+    Ok(())
+}
+
+fn publish_test_raised_events(
+    router: &DeliveryRouter,
+    raised_events: Vec<Event>,
+    parent: &DeliveryRecord,
+) -> anyhow::Result<()> {
+    let mut next_ordinal = 0;
+    publish_raised_events(router, raised_events, parent, &mut next_ordinal)
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct DeliveryFailure {
     message: String,

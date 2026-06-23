@@ -712,6 +712,7 @@ local allowed = {
   mock_command = true,
   raises = true,
   fire_raiser = true,
+  run_graph = true,
   run_department = true,
   with_command_cassette = true,
 }
