@@ -1247,9 +1247,24 @@ fn declarative_pack_non_utf8_relative_path_fails_closed() {
 
     let output = run_package_conformance(host.path(), &package);
 
-    assert_fail_closed(
-        &output,
-        &["invalid relative path", "non-utf8 relative path component"],
+    // A non-UTF-8 path under the package is rejected fail-closed. The engine's
+    // module-path scan catches a non-UTF-8 `*.lua` module at startup (exit 2,
+    // "non-utf8 module path") before the declarative runner ever sees it; the
+    // runner's own non-utf8 guard is defense-in-depth for non-module files.
+    // Assert fail-closed at whichever layer catches it (non-zero exit + a
+    // non-utf8 rejection message), not a single layer's exit code.
+    let code = output.status.code();
+    assert!(
+        matches!(code, Some(c) if c != 0),
+        "expected non-zero fail-closed exit, got {code:?}\n{}",
+        combined_log(&output)
+    );
+    let log = combined_log(&output);
+    assert!(
+        log.contains("non-utf8 module path")
+            || log.contains("non-utf8 relative path component")
+            || log.contains("invalid relative path"),
+        "expected a non-utf8 rejection message in:\n{log}"
     );
 }
 
