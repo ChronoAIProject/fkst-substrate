@@ -4,7 +4,7 @@
 //! Multiple `--package-root` flags give composed namespace knowledge; `--owner-namespace`
 //! selects the owner root used for Lua `require`.
 //! CLI: `fkst-framework supervise --project-root <path> --framework-bin <path>`
-//! CLI: `fkst-framework conformance --project-root <path>`
+//! CLI: `fkst-framework conformance --project-root <path> [--package-root <path> ...] [--config <path>]`
 //! CLI: `fkst-framework test --project-root <path> [--package-root <path> ...] [--report-json <path>]`
 //! CLI: `fkst-framework deps --project-root <path> [--package-root <path> ...] [--json]`
 //! CLI: `fkst-framework init-package-repo [--ref <substrate-ref>] [--force]`
@@ -17,7 +17,7 @@
 //!   124 = codex subprocess timed out and was killed by SIGKILL -pgid
 
 use anyhow::{Context, Result};
-use host_conformance::HostConformanceOptions;
+use host_conformance::{HostConformanceConfig, HostConformanceOptions};
 use path_resolver::PackageRoots;
 use serde_json::Value as JsonValue;
 use std::collections::BTreeSet;
@@ -111,7 +111,7 @@ fn parse_args() -> Result<CliCommand> {
     let mut args_iter = args.into_iter();
     let sub = args_iter.next().ok_or_else(|| {
         anyhow::anyhow!(
-            "usage: fkst-framework run <lua> --project-root <path> --package-root <path> [--package-root <path> ...] [--owner-namespace <id>] --event <json> | fkst-framework supervise --project-root <path> --framework-bin <path> [--package-root <path> ...] | fkst-framework conformance --project-root <path> [--package-root <path> ...] | fkst-framework config --project-root <path> [--package-root <path> ...] | fkst-framework boundary-resources | fkst-framework rate-acquire <pool> | fkst-framework rate-exec <pool> -- <program> [args...] | fkst-framework test --project-root <path> [--package-root <path> ...] [--report-json <path>] | fkst-framework deps --project-root <path> [--package-root <path> ...] [--json] | fkst-framework init-package-repo [--ref <substrate-ref>] [--force] | fkst-framework observe --durable-root <path> [--json] [--limit <n>] | fkst-framework --self-test"
+            "usage: fkst-framework run <lua> --project-root <path> --package-root <path> [--package-root <path> ...] [--owner-namespace <id>] --event <json> | fkst-framework supervise --project-root <path> --framework-bin <path> [--package-root <path> ...] | fkst-framework conformance --project-root <path> [--package-root <path> ...] [--config <path>] | fkst-framework config --project-root <path> [--package-root <path> ...] | fkst-framework boundary-resources | fkst-framework rate-acquire <pool> | fkst-framework rate-exec <pool> -- <program> [args...] | fkst-framework test --project-root <path> [--package-root <path> ...] [--report-json <path>] | fkst-framework deps --project-root <path> [--package-root <path> ...] [--json] | fkst-framework init-package-repo [--ref <substrate-ref>] [--force] | fkst-framework observe --durable-root <path> [--json] [--limit <n>] | fkst-framework --self-test"
         )
     })?;
     if sub == "--self-test" {
@@ -273,6 +273,7 @@ struct SelfTestCli {
 fn parse_conformance_args(args: &[String]) -> Result<HostConformanceOptions> {
     let mut project_root: Option<PathBuf> = None;
     let mut package_roots: Vec<PathBuf> = Vec::new();
+    let mut config: Option<PathBuf> = None;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -287,6 +288,13 @@ fn parse_conformance_args(args: &[String]) -> Result<HostConformanceOptions> {
                 i += 1;
                 package_roots.push(next_value(args, i, "--package-root")?.into());
             }
+            "--config" => {
+                if config.is_some() {
+                    anyhow::bail!("duplicate --config");
+                }
+                i += 1;
+                config = Some(next_value(args, i, "--config")?.into());
+            }
             other => anyhow::bail!("unknown conformance argument: {}", other),
         }
         i += 1;
@@ -295,6 +303,7 @@ fn parse_conformance_args(args: &[String]) -> Result<HostConformanceOptions> {
     let root = project_root.ok_or_else(|| anyhow::anyhow!("missing --project-root"))?;
     Ok(HostConformanceOptions {
         roots: PackageRoots::resolve(root, package_roots)?,
+        config: config.map(HostConformanceConfig::load).transpose()?,
     })
 }
 
