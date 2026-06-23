@@ -8,10 +8,10 @@ use tracing::{error, info, warn};
 
 use crate::path_resolver::PackageRoots;
 
-mod consumer;
+pub(crate) mod consumer;
 mod delivery_index;
 mod delivery_retry;
-mod delivery_router;
+pub(crate) mod delivery_router;
 pub(crate) mod delivery_store;
 mod delivery_transition;
 pub(crate) mod delivery_types;
@@ -19,7 +19,7 @@ mod delivery_watch;
 pub mod event_fanout;
 pub(crate) mod failure_fact;
 pub(crate) mod graph_scan;
-mod journal;
+pub(crate) mod journal;
 mod observe_server;
 mod queue_starvation;
 mod raised;

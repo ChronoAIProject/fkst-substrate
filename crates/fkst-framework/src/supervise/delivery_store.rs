@@ -329,6 +329,74 @@ impl DeliveryStore {
         self.lease_matching(now_ms, batch_limit, lease_dur, None, &BTreeSet::new())
     }
 
+    pub(crate) fn next_due_deterministic(
+        &self,
+        now_ms: u64,
+        lease_dur: Duration,
+    ) -> Result<Option<DeliveryRecord>> {
+        let mut due = self.due_ready_records(now_ms)?;
+        // TestRuntime dispatches one delivery at a time with a stable key.
+        // Production consumers keep their normal per-department scheduler.
+        due.sort_by(|left, right| {
+            left.not_before_ms
+                .cmp(&right.not_before_ms)
+                .then_with(|| left.queue.cmp(&right.queue))
+                .then_with(|| left.dept.cmp(&right.dept))
+                .then_with(|| left.delivery_id.cmp(&right.delivery_id))
+        });
+        let Some(next) = due.into_iter().next() else {
+            return Ok(None);
+        };
+        self.lease_delivery(&next.delivery_id, now_ms, lease_dur)
+    }
+
+    fn due_ready_records(&self, now_ms: u64) -> Result<Vec<DeliveryRecord>> {
+        let read = self.db.begin_read()?;
+        let ready = read.open_table(READY_BY_DEPT_DUE)?;
+        let delivery = read.open_table(DELIVERY_BY_ID)?;
+        let mut records = Vec::new();
+        for key in collect_due_keys(&ready, None, now_ms, usize::MAX)? {
+            if let Some(record) = read_delivery_read_only(&delivery, &key.delivery_id)? {
+                records.push(record);
+            }
+        }
+        Ok(records)
+    }
+
+    fn lease_delivery(
+        &self,
+        delivery_id: &str,
+        now_ms: u64,
+        lease_dur: Duration,
+    ) -> Result<Option<DeliveryRecord>> {
+        let lease_until = now_ms.saturating_add(duration_millis(lease_dur));
+        let write = self.begin_write()?;
+        let outcome = {
+            let mut delivery = write.open_table(DELIVERY_BY_ID)?;
+            let mut ready = write.open_table(READY_BY_DEPT_DUE)?;
+            let mut lease_index = write.open_table(LEASED_BY_DEPT_UNTIL)?;
+            let Some(mut record) = read_delivery_table(&delivery, delivery_id)? else {
+                return Ok(None);
+            };
+            if record.lease_until_ms.is_some() || record.not_before_ms > now_ms {
+                return Ok(None);
+            }
+            ready
+                .remove(make_index_key(&record.dept, record.not_before_ms, delivery_id).as_str())?;
+            record.lease_generation = record.lease_generation.saturating_add(1);
+            record.lease_until_ms = Some(lease_until);
+            let bytes = serde_json::to_vec(&record)?;
+            delivery.insert(delivery_id, bytes.as_slice())?;
+            lease_index.insert(
+                make_index_key(&record.dept, lease_until, delivery_id).as_str(),
+                &(),
+            )?;
+            record
+        };
+        commit_write(write)?;
+        Ok(Some(outcome))
+    }
+
     pub(crate) fn lease_for_dept(
         &self,
         dept: &str,
