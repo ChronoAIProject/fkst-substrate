@@ -4,9 +4,26 @@ use anyhow::{Context, Result};
 use fkst_common::runtime_layout::RUNTIME_ROOT_ENV;
 use fkst_common::validation::{validate_with_scope, ValidationScope};
 use fkst_common::RuntimeKind;
+use serde::Serialize;
+use std::path::PathBuf;
 
 pub(crate) struct HostConformanceOptions {
     pub(crate) roots: PackageRoots,
+    pub(crate) config: Option<HostConformanceConfig>,
+}
+
+pub(crate) struct HostConformanceConfig {
+    path: PathBuf,
+}
+
+impl HostConformanceConfig {
+    pub(crate) fn load(path: PathBuf) -> Result<Self> {
+        let raw = std::fs::read_to_string(&path)
+            .with_context(|| format!("read conformance config {}", path.display()))?;
+        let _config: toml::Value = toml::from_str(&raw)
+            .with_context(|| format!("parse conformance config {}", path.display()))?;
+        Ok(Self { path })
+    }
 }
 
 pub(crate) struct HostConformanceSuite {
@@ -14,7 +31,9 @@ pub(crate) struct HostConformanceSuite {
 }
 
 struct HostCheck {
+    pack: &'static str,
     id: &'static str,
+    package: Option<String>,
     status: CheckStatus,
     message: String,
 }
@@ -30,13 +49,86 @@ impl HostConformanceSuite {
     }
 
     pub(crate) fn run(&self) -> Result<i32> {
+        let context = ConformanceContext {
+            options: &self.options,
+        };
+        let registry = RulePackRegistry::from_options(&self.options);
+        let checks = registry.run(&context);
+        let report = ConformanceReport::from_checks(registry.pack_count(), &checks);
+
+        for check in &checks {
+            check.print();
+        }
+        println!("{}", serde_json::to_string(&report)?);
+
+        Ok(if report.ok { 0 } else { 1 })
+    }
+}
+
+struct ConformanceContext<'a> {
+    options: &'a HostConformanceOptions,
+}
+
+trait RulePack {
+    fn name(&self) -> &'static str;
+    fn run(&self, context: &ConformanceContext<'_>) -> Vec<HostCheck>;
+}
+
+struct RulePackRegistry {
+    packs: Vec<Box<dyn RulePack>>,
+}
+
+impl RulePackRegistry {
+    fn from_options(options: &HostConformanceOptions) -> Self {
+        let mut registry = Self { packs: Vec::new() };
+        registry.register(Box::new(EngineRulePack));
+        if let Some(config) = &options.config {
+            let _config_path = &config.path;
+            // Future rule packs, including a source-ratchet pack that migrates
+            // external repository ratchets, should be selected from this parsed
+            // config seam. The keystone intentionally registers only engine.
+        }
+        registry
+    }
+
+    fn register(&mut self, pack: Box<dyn RulePack>) {
+        self.packs.push(pack);
+    }
+
+    fn pack_count(&self) -> usize {
+        self.packs.len()
+    }
+
+    fn run(&self, context: &ConformanceContext<'_>) -> Vec<HostCheck> {
         let mut checks = Vec::new();
 
-        checks.push(self.check_runtime_layout());
-        checks.push(self.check_project_layout());
-        checks.push(self.check_locale_catalogs());
+        for pack in &self.packs {
+            let mut pack_checks = pack.run(context);
+            for check in &mut pack_checks {
+                check.pack = pack.name();
+            }
+            checks.extend(pack_checks);
+        }
 
-        let graph_result = supervise::load_host_graph_for_conformance(&self.options.roots);
+        checks
+    }
+}
+
+struct EngineRulePack;
+
+impl RulePack for EngineRulePack {
+    fn name(&self) -> &'static str {
+        "engine"
+    }
+
+    fn run(&self, context: &ConformanceContext<'_>) -> Vec<HostCheck> {
+        let mut checks = Vec::new();
+
+        checks.push(self.check_runtime_layout(context));
+        checks.push(self.check_project_layout(context));
+        checks.push(self.check_locale_catalogs(context));
+
+        let graph_result = supervise::load_host_graph_for_conformance(&context.options.roots);
         let graph_available = match &graph_result {
             Ok(cfg) => {
                 checks.push(HostCheck::pass(
@@ -49,7 +141,7 @@ impl HostConformanceSuite {
                     ),
                 ));
                 checks.push(self.check_department_non_empty(cfg));
-                checks.push(self.check_schema_validation(cfg));
+                checks.push(self.check_schema_validation(context, cfg));
                 true
             }
             Err(err) => {
@@ -72,18 +164,12 @@ impl HostConformanceSuite {
             ));
         }
 
-        let mut failed = false;
-        for check in checks {
-            if matches!(check.status, CheckStatus::Fail) {
-                failed = true;
-            }
-            check.print();
-        }
-
-        Ok(if failed { 1 } else { 0 })
+        checks
     }
+}
 
-    fn check_runtime_layout(&self) -> HostCheck {
+impl EngineRulePack {
+    fn check_runtime_layout(&self, context: &ConformanceContext<'_>) -> HostCheck {
         if std::env::var_os(RUNTIME_ROOT_ENV)
             .filter(|value| !value.is_empty())
             .is_none()
@@ -94,7 +180,7 @@ impl HostConformanceSuite {
             );
         }
 
-        match crate::runtime_context::layout_from_host_root(self.options.roots.host_root())
+        match crate::runtime_context::layout_from_host_root(context.options.roots.host_root())
             .and_then(|layout| {
                 layout.runtime_dir(RuntimeKind::Worktrees);
                 layout.runtime_dir(RuntimeKind::CodexPermits);
@@ -114,8 +200,8 @@ impl HostConformanceSuite {
         }
     }
 
-    fn check_project_layout(&self) -> HostCheck {
-        let departments = self.options.roots.host_root().join("departments");
+    fn check_project_layout(&self, context: &ConformanceContext<'_>) -> HostCheck {
+        let departments = context.options.roots.host_root().join("departments");
         if !departments.exists() {
             return HostCheck::pass(
                 "project-layout",
@@ -139,9 +225,9 @@ impl HostConformanceSuite {
         }
     }
 
-    fn check_locale_catalogs(&self) -> HostCheck {
+    fn check_locale_catalogs(&self, context: &ConformanceContext<'_>) -> HostCheck {
         let mut checked = 0usize;
-        for graph_root in self.options.roots.graph_roots() {
+        for graph_root in context.options.roots.graph_roots() {
             if let Err(err) = crate::sdk_i18n::validate_graph_root_catalogs(&graph_root.root)
                 .with_context(|| {
                     format!(
@@ -151,7 +237,11 @@ impl HostConformanceSuite {
                     )
                 })
             {
-                return HostCheck::fail("locale-catalogs", format!("{err:#}"));
+                return HostCheck::fail_for_package(
+                    "locale-catalogs",
+                    graph_root.namespace,
+                    format!("{err:#}"),
+                );
             }
             if graph_root.root.join("locales").exists() {
                 checked += 1;
@@ -177,13 +267,17 @@ impl HostConformanceSuite {
         }
     }
 
-    fn check_schema_validation(&self, cfg: &fkst_common::config::Config) -> HostCheck {
-        let scope = if self.options.roots.is_single_folded_graph_root() {
+    fn check_schema_validation(
+        &self,
+        context: &ConformanceContext<'_>,
+        cfg: &fkst_common::config::Config,
+    ) -> HostCheck {
+        let scope = if context.options.roots.is_single_folded_graph_root() {
             ValidationScope::PartialGraph
         } else {
             ValidationScope::ClosedWorld
         };
-        match validate_with_scope(cfg, self.options.roots.host_root(), scope) {
+        match validate_with_scope(cfg, context.options.roots.host_root(), scope) {
             Ok(warnings) => {
                 if warnings.is_empty() {
                     HostCheck::pass("schema-validation", "schema validation passed".to_string())
@@ -202,7 +296,9 @@ impl HostConformanceSuite {
 impl HostCheck {
     fn pass(id: &'static str, message: String) -> Self {
         Self {
+            pack: "unregistered",
             id,
+            package: None,
             status: CheckStatus::Pass,
             message,
         }
@@ -210,7 +306,19 @@ impl HostCheck {
 
     fn fail(id: &'static str, message: String) -> Self {
         Self {
+            pack: "unregistered",
             id,
+            package: None,
+            status: CheckStatus::Fail,
+            message,
+        }
+    }
+
+    fn fail_for_package(id: &'static str, package: String, message: String) -> Self {
+        Self {
+            pack: "unregistered",
+            id,
+            package: Some(package),
             status: CheckStatus::Fail,
             message,
         }
@@ -222,6 +330,54 @@ impl HostCheck {
             CheckStatus::Fail => "FAIL",
         };
         println!("{status} {} {}", self.id, self.message);
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct ConformanceReport {
+    ok: bool,
+    violations: Vec<ConformanceViolation>,
+    counts: ConformanceCounts,
+}
+
+#[derive(Debug, Serialize)]
+struct ConformanceViolation {
+    rule: String,
+    package: Option<String>,
+    detail: String,
+}
+
+#[derive(Debug, Serialize)]
+struct ConformanceCounts {
+    packs: usize,
+    checks: usize,
+    passed: usize,
+    failed: usize,
+}
+
+impl ConformanceReport {
+    fn from_checks(packs: usize, checks: &[HostCheck]) -> Self {
+        let violations = checks
+            .iter()
+            .filter(|check| matches!(check.status, CheckStatus::Fail))
+            .map(|check| ConformanceViolation {
+                rule: format!("{}.{}", check.pack, check.id),
+                package: check.package.clone(),
+                detail: check.message.clone(),
+            })
+            .collect::<Vec<_>>();
+        let failed = violations.len();
+        let checks_count = checks.len();
+        Self {
+            ok: failed == 0,
+            violations,
+            counts: ConformanceCounts {
+                packs,
+                checks: checks_count,
+                passed: checks_count - failed,
+                failed,
+            },
+        }
     }
 }
 

@@ -66,6 +66,12 @@ fn combined_log(output: &Output) -> String {
     )
 }
 
+fn stdout_json_report(output: &Output) -> serde_json::Value {
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let line = stdout.lines().last().expect("stdout should contain JSON");
+    serde_json::from_str(line).unwrap_or_else(|err| panic!("invalid JSON report {line}: {err}"))
+}
+
 fn write_minimal_host(root: &std::path::Path) {
     write_single_package_workspace(root);
     fs::create_dir_all(root.join("departments/hello")).unwrap();
@@ -192,6 +198,12 @@ fn valid_minimal_host_exits_zero() {
     assert!(log.contains("PASS graph-scan"), "{log}");
     assert!(log.contains("PASS department-non-empty"), "{log}");
     assert!(log.contains("PASS schema-validation"), "{log}");
+    let report = stdout_json_report(&output);
+    assert_eq!(report["ok"], true);
+    assert_eq!(report["violations"], serde_json::json!([]));
+    assert_eq!(report["counts"]["packs"], 1);
+    assert_eq!(report["counts"]["checks"], 6);
+    assert_eq!(report["counts"]["failed"], 0);
 }
 
 #[test]
@@ -251,6 +263,17 @@ fn locale_catalogs_reject_missing_non_reference_key() {
     let log = combined_log(&output);
     assert!(log.contains("FAIL locale-catalogs"), "{log}");
     assert!(log.contains("missing reference key `body`"), "{log}");
+    let report = stdout_json_report(&output);
+    assert_eq!(report["ok"], false);
+    assert_eq!(report["violations"][0]["rule"], "engine.locale-catalogs");
+    assert!(report["violations"][0]["package"].is_string());
+    assert!(
+        report["violations"][0]["detail"]
+            .as_str()
+            .unwrap()
+            .contains("missing reference key `body`"),
+        "{report}"
+    );
 }
 
 #[test]
@@ -494,6 +517,44 @@ fn composed_graph_sibling_producer_to_unpublished_queue_fails_graph_scan() {
         "{log}"
     );
     assert!(log.contains("M.spec.published_seam"), "{log}");
+    let report = stdout_json_report(&output);
+    assert_eq!(report["ok"], false);
+    assert_eq!(report["violations"][0]["rule"], "engine.graph-scan");
+    assert!(
+        report["violations"][0]["detail"]
+            .as_str()
+            .unwrap()
+            .contains("M.spec.published_seam"),
+        "{report}"
+    );
+}
+
+#[test]
+fn config_file_is_accepted_as_rule_pack_selection_seam() {
+    let host = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
+    write_minimal_host(host.path());
+    let config = host.path().join("conformance.toml");
+    fs::write(
+        &config,
+        r#"
+[rule_packs]
+engine = {}
+"#,
+    )
+    .unwrap();
+
+    let args = [
+        std::ffi::OsStr::new("--project-root"),
+        path_arg(host.path()),
+        std::ffi::OsStr::new("--config"),
+        path_arg(&config),
+    ];
+    let output = run_conformance(&args, host.path());
+
+    assert_exit(&output, 0);
+    let report = stdout_json_report(&output);
+    assert_eq!(report["ok"], true);
+    assert_eq!(report["counts"]["packs"], 1);
 }
 
 #[test]
