@@ -201,6 +201,10 @@ impl DeliveryRouter {
         }
     }
 
+    pub(crate) fn route_subscriptions_for_test(cfg: &Config, queue: &str) -> Vec<Subscription> {
+        subscriptions(cfg).remove(queue).unwrap_or_default()
+    }
+
     pub(crate) fn notify_reliable_public(&self, dept: &str) {
         self.notify_reliable(dept);
     }

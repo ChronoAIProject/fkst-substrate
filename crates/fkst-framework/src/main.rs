@@ -62,7 +62,12 @@ mod sdk_strings;
 mod self_test;
 mod spec_queues;
 mod supervise;
+mod test_assertions;
+mod test_department_env;
+mod test_fire_raiser;
 mod test_runner;
+#[cfg(test)]
+mod test_runner_unit;
 
 #[cfg(test)]
 mod test_env {

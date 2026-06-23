@@ -14,6 +14,7 @@ use crate::lua_coverage::LuaCoverage;
 use crate::manifest::UnitCatalog;
 use crate::path_resolver::PackageRoots;
 use crate::raise::RaiseBuffer;
+use crate::test_department_env::{DeptRunEnvGuard, DeptRunOptions};
 
 pub(crate) fn run_tests(
     roots: PackageRoots,
@@ -362,64 +363,7 @@ fn register_test_sdk(
         }
     };
     let test = lua.create_table()?;
-    test.set(
-        "eq",
-        lua.create_function(
-            |lua, (actual, expected, msg): (Value, Value, Option<String>)| {
-                if lua_values_equal(lua, actual.clone(), expected.clone())? {
-                    return Ok(());
-                }
-                Err(assertion_error(
-                    "eq",
-                    msg,
-                    format!(
-                        "expected {}, got {}",
-                        display_value(expected),
-                        display_value(actual)
-                    ),
-                ))
-            },
-        )?,
-    )?;
-    test.set(
-        "is_true",
-        lua.create_function(|_, (value, msg): (Value, Option<String>)| {
-            if !matches!(value, Value::Nil | Value::Boolean(false)) {
-                return Ok(());
-            }
-            Err(assertion_error(
-                "is_true",
-                msg,
-                format!("got {}", display_value(value)),
-            ))
-        })?,
-    )?;
-    test.set(
-        "raises",
-        lua.create_function(|_, (func, msg): (Function, Option<String>)| {
-            match func.call::<()>(()) {
-                Ok(()) => Err(assertion_error(
-                    "raises",
-                    msg,
-                    "function did not raise".to_string(),
-                )),
-                Err(_) => Ok(()),
-            }
-        })?,
-    )?;
-    test.set(
-        "is_nil",
-        lua.create_function(|_, (value, msg): (Value, Option<String>)| {
-            if matches!(value, Value::Nil) {
-                return Ok(());
-            }
-            Err(assertion_error(
-                "is_nil",
-                msg,
-                format!("got {}", display_value(value)),
-            ))
-        })?,
-    )?;
+    crate::test_assertions::register(lua, &test)?;
     test.set("mock_command", {
         let mock_commands = mock_commands.clone();
         lua.create_function(move |_, (pattern, result): (String, Table)| {
@@ -491,6 +435,9 @@ fn register_test_sdk(
     test.set("run_department", {
         let mock_commands = mock_commands.clone();
         let cache = cache.clone();
+        let roots = roots.clone();
+        let owner_namespace = owner_namespace.clone();
+        let coverage = coverage.clone();
         lua.create_function(
             move |lua, (path, event, opts): (String, Value, Option<Table>)| {
                 run_department(
@@ -508,6 +455,15 @@ fn register_test_sdk(
             },
         )?
     })?;
+    crate::test_fire_raiser::register(
+        lua,
+        cache,
+        roots,
+        owner_namespace,
+        mock_commands,
+        coverage,
+        &test,
+    )?;
     fkst.set("test", test)?;
     globals.set("fkst", fkst)?;
     Ok(())
@@ -558,7 +514,7 @@ fn parse_command_cassette_redactions(
     Ok(redactions)
 }
 
-fn run_department(
+pub(crate) fn run_department(
     lua: &Lua,
     cache: &TestRunCache,
     roots: &PackageRoots,
@@ -573,6 +529,38 @@ fn run_department(
     let opts = DeptRunOptions::from_lua(opts)?;
     let lua_path = resolve_department_path(owner_root, &path);
     let event_json: serde_json::Value = lua.from_value(event)?;
+    let outcome = run_department_core(
+        cache,
+        roots,
+        owner_root,
+        owner_namespace,
+        mock_commands,
+        &lua_path,
+        event_json,
+        opts,
+        coverage,
+    )?;
+    department_run_table(lua, outcome)
+}
+
+pub(crate) struct DepartmentRunOutcome {
+    pub(crate) exit_code: i32,
+    pub(crate) error: Option<String>,
+    pub(crate) raises: Vec<(String, JsonValue)>,
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn run_department_core(
+    cache: &TestRunCache,
+    roots: &PackageRoots,
+    owner_root: &Path,
+    owner_namespace: &str,
+    mock_commands: MockCommandState,
+    lua_path: &Path,
+    event_json: JsonValue,
+    opts: DeptRunOptions,
+    coverage: Option<LuaCoverage>,
+) -> mlua::Result<DepartmentRunOutcome> {
     let _guard = DeptRunEnvGuard::apply(opts)?;
     let owner_unit = cache.owner_unit_for_root(owner_root)?;
     let graph_json_authorized =
@@ -615,29 +603,45 @@ fn run_department(
     } else {
         Some(cache.lua_chunk_cache())
     };
-    let exit_code = match crate::mlua_init::run_dept_with_package_path_chunk_cache_and_name_root(
-        &dept_lua,
-        &lua_path,
-        &event_json,
-        chunk_cache,
-        owner_root,
-        cache.catalog_for_root(owner_root)?,
-        &owner_unit,
-    ) {
-        Ok(()) => 0,
-        Err(err) => {
-            eprintln!(
-                "[framework:test] department failed {}: {err:#}",
-                lua_path.display()
-            );
-            1
-        }
-    };
+    let (exit_code, error) =
+        match crate::mlua_init::run_dept_with_package_path_chunk_cache_and_name_root(
+            &dept_lua,
+            &lua_path,
+            &event_json,
+            chunk_cache,
+            owner_root,
+            cache.catalog_for_root(owner_root)?,
+            &owner_unit,
+        ) {
+            Ok(()) => (0, None),
+            Err(err) => {
+                let message = format!("{err:#}");
+                eprintln!(
+                    "[framework:test] department failed {}: {message}",
+                    lua_path.display()
+                );
+                (1, Some(message))
+            }
+        };
 
+    Ok(DepartmentRunOutcome {
+        exit_code,
+        error,
+        raises: raise_buf.snapshot(),
+    })
+}
+
+pub(crate) fn department_run_table(
+    lua: &Lua,
+    outcome: DepartmentRunOutcome,
+) -> mlua::Result<Table> {
     let result = lua.create_table()?;
-    result.set("exit_code", exit_code)?;
+    result.set("exit_code", outcome.exit_code)?;
+    if let Some(error) = outcome.error {
+        result.set("error", error)?;
+    }
     let raises = lua.create_table()?;
-    for (idx, (queue, payload)) in raise_buf.snapshot().into_iter().enumerate() {
+    for (idx, (queue, payload)) in outcome.raises.into_iter().enumerate() {
         let entry = lua.create_table()?;
         entry.set("queue", queue)?;
         entry.set("payload", lua.to_value(&payload)?)?;
@@ -648,7 +652,7 @@ fn run_department(
 }
 
 #[derive(Clone)]
-struct TestRunCache {
+pub(crate) struct TestRunCache {
     roots: PackageRoots,
     inner: Arc<Mutex<TestRunCacheInner>>,
     lua_chunks: crate::mlua_init::LuaChunkCache,
@@ -665,14 +669,14 @@ struct TestRunCacheInner {
 
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-struct TestRunCacheStats {
-    owner_unit_misses: usize,
-    declared_produces_misses: usize,
-    declared_consumes_misses: usize,
+pub(crate) struct TestRunCacheStats {
+    pub(crate) owner_unit_misses: usize,
+    pub(crate) declared_produces_misses: usize,
+    pub(crate) declared_consumes_misses: usize,
 }
 
 impl TestRunCache {
-    fn new(roots: PackageRoots) -> Result<Self> {
+    pub(crate) fn new(roots: PackageRoots) -> Result<Self> {
         Ok(Self {
             roots,
             inner: Arc::new(Mutex::new(TestRunCacheInner::default())),
@@ -794,12 +798,12 @@ impl TestRunCache {
         Ok(consumes)
     }
 
-    fn lua_chunk_cache(&self) -> &crate::mlua_init::LuaChunkCache {
+    pub(crate) fn lua_chunk_cache(&self) -> &crate::mlua_init::LuaChunkCache {
         &self.lua_chunks
     }
 
     #[cfg(test)]
-    fn stats(&self) -> TestRunCacheStats {
+    pub(crate) fn stats(&self) -> TestRunCacheStats {
         self.inner.lock().unwrap().stats
     }
 }
@@ -880,96 +884,6 @@ fn resolve_department_path(package_root: &Path, path: &str) -> PathBuf {
     }
 }
 
-#[derive(Debug)]
-struct DeptRunOptions {
-    cwd: Option<PathBuf>,
-    env: Vec<(String, String)>,
-    path_prepend: Option<String>,
-}
-
-impl DeptRunOptions {
-    fn from_lua(opts: Option<Table>) -> mlua::Result<Self> {
-        let Some(opts) = opts else {
-            return Ok(Self {
-                cwd: None,
-                env: Vec::new(),
-                path_prepend: None,
-            });
-        };
-        let cwd = opts.get::<Option<String>>("cwd")?.map(PathBuf::from);
-        let env = match opts.get::<Option<Table>>("env")? {
-            Some(env_table) => env_table
-                .pairs::<String, String>()
-                .collect::<mlua::Result<Vec<(String, String)>>>()?,
-            None => Vec::new(),
-        };
-        let path_prepend = opts.get::<Option<String>>("path_prepend")?;
-        Ok(Self {
-            cwd,
-            env,
-            path_prepend,
-        })
-    }
-}
-
-struct DeptRunEnvGuard {
-    cwd: Option<PathBuf>,
-    env: Vec<(String, Option<std::ffi::OsString>)>,
-}
-
-impl DeptRunEnvGuard {
-    fn apply(opts: DeptRunOptions) -> mlua::Result<Self> {
-        let mut guard = Self {
-            cwd: if opts.cwd.is_some() {
-                Some(std::env::current_dir().map_err(mlua::Error::external)?)
-            } else {
-                None
-            },
-            env: Vec::new(),
-        };
-
-        for (key, value) in opts.env {
-            guard.env.push((key.clone(), std::env::var_os(&key)));
-            std::env::set_var(key, value);
-        }
-
-        if let Some(prepend) = opts.path_prepend {
-            let key = "PATH".to_string();
-            let previous = std::env::var_os(&key);
-            let mut paths = vec![PathBuf::from(prepend)];
-            if let Some(previous) = &previous {
-                paths.extend(std::env::split_paths(previous));
-            }
-            let next = std::env::join_paths(paths).map_err(mlua::Error::external)?;
-            guard.env.push((key.clone(), previous));
-            std::env::set_var(key, next);
-        }
-
-        if let Some(next_cwd) = opts.cwd {
-            if let Err(err) = std::env::set_current_dir(&next_cwd) {
-                drop(guard);
-                return Err(mlua::Error::external(err));
-            }
-        }
-
-        Ok(guard)
-    }
-}
-
-impl Drop for DeptRunEnvGuard {
-    fn drop(&mut self) {
-        for (key, value) in self.env.iter().rev() {
-            match value {
-                Some(value) => std::env::set_var(key, value),
-                None => std::env::remove_var(key),
-            }
-        }
-        if let Some(cwd) = &self.cwd {
-            let _ = std::env::set_current_dir(cwd);
-        }
-    }
-}
-
 struct TestModeSupervisorPidGuard {
     previous: Option<std::ffi::OsString>,
 }
@@ -990,203 +904,10 @@ impl Drop for TestModeSupervisorPidGuard {
     }
 }
 
-fn lua_values_equal(lua: &Lua, actual: Value, expected: Value) -> mlua::Result<bool> {
-    lua.globals()
-        .get::<Function>("rawequal")?
-        .call::<bool>((actual, expected))
-}
-
-fn assertion_error(name: &str, msg: Option<String>, detail: String) -> mlua::Error {
-    let prefix = match msg {
-        Some(msg) if !msg.is_empty() => format!("{name}: {msg}: "),
-        _ => format!("{name}: "),
-    };
-    mlua::Error::runtime(format!("{prefix}{detail}"))
-}
-
-fn display_value(value: Value) -> String {
-    match value {
-        Value::Nil => "nil".to_string(),
-        Value::Boolean(value) => value.to_string(),
-        Value::Integer(value) => value.to_string(),
-        Value::Number(value) => value.to_string(),
-        Value::String(value) => match value.to_str() {
-            Ok(value) => format!("{value:?}"),
-            Err(_) => "<non-utf8-string>".to_string(),
-        },
-        Value::Table(_) => "<table>".to_string(),
-        Value::Function(_) => "<function>".to_string(),
-        Value::Thread(_) => "<thread>".to_string(),
-        Value::UserData(_) => "<userdata>".to_string(),
-        Value::LightUserData(_) => "<lightuserdata>".to_string(),
-        Value::Error(err) => format!("<error:{err}>"),
-        Value::Other(_) => "<other>".to_string(),
-    }
-}
-
 fn display_path(path: &Path, owner_root: &Path) -> String {
     path.strip_prefix(owner_root)
         .unwrap_or(path)
         .to_string_lossy()
         .trim_start_matches(std::path::MAIN_SEPARATOR)
         .to_string()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use tempfile::TempDir;
-
-    fn write(path: &Path, body: &str) {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).unwrap();
-        }
-        std::fs::write(path, body).unwrap();
-    }
-
-    fn write_package_manifest(root: &Path) {
-        write(
-            &root.join("fkst.workspace.toml"),
-            r#"
-[workspace]
-units = ["."]
-"#,
-        );
-        write(
-            &root.join("fkst.toml"),
-            r#"
-kind = "package"
-name = "pkg"
-
-[code]
-root = "."
-"#,
-        );
-    }
-
-    fn table_len(table: Table) -> usize {
-        table.pairs::<Value, Value>().count()
-    }
-
-    #[test]
-    fn run_department_cache_reuses_derivations_and_preserves_isolation() {
-        let temp = TempDir::new().unwrap();
-        write_package_manifest(temp.path());
-        let dept_dir = temp.path().join("departments/worker");
-        std::fs::create_dir_all(&dept_dir).unwrap();
-        std::fs::write(
-            temp.path().join("helper.lua"),
-            r#"
-            local M = {}
-            local counter = 0
-            function M.next()
-                counter = counter + 1
-                return counter
-            end
-            return M
-            "#,
-        )
-        .unwrap();
-        let main = dept_dir.join("main.lua");
-        std::fs::write(
-            &main,
-            r#"
-            function pipeline(event)
-                local helper = require("helper")
-                local result = exec_sync({ cmd = "echo " .. tostring(event.n) })
-                raise("pkg.done", { stdout = result.stdout, n = event.n, counter = helper.next() })
-            end
-            return {
-                spec = { produces = { "pkg.done" } },
-                pipeline = pipeline,
-            }
-            "#,
-        )
-        .unwrap();
-        let roots = PackageRoots::resolve(temp.path(), vec![temp.path().to_path_buf()]).unwrap();
-        let owner_root = temp.path().canonicalize().unwrap();
-        let owner_namespace = roots.sole_package_namespace().unwrap().to_string();
-        let cache = TestRunCache::new(roots.clone()).unwrap();
-        let mock_commands = MockCommandState::new();
-        let outer_lua = crate::mlua_init::new_lua();
-
-        let first_event = outer_lua
-            .to_value(&serde_json::json!({"queue": "jobs", "payload": {}, "ts": 1, "n": 1}))
-            .unwrap();
-        mock_commands
-            .push_mock(
-                "echo 1".to_string(),
-                MockCommandResult {
-                    stdout: "one\n".to_string(),
-                    stderr: String::new(),
-                    exit_code: 0,
-                },
-            )
-            .unwrap();
-        let first = run_department(
-            &outer_lua,
-            &cache,
-            &roots,
-            &owner_root,
-            &owner_namespace,
-            mock_commands.clone(),
-            "departments/worker/main.lua".to_string(),
-            first_event,
-            None,
-            None,
-        )
-        .unwrap();
-        assert_eq!(first.get::<i64>("exit_code").unwrap(), 0);
-        let first_raises: Table = first.get("raises").unwrap();
-        let first_raise: Table = first_raises.get(1).unwrap();
-        let first_payload: Table = first_raise.get("payload").unwrap();
-        assert_eq!(first_payload.get::<i64>("counter").unwrap(), 1);
-        assert_eq!(table_len(first_raises), 1);
-        assert_eq!(mock_commands.calls().unwrap().len(), 1);
-
-        mock_commands.reset().unwrap();
-        let second_event = outer_lua
-            .to_value(&serde_json::json!({"queue": "jobs", "payload": {}, "ts": 2, "n": 2}))
-            .unwrap();
-        mock_commands
-            .push_mock(
-                "echo 2".to_string(),
-                MockCommandResult {
-                    stdout: "two\n".to_string(),
-                    stderr: String::new(),
-                    exit_code: 0,
-                },
-            )
-            .unwrap();
-        let second = run_department(
-            &outer_lua,
-            &cache,
-            &roots,
-            &owner_root,
-            &owner_namespace,
-            mock_commands.clone(),
-            "departments/worker/main.lua".to_string(),
-            second_event,
-            None,
-            None,
-        )
-        .unwrap();
-
-        assert_eq!(second.get::<i64>("exit_code").unwrap(), 0);
-        let second_raises: Table = second.get("raises").unwrap();
-        let second_raise: Table = second_raises.get(1).unwrap();
-        let second_payload: Table = second_raise.get("payload").unwrap();
-        assert_eq!(second_payload.get::<i64>("counter").unwrap(), 1);
-        assert_eq!(table_len(second_raises), 1);
-        assert_eq!(mock_commands.calls().unwrap().len(), 1);
-        assert_eq!(
-            cache.stats(),
-            TestRunCacheStats {
-                owner_unit_misses: 1,
-                declared_produces_misses: 1,
-                declared_consumes_misses: 1,
-            }
-        );
-        assert_eq!(cache.lua_chunk_cache().chunk_count(), 1);
-    }
 }

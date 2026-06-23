@@ -86,6 +86,9 @@ parse business schemas — those assertions live in the package test.
 
 ## 6. Migration
 
+This implementation PR covers step 1 and the substrate self-test in step 2 only. The #1362
+producer-liveness conformance hook and package fixture migration remain separate follow-ups.
+
 1. Add `fkst.test.fire_raiser` (engine), reusing `run_department`'s dispatch; cron + file_watch.
 2. `cargo test` + a substrate self-test proving: a cron raiser whose consumer rejects the real tick
    FAILS `fire_raiser` (the #1361 shape), and one that accepts it passes (mirrors the package fix).
