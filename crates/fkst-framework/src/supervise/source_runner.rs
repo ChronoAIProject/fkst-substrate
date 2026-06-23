@@ -11,6 +11,13 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::time::Instant;
 use tracing::{info, warn};
 
+#[derive(Clone, Debug)]
+pub(crate) struct SourceEmission {
+    pub(crate) event: Event,
+    pub(crate) source: SourceRef,
+    pub(crate) cron_payload: Option<serde_json::Value>,
+}
+
 /// Spawn a Cron raiser as a tokio task. First fire is start plus deterministic jitter.
 /// Missed ticks during sleep/pause coalesce to one tick.
 ///
@@ -60,6 +67,27 @@ pub fn spawn_cron(
 
 fn cron_payload(name: &str) -> serde_json::Value {
     serde_json::json!({"raiser": name})
+}
+
+pub(crate) fn cron_emission(
+    name: &str,
+    produces: &str,
+    slot_unix_ms: u64,
+    observed_at_ms: u64,
+) -> SourceEmission {
+    let payload = cron_payload(name);
+    SourceEmission {
+        event: Event {
+            queue: produces.to_string(),
+            payload: payload.clone(),
+            ts: observed_at_ms,
+        },
+        source: SourceRef {
+            kind: SourceKind::Cron,
+            reference: cron_source_reference(name, slot_unix_ms),
+        },
+        cron_payload: Some(payload),
+    }
 }
 
 fn cron_first_fire_jitter(name: &str, interval: Duration) -> Duration {
@@ -234,6 +262,48 @@ fn file_identity(path: &Path) -> std::io::Result<FileIdentity> {
     Ok(FileIdentity {
         len: metadata.len(),
         modified: metadata.modified().ok(),
+    })
+}
+
+pub(crate) fn file_watch_fixture_emission(
+    _name: &str,
+    glob: &str,
+    host_root: &Path,
+    produces: &str,
+    fixture: &Path,
+    observed_at_ms: u64,
+) -> anyhow::Result<SourceEmission> {
+    let glob = absolutize_glob(glob, host_root)?;
+    let path = fixture.canonicalize().map_err(|err| {
+        anyhow::anyhow!(
+            "canonicalize file_watch fixture {}: {err}",
+            fixture.display()
+        )
+    })?;
+    if !path.is_file() {
+        anyhow::bail!("file_watch fixture is not a file: {}", path.display());
+    }
+    if !glob_matches_path(&glob, &path) {
+        anyhow::bail!(
+            "file_watch fixture {} does not match declared glob {}",
+            path.display(),
+            glob
+        );
+    }
+    let identity = file_identity(&path)
+        .map_err(|err| anyhow::anyhow!("stat file_watch fixture {}: {err}", path.display()))?;
+    let payload = serde_json::json!({"path": path.to_string_lossy()});
+    Ok(SourceEmission {
+        event: Event {
+            queue: produces.to_string(),
+            payload,
+            ts: observed_at_ms,
+        },
+        source: SourceRef {
+            kind: SourceKind::File,
+            reference: file_source_reference(&path, identity),
+        },
+        cron_payload: None,
     })
 }
 

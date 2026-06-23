@@ -354,7 +354,11 @@ fn validate_lock_matches_manifest(
     // loop (which rejects locked libraries not in the manifest), this pins
     // lock.libraries == source.libraries exactly.
     for allowed in &source.libraries {
-        if !lock.libraries.iter().any(|library| &library.name == allowed) {
+        if !lock
+            .libraries
+            .iter()
+            .any(|library| &library.name == allowed)
+        {
             bail!(
                 "external source `{}` library `{}` is allowed by the workspace manifest but missing from fkst.lock; run `deps lock`",
                 source.id,
@@ -640,7 +644,10 @@ fn collect_hash_files(root: &Path, dir: &Path, files: &mut Vec<(String, HashEntr
             // without following the link out of the cache.
             let target =
                 fs::read_link(&path).with_context(|| format!("readlink {}", path.display()))?;
-            files.push((relative, HashEntry::Symlink(target.into_os_string().into_vec())));
+            files.push((
+                relative,
+                HashEntry::Symlink(target.into_os_string().into_vec()),
+            ));
         } else if file_type.is_file() {
             files.push((relative, HashEntry::File(path)));
         }

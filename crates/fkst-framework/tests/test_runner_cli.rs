@@ -711,6 +711,7 @@ local allowed = {
   is_true = true,
   mock_command = true,
   raises = true,
+  fire_raiser = true,
   run_department = true,
   with_command_cassette = true,
 }
@@ -743,6 +744,160 @@ return {
     let out = stdout(&output);
     assert!(
         out.contains("PASS tests/fkst_test_surface_test.lua::test_fkst_test_surface_is_explicit"),
+        "stdout: {out}"
+    );
+    assert!(out.contains("1 passed, 0 failed"), "stdout: {out}");
+}
+
+#[test]
+fn fire_raiser_uses_real_cron_tick_and_surfaces_consumer_result() {
+    let host = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
+    fs::create_dir_all(host.path().join("departments/reject_tick")).unwrap();
+    fs::create_dir_all(host.path().join("departments/accept_tick")).unwrap();
+    fs::create_dir_all(host.path().join("raisers")).unwrap();
+    fs::create_dir_all(host.path().join("tests")).unwrap();
+    fs::write(
+        host.path().join("raisers/reject_tick.lua"),
+        r#"return { type = "cron", interval = "60s", produces = "reject_tick" }"#,
+    )
+    .unwrap();
+    fs::write(
+        host.path().join("raisers/accept_tick.lua"),
+        r#"return { type = "cron", interval = "60s", produces = "accept_tick" }"#,
+    )
+    .unwrap();
+    fs::write(
+        host.path().join("departments/reject_tick/main.lua"),
+        r#"
+local M = {}
+M.spec = { consumes = { "reject_tick" } }
+function M.pipeline(event)
+  if event.payload.schema ~= "ideal-cron-fixture" then
+    error("unknown-schema")
+  end
+end
+return M
+"#,
+    )
+    .unwrap();
+    fs::write(
+        host.path().join("departments/accept_tick/main.lua"),
+        r#"
+local M = {}
+M.spec = { consumes = { "accept_tick" }, produces = { "done" } }
+function M.pipeline(event)
+  assert(event.payload.raiser == "accept_tick", "expected real cron tick")
+  raise("done", { seen = event.payload.raiser })
+end
+return M
+"#,
+    )
+    .unwrap();
+    fs::write(
+        host.path().join("tests/fire_raiser_test.lua"),
+        r#"
+local t = fkst.test
+
+return {
+  test_fire_raiser_surfaces_real_tick_rejection = function()
+    local trace = t.fire_raiser("reject_tick")
+    t.eq(trace.source_payload.raiser, "reject_tick")
+    t.eq(trace.routed_to[1], "reject_tick")
+    t.eq(trace.consumer_result.status, "error")
+    t.is_true(string.find(trace.consumer_result.message, "unknown-schema", 1, true) ~= nil)
+  end,
+
+  test_fire_raiser_accepts_real_tick_and_captures_raises = function()
+    local trace = t.fire_raiser("accept_tick")
+    t.eq(trace.source_payload.raiser, "accept_tick")
+    t.eq(trace.routed_to[1], "accept_tick")
+    t.eq(trace.consumer_result.status, "accepted")
+    t.eq(trace.raised[1].queue, "done")
+    t.eq(trace.raised[1].payload.seen, "accept_tick")
+  end,
+}
+"#,
+    )
+    .unwrap();
+
+    let output = run_lua_tests(host.path(), host.path());
+
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}",
+        stdout(&output),
+        stderr(&output)
+    );
+    let out = stdout(&output);
+    assert!(
+        out.contains(
+            "PASS tests/fire_raiser_test.lua::test_fire_raiser_surfaces_real_tick_rejection"
+        ),
+        "stdout: {out}"
+    );
+    assert!(
+        out.contains("PASS tests/fire_raiser_test.lua::test_fire_raiser_accepts_real_tick_and_captures_raises"),
+        "stdout: {out}"
+    );
+    assert!(out.contains("2 passed, 0 failed"), "stdout: {out}");
+}
+
+#[test]
+fn fire_raiser_uses_real_file_watch_fixture_payload() {
+    let host = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
+    fs::create_dir_all(host.path().join("departments/watch")).unwrap();
+    fs::create_dir_all(host.path().join("raisers")).unwrap();
+    fs::create_dir_all(host.path().join("tests")).unwrap();
+    fs::create_dir_all(host.path().join("input")).unwrap();
+    fs::write(host.path().join("input/ready.json"), "{}").unwrap();
+    fs::write(
+        host.path().join("raisers/files.lua"),
+        r#"return { type = "file_watch", glob = "input/*.json", produces = "files" }"#,
+    )
+    .unwrap();
+    fs::write(
+        host.path().join("departments/watch/main.lua"),
+        r#"
+local M = {}
+M.spec = { consumes = { "files" }, produces = { "done" } }
+function M.pipeline(event)
+  assert(string.find(event.payload.path, "/input/ready.json", 1, true) ~= nil, "expected file path payload")
+  raise("done", { path = event.payload.path })
+end
+return M
+"#,
+    )
+    .unwrap();
+    fs::write(
+        host.path().join("tests/fire_file_watch_test.lua"),
+        r#"
+local t = fkst.test
+
+return {
+  test_file_watch_fixture_routes_real_path_payload = function()
+    local trace = t.fire_raiser("files", { fixture = "input/ready.json" })
+    t.eq(trace.consumer_result.status, "accepted")
+    t.is_true(string.find(trace.source_payload.path, "/input/ready.json", 1, true) ~= nil)
+    t.eq(trace.raised[1].payload.path, trace.source_payload.path)
+  end,
+}
+"#,
+    )
+    .unwrap();
+
+    let output = run_lua_tests(host.path(), host.path());
+
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}",
+        stdout(&output),
+        stderr(&output)
+    );
+    let out = stdout(&output);
+    assert!(
+        out.contains(
+            "PASS tests/fire_file_watch_test.lua::test_file_watch_fixture_routes_real_path_payload"
+        ),
         "stdout: {out}"
     );
     assert!(out.contains("1 passed, 0 failed"), "stdout: {out}");

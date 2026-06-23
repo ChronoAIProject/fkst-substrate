@@ -41,6 +41,13 @@ pub(crate) fn load_host_graph_for_conformance(roots: &PackageRoots) -> Result<Co
     graph_scan::load_roots(roots)
 }
 
+pub(crate) fn route_subscriptions_for_test(
+    cfg: &Config,
+    queue: &str,
+) -> Vec<delivery_router::Subscription> {
+    DeliveryRouter::route_subscriptions_for_test(cfg, queue)
+}
+
 pub async fn supervise(roots: PackageRoots, framework_bin: PathBuf) -> Result<()> {
     let project_root = roots.host_root().to_path_buf();
     let journal = SupervisorJournal::open(&project_root);
