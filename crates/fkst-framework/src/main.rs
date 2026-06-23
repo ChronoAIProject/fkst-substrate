@@ -26,6 +26,7 @@ use std::sync::Arc;
 
 mod boundary_resource;
 mod config_registry;
+mod declarative_conformance;
 mod deps_cli;
 mod external_command;
 mod host_conformance;

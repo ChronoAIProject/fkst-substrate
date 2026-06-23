@@ -7,6 +7,7 @@ use serde::Deserialize;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
+use toml::Value;
 
 #[path = "manifest_exports.rs"]
 pub(crate) mod manifest_exports;
@@ -154,13 +155,22 @@ pub(crate) struct UnitManifest {
     pub(crate) library: Option<LibraryMeta>,
     pub(crate) visibility: Visibility,
     pub(crate) exports: Exports,
+    pub(crate) conformance: Option<ConformanceManifest>,
 }
 
 impl UnitManifest {
     pub(crate) fn parse_file(path: &Path) -> Result<Self> {
+        Self::parse_file_inner(path, false)
+    }
+
+    pub(crate) fn parse_file_strict(path: &Path) -> Result<Self> {
+        Self::parse_file_inner(path, true)
+    }
+
+    fn parse_file_inner(path: &Path, strict_conformance: bool) -> Result<Self> {
         let raw = fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
         toml::from_str::<UnitManifestToml>(&raw)
-            .map(UnitManifestToml::into_manifest)
+            .and_then(|manifest| manifest.into_manifest(strict_conformance))
             .with_context(|| format!("parse {}", path.display()))
     }
 }
@@ -179,11 +189,22 @@ struct UnitManifestToml {
     visibility: Visibility,
     #[serde(default)]
     exports: Exports,
+    conformance: Option<Value>,
 }
 
 impl UnitManifestToml {
-    fn into_manifest(self) -> UnitManifest {
-        UnitManifest {
+    fn into_manifest(
+        self,
+        strict_conformance: bool,
+    ) -> std::result::Result<UnitManifest, toml::de::Error> {
+        let conformance = match self.conformance {
+            Some(raw) if strict_conformance => {
+                Some(raw.try_into::<ConformanceToml>()?.into_manifest())
+            }
+            Some(raw) => Some(ConformanceManifest::from_value(raw)),
+            None => None,
+        };
+        Ok(UnitManifest {
             kind: self.kind,
             name: self.name,
             code_root: self.code.root,
@@ -192,13 +213,42 @@ impl UnitManifestToml {
             library: self.library,
             visibility: self.visibility,
             exports: self.exports,
-        }
+            conformance,
+        })
     }
 }
 
 #[derive(Deserialize)]
 struct CodeToml {
     root: PathBuf,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ConformanceManifest {
+    pub(crate) pack: PathBuf,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ConformanceToml {
+    pack: PathBuf,
+}
+
+impl ConformanceToml {
+    fn into_manifest(self) -> ConformanceManifest {
+        ConformanceManifest { pack: self.pack }
+    }
+}
+
+impl ConformanceManifest {
+    fn from_value(value: Value) -> Self {
+        let pack = value
+            .get("pack")
+            .and_then(Value::as_str)
+            .map(PathBuf::from)
+            .unwrap_or_default();
+        Self { pack }
+    }
 }
 
 #[derive(Default, Deserialize)]

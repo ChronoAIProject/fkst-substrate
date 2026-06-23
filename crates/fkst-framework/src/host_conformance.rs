@@ -7,6 +7,8 @@ use fkst_common::RuntimeKind;
 use serde::Serialize;
 use std::path::PathBuf;
 
+use crate::declarative_conformance::DeclarativeRulePack;
+
 pub(crate) struct HostConformanceOptions {
     pub(crate) roots: PackageRoots,
     pub(crate) config: Option<HostConformanceConfig>,
@@ -30,9 +32,9 @@ pub(crate) struct HostConformanceSuite {
     options: HostConformanceOptions,
 }
 
-struct HostCheck {
-    pack: &'static str,
-    id: &'static str,
+pub(crate) struct HostCheck {
+    pack: String,
+    id: String,
     package: Option<String>,
     status: CheckStatus,
     message: String,
@@ -65,12 +67,12 @@ impl HostConformanceSuite {
     }
 }
 
-struct ConformanceContext<'a> {
+pub(crate) struct ConformanceContext<'a> {
     options: &'a HostConformanceOptions,
 }
 
-trait RulePack {
-    fn name(&self) -> &'static str;
+pub(crate) trait RulePack {
+    fn name(&self) -> &str;
     fn run(&self, context: &ConformanceContext<'_>) -> Vec<HostCheck>;
 }
 
@@ -82,6 +84,11 @@ impl RulePackRegistry {
     fn from_options(options: &HostConformanceOptions) -> Self {
         let mut registry = Self { packs: Vec::new() };
         registry.register(Box::new(EngineRulePack));
+        for graph_root in options.roots.graph_roots() {
+            if let Some(pack) = DeclarativeRulePack::from_graph_root(&graph_root) {
+                registry.register(Box::new(pack));
+            }
+        }
         if let Some(config) = &options.config {
             let _config_path = &config.path;
             // Future rule packs, including a source-ratchet pack that migrates
@@ -105,7 +112,7 @@ impl RulePackRegistry {
         for pack in &self.packs {
             let mut pack_checks = pack.run(context);
             for check in &mut pack_checks {
-                check.pack = pack.name();
+                check.pack = pack.name().to_string();
             }
             checks.extend(pack_checks);
         }
@@ -117,7 +124,7 @@ impl RulePackRegistry {
 struct EngineRulePack;
 
 impl RulePack for EngineRulePack {
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         "engine"
     }
 
@@ -294,31 +301,49 @@ impl EngineRulePack {
 }
 
 impl HostCheck {
-    fn pass(id: &'static str, message: String) -> Self {
+    pub(crate) fn pass(id: impl Into<String>, message: String) -> Self {
         Self {
-            pack: "unregistered",
-            id,
+            pack: "unregistered".to_string(),
+            id: id.into(),
             package: None,
             status: CheckStatus::Pass,
             message,
         }
     }
 
-    fn fail(id: &'static str, message: String) -> Self {
+    pub(crate) fn fail(id: impl Into<String>, message: String) -> Self {
         Self {
-            pack: "unregistered",
-            id,
+            pack: "unregistered".to_string(),
+            id: id.into(),
             package: None,
             status: CheckStatus::Fail,
             message,
         }
     }
 
-    fn fail_for_package(id: &'static str, package: String, message: String) -> Self {
+    pub(crate) fn pass_for_package(
+        id: impl Into<String>,
+        package: impl Into<String>,
+        message: String,
+    ) -> Self {
         Self {
-            pack: "unregistered",
-            id,
-            package: Some(package),
+            pack: "unregistered".to_string(),
+            id: id.into(),
+            package: Some(package.into()),
+            status: CheckStatus::Pass,
+            message,
+        }
+    }
+
+    pub(crate) fn fail_for_package(
+        id: impl Into<String>,
+        package: impl Into<String>,
+        message: String,
+    ) -> Self {
+        Self {
+            pack: "unregistered".to_string(),
+            id: id.into(),
+            package: Some(package.into()),
             status: CheckStatus::Fail,
             message,
         }
