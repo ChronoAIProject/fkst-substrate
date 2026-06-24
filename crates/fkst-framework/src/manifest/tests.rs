@@ -918,6 +918,67 @@ fn missing_workspace_manifest_returns_no_catalog() {
 }
 
 #[test]
+fn workspace_discovery_does_not_cross_nested_workspace_boundary() {
+    let host = tempfile::tempdir().unwrap();
+    write(
+        &host.path().join("fkst.workspace.toml"),
+        r#"
+[workspace]
+units = [
+  ".fkst/local-packages/*",
+  ".fkst/std",
+  ".fkst/run/fkst-packages-conformance/packages/*",
+]
+"#,
+    );
+    write(
+        &host
+            .path()
+            .join(".fkst/local-packages/site-board/fkst.toml"),
+        r#"
+kind = "package"
+name = "site-board"
+persistence_class = "stateless_adapter"
+
+[code]
+root = "."
+"#,
+    );
+    write(
+        &host.path().join(".fkst/std/fkst.toml"),
+        r#"
+kind = "library"
+name = "std"
+
+[code]
+root = "."
+
+[library]
+name = "std"
+stable_id = "std"
+version = "0.1.0"
+"#,
+    );
+    let platform = host.path().join(".fkst/run/fkst-packages-conformance");
+    write_workspace(&platform);
+    write_package(&platform, "idle-detector", &["workflow"]);
+    write_library(&platform, "workflow");
+
+    let host_catalog = UnitCatalog::discover(host.path()).unwrap().unwrap();
+    assert!(host_catalog.contains_unit("site-board"));
+    assert!(host_catalog.contains_unit("std"));
+    assert!(!host_catalog.contains_unit("idle-detector"));
+    assert!(host_catalog.library_unit_name("workflow").is_none());
+
+    let platform_catalog = UnitCatalog::discover(&platform).unwrap().unwrap();
+    assert!(platform_catalog.contains_unit("idle-detector"));
+    assert_eq!(
+        platform_catalog.library_unit_name("workflow"),
+        Some("workflow")
+    );
+}
+
+#[test]
 fn package_manifest_missing_persistence_class_parses_as_absent() {
     let temp = tempfile::tempdir().unwrap();
     write(

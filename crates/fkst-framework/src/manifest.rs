@@ -1056,10 +1056,15 @@ fn collect_glob(workspace_root: &Path, pattern: &str, roots: &mut BTreeSet<PathB
     if segments.iter().any(|segment| *segment == "..") {
         bail!("workspace unit pattern `{pattern}` must not contain `..`");
     }
-    collect_glob_inner(workspace_root, &segments, roots)
+    collect_glob_inner(workspace_root, workspace_root, &segments, roots)
 }
 
-fn collect_glob_inner(base: &Path, segments: &[&str], roots: &mut BTreeSet<PathBuf>) -> Result<()> {
+fn collect_glob_inner(
+    workspace_root: &Path,
+    base: &Path,
+    segments: &[&str],
+    roots: &mut BTreeSet<PathBuf>,
+) -> Result<()> {
     let Some((segment, rest)) = segments.split_first() else {
         let manifest = base.join(UNIT_MANIFEST);
         if !manifest.exists() {
@@ -1074,6 +1079,9 @@ fn collect_glob_inner(base: &Path, segments: &[&str], roots: &mut BTreeSet<PathB
         );
         return Ok(());
     };
+    if base != workspace_root && base.join(WORKSPACE_MANIFEST).exists() {
+        return Ok(());
+    }
 
     if *segment == "*" {
         let mut entries = fs::read_dir(base)
@@ -1088,7 +1096,7 @@ fn collect_glob_inner(base: &Path, segments: &[&str], roots: &mut BTreeSet<PathB
             if metadata.file_type().is_symlink() || !metadata.is_dir() {
                 continue;
             }
-            collect_glob_inner(&path, rest, roots)?;
+            collect_glob_inner(workspace_root, &path, rest, roots)?;
         }
         return Ok(());
     }
@@ -1105,7 +1113,7 @@ fn collect_glob_inner(base: &Path, segments: &[&str], roots: &mut BTreeSet<PathB
             next.display()
         );
     }
-    collect_glob_inner(&next, rest, roots)
+    collect_glob_inner(workspace_root, &next, rest, roots)
 }
 
 fn find_workspace_manifest(start: &Path) -> Result<Option<PathBuf>> {

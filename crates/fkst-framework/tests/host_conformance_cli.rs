@@ -991,6 +991,7 @@ fn host_external_source_contract_only_still_resolves_platform_same_source_lib_de
     fs::create_dir_all(platform_package.join("raisers")).unwrap();
     fs::create_dir_all(host_package.join("departments/board_scan")).unwrap();
     fs::create_dir_all(host_package.join("raisers")).unwrap();
+    fs::create_dir_all(host_package.join("tests")).unwrap();
     fs::create_dir_all(&host_std).unwrap();
     fs::create_dir_all(host.join(".fkst/conformance")).unwrap();
 
@@ -1035,6 +1036,31 @@ return M
     fs::write(
         host_package.join("raisers/board_poll.lua"),
         r#"return { type = "cron", interval = "10s", produces = "board_poll_tick" }"#,
+    )
+    .unwrap();
+    fs::write(
+        host_package.join("tests/board_scan_test.lua"),
+        r#"
+local core = require("core")
+local M = {}
+function M.test_host_package_test_discovery()
+  local fkst_test = fkst.test
+  assert(fkst_test ~= nil, "fkst.test should be registered")
+  assert(core.label() == "site-board")
+end
+return M
+"#,
+    )
+    .unwrap();
+    fs::write(
+        host_package.join("core.lua"),
+        r#"
+local M = {}
+function M.label()
+  return "site-board"
+end
+return M
+"#,
     )
     .unwrap();
     write_library_manifest_at(&host_std, "std", &[], false);
@@ -1200,6 +1226,47 @@ return M
     assert!(
         !pass_log.contains("declares unknown library `workflow`"),
         "{pass_log}"
+    );
+
+    let test_report = root.path().join("site-board-test-report.json");
+    let test_output = Command::new(framework_bin())
+        .arg("test")
+        .arg("--project-root")
+        .arg(&host)
+        .arg("--package-root")
+        .arg(&host_package)
+        .arg("--report-json")
+        .arg(&test_report)
+        .current_dir(&host)
+        .env(RUNTIME_ROOT_ENV, root.path().join("test-runtime"))
+        .env("FKST_CACHE_ROOT", &cache)
+        .output()
+        .unwrap();
+    assert_exit(&test_output, 0);
+    let test_log = combined_log(&test_output);
+    assert!(
+        test_log.contains("PASS tests/board_scan_test.lua::test_host_package_test_discovery"),
+        "{test_log}"
+    );
+    assert!(test_log.contains("1 passed, 0 failed"), "{test_log}");
+    let report: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&test_report).unwrap()).unwrap();
+    assert_eq!(report["summary"]["passed"], 1, "{report}");
+    assert_eq!(report["summary"]["failed"], 0, "{report}");
+
+    let relock_output = Command::new(framework_bin())
+        .arg("deps")
+        .arg("lock")
+        .arg("--project-root")
+        .arg(&host)
+        .env("FKST_CACHE_ROOT", &cache)
+        .output()
+        .unwrap();
+    assert_exit(&relock_output, 0);
+    let relock_log = combined_log(&relock_output);
+    assert!(
+        !relock_log.contains("external source `fkst-platform` does not allow library `workflow`"),
+        "{relock_log}"
     );
 
     write_host_package_manifest_at(
