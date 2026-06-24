@@ -103,6 +103,54 @@ allow = [{allow}]
     );
 }
 
+fn write_library_with_dependency_constraints(
+    root: &Path,
+    name: &str,
+    deps: &[&str],
+    allowed: Option<&[&str]>,
+) {
+    let deps = deps
+        .iter()
+        .map(|library| format!(r#""{library}""#))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let constraints = allowed
+        .map(|allowed| {
+            let allowed = allowed
+                .iter()
+                .map(|library| format!(r#""{library}""#))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!(
+                r#"
+[dependency_constraints]
+allowed_lib_deps = [{allowed}]
+"#
+            )
+        })
+        .unwrap_or_default();
+    write(
+        &root.join(format!("libraries/{name}/fkst.toml")),
+        &format!(
+            r#"
+kind = "library"
+name = "{name}"
+
+[code]
+root = "."
+
+[library]
+name = "{name}"
+stable_id = "{name}"
+version = "0.1.0"
+
+[lib_deps]
+libraries = [{deps}]
+{constraints}"#
+        ),
+    );
+}
+
 #[test]
 fn parses_workspace_unit_lists_and_lock_manifests() {
     let temp = tempfile::tempdir().unwrap();
@@ -258,6 +306,198 @@ public = ["std.*"]
 }
 
 #[test]
+fn catalog_accepts_exact_public_exports_matching_actual_modules() {
+    let temp = tempfile::tempdir().unwrap();
+    write_workspace(temp.path());
+    write_package(temp.path(), "app", &[]);
+    write(&temp.path().join("packages/app/main.lua"), "return {}\n");
+    write(
+        &temp.path().join("libraries/contract/fkst.toml"),
+        r#"
+kind = "library"
+name = "contract"
+
+[code]
+root = "."
+
+[library]
+name = "contract"
+stable_id = "contract"
+version = "0.1.0"
+
+[exports]
+public = ["contract.error_facts", "contract.payload", "contract.source_ref", "contract.strings"]
+exact = true
+"#,
+    );
+    write(
+        &temp
+            .path()
+            .join("libraries/contract/public/error_facts.lua"),
+        "return {}\n",
+    );
+    write(
+        &temp.path().join("libraries/contract/public/payload.lua"),
+        "return {}\n",
+    );
+    write(
+        &temp.path().join("libraries/contract/public/source_ref.lua"),
+        "return {}\n",
+    );
+    write(
+        &temp.path().join("libraries/contract/public/strings.lua"),
+        "return {}\n",
+    );
+
+    let catalog = UnitCatalog::discover(temp.path()).unwrap().unwrap();
+    let contract = catalog
+        .units()
+        .find(|unit| unit.name() == "contract")
+        .unwrap();
+
+    assert_eq!(
+        contract
+            .public_modules()
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>(),
+        vec![
+            "contract.error_facts".to_string(),
+            "contract.payload".to_string(),
+            "contract.source_ref".to_string(),
+            "contract.strings".to_string(),
+        ]
+    );
+}
+
+#[test]
+fn catalog_rejects_exact_public_exports_with_extra_actual_module() {
+    let temp = tempfile::tempdir().unwrap();
+    write_workspace(temp.path());
+    write_package(temp.path(), "app", &[]);
+    write(&temp.path().join("packages/app/main.lua"), "return {}\n");
+    write(
+        &temp.path().join("libraries/contract/fkst.toml"),
+        r#"
+kind = "library"
+name = "contract"
+
+[code]
+root = "."
+
+[library]
+name = "contract"
+stable_id = "contract"
+version = "0.1.0"
+
+[exports]
+public = ["contract.error_facts"]
+exact = true
+"#,
+    );
+    write(
+        &temp
+            .path()
+            .join("libraries/contract/public/error_facts.lua"),
+        "return {}\n",
+    );
+    write(
+        &temp.path().join("libraries/contract/public/payload.lua"),
+        "return {}\n",
+    );
+
+    let err = UnitCatalog::discover(temp.path()).unwrap_err();
+
+    assert!(err
+        .to_string()
+        .contains("exact exports omit public module `contract.payload`"));
+}
+
+#[test]
+fn catalog_rejects_exact_public_exports_with_missing_declared_module() {
+    let temp = tempfile::tempdir().unwrap();
+    write_workspace(temp.path());
+    write_package(temp.path(), "app", &[]);
+    write(&temp.path().join("packages/app/main.lua"), "return {}\n");
+    write(
+        &temp.path().join("libraries/contract/fkst.toml"),
+        r#"
+kind = "library"
+name = "contract"
+
+[code]
+root = "."
+
+[library]
+name = "contract"
+stable_id = "contract"
+version = "0.1.0"
+
+[exports]
+public = ["contract.error_facts", "contract.payload"]
+exact = true
+"#,
+    );
+    write(
+        &temp
+            .path()
+            .join("libraries/contract/public/error_facts.lua"),
+        "return {}\n",
+    );
+
+    let err = UnitCatalog::discover(temp.path()).unwrap_err();
+
+    assert!(err
+        .to_string()
+        .contains("exact exports declare missing public module `contract.payload`"));
+}
+
+#[test]
+fn catalog_keeps_pattern_export_matching_when_exact_absent() {
+    let temp = tempfile::tempdir().unwrap();
+    write_workspace(temp.path());
+    write_package(temp.path(), "app", &[]);
+    write(&temp.path().join("packages/app/main.lua"), "return {}\n");
+    write(
+        &temp.path().join("libraries/contract/fkst.toml"),
+        r#"
+kind = "library"
+name = "contract"
+
+[code]
+root = "."
+
+[library]
+name = "contract"
+stable_id = "contract"
+version = "0.1.0"
+
+[exports]
+public = ["contract.*"]
+"#,
+    );
+    write(
+        &temp.path().join("libraries/contract/public/payload.lua"),
+        "return {}\n",
+    );
+    write(
+        &temp.path().join("libraries/contract/public/source_ref.lua"),
+        "return {}\n",
+    );
+
+    let catalog = UnitCatalog::discover(temp.path()).unwrap().unwrap();
+    let contract = catalog
+        .units()
+        .find(|unit| unit.name() == "contract")
+        .unwrap();
+
+    assert!(contract.public_modules().contains_key("contract.payload"));
+    assert!(contract
+        .public_modules()
+        .contains_key("contract.source_ref"));
+}
+
+#[test]
 fn catalog_rejects_export_pattern_that_matches_no_prefixed_public_module() {
     let temp = tempfile::tempdir().unwrap();
     write_workspace_by_kind(temp.path());
@@ -288,6 +528,35 @@ public = ["other.*"]
     assert!(err
         .to_string()
         .contains("export pattern `other.*` matches no public modules"));
+}
+
+#[test]
+fn library_manifest_rejects_unknown_exports_field() {
+    let temp = tempfile::tempdir().unwrap();
+    write(
+        &temp.path().join("fkst.toml"),
+        r#"
+kind = "library"
+name = "contract"
+
+[code]
+root = "."
+
+[library]
+name = "contract"
+stable_id = "contract"
+version = "0.1.0"
+
+[exports]
+public = ["contract.payload"]
+unexpected = true
+"#,
+    );
+
+    let err = UnitManifest::parse_file(&temp.path().join("fkst.toml")).unwrap_err();
+    let msg = format!("{err:#}");
+
+    assert!(msg.contains("unknown field `unexpected`"), "{msg}");
 }
 
 #[test]
@@ -338,6 +607,35 @@ fn catalog_namespaces_same_physical_module_names_by_library() {
 }
 
 #[test]
+fn library_manifest_rejects_unknown_dependency_constraints_field() {
+    let temp = tempfile::tempdir().unwrap();
+    write(
+        &temp.path().join("fkst.toml"),
+        r#"
+kind = "library"
+name = "contract"
+
+[code]
+root = "."
+
+[library]
+name = "contract"
+stable_id = "contract"
+version = "0.1.0"
+
+[dependency_constraints]
+allowed_lib_deps = []
+unexpected = true
+"#,
+    );
+
+    let err = UnitManifest::parse_file(&temp.path().join("fkst.toml")).unwrap_err();
+    let msg = format!("{err:#}");
+
+    assert!(msg.contains("unknown field `unexpected`"), "{msg}");
+}
+
+#[test]
 fn catalog_rejects_lib_dep_disallowed_by_visibility_allowlist() {
     let temp = tempfile::tempdir().unwrap();
     write_workspace(temp.path());
@@ -353,6 +651,87 @@ fn catalog_rejects_lib_dep_disallowed_by_visibility_allowlist() {
     assert!(err
         .to_string()
         .contains("unit `app` is not allowed to declare library `restricted`"));
+}
+
+#[test]
+fn catalog_rejects_library_lib_deps_outside_allowed_constraint() {
+    let temp = tempfile::tempdir().unwrap();
+    write_workspace(temp.path());
+    write_package(temp.path(), "app", &[]);
+    write(&temp.path().join("packages/app/main.lua"), "return {}\n");
+    write_library_with_dependency_constraints(
+        temp.path(),
+        "contract",
+        &["json", "strings"],
+        Some(&["json"]),
+    );
+    write_library(temp.path(), "json");
+    write_library(temp.path(), "strings");
+
+    let err = UnitCatalog::discover(temp.path()).unwrap_err();
+    let msg = format!("{err:#}");
+
+    assert!(
+        msg.contains("lib_dep `strings` outside dependency_constraints.allowed_lib_deps"),
+        "{msg}"
+    );
+}
+
+#[test]
+fn catalog_accepts_library_lib_deps_inside_allowed_constraint() {
+    let temp = tempfile::tempdir().unwrap();
+    write_workspace(temp.path());
+    write_package(temp.path(), "app", &[]);
+    write(&temp.path().join("packages/app/main.lua"), "return {}\n");
+    write_library_with_dependency_constraints(
+        temp.path(),
+        "contract",
+        &["json"],
+        Some(&["json", "strings"]),
+    );
+    write_library(temp.path(), "json");
+
+    let catalog = UnitCatalog::discover(temp.path()).unwrap().unwrap();
+
+    assert_eq!(
+        catalog.graph().lib_deps_for("contract"),
+        Some(&["json".to_string()][..])
+    );
+}
+
+#[test]
+fn catalog_rejects_any_library_lib_dep_when_allowed_constraint_is_empty() {
+    let temp = tempfile::tempdir().unwrap();
+    write_workspace(temp.path());
+    write_package(temp.path(), "app", &[]);
+    write(&temp.path().join("packages/app/main.lua"), "return {}\n");
+    write_library_with_dependency_constraints(temp.path(), "contract", &["json"], Some(&[]));
+    write_library(temp.path(), "json");
+
+    let err = UnitCatalog::discover(temp.path()).unwrap_err();
+    let msg = format!("{err:#}");
+
+    assert!(
+        msg.contains("lib_dep `json` outside dependency_constraints.allowed_lib_deps"),
+        "{msg}"
+    );
+}
+
+#[test]
+fn catalog_keeps_library_lib_deps_unconstrained_when_constraint_absent() {
+    let temp = tempfile::tempdir().unwrap();
+    write_workspace(temp.path());
+    write_package(temp.path(), "app", &[]);
+    write(&temp.path().join("packages/app/main.lua"), "return {}\n");
+    write_library_with_dependency_constraints(temp.path(), "contract", &["json"], None);
+    write_library(temp.path(), "json");
+
+    let catalog = UnitCatalog::discover(temp.path()).unwrap().unwrap();
+
+    assert_eq!(
+        catalog.graph().lib_deps_for("contract"),
+        Some(&["json".to_string()][..])
+    );
 }
 
 #[test]
