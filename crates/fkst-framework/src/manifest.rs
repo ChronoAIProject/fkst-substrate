@@ -148,10 +148,13 @@ struct VisibilityToml {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct LibraryMeta {
     pub(crate) name: String,
     pub(crate) stable_id: String,
     pub(crate) version: String,
+    #[serde(default)]
+    pub(crate) publishable: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -231,6 +234,7 @@ impl UnitManifestToml {
         validate_persistence_class(&self.kind, self.persistence_class)?;
         self.dependency_constraints
             .validate(&self.kind, &self.lib_deps.libraries)?;
+        validate_library_section(&self.kind, &self.library)?;
         let conformance = match self.conformance {
             Some(raw) if matches!(mode, ManifestParseMode::Strict) => {
                 Some(raw.try_into::<ConformanceToml>()?.into_manifest())
@@ -261,6 +265,18 @@ fn validate_persistence_class(
     match (kind, persistence_class) {
         (UnitKind::Library, Some(_)) => Err(serde::de::Error::custom(
             "library manifest must not declare `persistence_class`",
+        )),
+        _ => Ok(()),
+    }
+}
+
+fn validate_library_section(
+    kind: &UnitKind,
+    library: &Option<LibraryMeta>,
+) -> std::result::Result<(), toml::de::Error> {
+    match (kind, library) {
+        (UnitKind::Package(_), Some(_)) => Err(serde::de::Error::custom(
+            "package manifest must not declare `[library]`",
         )),
         _ => Ok(()),
     }
@@ -879,6 +895,18 @@ fn add_external_units(
             if library_name != library.name {
                 bail!(
                     "external source `{}` locked library `{}` resolved to manifest library `{library_name}`",
+                    checkout.source_id,
+                    library.name
+                );
+            }
+            if !manifest
+                .library
+                .as_ref()
+                .map(|meta| meta.publishable)
+                .unwrap_or(false)
+            {
+                bail!(
+                    "external source `{}` locked library `{}` is not publishable",
                     checkout.source_id,
                     library.name
                 );
