@@ -8,9 +8,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tracing::warn;
 
-use crate::observe::{ObserveSocketRequest, ObserveSocketResponse};
-
-const MAX_OBSERVE_LIMIT: usize = 10_000;
+use crate::observe::{ObserveSocketRequest, ObserveSocketResponse, MAX_LIMIT};
 
 #[derive(Clone, Default)]
 pub(crate) struct ObserveEndpoint {
@@ -81,7 +79,8 @@ async fn serve_connection(
             &endpoint.database,
             &DeliveryObserveOptions {
                 now_ms: request.now_ms,
-                limit: request.limit.clamp(1, MAX_OBSERVE_LIMIT),
+                limit: request.limit.clamp(1, MAX_LIMIT),
+                since: request.since,
             },
         ) {
             Ok(snapshot) => ObserveSocketResponse::Ok { snapshot },
@@ -165,12 +164,19 @@ mod tests {
             Err(_) => {}
         };
 
-        let snapshot =
-            tokio::task::spawn_blocking(move || observe::request_live_snapshot(&layout, 10))
-                .await
-                .unwrap()
-                .unwrap()
-                .expect("live owner process should answer observe request");
+        let snapshot = tokio::task::spawn_blocking(move || {
+            observe::request_live_snapshot(
+                &layout,
+                &observe::ObserveSnapshotOptions {
+                    limit: 10,
+                    since: None,
+                },
+            )
+        })
+        .await
+        .unwrap()
+        .unwrap()
+        .expect("live owner process should answer observe request");
 
         assert_eq!(snapshot.deliveries.len(), 1);
         assert_eq!(snapshot.deliveries[0].delivery_id, "one");

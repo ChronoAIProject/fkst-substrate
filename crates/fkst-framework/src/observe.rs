@@ -10,14 +10,20 @@ use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-const DEFAULT_LIMIT: usize = 500;
-const MAX_LIMIT: usize = 10_000;
+pub(crate) const DEFAULT_LIMIT: usize = 500;
+pub(crate) const MAX_LIMIT: usize = 10_000;
 
 #[derive(Clone, Debug)]
 pub(crate) struct ObserveOptions {
     pub(crate) durable_root: PathBuf,
     pub(crate) json: bool,
     pub(crate) limit: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ObserveSnapshotOptions {
+    pub(crate) limit: usize,
+    pub(crate) since: Option<String>,
 }
 
 pub(crate) fn parse_args(args: &[String]) -> Result<ObserveOptions> {
@@ -57,7 +63,13 @@ pub(crate) fn parse_args(args: &[String]) -> Result<ObserveOptions> {
 }
 
 pub(crate) fn run(options: ObserveOptions) -> Result<i32> {
-    let snapshot = snapshot_for_durable_root(&options.durable_root, options.limit)?;
+    let snapshot = snapshot_for_durable_root(
+        &options.durable_root,
+        &ObserveSnapshotOptions {
+            limit: options.limit,
+            since: None,
+        },
+    )?;
     if options.json {
         println!("{}", serde_json::to_string_pretty(&snapshot)?);
     } else {
@@ -68,13 +80,20 @@ pub(crate) fn run(options: ObserveOptions) -> Result<i32> {
 
 pub(crate) fn snapshot_for_durable_root(
     durable_root: impl Into<PathBuf>,
-    limit: usize,
+    options: &ObserveSnapshotOptions,
 ) -> Result<DeliveryObserveSnapshot> {
-    let limit = validate_limit(limit)?;
+    let limit = validate_limit(options.limit)?;
+    validate_since(options.since.as_deref())?;
     let durable_root = durable_root.into();
     let layout = DurableLayout::new(&durable_root)?;
     let database = layout.delivery_db_path();
-    let snapshot = match request_live_snapshot(&layout, limit)? {
+    let snapshot = match request_live_snapshot(
+        &layout,
+        &ObserveSnapshotOptions {
+            limit,
+            since: options.since.clone(),
+        },
+    )? {
         Some(snapshot) => Ok(snapshot),
         None => {
             let store = DeliveryStore::open_existing(&database)?;
@@ -85,6 +104,7 @@ pub(crate) fn snapshot_for_durable_root(
                 &DeliveryObserveOptions {
                     now_ms: now_ms(),
                     limit,
+                    since: options.since.clone(),
                 },
             )
         }
@@ -98,7 +118,7 @@ pub(crate) fn socket_path(layout: &DurableLayout) -> PathBuf {
 
 pub(crate) fn request_live_snapshot(
     layout: &DurableLayout,
-    limit: usize,
+    options: &ObserveSnapshotOptions,
 ) -> Result<Option<DeliveryObserveSnapshot>> {
     let path = socket_path(layout);
     if !path.exists() {
@@ -113,7 +133,8 @@ pub(crate) fn request_live_snapshot(
         }
     };
     let request = ObserveSocketRequest {
-        limit,
+        limit: options.limit,
+        since: options.since.clone(),
         now_ms: now_ms(),
     };
     serde_json::to_writer(&mut stream, &request)?;
@@ -142,6 +163,8 @@ pub(crate) fn request_live_snapshot(
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub(crate) struct ObserveSocketRequest {
     pub(crate) limit: usize,
+    #[serde(default)]
+    pub(crate) since: Option<String>,
     pub(crate) now_ms: u64,
 }
 
@@ -241,6 +264,13 @@ pub(crate) fn validate_limit(limit: usize) -> Result<usize> {
     Ok(limit)
 }
 
+pub(crate) fn validate_since(since: Option<&str>) -> Result<()> {
+    if since.is_some_and(str::is_empty) {
+        anyhow::bail!("observe since cursor must not be empty");
+    }
+    Ok(())
+}
+
 fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -269,5 +299,19 @@ mod tests {
         ])
         .unwrap_err();
         assert!(format!("{err:#}").contains("--limit must be between"));
+    }
+
+    #[test]
+    fn snapshot_options_reject_empty_since_cursor() {
+        let err = snapshot_for_durable_root(
+            "/tmp/fkst-durable",
+            &ObserveSnapshotOptions {
+                limit: DEFAULT_LIMIT,
+                since: Some(String::new()),
+            },
+        )
+        .unwrap_err();
+
+        assert!(format!("{err:#}").contains("observe since cursor must not be empty"));
     }
 }

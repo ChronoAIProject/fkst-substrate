@@ -19,6 +19,12 @@ fn framework_bin() -> &'static str {
     env!("CARGO_BIN_EXE_fkst-framework")
 }
 
+fn framework_command() -> Command {
+    let mut command = Command::new(framework_bin());
+    command.env_remove("FKST_SUPERVISOR_PID");
+    command
+}
+
 fn assert_exit(output: &Output, code: i32) {
     assert_eq!(
         output.status.code(),
@@ -123,7 +129,7 @@ fn observe_json_reports_snapshot_without_payload_body() {
         .unwrap();
     write_observe_fixture(durable.path());
 
-    let output = Command::new(framework_bin())
+    let output = framework_command()
         .arg("observe")
         .arg("--durable-root")
         .arg(durable.path())
@@ -174,7 +180,7 @@ return M
     .unwrap();
     write_single_package_workspace(host.path());
 
-    let cli = Command::new(framework_bin())
+    let cli = framework_command()
         .arg("observe")
         .arg("--durable-root")
         .arg(durable.path())
@@ -184,7 +190,7 @@ return M
     assert_exit(&cli, 0);
     let cli_json: serde_json::Value = serde_json::from_slice(&cli.stdout).unwrap();
 
-    let run = Command::new(framework_bin())
+    let run = framework_command()
         .arg("run")
         .arg(&probe)
         .arg("--project-root")
@@ -236,11 +242,14 @@ local M = {}
 M.spec = { consumes = { "tick" }, produces = { "seen" }, ephemeral = { "tick" } }
 
 function M.pipeline(event)
-  local snapshot = fkst.observe()
+  local snapshot = fkst.observe({ limit = 1 })
   raise("seen", {
     generated_at_ms = snapshot.generated_at_ms,
     queue = snapshot.queues[1].queue,
     depth = snapshot.queues[1].depth,
+    deliveries = #snapshot.deliveries,
+    max_deliveries = snapshot.limits.max_deliveries,
+    truncated_deliveries = snapshot.truncated.deliveries,
   })
 end
 
@@ -261,14 +270,21 @@ return {
       queues = {
         { queue = "work", depth = 7 },
       },
-      deliveries = {},
-      dead_letters = {},
+      limits = { max_deliveries = 10, max_dead_letters = 10 },
+      truncated = { deliveries = false, dead_letters = false },
+      deliveries = {
+        { delivery_id = "delivery-one" },
+        { delivery_id = "delivery-two" },
+      },
     })
     local result = t.run_department("departments/probe/main.lua", { queue = "tick", payload = {} })
     t.eq(result.exit_code, 0)
     t.eq(result.raises[1].payload.generated_at_ms, 4242)
     t.eq(result.raises[1].payload.queue, "work")
     t.eq(result.raises[1].payload.depth, 7)
+    t.eq(result.raises[1].payload.deliveries, 1)
+    t.eq(result.raises[1].payload.max_deliveries, 1)
+    t.eq(result.raises[1].payload.truncated_deliveries, true)
   end,
 }
 "#,
@@ -276,7 +292,7 @@ return {
     .unwrap();
     write_single_package_workspace(host.path());
 
-    let output = Command::new(framework_bin())
+    let output = framework_command()
         .arg("test")
         .arg("--project-root")
         .arg(host.path())
@@ -302,13 +318,59 @@ return {
 }
 
 #[test]
+fn fkst_test_observe_fails_closed_without_mock() {
+    let host = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
+    let durable = tempfile::Builder::new()
+        .prefix("fkst-durable")
+        .tempdir()
+        .unwrap();
+    write_observe_fixture(durable.path());
+    fs::create_dir_all(host.path().join("tests")).unwrap();
+    fs::write(
+        host.path().join("tests/observe_test.lua"),
+        r#"
+return {
+  test_unmocked_observe_fails_closed = function()
+    fkst.observe()
+  end,
+}
+"#,
+    )
+    .unwrap();
+    write_single_package_workspace(host.path());
+
+    let output = framework_command()
+        .arg("test")
+        .arg("--project-root")
+        .arg(host.path())
+        .arg("--package-root")
+        .arg(host.path())
+        .current_dir(host.path())
+        .env("FKST_RUNTIME_ROOT", host.path().join(".fkst/runtime"))
+        .env("FKST_DURABLE_ROOT", durable.path())
+        .output()
+        .unwrap();
+
+    assert_exit(&output, 1);
+    let out = stdout(&output);
+    assert!(
+        out.contains("FAIL tests/observe_test.lua::test_unmocked_observe_fails_closed"),
+        "stdout: {out}"
+    );
+    assert!(
+        out.contains("fkst.observe is not mocked in test mode"),
+        "stdout: {out}"
+    );
+}
+
+#[test]
 fn observe_rejects_missing_database_without_creating_it() {
     let durable = tempfile::Builder::new()
         .prefix("fkst-durable")
         .tempdir()
         .unwrap();
 
-    let output = Command::new(framework_bin())
+    let output = framework_command()
         .arg("observe")
         .arg("--durable-root")
         .arg(durable.path())
@@ -413,7 +475,7 @@ fn observe_json_uses_live_socket_when_database_is_open() {
         writeln!(stream, "{}", serde_json::to_string(&response).unwrap()).unwrap();
     });
 
-    let output = Command::new(framework_bin())
+    let output = framework_command()
         .arg("observe")
         .arg("--durable-root")
         .arg(durable.path())
