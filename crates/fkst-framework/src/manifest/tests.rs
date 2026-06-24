@@ -254,6 +254,107 @@ fn catalog_indexes_owner_and_declared_public_library_modules() {
 }
 
 #[test]
+fn library_publishable_defaults_false_and_does_not_change_intra_repo_visibility() {
+    let temp = tempfile::tempdir().unwrap();
+    write_workspace(temp.path());
+    write_package(temp.path(), "app", &["std"]);
+    write(&temp.path().join("packages/app/main.lua"), "return {}\n");
+    write_library(temp.path(), "std");
+    write(
+        &temp.path().join("libraries/std/public/fkst/json.lua"),
+        "return {}\n",
+    );
+
+    let catalog = UnitCatalog::discover(temp.path()).unwrap().unwrap();
+    let scope = catalog.require_scope_for_unit("app").unwrap();
+    let std = catalog.units().find(|unit| unit.name() == "std").unwrap();
+
+    assert!(!std.manifest().library.as_ref().unwrap().publishable);
+    assert!(scope.resolve("std.fkst.json").is_some());
+}
+
+#[test]
+fn library_publishable_parses_true() {
+    let temp = tempfile::tempdir().unwrap();
+    write(
+        &temp.path().join("fkst.toml"),
+        r#"
+kind = "library"
+name = "contract"
+
+[code]
+root = "."
+
+[library]
+name = "contract"
+stable_id = "contract"
+version = "0.1.0"
+publishable = true
+"#,
+    );
+
+    let manifest = UnitManifest::parse_file(&temp.path().join("fkst.toml")).unwrap();
+
+    assert!(manifest.library.as_ref().unwrap().publishable);
+}
+
+#[test]
+fn package_manifest_rejects_library_section() {
+    let temp = tempfile::tempdir().unwrap();
+    write(
+        &temp.path().join("fkst.toml"),
+        r#"
+kind = "package"
+name = "app"
+persistence_class = "stateless_adapter"
+
+[code]
+root = "."
+
+[library]
+name = "app"
+stable_id = "app"
+version = "0.1.0"
+publishable = true
+"#,
+    );
+
+    let err = UnitManifest::parse_file(&temp.path().join("fkst.toml")).unwrap_err();
+    let msg = format!("{err:#}");
+
+    assert!(
+        msg.contains("package manifest must not declare `[library]`"),
+        "{msg}"
+    );
+}
+
+#[test]
+fn library_manifest_rejects_unknown_library_field() {
+    let temp = tempfile::tempdir().unwrap();
+    write(
+        &temp.path().join("fkst.toml"),
+        r#"
+kind = "library"
+name = "contract"
+
+[code]
+root = "."
+
+[library]
+name = "contract"
+stable_id = "contract"
+version = "0.1.0"
+unexpected = true
+"#,
+    );
+
+    let err = UnitManifest::parse_file(&temp.path().join("fkst.toml")).unwrap_err();
+    let msg = format!("{err:#}");
+
+    assert!(msg.contains("unknown field `unexpected`"), "{msg}");
+}
+
+#[test]
 fn catalog_prefixes_flat_library_public_modules_with_library_name() {
     let temp = tempfile::tempdir().unwrap();
     write_workspace_by_kind(temp.path());
@@ -814,6 +915,67 @@ fn missing_workspace_manifest_returns_no_catalog() {
     let temp = tempfile::tempdir().unwrap();
 
     assert!(UnitCatalog::discover(temp.path()).unwrap().is_none());
+}
+
+#[test]
+fn workspace_discovery_does_not_cross_nested_workspace_boundary() {
+    let host = tempfile::tempdir().unwrap();
+    write(
+        &host.path().join("fkst.workspace.toml"),
+        r#"
+[workspace]
+units = [
+  ".fkst/local-packages/*",
+  ".fkst/std",
+  ".fkst/run/fkst-packages-conformance/packages/*",
+]
+"#,
+    );
+    write(
+        &host
+            .path()
+            .join(".fkst/local-packages/site-board/fkst.toml"),
+        r#"
+kind = "package"
+name = "site-board"
+persistence_class = "stateless_adapter"
+
+[code]
+root = "."
+"#,
+    );
+    write(
+        &host.path().join(".fkst/std/fkst.toml"),
+        r#"
+kind = "library"
+name = "std"
+
+[code]
+root = "."
+
+[library]
+name = "std"
+stable_id = "std"
+version = "0.1.0"
+"#,
+    );
+    let platform = host.path().join(".fkst/run/fkst-packages-conformance");
+    write_workspace(&platform);
+    write_package(&platform, "idle-detector", &["workflow"]);
+    write_library(&platform, "workflow");
+
+    let host_catalog = UnitCatalog::discover(host.path()).unwrap().unwrap();
+    assert!(host_catalog.contains_unit("site-board"));
+    assert!(host_catalog.contains_unit("std"));
+    assert!(!host_catalog.contains_unit("idle-detector"));
+    assert!(host_catalog.library_unit_name("workflow").is_none());
+
+    let platform_catalog = UnitCatalog::discover(&platform).unwrap().unwrap();
+    assert!(platform_catalog.contains_unit("idle-detector"));
+    assert_eq!(
+        platform_catalog.library_unit_name("workflow"),
+        Some("workflow")
+    );
 }
 
 #[test]
