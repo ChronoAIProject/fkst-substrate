@@ -281,6 +281,25 @@ message = "source files must stay under 10 lines"
     )
 }
 
+fn text_forbid_regex_pack(pattern: &str) -> String {
+    format!(
+        r#"
+schema = 1
+runner_protocol = "fkst-declarative-rulepack@1"
+owner_package = "{{{{name}}}}"
+
+[[rules]]
+id = "source.no-forbidden-text"
+severity = "error"
+kind = "text_forbid_regex"
+include = ["src/**/*.lua"]
+exclude = ["tests/**"]
+pattern = "{pattern}"
+message = "source files must not contain forbidden text"
+"#
+    )
+}
+
 fn run_package_conformance(host: &std::path::Path, package: &std::path::Path) -> Output {
     let args = [
         std::ffi::OsStr::new("--project-root"),
@@ -796,9 +815,8 @@ owner_package = "{{name}}"
 [[rules]]
 id = "source.future"
 severity = "error"
-kind = "text_forbid_regex"
+kind = "future_rule_kind"
 include = ["src/**/*.lua"]
-max = 1
 message = "future rules are not supported in this runner"
 "#,
     );
@@ -815,13 +833,367 @@ message = "future rules are not supported in this runner"
     assert_exit(&output, 1);
     let log = combined_log(&output);
     assert!(log.contains("FAIL conformance-pack-loader"), "{log}");
-    assert!(log.contains("unknown kind `text_forbid_regex`"), "{log}");
+    assert!(log.contains("unknown kind `future_rule_kind`"), "{log}");
     let report = stdout_json_report(&output);
     assert_eq!(
         report["violations"][0]["rule"],
         "declarative:traveler.conformance-pack-loader"
     );
     assert_eq!(report["violations"][0]["package"], "traveler");
+}
+
+#[test]
+fn declarative_pack_text_forbid_regex_fails_for_package_owned_source_file() {
+    let root = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
+    let package = root.path().join("traveler");
+    fs::create_dir_all(package.join("src")).unwrap();
+    let host = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
+    write_host_defaults(host.path());
+    write_workspace_for_roots(host.path(), &[&package]);
+    write_declarative_pack_package(&package, &text_forbid_regex_pack("forbidden_call"));
+    fs::write(package.join("src/clean.lua"), "return 1\n").unwrap();
+    fs::write(
+        package.join("src/bad.lua"),
+        "local x = 1\nforbidden_call()\nreturn x\n",
+    )
+    .unwrap();
+
+    let output = run_package_conformance(host.path(), &package);
+
+    assert_exit(&output, 1);
+    let log = combined_log(&output);
+    assert!(
+        log.contains("FAIL source.no-forbidden-text:src/bad.lua"),
+        "{log}"
+    );
+    assert!(
+        log.contains("source files must not contain forbidden text"),
+        "{log}"
+    );
+    assert!(log.contains("line 2"), "{log}");
+    let report = stdout_json_report(&output);
+    assert_eq!(report["ok"], false);
+    assert_eq!(
+        report["violations"][0]["rule"],
+        "declarative:traveler.source.no-forbidden-text:src/bad.lua"
+    );
+    assert_eq!(report["violations"][0]["package"], "traveler");
+}
+
+#[test]
+fn declarative_pack_text_forbid_regex_passes_for_clean_package() {
+    let root = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
+    let package = root.path().join("traveler");
+    fs::create_dir_all(package.join("src")).unwrap();
+    let host = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
+    write_host_defaults(host.path());
+    write_workspace_for_roots(host.path(), &[&package]);
+    write_declarative_pack_package(&package, &text_forbid_regex_pack("forbidden_call"));
+    fs::write(package.join("src/clean.lua"), "return 1\n").unwrap();
+
+    let output = run_package_conformance(host.path(), &package);
+
+    assert_exit(&output, 0);
+    let log = combined_log(&output);
+    assert!(log.contains("PASS source.no-forbidden-text"), "{log}");
+    let report = stdout_json_report(&output);
+    assert_eq!(report["ok"], true);
+    assert_eq!(report["violations"], serde_json::json!([]));
+}
+
+#[test]
+fn declarative_pack_text_forbid_regex_supports_real_regex_features() {
+    let root = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
+    let package = root.path().join("traveler");
+    fs::create_dir_all(package.join("src")).unwrap();
+    let host = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
+    write_host_defaults(host.path());
+    write_workspace_for_roots(host.path(), &[&package]);
+    write_declarative_pack_package(
+        &package,
+        r#"
+schema = 1
+runner_protocol = "fkst-declarative-rulepack@1"
+owner_package = "{{name}}"
+
+[[rules]]
+id = "source.no-local-parser"
+severity = "error"
+kind = "text_forbid_regex"
+include = ["src/**/*.lua"]
+exclude = ["tests/**"]
+pattern = '\blocal\s+function\s+parse_name_only_paths\s*\('
+message = "source files must not define the local parser"
+"#,
+    );
+    fs::write(
+        package.join("src/bad.lua"),
+        "return 1\nlocal  function\nparse_name_only_paths (\nend\n",
+    )
+    .unwrap();
+    fs::write(
+        package.join("src/allowed.lua"),
+        "core.parse_name_only_paths(input)\n",
+    )
+    .unwrap();
+
+    let output = run_package_conformance(host.path(), &package);
+
+    assert_exit(&output, 1);
+    let log = combined_log(&output);
+    assert!(
+        log.contains("FAIL source.no-local-parser:src/bad.lua"),
+        "{log}"
+    );
+    assert!(
+        log.contains("source files must not define the local parser"),
+        "{log}"
+    );
+    assert!(log.contains("line 2"), "{log}");
+    assert!(
+        !log.contains("source.no-local-parser:src/allowed.lua"),
+        "{log}"
+    );
+    let report = stdout_json_report(&output);
+    assert_eq!(report["violations"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        report["violations"][0]["rule"],
+        "declarative:traveler.source.no-local-parser:src/bad.lua"
+    );
+    assert_eq!(report["violations"][0]["package"], "traveler");
+}
+
+#[test]
+fn declarative_pack_text_forbid_regex_invalid_pattern_fails_closed() {
+    let root = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
+    let package = root.path().join("traveler");
+    fs::create_dir_all(package.join("src")).unwrap();
+    let host = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
+    write_host_defaults(host.path());
+    write_workspace_for_roots(host.path(), &[&package]);
+    write_declarative_pack_package(&package, &text_forbid_regex_pack("("));
+    fs::write(package.join("src/clean.lua"), "return 1\n").unwrap();
+
+    let output = run_package_conformance(host.path(), &package);
+
+    assert_fail_closed(
+        &output,
+        &[
+            "FAIL conformance-pack-loader",
+            "invalid text_forbid_regex pattern",
+            "unclosed group",
+        ],
+    );
+}
+
+#[test]
+fn declarative_pack_text_forbid_regex_cannot_inspect_host_or_sibling_files() {
+    let root = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
+    let package = root.path().join("traveler");
+    let sibling = root.path().join("sibling");
+    fs::create_dir_all(package.join("src")).unwrap();
+    fs::create_dir_all(sibling.join("src")).unwrap();
+    fs::write(sibling.join("src/bad.lua"), "forbidden_call()\n").unwrap();
+    let host = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
+    write_host_defaults(host.path());
+    fs::create_dir_all(host.path().join("src")).unwrap();
+    fs::write(host.path().join("src/bad.lua"), "forbidden_call()\n").unwrap();
+    write_workspace_for_roots(host.path(), &[&package, &sibling]);
+    write_declarative_pack_package(&package, &text_forbid_regex_pack("forbidden_call"));
+    write_package_consumer(&sibling, "unused");
+    fs::write(package.join("src/clean.lua"), "return 1\n").unwrap();
+
+    let output = run_package_conformance(host.path(), &package);
+
+    assert_exit(&output, 0);
+    let log = combined_log(&output);
+    assert!(log.contains("PASS source.no-forbidden-text"), "{log}");
+    assert!(!log.contains("src/bad.lua matches forbidden text"), "{log}");
+    let report = stdout_json_report(&output);
+    assert_eq!(report["violations"], serde_json::json!([]));
+}
+
+#[test]
+fn declarative_pack_text_forbid_regex_forbids_max_field() {
+    let root = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
+    let package = root.path().join("traveler");
+    fs::create_dir_all(package.join("src")).unwrap();
+    let host = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
+    write_host_defaults(host.path());
+    write_workspace_for_roots(host.path(), &[&package]);
+    write_declarative_pack_package(
+        &package,
+        r#"
+schema = 1
+runner_protocol = "fkst-declarative-rulepack@1"
+owner_package = "{{name}}"
+
+[[rules]]
+id = "source.no-forbidden-text"
+severity = "error"
+kind = "text_forbid_regex"
+include = ["src/**/*.lua"]
+pattern = "forbidden_call"
+max = 1
+message = "source files must not contain forbidden text"
+"#,
+    );
+    fs::write(package.join("src/clean.lua"), "return 1\n").unwrap();
+
+    let output = run_package_conformance(host.path(), &package);
+
+    assert_fail_closed(
+        &output,
+        &[
+            "FAIL conformance-pack-loader",
+            "field `max` is not allowed for kind `text_forbid_regex`",
+        ],
+    );
+}
+
+#[test]
+fn declarative_pack_text_forbid_regex_requires_pattern_field() {
+    let root = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
+    let package = root.path().join("traveler");
+    fs::create_dir_all(package.join("src")).unwrap();
+    let host = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
+    write_host_defaults(host.path());
+    write_workspace_for_roots(host.path(), &[&package]);
+    write_declarative_pack_package(
+        &package,
+        r#"
+schema = 1
+runner_protocol = "fkst-declarative-rulepack@1"
+owner_package = "{{name}}"
+
+[[rules]]
+id = "source.no-forbidden-text"
+severity = "error"
+kind = "text_forbid_regex"
+include = ["src/**/*.lua"]
+message = "source files must not contain forbidden text"
+"#,
+    );
+    fs::write(package.join("src/clean.lua"), "return 1\n").unwrap();
+
+    let output = run_package_conformance(host.path(), &package);
+
+    assert_fail_closed(
+        &output,
+        &[
+            "FAIL conformance-pack-loader",
+            "missing required field `pattern`",
+        ],
+    );
+}
+
+#[test]
+fn declarative_pack_max_line_count_forbids_pattern_field() {
+    let root = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
+    let package = root.path().join("traveler");
+    fs::create_dir_all(package.join("src")).unwrap();
+    let host = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
+    write_host_defaults(host.path());
+    write_workspace_for_roots(host.path(), &[&package]);
+    write_declarative_pack_package(
+        &package,
+        r#"
+schema = 1
+runner_protocol = "fkst-declarative-rulepack@1"
+owner_package = "{{name}}"
+
+[[rules]]
+id = "source.max-lines"
+severity = "error"
+kind = "max_line_count"
+include = ["src/**/*.lua"]
+max = 10
+pattern = "forbidden_call"
+message = "source files must stay under 10 lines"
+"#,
+    );
+    fs::write(package.join("src/clean.lua"), "return 1\n").unwrap();
+
+    let output = run_package_conformance(host.path(), &package);
+
+    assert_fail_closed(
+        &output,
+        &[
+            "FAIL conformance-pack-loader",
+            "field `pattern` is not allowed for kind `max_line_count`",
+        ],
+    );
+}
+
+#[test]
+fn declarative_pack_max_line_count_requires_max_field() {
+    let root = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
+    let package = root.path().join("traveler");
+    fs::create_dir_all(package.join("src")).unwrap();
+    let host = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
+    write_host_defaults(host.path());
+    write_workspace_for_roots(host.path(), &[&package]);
+    write_declarative_pack_package(
+        &package,
+        r#"
+schema = 1
+runner_protocol = "fkst-declarative-rulepack@1"
+owner_package = "{{name}}"
+
+[[rules]]
+id = "source.max-lines"
+severity = "error"
+kind = "max_line_count"
+include = ["src/**/*.lua"]
+message = "source files must stay under 10 lines"
+"#,
+    );
+    fs::write(package.join("src/clean.lua"), "return 1\n").unwrap();
+
+    let output = run_package_conformance(host.path(), &package);
+
+    assert_fail_closed(
+        &output,
+        &[
+            "FAIL conformance-pack-loader",
+            "missing required field `max`",
+        ],
+    );
+}
+
+#[test]
+fn declarative_pack_rule_unknown_field_fails_closed() {
+    let root = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
+    let package = root.path().join("traveler");
+    fs::create_dir_all(package.join("src")).unwrap();
+    let host = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
+    write_host_defaults(host.path());
+    write_workspace_for_roots(host.path(), &[&package]);
+    write_declarative_pack_package(
+        &package,
+        r#"
+schema = 1
+runner_protocol = "fkst-declarative-rulepack@1"
+owner_package = "{{name}}"
+
+[[rules]]
+id = "source.no-forbidden-text"
+severity = "error"
+kind = "text_forbid_regex"
+include = ["src/**/*.lua"]
+pattern = "forbidden_call"
+message = "source files must not contain forbidden text"
+unexpected = true
+"#,
+    );
+    fs::write(package.join("src/clean.lua"), "return 1\n").unwrap();
+
+    let output = run_package_conformance(host.path(), &package);
+
+    assert_fail_closed(
+        &output,
+        &["FAIL conformance-pack-loader", "unknown field `unexpected`"],
+    );
 }
 
 #[test]
