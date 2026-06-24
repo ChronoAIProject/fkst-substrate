@@ -19,6 +19,8 @@ use tracing::info;
 
 static NEXT_FRAMEWORK_CHILD_LOG_ID: AtomicU64 = AtomicU64::new(1);
 const RAISED_AUTH_TOKEN_ENV: &str = "FKST_RAISED_AUTH_TOKEN";
+const ENGINE_BINARY_PATH_ENV_KEYS: &[&str] =
+    &["BIN", "FKST_FRAMEWORK_BIN", "FKST_CODEX_WORKER_BIN"];
 
 pub struct SpawnResult {
     pub pid: u32,
@@ -151,6 +153,7 @@ pub async fn spawn_framework_with_stdout_observer(
     if let Some(token) = raised_auth_token {
         cmd.env(RAISED_AUTH_TOKEN_ENV, token);
     }
+    scrub_engine_binary_path_env(&mut cmd);
     cmd.current_dir(host_root);
 
     // Set a new process group before exec so framework becomes its own group leader.
@@ -172,6 +175,18 @@ pub async fn spawn_framework_with_stdout_observer(
     let registration = process_groups.register(pid);
 
     wait_for_framework_child(child, pid, start, log, registration, stdout_observer).await
+}
+
+pub(crate) fn scrub_current_engine_binary_path_env() {
+    for key in ENGINE_BINARY_PATH_ENV_KEYS {
+        std::env::remove_var(key);
+    }
+}
+
+fn scrub_engine_binary_path_env(cmd: &mut Command) {
+    for key in ENGINE_BINARY_PATH_ENV_KEYS {
+        cmd.env_remove(key);
+    }
 }
 
 fn package_root_flags(package_roots: &[PathBuf]) -> String {

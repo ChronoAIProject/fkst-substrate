@@ -555,6 +555,7 @@ fn run_pipeline(
     owner_namespace: String,
     event: JsonValue,
 ) -> Result<i32> {
+    supervise::scrub_current_engine_binary_path_env();
     crate::process_tree::install_sdk_shutdown_watch();
     let parent_pid = std::env::var("FKST_SUPERVISOR_PID")
         .ok()

@@ -77,6 +77,23 @@ fn run_department(host: &Path, runtime: &Path, lua: &str, event: &str) -> Output
         .unwrap()
 }
 
+fn run_department_command(host: &Path, runtime: &Path, lua: &str, event: &str) -> Command {
+    let mut command = Command::new(framework_bin());
+    command
+        .arg("run")
+        .arg(host.join(lua))
+        .arg("--project-root")
+        .arg(host)
+        .arg("--package-root")
+        .arg(host)
+        .arg("--event")
+        .arg(event)
+        .current_dir(host)
+        .env_remove("FKST_SUPERVISOR_PID")
+        .env("FKST_RUNTIME_ROOT", runtime);
+    command
+}
+
 fn run_conformance(host: &Path, runtime: &Path) -> Output {
     Command::new(framework_bin())
         .arg("conformance")
@@ -210,6 +227,55 @@ fn producer_raises_example_event_from_tick() {
     assert_eq!(raised[0]["payload"]["source_queue"], "tick");
     assert_eq!(raised[0]["payload"]["source_raiser"], "tick");
     assert!(raised[0].get("ts").is_none(), "raised={raised}");
+}
+
+#[test]
+fn package_runtime_cannot_observe_engine_binary_path_env() {
+    let host = tempfile::tempdir().unwrap();
+    let runtime = tempfile::tempdir().unwrap();
+    copy_minimal_package(host.path());
+    let fact = host.path().join("env-fact.txt");
+    fs::create_dir_all(host.path().join("departments/env_probe")).unwrap();
+    fs::write(
+        host.path().join("departments/env_probe/main.lua"),
+        format!(
+            r#"
+local M = {{}}
+M.spec = {{ consumes = {{ "tick" }}, produces = {{}} }}
+function pipeline(event)
+  local out = assert(io.open({:?}, "w"))
+  out:write("lua.BIN=" .. tostring(os.getenv("BIN")) .. "\n")
+  out:write("lua.FKST_FRAMEWORK_BIN=" .. tostring(os.getenv("FKST_FRAMEWORK_BIN")) .. "\n")
+  out:write("lua.FKST_CODEX_WORKER_BIN=" .. tostring(os.getenv("FKST_CODEX_WORKER_BIN")) .. "\n")
+  local shell = exec_sync({{ cmd = [[printf 'shell.BIN=%s\nshell.FKST_FRAMEWORK_BIN=%s\nshell.FKST_CODEX_WORKER_BIN=%s\n' "$BIN" "$FKST_FRAMEWORK_BIN" "$FKST_CODEX_WORKER_BIN"]] }})
+  out:write(shell.stdout)
+  out:close()
+end
+return M
+"#,
+            fact.to_string_lossy()
+        ),
+    )
+    .unwrap();
+
+    let output = run_department_command(
+        host.path(),
+        runtime.path(),
+        "departments/env_probe/main.lua",
+        r#"{"queue":"tick","payload":{}}"#,
+    )
+    .env("BIN", framework_bin())
+    .env("FKST_FRAMEWORK_BIN", framework_bin())
+    .env("FKST_CODEX_WORKER_BIN", framework_bin())
+    .output()
+    .unwrap();
+    assert_success(&output);
+
+    let body = fs::read_to_string(&fact).unwrap();
+    assert_eq!(
+        body,
+        "lua.BIN=nil\nlua.FKST_FRAMEWORK_BIN=nil\nlua.FKST_CODEX_WORKER_BIN=nil\nshell.BIN=\nshell.FKST_FRAMEWORK_BIN=\nshell.FKST_CODEX_WORKER_BIN=\n"
+    );
 }
 
 #[test]
