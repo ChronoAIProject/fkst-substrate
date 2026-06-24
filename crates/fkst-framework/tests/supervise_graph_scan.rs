@@ -281,7 +281,7 @@ fn host_manifest_claim_does_not_make_external_package_use_host_catalog() {
         .tempdir()
         .unwrap();
     let host = root.path().join("host");
-    let external_workspace = host.join(".fkst/run/fkst-packages-conformance");
+    let external_workspace = root.path().join("platform");
     let external_package = external_workspace.join("packages/platform-pkg");
     let host_std = host.join("libraries/std");
     let external_std = external_workspace.join("libraries/std");
@@ -292,7 +292,7 @@ fn host_manifest_claim_does_not_make_external_package_use_host_catalog() {
         host.join("fkst.workspace.toml"),
         r#"
 [workspace]
-units = [".", "libraries/std", ".fkst/run/fkst-packages-conformance/packages/platform-pkg"]
+units = [".", "libraries/std", "../platform/packages/platform-pkg"]
 "#,
     )
     .unwrap();
@@ -333,6 +333,13 @@ return M
 
     let _env_lock = env_lock();
     let _runtime = EnvGuard::set(RUNTIME_ROOT_ENV, root.path().join("runtime"));
+    let err = PackageRoots::resolve(&host, vec![external_package.clone()]).unwrap_err();
+    assert!(
+        format!("{err:#}").contains("must not contain `..`"),
+        "{err:#}"
+    );
+
+    write_workspace(&host, &[&host, &host_std]);
     let roots = PackageRoots::resolve(&host, vec![external_package.clone()]).unwrap();
     let cfg = graph_scan::load_roots(&roots).unwrap();
 
@@ -365,9 +372,10 @@ return M
 
     let _env_lock = env_lock();
     let _runtime = EnvGuard::set(RUNTIME_ROOT_ENV, root.path().join("runtime"));
-    let err = PackageRoots::resolve(&host, vec![internal_package.clone()]).unwrap_err();
+    let roots = PackageRoots::resolve(&host, vec![internal_package.clone()]).unwrap();
+    let err = graph_scan::load_roots(&roots).unwrap_err();
 
-    let msg = format!("{err:#}");
+    let msg = err.to_string();
     assert!(msg.contains("no manifest unit owns"), "{err:#}");
     assert!(msg.contains("internal-pkg"), "{err:#}");
 }
