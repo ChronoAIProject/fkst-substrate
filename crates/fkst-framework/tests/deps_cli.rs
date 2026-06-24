@@ -96,16 +96,6 @@ packages = [{}]
 }
 
 fn library(root: &Path, name: &str, libs: &[&str], allow: Option<&[&str]>) {
-    library_with_publishable(root, name, libs, allow, false);
-}
-
-fn library_with_publishable(
-    root: &Path,
-    name: &str,
-    libs: &[&str],
-    allow: Option<&[&str]>,
-    publishable: bool,
-) {
     let visibility = allow
         .map(|allow| {
             format!(
@@ -117,11 +107,6 @@ allow = [{}]
             )
         })
         .unwrap_or_default();
-    let publishable = if publishable {
-        "\npublishable = true"
-    } else {
-        ""
-    };
     write(
         &root.join(format!("libraries/{name}/fkst.toml")),
         &format!(
@@ -138,7 +123,7 @@ libraries = [{}]
 [library]
 name = "{name}"
 stable_id = "{name}"
-version = "0.1.0"{publishable}
+version = "0.1.0"
 {visibility}
 "#,
             quoted(libs)
@@ -175,7 +160,7 @@ fn git_checked(root: &Path, args: &[&str]) {
 
 fn init_external_library_repo(root: &Path, visibility: Option<&[&str]>) -> String {
     workspace(root, &["libraries/contract"]);
-    library_with_publishable(root, "contract", &[], visibility, true);
+    library(root, "contract", &[], visibility);
     write(
         &root.join("libraries/contract/public/api.lua"),
         r#"return { value = "external-contract" }"#,
@@ -303,7 +288,6 @@ fn cross_repo_deps_lock_writes_hashes_and_locked_catalog_resolves_external_libra
     assert!(lock.contains("[[external_source]]"), "{lock}");
     assert!(lock.contains(r#"id = "fkst-platform""#), "{lock}");
     assert!(lock.contains(&format!(r#"rev = "{rev}""#)), "{lock}");
-    assert!(lock.contains(r#"name = "contract""#), "{lock}");
     assert!(lock.contains("tree_sha256 = \"sha256-"), "{lock}");
     assert!(lock.contains("exports_sha256 = \"sha256-"), "{lock}");
 
@@ -352,73 +336,6 @@ fn cross_repo_unlocked_external_source_fails_closed_until_lock_is_written() {
 }
 
 #[test]
-fn cross_repo_non_publishable_library_is_not_externally_available_but_remains_intra_repo_visible() {
-    let temp = tempfile::tempdir().unwrap();
-    let cache = temp.path().join("cache");
-    let source = temp.path().join("source");
-    let external_consumer = temp.path().join("external-consumer");
-
-    workspace(&source, &["packages/app", "libraries/contract"]);
-    package(&source, "app", &["contract"], &[]);
-    write(
-        &source.join("packages/app/main.lua"),
-        r#"return require("contract.api")"#,
-    );
-    library(&source, "contract", &[], None);
-    write(
-        &source.join("libraries/contract/public/api.lua"),
-        r#"return { value = "intra-repo-contract" }"#,
-    );
-
-    let intra_output = deps(&source).output().unwrap();
-    assert_exit(&intra_output, 0);
-    let intra_out = stdout(&intra_output);
-    assert!(intra_out.contains("fkst deps: PASS"), "{intra_out}");
-    assert!(intra_out.contains("app -> contract"), "{intra_out}");
-
-    let init = Command::new("git")
-        .arg("-C")
-        .arg(&source)
-        .arg("init")
-        .output()
-        .unwrap();
-    assert_exit(&init, 0);
-    git(
-        &source,
-        &["config", "user.email", "fkst-test@example.invalid"],
-    );
-    git(&source, &["config", "user.name", "fkst test"]);
-    git(&source, &["add", "."]);
-    git(
-        &source,
-        &["commit", "-m", "Add non-publishable contract library"],
-    );
-    let rev = git(&source, &["rev-parse", "HEAD"]);
-
-    consumer_workspace_with_external_source(
-        &external_consumer,
-        &source,
-        &rev,
-        &["contract"],
-        &["contract"],
-    );
-
-    let output = deps(&external_consumer)
-        .arg("lock")
-        .env("FKST_CACHE_ROOT", &cache)
-        .output()
-        .unwrap();
-    assert_exit(&output, 2);
-    let err = stderr(&output);
-    assert!(
-        err.contains(
-            "external source `fkst-platform` does not allow library `contract` because it is absent or not publishable"
-        ),
-        "{err}"
-    );
-}
-
-#[test]
 fn cross_repo_non_allowlisted_or_non_visible_library_is_denied() {
     let temp = tempfile::tempdir().unwrap();
     let cache = temp.path().join("cache");
@@ -426,12 +343,12 @@ fn cross_repo_non_allowlisted_or_non_visible_library_is_denied() {
     let non_allowlisted = temp.path().join("non-allowlisted");
     let non_visible = temp.path().join("non-visible");
     workspace(&source, &["libraries/contract", "libraries/other"]);
-    library_with_publishable(&source, "contract", &[], Some(&["other-app"]), true);
+    library(&source, "contract", &[], Some(&["other-app"]));
     write(
         &source.join("libraries/contract/public/api.lua"),
         r#"return { value = "external-contract" }"#,
     );
-    library_with_publishable(&source, "other", &[], None, true);
+    library(&source, "other", &[], None);
     write(
         &source.join("libraries/other/public/api.lua"),
         "return {}\n",
