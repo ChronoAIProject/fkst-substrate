@@ -501,11 +501,9 @@ fn catalog_allowed_libraries(
         if manifest.kind != crate::manifest::UnitKind::Library {
             continue;
         }
-        let library_name = manifest
-            .library
-            .as_ref()
-            .map(|library| library.name.clone())
-            .unwrap_or_else(|| manifest.name.clone());
+        let Some(library_name) = publishable_library_name(&manifest) else {
+            continue;
+        };
         if let Some(previous) = libraries_by_name.insert(library_name.clone(), unit_root.clone()) {
             bail!(
                 "external source `{}` declares duplicate library `{library_name}` at {} and {}",
@@ -519,7 +517,7 @@ fn catalog_allowed_libraries(
     for library in &source.libraries {
         let Some(unit_root) = libraries_by_name.get(library) else {
             bail!(
-                "external source `{}` does not allow library `{library}` because it is absent",
+                "external source `{}` does not allow library `{library}` because it is absent or not publishable",
                 source.id
             );
         };
@@ -550,17 +548,29 @@ fn available_library_names(checkout_root: &Path) -> Result<BTreeSet<String>> {
     let mut names = BTreeSet::new();
     for unit_root in unit_roots {
         let manifest = crate::manifest::UnitManifest::parse_file(&unit_root.join("fkst.toml"))?;
-        if manifest.kind == crate::manifest::UnitKind::Library {
-            names.insert(
-                manifest
-                    .library
-                    .as_ref()
-                    .map(|library| library.name.clone())
-                    .unwrap_or(manifest.name),
-            );
+        if let Some(library_name) = publishable_library_name(&manifest) {
+            names.insert(library_name);
         }
     }
     Ok(names)
+}
+
+fn publishable_library_name(manifest: &crate::manifest::UnitManifest) -> Option<String> {
+    if manifest.kind != crate::manifest::UnitKind::Library {
+        return None;
+    }
+    let library_meta = manifest.library.as_ref();
+    if !library_meta
+        .map(|library| library.publishable)
+        .unwrap_or(false)
+    {
+        return None;
+    }
+    Some(
+        library_meta
+            .map(|library| library.name.clone())
+            .unwrap_or_else(|| manifest.name.clone()),
+    )
 }
 
 // A tree-hash entry is either a regular file (hashed by content) or a symlink
