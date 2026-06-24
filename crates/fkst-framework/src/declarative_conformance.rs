@@ -24,8 +24,10 @@ pub(crate) struct DeclarativeRulePack {
 
 impl DeclarativeRulePack {
     pub(crate) fn from_graph_root(graph_root: &GraphRoot) -> Option<Self> {
-        let owner_root = graph_root.root.clone();
-        let owner_package = graph_root.namespace.clone();
+        Self::from_root(graph_root.namespace.clone(), graph_root.root.clone())
+    }
+
+    pub(crate) fn from_root(owner_package: String, owner_root: PathBuf) -> Option<Self> {
         let name = format!("declarative:{owner_package}");
         let manifest_path = owner_root.join(UNIT_MANIFEST);
         let manifest = match UnitManifest::parse_file_strict(&manifest_path) {

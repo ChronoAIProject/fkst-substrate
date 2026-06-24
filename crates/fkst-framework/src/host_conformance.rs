@@ -90,6 +90,13 @@ impl RulePackRegistry {
                 registry.register(Box::new(pack));
             }
         }
+        for library_root in options.roots.conformance_library_roots() {
+            if let Some(pack) =
+                DeclarativeRulePack::from_root(library_root.namespace, library_root.root)
+            {
+                registry.register(Box::new(pack));
+            }
+        }
         if let Some(config) = &options.config {
             let _config_path = &config.path;
             // Future rule packs, including a source-ratchet pack that migrates

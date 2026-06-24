@@ -6,8 +6,8 @@ use std::process::{Command, Output};
 mod support;
 
 use support::manifest_fixture::{
-    unit_name, write_package_manifest, write_single_package_workspace, write_workspace,
-    write_workspace_for_roots,
+    unit_name, write_library_manifest, write_package_manifest, write_single_package_workspace,
+    write_workspace, write_workspace_for_roots,
 };
 
 const RUNTIME_ROOT_ENV: &str = "FKST_RUNTIME_ROOT";
@@ -189,6 +189,17 @@ return M
 
 fn write_declarative_pack_package(root: &std::path::Path, pack_body: &str) {
     write_declarative_pack_package_with_manifest_name(root, &unit_name(root), pack_body);
+}
+
+fn write_declarative_pack_library(root: &std::path::Path, name: &str, pack_body: &str) {
+    write_library_manifest(root, name, &[]);
+    append_conformance_manifest(root, "conformance/pack.toml");
+    fs::create_dir_all(root.join("conformance")).unwrap();
+    fs::write(
+        root.join("conformance/pack.toml"),
+        pack_body.replace("{{name}}", name),
+    )
+    .unwrap();
 }
 
 fn write_declarative_pack_package_with_manifest_name(
@@ -882,6 +893,161 @@ fn declarative_pack_max_line_count_passes_for_clean_package() {
     assert_eq!(report["ok"], true);
     assert_eq!(report["counts"]["packs"], 2);
     assert_eq!(report["violations"], serde_json::json!([]));
+}
+
+#[test]
+fn declarative_pack_max_line_count_passes_for_clean_library() {
+    let host = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
+    write_minimal_host(host.path());
+    let library = host.path().join("libraries/stdlib");
+    fs::create_dir_all(library.join("src")).unwrap();
+    write_workspace(host.path(), &[host.path(), &library]);
+    write_declarative_pack_library(&library, "stdlib", &max_line_count_pack(3));
+    fs::write(library.join("src/short.lua"), "return 1\n").unwrap();
+    fs::write(library.join("src/also_short.lua"), "one\ntwo\n").unwrap();
+
+    let args = [
+        std::ffi::OsStr::new("--project-root"),
+        path_arg(host.path()),
+    ];
+    let output = run_conformance(&args, host.path());
+
+    assert_exit(&output, 0);
+    let log = combined_log(&output);
+    assert!(log.contains("PASS source.max-lines"), "{log}");
+    let report = stdout_json_report(&output);
+    assert_eq!(report["ok"], true);
+    assert_eq!(report["counts"]["packs"], 2);
+    assert_eq!(report["violations"], serde_json::json!([]));
+}
+
+#[test]
+fn declarative_pack_max_line_count_fails_for_library_owned_source_file() {
+    let host = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
+    write_minimal_host(host.path());
+    let library = host.path().join("libraries/stdlib");
+    fs::create_dir_all(library.join("src")).unwrap();
+    write_workspace(host.path(), &[host.path(), &library]);
+    write_declarative_pack_library(&library, "stdlib", &max_line_count_pack(2));
+    fs::write(library.join("src/long.lua"), "one\ntwo\nthree\n").unwrap();
+
+    let args = [
+        std::ffi::OsStr::new("--project-root"),
+        path_arg(host.path()),
+    ];
+    let output = run_conformance(&args, host.path());
+
+    assert_exit(&output, 1);
+    let log = combined_log(&output);
+    assert!(log.contains("FAIL source.max-lines:src/long.lua"), "{log}");
+    assert!(
+        log.contains("source files must stay under 2 lines"),
+        "{log}"
+    );
+    let report = stdout_json_report(&output);
+    assert_eq!(report["ok"], false);
+    assert_eq!(
+        report["violations"][0]["rule"],
+        "declarative:stdlib.source.max-lines:src/long.lua"
+    );
+    assert_eq!(report["violations"][0]["package"], "stdlib");
+}
+
+#[test]
+fn declarative_pack_for_library_cannot_inspect_host_sibling_or_package_files() {
+    let host = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
+    write_minimal_host(host.path());
+    let library = host.path().join("libraries/stdlib");
+    let sibling_library = host.path().join("libraries/sibling");
+    let package = host.path().join("packages/traveler");
+    fs::create_dir_all(library.join("src")).unwrap();
+    fs::create_dir_all(sibling_library.join("src")).unwrap();
+    fs::create_dir_all(package.join("src")).unwrap();
+    fs::create_dir_all(host.path().join("src")).unwrap();
+    write_workspace(
+        host.path(),
+        &[host.path(), &library, &sibling_library, &package],
+    );
+    write_declarative_pack_library(
+        &library,
+        "stdlib",
+        &text_forbid_regex_pack("forbidden_call"),
+    );
+    write_library_manifest(&sibling_library, "sibling", &[]);
+    write_package_manifest(&package, "traveler", &[]);
+    fs::write(library.join("src/clean.lua"), "return 1\n").unwrap();
+    fs::write(sibling_library.join("src/bad.lua"), "forbidden_call()\n").unwrap();
+    fs::write(package.join("src/bad.lua"), "forbidden_call()\n").unwrap();
+    fs::write(host.path().join("src/bad.lua"), "forbidden_call()\n").unwrap();
+
+    let args = [
+        std::ffi::OsStr::new("--project-root"),
+        path_arg(host.path()),
+    ];
+    let output = run_conformance(&args, host.path());
+
+    assert_exit(&output, 0);
+    let log = combined_log(&output);
+    assert!(log.contains("PASS source.no-forbidden-text"), "{log}");
+    assert!(!log.contains("src/bad.lua matches forbidden text"), "{log}");
+    let report = stdout_json_report(&output);
+    assert_eq!(report["violations"], serde_json::json!([]));
+}
+
+#[test]
+fn library_without_conformance_section_does_not_register_declarative_pack() {
+    let host = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
+    write_minimal_host(host.path());
+    let library = host.path().join("libraries/stdlib");
+    fs::create_dir_all(library.join("src")).unwrap();
+    write_workspace(host.path(), &[host.path(), &library]);
+    write_library_manifest(&library, "stdlib", &[]);
+    fs::write(library.join("src/short.lua"), "return 1\n").unwrap();
+
+    let args = [
+        std::ffi::OsStr::new("--project-root"),
+        path_arg(host.path()),
+    ];
+    let output = run_conformance(&args, host.path());
+
+    assert_exit(&output, 0);
+    let log = combined_log(&output);
+    assert!(!log.contains("conformance-pack-loader"), "{log}");
+    assert!(!log.contains("declarative:stdlib"), "{log}");
+    let report = stdout_json_report(&output);
+    assert_eq!(report["ok"], true);
+    assert_eq!(report["counts"]["packs"], 1);
+}
+
+#[test]
+fn declarative_pack_owner_package_must_match_library_name() {
+    let host = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
+    write_minimal_host(host.path());
+    let library = host.path().join("libraries/stdlib");
+    fs::create_dir_all(library.join("src")).unwrap();
+    write_workspace(host.path(), &[host.path(), &library]);
+    write_declarative_pack_library(
+        &library,
+        "stdlib",
+        &max_line_count_pack(10).replace("{{name}}", "wronglib"),
+    );
+    fs::write(library.join("src/short.lua"), "return 1\n").unwrap();
+
+    let args = [
+        std::ffi::OsStr::new("--project-root"),
+        path_arg(host.path()),
+    ];
+    let output = run_conformance(&args, host.path());
+
+    assert_fail_closed(
+        &output,
+        &[
+            "owner_package `wronglib` does not match active package `stdlib`",
+            "declarative:stdlib.conformance-pack-loader",
+        ],
+    );
+    let report = stdout_json_report(&output);
+    assert_eq!(report["violations"][0]["package"], "stdlib");
 }
 
 #[test]
