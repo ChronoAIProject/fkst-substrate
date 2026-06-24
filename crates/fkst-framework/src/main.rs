@@ -26,6 +26,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 mod boundary_resource;
+mod capabilities;
 mod config_registry;
 mod declarative_conformance;
 mod deps_cli;

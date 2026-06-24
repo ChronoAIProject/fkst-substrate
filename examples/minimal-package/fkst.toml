@@ -1,6 +1,7 @@
 
 kind = "package"
 name = "minimal-package"
+persistence_class = "stateless_adapter"
 
 [code]
 root = "."

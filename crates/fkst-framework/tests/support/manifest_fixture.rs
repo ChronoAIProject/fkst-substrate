@@ -15,6 +15,7 @@ pub fn write_package_manifest(root: &Path, name: &str, lib_deps: &[&str]) {
             r#"
 kind = "package"
 name = "{name}"
+persistence_class = "stateless_adapter"
 
 [code]
 root = "."
