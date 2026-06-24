@@ -1,4 +1,5 @@
-use crate::path_resolver::PackageRoots;
+use crate::manifest::{UnitKind, UnitManifest, UNIT_MANIFEST};
+use crate::path_resolver::{GraphRootKind, PackageRoots};
 use crate::supervise;
 use anyhow::{Context, Result};
 use fkst_common::runtime_layout::RUNTIME_ROOT_ENV;
@@ -134,6 +135,7 @@ impl RulePack for EngineRulePack {
         checks.push(self.check_runtime_layout(context));
         checks.push(self.check_project_layout(context));
         checks.push(self.check_locale_catalogs(context));
+        checks.extend(self.check_package_persistence_classes(context));
 
         let graph_result = supervise::load_host_graph_for_conformance(&context.options.roots);
         let graph_available = match &graph_result {
@@ -258,6 +260,65 @@ impl EngineRulePack {
             "locale-catalogs",
             format!("validated locale catalogs for {checked} graph roots"),
         )
+    }
+
+    fn check_package_persistence_classes(
+        &self,
+        context: &ConformanceContext<'_>,
+    ) -> Vec<HostCheck> {
+        let mut checks = Vec::new();
+        let mut checked = 0usize;
+        for graph_root in context.options.roots.graph_roots() {
+            if !matches!(
+                graph_root.kind,
+                GraphRootKind::Package | GraphRootKind::PackageAndHost
+            ) {
+                continue;
+            }
+            checked += 1;
+            let manifest_path = graph_root.root.join(UNIT_MANIFEST);
+            let manifest = match UnitManifest::parse_file_strict(&manifest_path) {
+                Ok(manifest) => manifest,
+                Err(err) => {
+                    checks.push(HostCheck::fail_for_package(
+                        "persistence-class",
+                        graph_root.namespace,
+                        format!(
+                            "package manifest {} failed persistence_class validation: {err:#}",
+                            manifest_path.display()
+                        ),
+                    ));
+                    continue;
+                }
+            };
+            if !matches!(manifest.kind, UnitKind::Package(_)) {
+                checks.push(HostCheck::fail_for_package(
+                    "persistence-class",
+                    graph_root.namespace,
+                    format!(
+                        "active package root {} resolved to non-package manifest kind",
+                        graph_root.root.display()
+                    ),
+                ));
+                continue;
+            }
+            if manifest.persistence_class().is_none() {
+                checks.push(HostCheck::fail_for_package(
+                    "persistence-class",
+                    graph_root.namespace,
+                    "package manifest must declare `persistence_class`".to_string(),
+                ));
+            }
+        }
+
+        if checks.is_empty() {
+            vec![HostCheck::pass(
+                "persistence-class",
+                format!("validated persistence_class for {checked} package roots"),
+            )]
+        } else {
+            checks
+        }
     }
 
     fn check_department_non_empty(&self, cfg: &fkst_common::config::Config) -> HostCheck {

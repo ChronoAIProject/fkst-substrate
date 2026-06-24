@@ -43,6 +43,7 @@ fn write_package(root: &Path, name: &str, libs: &[&str]) {
             r#"
 kind = "package"
 name = "{name}"
+persistence_class = "stateless_adapter"
 
 [code]
 root = "."
@@ -130,6 +131,7 @@ version = "0.1.0"
         r#"
 kind = "package"
 name = "app"
+persistence_class = "stateless_adapter"
 
 [code]
 root = "."
@@ -158,6 +160,10 @@ packages = ["host"]
     assert_eq!(lockfile.entries().len(), 1);
     assert_eq!(unit.kind, UnitKind::Package(PackageKind::Flat));
     assert_eq!(unit.name, "app");
+    assert_eq!(
+        unit.persistence_class(),
+        Some(PersistenceClass::StatelessAdapter)
+    );
     assert_eq!(unit.code_root, Path::new("."));
     assert_eq!(unit.lib_deps, vec![LibDep::new("std")]);
     assert_eq!(unit.event_deps, vec![EventDep::new("host")]);
@@ -379,6 +385,7 @@ units = ["../external/pkg"]
         r#"
 kind = "package"
 name = "external-pkg"
+persistence_class = "stateless_adapter"
 
 [code]
 root = "."
@@ -406,6 +413,7 @@ units = ["packages/app"]
         r#"
 kind = "package"
 name = "app"
+persistence_class = "stateless_adapter"
 
 [code]
 root = "../../../outside"
@@ -427,4 +435,111 @@ fn missing_workspace_manifest_returns_no_catalog() {
     let temp = tempfile::tempdir().unwrap();
 
     assert!(UnitCatalog::discover(temp.path()).unwrap().is_none());
+}
+
+#[test]
+fn package_manifest_missing_persistence_class_parses_as_absent() {
+    let temp = tempfile::tempdir().unwrap();
+    write(
+        &temp.path().join("fkst.toml"),
+        r#"
+kind = "package"
+name = "app"
+
+[code]
+root = "."
+"#,
+    );
+
+    let runtime_manifest = UnitManifest::parse_file(&temp.path().join("fkst.toml")).unwrap();
+    let strict_manifest = UnitManifest::parse_file_strict(&temp.path().join("fkst.toml")).unwrap();
+
+    assert_eq!(runtime_manifest.persistence_class(), None);
+    assert_eq!(strict_manifest.persistence_class(), None);
+}
+
+#[test]
+fn package_manifest_parses_valid_persistence_classes() {
+    for (raw, class) in [
+        ("saga", PersistenceClass::Saga),
+        ("stateless_adapter", PersistenceClass::StatelessAdapter),
+        ("judgment_pipeline", PersistenceClass::JudgmentPipeline),
+        (
+            "composed_judgment_pipeline",
+            PersistenceClass::ComposedJudgmentPipeline,
+        ),
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        write(
+            &temp.path().join("fkst.toml"),
+            &format!(
+                r#"
+kind = "package"
+name = "app"
+persistence_class = "{raw}"
+
+[code]
+root = "."
+"#
+            ),
+        );
+
+        let manifest = UnitManifest::parse_file_strict(&temp.path().join("fkst.toml")).unwrap();
+
+        assert_eq!(manifest.persistence_class(), Some(class));
+    }
+}
+
+#[test]
+fn library_manifest_rejects_persistence_class() {
+    let temp = tempfile::tempdir().unwrap();
+    write(
+        &temp.path().join("fkst.toml"),
+        r#"
+kind = "library"
+name = "std"
+persistence_class = "stateless_adapter"
+
+[code]
+root = "."
+
+[library]
+name = "std"
+stable_id = "std"
+version = "0.1.0"
+"#,
+    );
+
+    for parse in [UnitManifest::parse_file, UnitManifest::parse_file_strict] {
+        let err = parse(&temp.path().join("fkst.toml")).unwrap_err();
+        let msg = format!("{err:#}");
+
+        assert!(
+            msg.contains("library manifest must not declare `persistence_class`"),
+            "{msg}"
+        );
+    }
+}
+
+#[test]
+fn package_manifest_unknown_persistence_class_fails_closed() {
+    let temp = tempfile::tempdir().unwrap();
+    write(
+        &temp.path().join("fkst.toml"),
+        r#"
+kind = "package"
+name = "app"
+persistence_class = "session_cache"
+
+[code]
+root = "."
+"#,
+    );
+
+    for parse in [UnitManifest::parse_file, UnitManifest::parse_file_strict] {
+        let err = parse(&temp.path().join("fkst.toml")).unwrap_err();
+        let msg = format!("{err:#}");
+
+        assert!(msg.contains("unknown variant `session_cache`"), "{msg}");
+    }
 }

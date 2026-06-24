@@ -39,6 +39,15 @@ pub(crate) enum PackageKind {
     Composed,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum PersistenceClass {
+    Saga,
+    StatelessAdapter,
+    JudgmentPipeline,
+    ComposedJudgmentPipeline,
+}
+
 impl<'de> Deserialize<'de> for UnitKind {
     fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
     where
@@ -149,6 +158,7 @@ pub(crate) struct LibraryMeta {
 pub(crate) struct UnitManifest {
     pub(crate) kind: UnitKind,
     pub(crate) name: String,
+    persistence_class: Option<PersistenceClass>,
     pub(crate) code_root: PathBuf,
     pub(crate) lib_deps: Vec<LibDep>,
     pub(crate) event_deps: Vec<EventDep>,
@@ -159,26 +169,44 @@ pub(crate) struct UnitManifest {
 }
 
 impl UnitManifest {
+    /// Declaration presence is enforced by the engine.persistence-class conformance
+    /// check. Runtime manifest load is intentionally lenient so a coordinated
+    /// two-repo deploy can bump the engine before every package has declared the
+    /// field; absent declarations derive safe capabilities.
     pub(crate) fn parse_file(path: &Path) -> Result<Self> {
-        Self::parse_file_inner(path, false)
+        Self::parse_file_inner(path, ManifestParseMode::Runtime)
     }
 
+    /// Strict parsing validates typed manifest subdocuments, such as the
+    /// `[conformance]` section. It does not enforce persistence_class presence;
+    /// that policy lives only in engine.persistence-class conformance.
     pub(crate) fn parse_file_strict(path: &Path) -> Result<Self> {
-        Self::parse_file_inner(path, true)
+        Self::parse_file_inner(path, ManifestParseMode::Strict)
     }
 
-    fn parse_file_inner(path: &Path, strict_conformance: bool) -> Result<Self> {
+    fn parse_file_inner(path: &Path, mode: ManifestParseMode) -> Result<Self> {
         let raw = fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
         toml::from_str::<UnitManifestToml>(&raw)
-            .and_then(|manifest| manifest.into_manifest(strict_conformance))
+            .and_then(|manifest| manifest.into_manifest(mode))
             .with_context(|| format!("parse {}", path.display()))
     }
+
+    pub(crate) fn persistence_class(&self) -> Option<PersistenceClass> {
+        self.persistence_class
+    }
+}
+
+#[derive(Clone, Copy)]
+enum ManifestParseMode {
+    Runtime,
+    Strict,
 }
 
 #[derive(Deserialize)]
 struct UnitManifestToml {
     kind: UnitKind,
     name: String,
+    persistence_class: Option<PersistenceClass>,
     code: CodeToml,
     #[serde(default)]
     lib_deps: LibDepsToml,
@@ -195,10 +223,11 @@ struct UnitManifestToml {
 impl UnitManifestToml {
     fn into_manifest(
         self,
-        strict_conformance: bool,
+        mode: ManifestParseMode,
     ) -> std::result::Result<UnitManifest, toml::de::Error> {
+        validate_persistence_class(&self.kind, self.persistence_class)?;
         let conformance = match self.conformance {
-            Some(raw) if strict_conformance => {
+            Some(raw) if matches!(mode, ManifestParseMode::Strict) => {
                 Some(raw.try_into::<ConformanceToml>()?.into_manifest())
             }
             Some(raw) => Some(ConformanceManifest::from_value(raw)),
@@ -207,6 +236,7 @@ impl UnitManifestToml {
         Ok(UnitManifest {
             kind: self.kind,
             name: self.name,
+            persistence_class: self.persistence_class,
             code_root: self.code.root,
             lib_deps: self.lib_deps.libraries,
             event_deps: self.event_deps.packages,
@@ -215,6 +245,18 @@ impl UnitManifestToml {
             exports: self.exports,
             conformance,
         })
+    }
+}
+
+fn validate_persistence_class(
+    kind: &UnitKind,
+    persistence_class: Option<PersistenceClass>,
+) -> std::result::Result<(), toml::de::Error> {
+    match (kind, persistence_class) {
+        (UnitKind::Library, Some(_)) => Err(serde::de::Error::custom(
+            "library manifest must not declare `persistence_class`",
+        )),
+        _ => Ok(()),
     }
 }
 

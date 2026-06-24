@@ -55,7 +55,7 @@
 ## Conformance
 
 - 当前 fkst-substrate 的 engine host-conformance 入口是 Rust CLI `fkst-framework conformance --project-root <path> [--package-root <path> ...]`。
-- 当前 conformance check 是 `runtime-layout`、`project-layout`、`locale-catalogs`、`graph-scan`、`department-non-empty`、`schema-validation`。
+- Current engine conformance checks are `runtime-layout`, `project-layout`, `locale-catalogs`, `persistence-class`, `graph-scan`, `department-non-empty`, and `schema-validation`. Declared package rule packs also contribute `conformance-pack-loader` and their declared rule ids.
 - conformance 读取仓库文件与 Lua graph 来执行上述 check。
 - conformance 不得调度工作、重试 pipeline、调用 GitHub、写隐藏状态、维护队列或承担 workflow engine 职责。
 

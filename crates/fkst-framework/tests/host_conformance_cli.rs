@@ -370,8 +370,102 @@ fn valid_minimal_host_exits_zero() {
     assert_eq!(report["ok"], true);
     assert_eq!(report["violations"], serde_json::json!([]));
     assert_eq!(report["counts"]["packs"], 1);
-    assert_eq!(report["counts"]["checks"], 6);
+    assert_eq!(report["counts"]["checks"], 7);
     assert_eq!(report["counts"]["failed"], 0);
+}
+
+#[test]
+fn package_manifest_missing_persistence_class_fails_conformance() {
+    let host = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
+    write_minimal_host(host.path());
+    fs::write(
+        host.path().join("fkst.toml"),
+        format!(
+            r#"
+kind = "package"
+name = "{}"
+
+[code]
+root = "."
+
+[lib_deps]
+libraries = []
+"#,
+            unit_name(host.path())
+        ),
+    )
+    .unwrap();
+
+    let args = [
+        std::ffi::OsStr::new("--project-root"),
+        path_arg(host.path()),
+    ];
+    let output = run_conformance(&args, host.path());
+
+    assert_fail_closed(
+        &output,
+        &[
+            "FAIL persistence-class",
+            "package manifest must declare `persistence_class`",
+            "engine.persistence-class",
+        ],
+    );
+    let report = stdout_json_report(&output);
+    assert_eq!(report["violations"][0]["rule"], "engine.persistence-class");
+    assert_eq!(report["violations"][0]["package"], unit_name(host.path()));
+}
+
+#[test]
+fn independent_host_root_without_persistence_class_passes_conformance() {
+    let root = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
+    let package = root.path().join("pkg");
+    fs::create_dir_all(&package).unwrap();
+    write_package_raiser(&package);
+
+    let host = root.path().join("host-root");
+    fs::create_dir_all(host.join("departments/hello")).unwrap();
+    write_host_defaults(&host);
+    fs::write(
+        host.join("fkst.toml"),
+        r#"
+kind = "package"
+name = "host_root"
+
+[code]
+root = "."
+"#,
+    )
+    .unwrap();
+    write_workspace(&host, &[&host]);
+    fs::write(
+        host.join("departments/hello/main.lua"),
+        r#"
+local M = {}
+M.spec = { consumes = {"pkg.tick"}, stall_window = "30s" }
+function pipeline(_) end
+return M
+"#,
+    )
+    .unwrap();
+
+    let args = [
+        std::ffi::OsStr::new("--project-root"),
+        path_arg(&host),
+        std::ffi::OsStr::new("--package-root"),
+        path_arg(&package),
+    ];
+    let output = run_conformance(&args, &host);
+
+    assert_exit(&output, 0);
+    let log = combined_log(&output);
+    assert!(log.contains("PASS persistence-class"), "{log}");
+    assert!(
+        log.contains("validated persistence_class for 1 package roots"),
+        "{log}"
+    );
+    let report = stdout_json_report(&output);
+    assert_eq!(report["ok"], true);
+    assert_eq!(report["violations"], serde_json::json!([]));
 }
 
 #[test]
@@ -1449,6 +1543,7 @@ fn declarative_manifest_malformed_conformance_section_fails_closed() {
         r#"
 kind = "package"
 name = "traveler"
+persistence_class = "stateless_adapter"
 
 [code]
 root = "."
