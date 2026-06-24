@@ -24,6 +24,7 @@ pub(crate) struct PackageRoots {
     run_host_owner: bool,
     catalog: UnitCatalog,
     external_catalogs: BTreeMap<PathBuf, UnitCatalog>,
+    external_package_catalog_roots: BTreeMap<PathBuf, PathBuf>,
 }
 
 impl PackageRoots {
@@ -129,10 +130,10 @@ impl PackageRoots {
         let catalog = UnitCatalog::discover(&host_root)?.ok_or_else(|| {
             anyhow::anyhow!("manifest catalog is required: missing fkst.workspace.toml")
         })?;
-        let external_catalogs = if package_roots_are_explicit {
-            external_package_catalogs(&host_root, &package_roots)?
+        let (external_catalogs, external_package_catalog_roots) = if package_roots_are_explicit {
+            external_package_catalogs(&host_root, &catalog, &package_roots)?
         } else {
-            BTreeMap::new()
+            (BTreeMap::new(), BTreeMap::new())
         };
         Ok(Self {
             package_roots,
@@ -141,6 +142,7 @@ impl PackageRoots {
             run_host_owner,
             catalog,
             external_catalogs,
+            external_package_catalog_roots,
         })
     }
 
@@ -152,7 +154,25 @@ impl PackageRoots {
         let canonical = owner_root
             .canonicalize()
             .with_context(|| format!("canonicalize {}", owner_root.display()))?;
-        if let Some(catalog) = self.external_catalogs.get(&canonical) {
+        if let Some(workspace_root) = self.external_package_catalog_roots.get(&canonical) {
+            return self.external_catalogs.get(workspace_root).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "external package root {} maps to missing catalog {}",
+                    canonical.display(),
+                    workspace_root.display()
+                )
+            });
+        }
+        if self.catalog.unit_name_for_root(&canonical)?.is_some() {
+            return Ok(&self.catalog);
+        }
+        if let Some(catalog) = self.external_catalogs.values().find_map(|catalog| {
+            catalog
+                .unit_name_for_root(&canonical)
+                .ok()
+                .flatten()
+                .map(|_| catalog)
+        }) {
             return Ok(catalog);
         }
         Ok(&self.catalog)
@@ -359,25 +379,33 @@ fn reject_env_external_package_roots(host_root: &Path, package_roots: &[PathBuf]
 
 fn external_package_catalogs(
     host_root: &Path,
+    host_catalog: &UnitCatalog,
     package_roots: &[PathBuf],
-) -> Result<BTreeMap<PathBuf, UnitCatalog>> {
+) -> Result<(BTreeMap<PathBuf, UnitCatalog>, BTreeMap<PathBuf, PathBuf>)> {
     let mut catalogs = BTreeMap::new();
+    let mut package_catalog_roots = BTreeMap::new();
     for package_root in package_roots {
-        if package_root == host_root || is_under(package_root, host_root) {
-            continue;
-        }
         let catalog = UnitCatalog::discover(package_root)?.ok_or_else(|| {
             anyhow::anyhow!(
-                "manifest catalog is required for external package root {}",
+                "manifest catalog is required for package root {}",
                 package_root.display()
             )
         })?;
+        if catalog.workspace_root() == host_catalog.workspace_root() {
+            if package_root == host_root || host_catalog.unit_name_for_root(package_root)?.is_some()
+            {
+                continue;
+            }
+            bail!("no manifest unit owns {}", package_root.display());
+        }
         if catalog.unit_name_for_root(package_root)?.is_none() {
             bail!("no manifest unit owns {}", package_root.display());
         }
-        catalogs.insert(package_root.clone(), catalog);
+        let workspace_root = catalog.workspace_root().to_path_buf();
+        package_catalog_roots.insert(package_root.clone(), workspace_root.clone());
+        catalogs.entry(workspace_root).or_insert(catalog);
     }
-    Ok(catalogs)
+    Ok((catalogs, package_catalog_roots))
 }
 
 fn collect_conformance_library_roots<'a>(
@@ -591,6 +619,7 @@ root = "."
             run_host_owner: false,
             catalog,
             external_catalogs: BTreeMap::new(),
+            external_package_catalog_roots: BTreeMap::new(),
         }
     }
 
