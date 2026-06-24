@@ -7,6 +7,7 @@
 //! CLI: `fkst-framework conformance --project-root <path> [--package-root <path> ...] [--config <path>]`
 //! CLI: `fkst-framework test --project-root <path> [--package-root <path> ...] [--report-json <path>]`
 //! CLI: `fkst-framework deps --project-root <path> [--package-root <path> ...] [--json]`
+//! CLI: `fkst-framework manifest composed-deps --manifest <path>`
 //! CLI: `fkst-framework init-package-repo [--ref <substrate-ref>] [--force]`
 //! CLI: `fkst-framework observe --durable-root <path> [--json] [--limit <n>]`
 //! CLI: `fkst-framework --self-test`
@@ -34,6 +35,7 @@ mod init_package_repo;
 mod lua_coverage;
 mod lua_require;
 mod manifest;
+mod manifest_composed_deps;
 mod manifest_external;
 mod manifest_hash;
 mod manifest_modules;
@@ -102,6 +104,7 @@ enum CliCommand {
     },
     Test(TestCli),
     Deps(deps_cli::DepsOptions),
+    ManifestComposedDeps(manifest_composed_deps::Options),
     InitPackageRepo(init_package_repo::InitPackageRepoOptions),
     Observe(observe::ObserveOptions),
     CodexWorker(sdk_codex::CodexWorkerOptions),
@@ -113,7 +116,7 @@ fn parse_args() -> Result<CliCommand> {
     let mut args_iter = args.into_iter();
     let sub = args_iter.next().ok_or_else(|| {
         anyhow::anyhow!(
-            "usage: fkst-framework run <lua> --project-root <path> --package-root <path> [--package-root <path> ...] [--owner-namespace <id>] --event <json> | fkst-framework supervise --project-root <path> --framework-bin <path> [--package-root <path> ...] | fkst-framework conformance --project-root <path> [--package-root <path> ...] [--config <path>] | fkst-framework config --project-root <path> [--package-root <path> ...] | fkst-framework boundary-resources | fkst-framework rate-acquire <pool> | fkst-framework rate-exec <pool> -- <program> [args...] | fkst-framework test --project-root <path> [--package-root <path> ...] [--report-json <path>] | fkst-framework deps --project-root <path> [--package-root <path> ...] [--json] | fkst-framework init-package-repo [--ref <substrate-ref>] [--force] | fkst-framework observe --durable-root <path> [--json] [--limit <n>] | fkst-framework --self-test"
+            "usage: fkst-framework run <lua> --project-root <path> --package-root <path> [--package-root <path> ...] [--owner-namespace <id>] --event <json> | fkst-framework supervise --project-root <path> --framework-bin <path> [--package-root <path> ...] | fkst-framework conformance --project-root <path> [--package-root <path> ...] [--config <path>] | fkst-framework config --project-root <path> [--package-root <path> ...] | fkst-framework boundary-resources | fkst-framework rate-acquire <pool> | fkst-framework rate-exec <pool> -- <program> [args...] | fkst-framework test --project-root <path> [--package-root <path> ...] [--report-json <path>] | fkst-framework deps --project-root <path> [--package-root <path> ...] [--json] | fkst-framework manifest composed-deps --manifest <path> | fkst-framework init-package-repo [--ref <substrate-ref>] [--force] | fkst-framework observe --durable-root <path> [--json] [--limit <n>] | fkst-framework --self-test"
         )
     })?;
     if sub == "--self-test" {
@@ -188,6 +191,12 @@ fn parse_args() -> Result<CliCommand> {
     if sub == "deps" {
         let rest = args_iter.collect::<Vec<_>>();
         return Ok(CliCommand::Deps(parse_deps_args(&rest)?));
+    }
+    if sub == "manifest" {
+        let rest = args_iter.collect::<Vec<_>>();
+        return Ok(CliCommand::ManifestComposedDeps(
+            parse_manifest_composed_deps_args(&rest)?,
+        ));
     }
     if sub == "init-package-repo" {
         let rest = args_iter.collect::<Vec<_>>();
@@ -431,6 +440,35 @@ fn parse_deps_args(args: &[String]) -> Result<deps_cli::DepsOptions> {
         json,
         mode,
         locked,
+    })
+}
+
+fn parse_manifest_composed_deps_args(args: &[String]) -> Result<manifest_composed_deps::Options> {
+    let Some(command) = args.first() else {
+        anyhow::bail!("missing manifest subcommand");
+    };
+    if command != "composed-deps" {
+        anyhow::bail!("unknown manifest subcommand: {}", command);
+    }
+
+    let mut manifest: Option<PathBuf> = None;
+    let mut i = 1;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--manifest" => {
+                if manifest.is_some() {
+                    anyhow::bail!("duplicate --manifest");
+                }
+                i += 1;
+                manifest = Some(next_value(args, i, "--manifest")?.into());
+            }
+            other => anyhow::bail!("unknown manifest composed-deps argument: {}", other),
+        }
+        i += 1;
+    }
+
+    Ok(manifest_composed_deps::Options {
+        manifest: manifest.ok_or_else(|| anyhow::anyhow!("missing --manifest"))?,
     })
 }
 
@@ -771,6 +809,7 @@ fn run() -> Result<i32> {
             test_runner::run_tests(options.roots, options.report_json, options.coverage)
         }
         CliCommand::Deps(options) => deps_cli::run(options),
+        CliCommand::ManifestComposedDeps(options) => manifest_composed_deps::run(options),
         CliCommand::InitPackageRepo(options) => init_package_repo::run(options),
         CliCommand::Observe(options) => observe::run(options),
         CliCommand::CodexWorker(options) => sdk_codex::run_codex_worker(options),

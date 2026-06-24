@@ -28,7 +28,9 @@
 
 flat package 指 `package-root == host-root` 且只有一个 graph root；它保持 LegacyFlat：裸 queue 名、`Event.queue`、`RAISED`、delivery id 和 `source_ref` 字节仍是裸名。composed packages 指多个 package root 与 host root 组合成一张 composed graph；此时 package root basename 是 namespace，裸 queue 名按 owner namespace 归一化为 `<pkg>.<queue>` 或 `host.<queue>`，跨包消费必须显式写 `pkg.queue`。详见 `SPEC.md` 的“身份边界 / SDK surface”和 `docs/architecture.md` §4。
 
-`composed.deps` 不是当前引擎 surface。当前仓库没有任何源码读取 `composed.deps`；如果 package-repo 使用这个文件，它只能是外部 test assembly / wrapper convention，用来决定给 `--package-root` 传哪些目录，不是依赖解析、版本解析、override、order 或跨包 `require` 机制。
+Composed package event dependencies are declared canonically in `fkst.toml` under `[event_deps] packages = [...]`. Package-repo scripts that need to ask whether a manifest is composed, and which package roots to pass as composed dependencies, must call `fkst-framework manifest composed-deps --manifest <path>`. That command parses exactly one manifest with the engine manifest parser, prints composed package deps one per line in declared order, exits `10` for a valid non-composed manifest, and exits `1` for a missing, unreadable, or malformed manifest.
+
+`composed.deps` is removed from the package-repo contract. It is not a dependency resolver, version resolver, override mechanism, ordering DSL, or cross-package `require` mechanism.
 
 ## 2. 固定 Lua SDK surface
 
@@ -302,7 +304,7 @@ schema-validation
 | no lifecycle hooks / no shared memory / same pipeline run independent | engine process model + doctrine |
 | cross-pipeline truth 只来自 git / external source / explicit host fact | doctrine-only；review 与 package tests |
 | downstream idempotency by `dedup_key` | package `*_test.lua` / reviewer doctrine；engine 不理解业务 dedup schema |
-| `composed.deps` 不是 dependency resolver | doctrine-only；当前 engine 不读取该文件 |
+| composed package deps are declared in `fkst.toml [event_deps] packages`; `composed.deps` is not a contract surface | engine manifest parser + `fkst-framework manifest composed-deps --manifest <path>` |
 | fixed production SDK surface | `SPEC.md` + `--self-test` + Rust tests；当前 host conformance 无独立 check |
 
 ## 10. 站起一个新 package-repo
