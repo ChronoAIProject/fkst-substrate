@@ -12,8 +12,9 @@ use crate::external_command::MockCommandState;
 use crate::lua_coverage::LuaCoverage;
 use crate::path_resolver::PackageRoots;
 use crate::supervise::consumer::{finish_test_durable_record, TestDurableCompletion};
+use crate::supervise::delivery_observe::{observe_snapshot, DeliveryObserveOptions};
 use crate::supervise::delivery_router::{DeliveryRouter, PublishEnvelope};
-use crate::supervise::delivery_store::{DeliveryObserveOptions, DeliveryStore};
+use crate::supervise::delivery_store::DeliveryStore;
 use crate::supervise::delivery_types::{DeliveryRecord, SourceKind, SourceRef};
 use crate::supervise::event_fanout::Fanout;
 use crate::supervise::journal::SupervisorJournal;
@@ -390,16 +391,16 @@ fn run_record(
 }
 
 fn final_state(store: &DeliveryStore) -> mlua::Result<FinalState> {
-    let snapshot = store
-        .observe_snapshot(
-            Path::new("<test-runtime>"),
-            Path::new("<test-runtime>/delivery.redb"),
-            &DeliveryObserveOptions {
-                now_ms: TEST_OBSERVED_AT_MS,
-                limit: MAX_TRACE_DELIVERIES,
-            },
-        )
-        .map_err(mlua::Error::external)?;
+    let snapshot = observe_snapshot(
+        store,
+        Path::new("<test-runtime>"),
+        Path::new("<test-runtime>/delivery.redb"),
+        &DeliveryObserveOptions {
+            now_ms: TEST_OBSERVED_AT_MS,
+            limit: MAX_TRACE_DELIVERIES,
+        },
+    )
+    .map_err(mlua::Error::external)?;
     let pending = snapshot
         .queues
         .iter()

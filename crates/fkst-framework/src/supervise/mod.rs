@@ -10,6 +10,7 @@ use crate::path_resolver::PackageRoots;
 
 pub(crate) mod consumer;
 mod delivery_index;
+pub(crate) mod delivery_observe;
 mod delivery_retry;
 pub(crate) mod delivery_router;
 pub(crate) mod delivery_store;

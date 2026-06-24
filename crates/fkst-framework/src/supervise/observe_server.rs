@@ -1,4 +1,5 @@
-use super::delivery_store::{DeliveryObserveOptions, DeliveryStore};
+use super::delivery_observe::{observe_snapshot, DeliveryObserveOptions};
+use super::delivery_store::DeliveryStore;
 use anyhow::{Context, Result};
 use fkst_common::DurableLayout;
 use std::path::{Path, PathBuf};
@@ -74,7 +75,8 @@ async fn serve_connection(
             .context("read observe request")?;
     }
     let response = match serde_json::from_str::<ObserveSocketRequest>(&line) {
-        Ok(request) => match store.observe_snapshot(
+        Ok(request) => match observe_snapshot(
+            &store,
             &endpoint.durable_root,
             &endpoint.database,
             &DeliveryObserveOptions {
