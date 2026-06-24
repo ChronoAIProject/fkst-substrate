@@ -1,6 +1,7 @@
 use crate::external_command::MockCommandState;
 use crate::lua_coverage::LuaCoverage;
 use crate::path_resolver::PackageRoots;
+use crate::sdk_observe::MockObserveState;
 use crate::supervise::event_fanout::Fanout;
 use crate::supervise::source_runner::{cron_emission, file_watch_fixture_emission, SourceEmission};
 use crate::test_department_env::DeptRunOptions;
@@ -19,6 +20,7 @@ pub(crate) fn register(
     roots: PackageRoots,
     owner_namespace: String,
     mock_commands: MockCommandState,
+    mock_observe: MockObserveState,
     coverage: Option<LuaCoverage>,
     test: &Table,
 ) -> mlua::Result<()> {
@@ -32,6 +34,7 @@ pub(crate) fn register(
                 &roots,
                 &owner_namespace,
                 mock_commands.clone(),
+                mock_observe.clone(),
                 &raiser_name,
                 opts,
                 coverage.clone(),
@@ -48,6 +51,7 @@ fn fire_raiser(
     roots: &PackageRoots,
     owner_namespace: &str,
     mock_commands: MockCommandState,
+    mock_observe: MockObserveState,
     raiser_name: &str,
     opts: Option<Table>,
     coverage: Option<LuaCoverage>,
@@ -79,6 +83,7 @@ fn fire_raiser(
             cache,
             roots,
             mock_commands.clone(),
+            mock_observe.clone(),
             &delivery.dept,
             &delivery.event,
             coverage.clone(),
@@ -179,6 +184,7 @@ fn run_consumer(
     cache: &TestRunCache,
     roots: &PackageRoots,
     mock_commands: MockCommandState,
+    mock_observe: MockObserveState,
     dept: &DepartmentDecl,
     event: &fkst_common::Event,
     coverage: Option<LuaCoverage>,
@@ -194,6 +200,7 @@ fn run_consumer(
         &dept.owner_root,
         &dept.owner_namespace,
         mock_commands,
+        mock_observe,
         &lua_path,
         serde_json::to_value(event).map_err(mlua::Error::external)?,
         DeptRunOptions::default_env(),

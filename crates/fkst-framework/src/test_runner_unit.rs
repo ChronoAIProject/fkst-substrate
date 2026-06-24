@@ -1,5 +1,6 @@
 use super::external_command::{MockCommandResult, MockCommandState};
 use super::path_resolver::PackageRoots;
+use super::sdk_observe::MockObserveState;
 use super::test_runner::{run_department, TestRunCache, TestRunCacheStats};
 use mlua::{LuaSerdeExt, Table, Value};
 use std::path::Path;
@@ -76,6 +77,7 @@ fn run_department_cache_reuses_derivations_and_preserves_isolation() {
     let owner_namespace = roots.sole_package_namespace().unwrap().to_string();
     let cache = TestRunCache::new(roots.clone()).unwrap();
     let mock_commands = MockCommandState::new();
+    let mock_observe = MockObserveState::new();
     let outer_lua = crate::mlua_init::new_lua();
 
     let first_event = outer_lua
@@ -98,6 +100,7 @@ fn run_department_cache_reuses_derivations_and_preserves_isolation() {
         &owner_root,
         &owner_namespace,
         mock_commands.clone(),
+        mock_observe.clone(),
         "departments/worker/main.lua".to_string(),
         first_event,
         None,
@@ -133,6 +136,7 @@ fn run_department_cache_reuses_derivations_and_preserves_isolation() {
         &owner_root,
         &owner_namespace,
         mock_commands.clone(),
+        mock_observe.clone(),
         "departments/worker/main.lua".to_string(),
         second_event,
         None,

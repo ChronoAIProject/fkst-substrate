@@ -46,6 +46,7 @@ pub fn register_framework_sdk(
     crate::sdk_git::register(lua, host_root, config.clone())?;
     crate::sdk_mark::register(lua, host_root)?;
     crate::sdk_cache::register(lua, host_root)?;
+    crate::sdk_observe::register(lua, None)?;
     crate::sdk_codex::register(
         lua,
         host_root,
@@ -71,6 +72,7 @@ pub(crate) fn register_framework_sdk_with_runner(
     graph_roots: Option<PackageRoots>,
     graph_json_authorized: bool,
     raised_auth_token: Option<String>,
+    mock_observe: Option<crate::sdk_observe::MockObserveState>,
 ) -> mlua::Result<()> {
     let config = ConfigContext::from_host_root(host_root).map_err(mlua::Error::external)?;
     crate::rate_pool::RatePoolRegistry::from_config(&config).map_err(mlua::Error::external)?;
@@ -85,6 +87,7 @@ pub(crate) fn register_framework_sdk_with_runner(
     crate::sdk_git::register_with_runner(lua, host_root, config.clone(), runner.clone())?;
     crate::sdk_mark::register(lua, host_root)?;
     crate::sdk_cache::register(lua, host_root)?;
+    crate::sdk_observe::register(lua, mock_observe)?;
     crate::sdk_codex::register_with_runner(
         lua,
         host_root,

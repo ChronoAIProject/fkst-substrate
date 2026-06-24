@@ -11,6 +11,7 @@
 use crate::external_command::MockCommandState;
 use crate::lua_coverage::LuaCoverage;
 use crate::path_resolver::PackageRoots;
+use crate::sdk_observe::MockObserveState;
 use crate::supervise::consumer::{finish_test_durable_record, TestDurableCompletion};
 use crate::supervise::delivery_observe::{observe_snapshot, DeliveryObserveOptions};
 use crate::supervise::delivery_router::{DeliveryRouter, PublishEnvelope};
@@ -42,6 +43,7 @@ pub(crate) fn register(
     roots: PackageRoots,
     owner_namespace: String,
     mock_commands: MockCommandState,
+    mock_observe: MockObserveState,
     coverage: Option<LuaCoverage>,
     test: &Table,
 ) -> mlua::Result<()> {
@@ -53,6 +55,7 @@ pub(crate) fn register(
                 &roots,
                 &owner_namespace,
                 mock_commands.clone(),
+                mock_observe.clone(),
                 input,
                 opts,
                 coverage.clone(),
@@ -69,6 +72,7 @@ fn run_graph(
     roots: &PackageRoots,
     owner_namespace: &str,
     mock_commands: MockCommandState,
+    mock_observe: MockObserveState,
     input: Value,
     opts: Option<Table>,
     coverage: Option<LuaCoverage>,
@@ -116,6 +120,7 @@ fn run_graph(
             cache,
             roots,
             mock_commands.clone(),
+            mock_observe.clone(),
             &dept,
             &record,
             coverage.clone(),
@@ -354,6 +359,7 @@ fn run_record(
     cache: &TestRunCache,
     roots: &PackageRoots,
     mock_commands: MockCommandState,
+    mock_observe: MockObserveState,
     dept: &DepartmentDecl,
     record: &DeliveryRecord,
     coverage: Option<LuaCoverage>,
@@ -369,6 +375,7 @@ fn run_record(
         &dept.owner_root,
         &dept.owner_namespace,
         mock_commands,
+        mock_observe,
         &lua_path,
         serde_json::to_value(Event {
             queue: record.queue.clone(),
