@@ -49,6 +49,10 @@ pub(crate) fn route_subscriptions_for_test(
     DeliveryRouter::route_subscriptions_for_test(cfg, queue)
 }
 
+pub(crate) fn scrub_current_engine_binary_path_env() {
+    spawner::scrub_current_engine_binary_path_env();
+}
+
 pub async fn supervise(roots: PackageRoots, framework_bin: PathBuf) -> Result<()> {
     let project_root = roots.host_root().to_path_buf();
     let journal = SupervisorJournal::open(&project_root);
