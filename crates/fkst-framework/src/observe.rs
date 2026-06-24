@@ -19,6 +19,21 @@ pub(crate) struct ObserveOptions {
     pub(crate) limit: usize,
 }
 
+pub(crate) fn default_limit() -> usize {
+    DEFAULT_LIMIT
+}
+
+pub(crate) fn validate_limit(limit: usize) -> Result<usize> {
+    validate_limit_with_label(limit, "observe limit")
+}
+
+fn validate_limit_with_label(limit: usize, label: &str) -> Result<usize> {
+    if limit == 0 || limit > MAX_LIMIT {
+        anyhow::bail!("{label} must be between 1 and {MAX_LIMIT}");
+    }
+    Ok(limit)
+}
+
 pub(crate) fn parse_args(args: &[String]) -> Result<ObserveOptions> {
     let mut durable_root: Option<PathBuf> = None;
     let mut json = false;
@@ -40,9 +55,7 @@ pub(crate) fn parse_args(args: &[String]) -> Result<ObserveOptions> {
                 limit = raw
                     .parse::<usize>()
                     .with_context(|| format!("invalid --limit value `{raw}`"))?;
-                if limit == 0 || limit > MAX_LIMIT {
-                    anyhow::bail!("--limit must be between 1 and {MAX_LIMIT}");
-                }
+                validate_limit_with_label(limit, "--limit")?;
             }
             other => anyhow::bail!("unknown observe argument: {}", other),
         }
@@ -56,9 +69,23 @@ pub(crate) fn parse_args(args: &[String]) -> Result<ObserveOptions> {
 }
 
 pub(crate) fn run(options: ObserveOptions) -> Result<i32> {
-    let layout = DurableLayout::new(&options.durable_root)?;
+    let snapshot = snapshot(&options.durable_root, options.limit)?;
+    if options.json {
+        println!("{}", serde_json::to_string_pretty(&snapshot)?);
+    } else {
+        print_human(&snapshot);
+    }
+    Ok(0)
+}
+
+pub(crate) fn snapshot(
+    durable_root: impl Into<PathBuf>,
+    limit: usize,
+) -> Result<DeliveryObserveSnapshot> {
+    let limit = validate_limit(limit)?;
+    let layout = DurableLayout::new(durable_root)?;
     let database = layout.delivery_db_path();
-    let snapshot = match request_live_snapshot(&layout, options.limit)? {
+    match request_live_snapshot(&layout, limit)? {
         Some(snapshot) => Ok(snapshot),
         None => {
             let store = DeliveryStore::open_existing(&database)?;
@@ -67,17 +94,11 @@ pub(crate) fn run(options: ObserveOptions) -> Result<i32> {
                 &database,
                 &DeliveryObserveOptions {
                     now_ms: now_ms(),
-                    limit: options.limit,
+                    limit,
                 },
             )
         }
-    }?;
-    if options.json {
-        println!("{}", serde_json::to_string_pretty(&snapshot)?);
-    } else {
-        print_human(&snapshot);
     }
-    Ok(0)
 }
 
 pub(crate) fn socket_path(layout: &DurableLayout) -> PathBuf {

@@ -46,6 +46,7 @@ pub fn register_framework_sdk(
     crate::sdk_git::register(lua, host_root, config.clone())?;
     crate::sdk_mark::register(lua, host_root)?;
     crate::sdk_cache::register(lua, host_root)?;
+    crate::sdk_observe::register(lua)?;
     crate::sdk_codex::register(
         lua,
         host_root,
@@ -85,6 +86,7 @@ pub(crate) fn register_framework_sdk_with_runner(
     crate::sdk_git::register_with_runner(lua, host_root, config.clone(), runner.clone())?;
     crate::sdk_mark::register(lua, host_root)?;
     crate::sdk_cache::register(lua, host_root)?;
+    crate::sdk_observe::register(lua)?;
     crate::sdk_codex::register_with_runner(
         lua,
         host_root,

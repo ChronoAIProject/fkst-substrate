@@ -41,6 +41,7 @@ raise(queue, payload)
 spawn_codex_sync(opts)
 spawn_codex(opts)
 fkst.codex_runs()
+fkst.observe([opts])
 exec_sync(cmd_or_opts)
 exec_argv(opts)
 await_all(handles)
@@ -81,6 +82,8 @@ now()
 `truncate_utf8(s, max_bytes)` returns the longest prefix of `s` that is at most `max_bytes` bytes and ends on a UTF-8 character boundary, matching Rust `str::floor_char_boundary` semantics. It never emits a partial sequence; `max_bytes >= #s` returns `s` unchanged; `max_bytes` smaller than the first character returns the empty string; negative `max_bytes` is an argument error; invalid UTF-8 input is an argument error. This is the blessed replacement for package-side byte truncation.
 
 `fkst.codex_runs()` is a read-only observability query for engine codex run records. It returns running and recent entries with `role`, `started_at`, `status` (`running`, `done`, or `failed`), bounded `output_tail`, and optional `exit_code`; it does not return runtime paths or unbounded stdout/stderr.
+
+`fkst.observe([opts])` is a read-only in-process query for the existing `fkst-framework observe --json` durable delivery snapshot. `opts.limit` defaults to 500 and must be within 1..10000. The primitive resolves `FKST_DURABLE_ROOT`, uses the live observe socket when available, otherwise uses the same offline read-only `<DURABLE>/delivery.redb` path, and returns the existing `DeliveryObserveSnapshot` model as Lua data. It does not add observe semantics beyond the CLI contract and does not shell out to the engine binary.
 
 用户提纲里的 SDK 列表漏掉了当前已存在的 `list_orphan_worktrees(prefix)`。提纲中的其它 production primitive 均存在。没有发现额外 production SDK primitive。
 

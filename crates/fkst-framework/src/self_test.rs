@@ -186,6 +186,7 @@ fn check_sdk_registration(host_root: &std::path::Path) -> Result<()> {
         expect_type("spawn_codex_sync", spawn_codex_sync, "function")
         expect_type("fkst", fkst, "table")
         expect_type("fkst.codex_runs", fkst.codex_runs, "function")
+        expect_type("fkst.observe", fkst.observe, "function")
         expect_type("await_all", await_all, "function")
         expect_type("raise", raise, "function")
         expect_nil("codex_status", codex_status)

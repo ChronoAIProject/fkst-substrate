@@ -23,6 +23,12 @@ fn assert_exit(output: &Output, code: i32) {
     );
 }
 
+fn run_command() -> Command {
+    let mut command = Command::new(framework_bin());
+    command.env_remove("FKST_SUPERVISOR_PID");
+    command
+}
+
 fn observe_socket_path(durable_root: &Path) -> PathBuf {
     let mut hash = 0xcbf29ce484222325_u64;
     for byte in durable_root.as_os_str().to_string_lossy().as_bytes() {
@@ -30,6 +36,88 @@ fn observe_socket_path(durable_root: &Path) -> PathBuf {
         hash = hash.wrapping_mul(0x100000001b3);
     }
     PathBuf::from("/tmp").join(format!("fkst-observe-{hash:016x}.sock"))
+}
+
+fn write_single_package_workspace(root: &Path) {
+    std::fs::write(
+        root.join("fkst.workspace.toml"),
+        r#"
+[workspace]
+units = ["."]
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("fkst.toml"),
+        r#"
+kind = "package"
+name = "host"
+
+[code]
+root = "."
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("fkst.env"),
+        "FKST_QUEUE_CAPACITY=8\nFKST_DEPARTMENT_DEFAULT_STALL_WINDOW=30s\nFKST_CODEX_PERMIT_SLOTS=1\n",
+    )
+    .unwrap();
+}
+
+fn write_observe_fixture(durable: &Path) {
+    let db = Database::create(durable.join("delivery.redb")).unwrap();
+    let write = db.begin_write().unwrap();
+    {
+        let mut deliveries = write.open_table(DELIVERY_BY_ID).unwrap();
+        let mut dead = write.open_table(DEAD_BY_ID).unwrap();
+        let delivery = json!({
+            "delivery_id": "delivery-one",
+            "queue": "input",
+            "dept": "worker",
+            "payload": {
+                "schema": "github.issue",
+                "dedup_key": "issue-169",
+                "body": "do not expose this body"
+            },
+            "source": {"kind": "External", "reference": "issue/169"},
+            "cron_payload": null,
+            "observed_at_ms": 1000,
+            "attempt": 0,
+            "redrive_count": 0,
+            "lease_generation": 0,
+            "lease_until_ms": null,
+            "not_before_ms": 1000,
+            "last_error_excerpt": null
+        });
+        deliveries
+            .insert(
+                "delivery-one",
+                serde_json::to_vec(&delivery).unwrap().as_slice(),
+            )
+            .unwrap();
+        let dead_record = json!({
+            "delivery_id": "dead-one",
+            "queue": "input",
+            "dept": "worker",
+            "source": null,
+            "observed_at_ms": 900,
+            "not_before_ms": 900,
+            "dead_at_ms": 1200,
+            "attempts": 3,
+            "redrive_count": 0,
+            "replayable": false,
+            "permanent": true,
+            "error_excerpt": "final failure",
+            "record": null
+        });
+        dead.insert(
+            "dead-one",
+            serde_json::to_vec(&dead_record).unwrap().as_slice(),
+        )
+        .unwrap();
+    }
+    write.commit().unwrap();
 }
 
 #[test]
@@ -108,6 +196,102 @@ fn observe_json_reports_snapshot_without_payload_body() {
     assert!(out.contains("\"dedup_key\": \"issue-81\""), "{out}");
     assert!(out.contains("\"delivery_id\": \"dead-one\""), "{out}");
     assert!(!out.contains("do not print this issue body"), "{out}");
+}
+
+#[test]
+fn lua_observe_returns_existing_snapshot_model_without_shelling_out() {
+    let host = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
+    let durable = tempfile::Builder::new()
+        .prefix("fkst-durable")
+        .tempdir()
+        .unwrap();
+    write_single_package_workspace(host.path());
+    write_observe_fixture(durable.path());
+    let dept = host.path().join("departments/probe/main.lua");
+    std::fs::create_dir_all(dept.parent().unwrap()).unwrap();
+    std::fs::write(
+        &dept,
+        r#"
+local M = {}
+M.spec = { consumes = { "tick" }, produces = { "seen" }, ephemeral = { "tick" }, stall_window = "30s" }
+function M.pipeline(_)
+  local snapshot = fkst.observe({ limit = 1 })
+  assert(snapshot.schema_version == 1, "schema_version")
+  assert(snapshot.limits.max_deliveries == 1, "limit")
+  assert(snapshot.queues[1].queue == "input", "queue")
+  assert(snapshot.deliveries[1].delivery_id == "delivery-one", "delivery")
+  assert(snapshot.deliveries[1].payload.schema == "github.issue", "schema")
+  assert(snapshot.deliveries[1].payload.dedup_key == "issue-169", "dedup_key")
+  assert(snapshot.deliveries[1].payload.body == nil, "payload body leaked")
+  assert(snapshot.dead_letters[1].delivery_id == "dead-one", "dead letter")
+  raise("seen", { observed = true, schema_version = snapshot.schema_version })
+end
+return M
+"#,
+    )
+    .unwrap();
+
+    let output = run_command()
+        .arg("run")
+        .arg(&dept)
+        .arg("--project-root")
+        .arg(host.path())
+        .arg("--package-root")
+        .arg(host.path())
+        .arg("--event")
+        .arg(r#"{"queue":"tick","payload":{},"ts":1}"#)
+        .current_dir(host.path())
+        .env("FKST_RUNTIME_ROOT", host.path().join(".fkst/runtime"))
+        .env("FKST_DURABLE_ROOT", durable.path())
+        .output()
+        .unwrap();
+
+    assert_exit(&output, 0);
+    let out = String::from_utf8_lossy(&output.stdout);
+    assert!(out.contains("RAISED:"), "{out}");
+    assert!(
+        !out.contains("do not expose this body"),
+        "observe must not expose full payload bodies: {out}"
+    );
+}
+
+#[test]
+fn lua_observe_fails_closed_without_durable_root() {
+    let host = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
+    write_single_package_workspace(host.path());
+    let dept = host.path().join("departments/probe/main.lua");
+    std::fs::create_dir_all(dept.parent().unwrap()).unwrap();
+    std::fs::write(
+        &dept,
+        r#"
+local M = {}
+M.spec = { consumes = { "tick" }, produces = {}, ephemeral = { "tick" }, stall_window = "30s" }
+function M.pipeline(_)
+  fkst.observe()
+end
+return M
+"#,
+    )
+    .unwrap();
+
+    let output = run_command()
+        .arg("run")
+        .arg(&dept)
+        .arg("--project-root")
+        .arg(host.path())
+        .arg("--package-root")
+        .arg(host.path())
+        .arg("--event")
+        .arg(r#"{"queue":"tick","payload":{},"ts":1}"#)
+        .current_dir(host.path())
+        .env("FKST_RUNTIME_ROOT", host.path().join(".fkst/runtime"))
+        .env_remove("FKST_DURABLE_ROOT")
+        .output()
+        .unwrap();
+
+    assert_exit(&output, 1);
+    let err = String::from_utf8_lossy(&output.stderr);
+    assert!(err.contains("FKST_DURABLE_ROOT must be set"), "{err}");
 }
 
 #[test]
