@@ -1,10 +1,16 @@
+use base64::Engine;
 use redb::{Database, TableDefinition};
 use serde_json::json;
+use std::fs;
 use std::io::ErrorKind;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
+
+mod support;
+
+use support::manifest_fixture::{unit_name, write_single_package_workspace};
 
 const DELIVERY_BY_ID: TableDefinition<&str, &[u8]> = TableDefinition::new("delivery_by_id");
 const DEAD_BY_ID: TableDefinition<&str, &[u8]> = TableDefinition::new("dead_by_id");
@@ -23,6 +29,27 @@ fn assert_exit(output: &Output, code: i32) {
     );
 }
 
+fn stdout(output: &Output) -> String {
+    String::from_utf8_lossy(&output.stdout).to_string()
+}
+
+fn stderr(output: &Output) -> String {
+    String::from_utf8_lossy(&output.stderr).to_string()
+}
+
+fn raised_payload(output: &Output) -> serde_json::Value {
+    let out = stdout(output);
+    let line = out
+        .lines()
+        .find_map(|line| line.strip_prefix("RAISED: "))
+        .unwrap_or_else(|| panic!("missing RAISED line in stdout: {out}"));
+    let decoded = base64::engine::general_purpose::URL_SAFE
+        .decode(line)
+        .unwrap();
+    let raises: serde_json::Value = serde_json::from_slice(&decoded).unwrap();
+    raises[0]["payload"].clone()
+}
+
 fn observe_socket_path(durable_root: &Path) -> PathBuf {
     let mut hash = 0xcbf29ce484222325_u64;
     for byte in durable_root.as_os_str().to_string_lossy().as_bytes() {
@@ -32,13 +59,8 @@ fn observe_socket_path(durable_root: &Path) -> PathBuf {
     PathBuf::from("/tmp").join(format!("fkst-observe-{hash:016x}.sock"))
 }
 
-#[test]
-fn observe_json_reports_snapshot_without_payload_body() {
-    let durable = tempfile::Builder::new()
-        .prefix("fkst-durable")
-        .tempdir()
-        .unwrap();
-    let db = Database::create(durable.path().join("delivery.redb")).unwrap();
+fn write_observe_fixture(durable_root: &Path) {
+    let db = Database::create(durable_root.join("delivery.redb")).unwrap();
     let write = db.begin_write().unwrap();
     {
         let mut deliveries = write.open_table(DELIVERY_BY_ID).unwrap();
@@ -91,6 +113,15 @@ fn observe_json_reports_snapshot_without_payload_body() {
     }
     write.commit().unwrap();
     drop(db);
+}
+
+#[test]
+fn observe_json_reports_snapshot_without_payload_body() {
+    let durable = tempfile::Builder::new()
+        .prefix("fkst-durable")
+        .tempdir()
+        .unwrap();
+    write_observe_fixture(durable.path());
 
     let output = Command::new(framework_bin())
         .arg("observe")
@@ -108,6 +139,166 @@ fn observe_json_reports_snapshot_without_payload_body() {
     assert!(out.contains("\"dedup_key\": \"issue-81\""), "{out}");
     assert!(out.contains("\"delivery_id\": \"dead-one\""), "{out}");
     assert!(!out.contains("do not print this issue body"), "{out}");
+}
+
+#[test]
+fn fkst_observe_returns_cli_snapshot_in_process() {
+    let host = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
+    let durable = tempfile::Builder::new()
+        .prefix("fkst-durable")
+        .tempdir()
+        .unwrap();
+    write_observe_fixture(durable.path());
+    fs::create_dir_all(host.path().join("departments/probe")).unwrap();
+    let probe = host.path().join("departments/probe/main.lua");
+    fs::write(
+        &probe,
+        r#"
+local M = {}
+M.spec = { consumes = { "tick" }, produces = { "seen" }, ephemeral = { "tick" } }
+
+function M.pipeline(event)
+  local snapshot = fkst.observe()
+  raise("seen", {
+    schema_version = snapshot.schema_version,
+    queue = snapshot.queues[1].queue,
+    deliveries = #snapshot.deliveries,
+    dead_letters = #snapshot.dead_letters,
+    digest = snapshot.deliveries[1].payload.digest,
+  })
+end
+
+return M
+"#,
+    )
+    .unwrap();
+    write_single_package_workspace(host.path());
+
+    let cli = Command::new(framework_bin())
+        .arg("observe")
+        .arg("--durable-root")
+        .arg(durable.path())
+        .arg("--json")
+        .output()
+        .unwrap();
+    assert_exit(&cli, 0);
+    let cli_json: serde_json::Value = serde_json::from_slice(&cli.stdout).unwrap();
+
+    let run = Command::new(framework_bin())
+        .arg("run")
+        .arg(&probe)
+        .arg("--project-root")
+        .arg(host.path())
+        .arg("--package-root")
+        .arg(host.path())
+        .arg("--owner-namespace")
+        .arg(unit_name(host.path()))
+        .arg("--event")
+        .arg(r#"{"queue":"tick","payload":{}}"#)
+        .current_dir(host.path())
+        .env("FKST_RUNTIME_ROOT", host.path().join(".fkst/runtime"))
+        .env("FKST_DURABLE_ROOT", durable.path())
+        .output()
+        .unwrap();
+
+    assert_exit(&run, 0);
+    let raised = raised_payload(&run);
+    assert_eq!(raised["schema_version"], cli_json["schema_version"]);
+    assert_eq!(raised["queue"], cli_json["queues"][0]["queue"]);
+    assert_eq!(
+        raised["deliveries"].as_u64().unwrap(),
+        cli_json["deliveries"].as_array().unwrap().len() as u64
+    );
+    assert_eq!(
+        raised["dead_letters"].as_u64().unwrap(),
+        cli_json["dead_letters"].as_array().unwrap().len() as u64
+    );
+    assert_eq!(
+        raised["digest"],
+        cli_json["deliveries"][0]["payload"]["digest"]
+    );
+    assert!(
+        !stdout(&run).contains("do not print this issue body"),
+        "stdout: {}",
+        stdout(&run)
+    );
+}
+
+#[test]
+fn fkst_test_mock_observe_injects_deterministic_snapshot() {
+    let host = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
+    fs::create_dir_all(host.path().join("departments/probe")).unwrap();
+    fs::create_dir_all(host.path().join("tests")).unwrap();
+    fs::write(
+        host.path().join("departments/probe/main.lua"),
+        r#"
+local M = {}
+M.spec = { consumes = { "tick" }, produces = { "seen" }, ephemeral = { "tick" } }
+
+function M.pipeline(event)
+  local snapshot = fkst.observe()
+  raise("seen", {
+    generated_at_ms = snapshot.generated_at_ms,
+    queue = snapshot.queues[1].queue,
+    depth = snapshot.queues[1].depth,
+  })
+end
+
+return M
+"#,
+    )
+    .unwrap();
+    fs::write(
+        host.path().join("tests/observe_test.lua"),
+        r#"
+local t = fkst.test
+
+return {
+  test_mock_observe_feeds_run_department = function()
+    t.mock_observe({
+      schema_version = 1,
+      generated_at_ms = 4242,
+      queues = {
+        { queue = "work", depth = 7 },
+      },
+      deliveries = {},
+      dead_letters = {},
+    })
+    local result = t.run_department("departments/probe/main.lua", { queue = "tick", payload = {} })
+    t.eq(result.exit_code, 0)
+    t.eq(result.raises[1].payload.generated_at_ms, 4242)
+    t.eq(result.raises[1].payload.queue, "work")
+    t.eq(result.raises[1].payload.depth, 7)
+  end,
+}
+"#,
+    )
+    .unwrap();
+    write_single_package_workspace(host.path());
+
+    let output = Command::new(framework_bin())
+        .arg("test")
+        .arg("--project-root")
+        .arg(host.path())
+        .arg("--package-root")
+        .arg(host.path())
+        .current_dir(host.path())
+        .env("FKST_RUNTIME_ROOT", host.path().join(".fkst/runtime"))
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}",
+        stdout(&output),
+        stderr(&output)
+    );
+    let out = stdout(&output);
+    assert!(
+        out.contains("PASS tests/observe_test.lua::test_mock_observe_feeds_run_department"),
+        "stdout: {out}"
+    );
+    assert!(out.contains("1 passed, 0 failed"), "stdout: {out}");
 }
 
 #[test]

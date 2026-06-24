@@ -710,6 +710,7 @@ local allowed = {
   is_nil = true,
   is_true = true,
   mock_command = true,
+  mock_observe = true,
   raises = true,
   fire_raiser = true,
   run_graph = true,

@@ -14,6 +14,7 @@ use crate::lua_coverage::LuaCoverage;
 use crate::manifest::UnitCatalog;
 use crate::path_resolver::PackageRoots;
 use crate::raise::RaiseBuffer;
+use crate::sdk_observe::MockObserveState;
 use crate::test_department_env::{DeptRunEnvGuard, DeptRunOptions};
 
 pub(crate) fn run_tests(
@@ -44,6 +45,7 @@ pub(crate) fn run_tests(
     for file in files {
         let relpath = display_path(&file.path, &file.owner_root);
         let mock_commands = MockCommandState::new();
+        let mock_observe = MockObserveState::new();
         let lua = crate::mlua_init::new_lua();
         crate::mlua_init::register_framework_sdk_with_runner(
             &lua,
@@ -58,6 +60,7 @@ pub(crate) fn run_tests(
             Some(roots.clone()),
             false,
             None,
+            Some(mock_observe.clone()),
         )
         .with_context(|| format!("register SDK for {}", relpath))?;
         register_test_sdk(
@@ -67,6 +70,7 @@ pub(crate) fn run_tests(
             file.owner_root.clone(),
             file.owner_namespace.clone(),
             mock_commands.clone(),
+            mock_observe.clone(),
             coverage.clone(),
         )
         .with_context(|| format!("register fkst.test for {}", relpath))?;
@@ -91,6 +95,9 @@ pub(crate) fn run_tests(
                     mock_commands
                         .reset()
                         .with_context(|| format!("reset mock commands for {relpath}::{name}"))?;
+                    mock_observe
+                        .reset()
+                        .with_context(|| format!("reset mock observe for {relpath}::{name}"))?;
                     match func.call::<()>(()) {
                         Ok(()) => {
                             println!("PASS {relpath}::{name}");
@@ -350,6 +357,7 @@ fn register_test_sdk(
     owner_root: PathBuf,
     owner_namespace: String,
     mock_commands: MockCommandState,
+    mock_observe: MockObserveState,
     coverage: Option<LuaCoverage>,
 ) -> mlua::Result<()> {
     let globals = lua.globals();
@@ -434,6 +442,7 @@ fn register_test_sdk(
     })?;
     test.set("run_department", {
         let mock_commands = mock_commands.clone();
+        let mock_observe = mock_observe.clone();
         let cache = cache.clone();
         let roots = roots.clone();
         let owner_namespace = owner_namespace.clone();
@@ -447,6 +456,7 @@ fn register_test_sdk(
                     &owner_root,
                     &owner_namespace,
                     mock_commands.clone(),
+                    mock_observe.clone(),
                     path,
                     event,
                     opts,
@@ -461,6 +471,7 @@ fn register_test_sdk(
         roots.clone(),
         owner_namespace.clone(),
         mock_commands.clone(),
+        mock_observe.clone(),
         coverage.clone(),
         &test,
     )?;
@@ -470,9 +481,11 @@ fn register_test_sdk(
         roots,
         owner_namespace,
         mock_commands,
+        mock_observe.clone(),
         coverage,
         &test,
     )?;
+    crate::sdk_observe::register_test(lua, &test, mock_observe)?;
     fkst.set("test", test)?;
     globals.set("fkst", fkst)?;
     Ok(())
@@ -530,6 +543,7 @@ pub(crate) fn run_department(
     owner_root: &Path,
     owner_namespace: &str,
     mock_commands: MockCommandState,
+    mock_observe: MockObserveState,
     path: String,
     event: Value,
     opts: Option<Table>,
@@ -544,6 +558,7 @@ pub(crate) fn run_department(
         owner_root,
         owner_namespace,
         mock_commands,
+        mock_observe,
         &lua_path,
         event_json,
         opts,
@@ -565,6 +580,7 @@ pub(crate) fn run_department_core(
     owner_root: &Path,
     owner_namespace: &str,
     mock_commands: MockCommandState,
+    mock_observe: MockObserveState,
     lua_path: &Path,
     event_json: JsonValue,
     opts: DeptRunOptions,
@@ -602,6 +618,7 @@ pub(crate) fn run_department_core(
         Some(roots.clone()),
         graph_json_authorized,
         None,
+        Some(mock_observe),
     )?;
     if let Some(coverage) = &coverage {
         coverage.install(&dept_lua)?;
