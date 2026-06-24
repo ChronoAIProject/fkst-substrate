@@ -89,6 +89,9 @@ impl RulePack for DeclarativeRulePack {
                 Rule::TextForbidRegex(rule) => {
                     checks.extend(rule.run(&self.owner_package, &self.owner_root))
                 }
+                Rule::TextRequireRegex(rule) => {
+                    checks.extend(rule.run(&self.owner_package, &self.owner_root))
+                }
             }
         }
         checks
@@ -205,6 +208,7 @@ enum SeverityToml {
 enum Rule {
     MaxLineCount(MaxLineCountRule),
     TextForbidRegex(TextForbidRegexRule),
+    TextRequireRegex(TextRequireRegexRule),
 }
 
 impl Rule {
@@ -236,6 +240,16 @@ impl Rule {
                 let pattern = pattern
                     .ok_or_else(|| anyhow!("rule `{id}` missing required field `pattern`"))?;
                 Ok(Self::TextForbidRegex(TextForbidRegexRule::new(
+                    id, severity, include, exclude, pattern, message,
+                )?))
+            }
+            "text_require_regex" => {
+                if max.is_some() {
+                    bail!("rule `{id}` field `max` is not allowed for kind `text_require_regex`");
+                }
+                let pattern = pattern
+                    .ok_or_else(|| anyhow!("rule `{id}` missing required field `pattern`"))?;
+                Ok(Self::TextRequireRegex(TextRequireRegexRule::new(
                     id, severity, include, exclude, pattern, message,
                 )?))
             }
@@ -369,6 +383,147 @@ fn compile_text_forbid_regex(rule_id: &str, pattern: &str) -> Result<Regex> {
     }
     Regex::new(pattern)
         .with_context(|| format!("rule `{rule_id}` invalid text_forbid_regex pattern `{pattern}`"))
+}
+
+#[derive(Debug)]
+struct TextRequireRegexRule {
+    id: String,
+    include: Vec<GlobPattern>,
+    exclude: Vec<GlobPattern>,
+    pattern: Regex,
+    message: String,
+}
+
+impl TextRequireRegexRule {
+    fn new(
+        id: String,
+        severity: SeverityToml,
+        include: Vec<String>,
+        exclude: Vec<String>,
+        pattern: String,
+        message: String,
+    ) -> Result<Self> {
+        match severity {
+            SeverityToml::Error => {}
+        }
+        validate_rule_id(&id)?;
+        if include.is_empty() {
+            bail!("rule `{id}` include must not be empty");
+        }
+        Ok(Self {
+            pattern: compile_text_require_regex(&id, &pattern)?,
+            id,
+            include: build_glob_patterns(&include, "include")?,
+            exclude: build_glob_patterns(&exclude, "exclude")?,
+            message,
+        })
+    }
+
+    fn run(&self, owner_package: &str, owner_root: &Path) -> Vec<HostCheck> {
+        match owner_package_files(owner_root) {
+            Ok(scan) => self.run_with_files(owner_package, &scan.root, scan.files),
+            Err(err) => vec![HostCheck::fail_for_package(
+                LOADER_CHECK_ID,
+                owner_package.to_string(),
+                format!("scan owner package files failed: {err:#}"),
+            )],
+        }
+    }
+
+    fn run_with_files(
+        &self,
+        owner_package: &str,
+        owner_root: &Path,
+        files: Vec<PathBuf>,
+    ) -> Vec<HostCheck> {
+        let mut checks = Vec::new();
+        let mut matched_files = 0usize;
+        for file in files {
+            let relative = match file.strip_prefix(owner_root) {
+                Ok(relative) => relative,
+                Err(_) => {
+                    checks.push(HostCheck::fail_for_package(
+                        LOADER_CHECK_ID,
+                        owner_package.to_string(),
+                        format!(
+                            "owner package file {} escaped root {}",
+                            file.display(),
+                            owner_root.display()
+                        ),
+                    ));
+                    continue;
+                }
+            };
+            let relative_segments = match relative_path_segments(relative) {
+                Ok(segments) => segments,
+                Err(err) => {
+                    checks.push(HostCheck::fail_for_package(
+                        LOADER_CHECK_ID,
+                        owner_package.to_string(),
+                        format!(
+                            "owner package file {} has an invalid relative path: {err:#}",
+                            file.display()
+                        ),
+                    ));
+                    continue;
+                }
+            };
+            let relative_display = display_relative_segments(&relative_segments);
+            if !matches_any(&self.include, &relative_segments)
+                || matches_any(&self.exclude, &relative_segments)
+            {
+                continue;
+            }
+            matched_files += 1;
+            match text_matches_required_pattern(&file, &self.pattern) {
+                Ok(true) => {}
+                Ok(false) => checks.push(HostCheck::fail_for_package(
+                    format!("{}:{}", self.id, relative_display),
+                    owner_package.to_string(),
+                    format!(
+                        "{}: {} does not match required text",
+                        self.message, relative_display
+                    ),
+                )),
+                Err(err) => checks.push(HostCheck::fail_for_package(
+                    format!("{}:{}", self.id, relative_display),
+                    owner_package.to_string(),
+                    format!(
+                        "{}: cannot read {}: {err:#}",
+                        self.message, relative_display
+                    ),
+                )),
+            }
+        }
+        if matched_files == 0 {
+            checks.push(HostCheck::fail_for_package(
+                self.id.clone(),
+                owner_package.to_string(),
+                format!("{}: no files matched required include globs", self.message),
+            ));
+        } else if checks.is_empty() {
+            checks.push(HostCheck::pass_for_package(
+                self.id.clone(),
+                owner_package.to_string(),
+                format!("{}: all matching files contain required text", self.message),
+            ));
+        }
+        checks
+    }
+}
+
+fn compile_text_require_regex(rule_id: &str, pattern: &str) -> Result<Regex> {
+    if pattern.is_empty() {
+        bail!("rule `{rule_id}` pattern must not be empty");
+    }
+    Regex::new(pattern)
+        .with_context(|| format!("rule `{rule_id}` invalid text_require_regex pattern `{pattern}`"))
+}
+
+fn text_matches_required_pattern(path: &Path, pattern: &Regex) -> Result<bool> {
+    let text =
+        fs::read_to_string(path).with_context(|| format!("read UTF-8 {}", path.display()))?;
+    Ok(pattern.is_match(&text))
 }
 
 fn first_forbidden_match_line(path: &Path, pattern: &Regex) -> Result<Option<usize>> {

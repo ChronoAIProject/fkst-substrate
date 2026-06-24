@@ -300,6 +300,25 @@ message = "source files must not contain forbidden text"
     )
 }
 
+fn text_require_regex_pack(pattern: &str) -> String {
+    format!(
+        r#"
+schema = 1
+runner_protocol = "fkst-declarative-rulepack@1"
+owner_package = "{{{{name}}}}"
+
+[[rules]]
+id = "source.requires-boundary-budget"
+severity = "error"
+kind = "text_require_regex"
+include = ["src/**/*.lua"]
+exclude = ["tests/**"]
+pattern = "{pattern}"
+message = "source files must call the boundary budget helper"
+"#
+    )
+}
+
 fn run_package_conformance(host: &std::path::Path, package: &std::path::Path) -> Output {
     let args = [
         std::ffi::OsStr::new("--project-root"),
@@ -1085,6 +1104,198 @@ message = "source files must not contain forbidden text"
             "missing required field `pattern`",
         ],
     );
+}
+
+#[test]
+fn declarative_pack_text_require_regex_passes_when_package_owned_source_matches() {
+    let root = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
+    let package = root.path().join("traveler");
+    fs::create_dir_all(package.join("src")).unwrap();
+    let host = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
+    write_host_defaults(host.path());
+    write_workspace_for_roots(host.path(), &[&package]);
+    write_declarative_pack_package(&package, &text_require_regex_pack("boundary_budget"));
+    fs::write(
+        package.join("src/loop.lua"),
+        "local budget = boundary_budget()\nreturn budget\n",
+    )
+    .unwrap();
+
+    let output = run_package_conformance(host.path(), &package);
+
+    assert_exit(&output, 0);
+    let log = combined_log(&output);
+    assert!(
+        log.contains("PASS source.requires-boundary-budget"),
+        "{log}"
+    );
+    let report = stdout_json_report(&output);
+    assert_eq!(report["ok"], true);
+    assert_eq!(report["violations"], serde_json::json!([]));
+}
+
+#[test]
+fn declarative_pack_text_require_regex_fails_when_package_owned_source_does_not_match() {
+    let root = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
+    let package = root.path().join("traveler");
+    fs::create_dir_all(package.join("src")).unwrap();
+    let host = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
+    write_host_defaults(host.path());
+    write_workspace_for_roots(host.path(), &[&package]);
+    write_declarative_pack_package(&package, &text_require_regex_pack("boundary_budget"));
+    fs::write(package.join("src/loop.lua"), "return 1\n").unwrap();
+
+    let output = run_package_conformance(host.path(), &package);
+
+    assert_exit(&output, 1);
+    let log = combined_log(&output);
+    assert!(
+        log.contains("FAIL source.requires-boundary-budget:src/loop.lua"),
+        "{log}"
+    );
+    assert!(
+        log.contains("source files must call the boundary budget helper"),
+        "{log}"
+    );
+    assert!(
+        log.contains("src/loop.lua does not match required text"),
+        "{log}"
+    );
+    let report = stdout_json_report(&output);
+    assert_eq!(report["ok"], false);
+    assert_eq!(
+        report["violations"][0]["rule"],
+        "declarative:traveler.source.requires-boundary-budget:src/loop.lua"
+    );
+    assert_eq!(report["violations"][0]["package"], "traveler");
+}
+
+#[test]
+fn declarative_pack_text_require_regex_fails_when_include_matches_no_files() {
+    let root = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
+    let package = root.path().join("traveler");
+    fs::create_dir_all(package.join("src")).unwrap();
+    let host = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
+    write_host_defaults(host.path());
+    write_workspace_for_roots(host.path(), &[&package]);
+    write_declarative_pack_package(&package, &text_require_regex_pack("boundary_budget"));
+
+    let output = run_package_conformance(host.path(), &package);
+
+    assert_exit(&output, 1);
+    let log = combined_log(&output);
+    assert!(
+        log.contains("FAIL source.requires-boundary-budget"),
+        "{log}"
+    );
+    assert!(
+        log.contains("no files matched required include globs"),
+        "{log}"
+    );
+    assert!(!log.contains("source.requires-boundary-budget:"), "{log}");
+    let report = stdout_json_report(&output);
+    assert_eq!(report["ok"], false);
+    assert_eq!(
+        report["violations"][0]["rule"],
+        "declarative:traveler.source.requires-boundary-budget"
+    );
+    assert_eq!(report["violations"][0]["package"], "traveler");
+}
+
+#[test]
+fn declarative_pack_text_require_regex_invalid_pattern_fails_closed() {
+    let root = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
+    let package = root.path().join("traveler");
+    fs::create_dir_all(package.join("src")).unwrap();
+    let host = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
+    write_host_defaults(host.path());
+    write_workspace_for_roots(host.path(), &[&package]);
+    write_declarative_pack_package(&package, &text_require_regex_pack("("));
+    fs::write(package.join("src/loop.lua"), "boundary_budget()\n").unwrap();
+
+    let output = run_package_conformance(host.path(), &package);
+
+    assert_fail_closed(
+        &output,
+        &[
+            "FAIL conformance-pack-loader",
+            "invalid text_require_regex pattern",
+            "unclosed group",
+        ],
+    );
+}
+
+#[test]
+fn declarative_pack_text_require_regex_forbids_max_field() {
+    let root = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
+    let package = root.path().join("traveler");
+    fs::create_dir_all(package.join("src")).unwrap();
+    let host = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
+    write_host_defaults(host.path());
+    write_workspace_for_roots(host.path(), &[&package]);
+    write_declarative_pack_package(
+        &package,
+        r#"
+schema = 1
+runner_protocol = "fkst-declarative-rulepack@1"
+owner_package = "{{name}}"
+
+[[rules]]
+id = "source.requires-boundary-budget"
+severity = "error"
+kind = "text_require_regex"
+include = ["src/**/*.lua"]
+pattern = "boundary_budget"
+max = 1
+message = "source files must call the boundary budget helper"
+"#,
+    );
+    fs::write(package.join("src/loop.lua"), "boundary_budget()\n").unwrap();
+
+    let output = run_package_conformance(host.path(), &package);
+
+    assert_fail_closed(
+        &output,
+        &[
+            "FAIL conformance-pack-loader",
+            "field `max` is not allowed for kind `text_require_regex`",
+        ],
+    );
+}
+
+#[test]
+fn declarative_pack_text_require_regex_cannot_inspect_host_or_sibling_files() {
+    let root = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
+    let package = root.path().join("traveler");
+    let sibling = root.path().join("sibling");
+    fs::create_dir_all(package.join("src")).unwrap();
+    fs::create_dir_all(sibling.join("src")).unwrap();
+    fs::write(sibling.join("src/loop.lua"), "boundary_budget()\n").unwrap();
+    let host = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
+    write_host_defaults(host.path());
+    fs::create_dir_all(host.path().join("src")).unwrap();
+    fs::write(host.path().join("src/loop.lua"), "boundary_budget()\n").unwrap();
+    write_workspace_for_roots(host.path(), &[&package, &sibling]);
+    write_declarative_pack_package(&package, &text_require_regex_pack("boundary_budget"));
+    write_package_consumer(&sibling, "unused");
+    fs::write(package.join("src/loop.lua"), "return 1\n").unwrap();
+
+    let output = run_package_conformance(host.path(), &package);
+
+    assert_exit(&output, 1);
+    let log = combined_log(&output);
+    assert!(
+        log.contains("FAIL source.requires-boundary-budget:src/loop.lua"),
+        "{log}"
+    );
+    let report = stdout_json_report(&output);
+    let violations = report["violations"].as_array().unwrap();
+    assert_eq!(violations.len(), 1, "{report}");
+    assert_eq!(
+        report["violations"][0]["rule"],
+        "declarative:traveler.source.requires-boundary-budget:src/loop.lua"
+    );
+    assert_eq!(report["violations"][0]["package"], "traveler");
 }
 
 #[test]
