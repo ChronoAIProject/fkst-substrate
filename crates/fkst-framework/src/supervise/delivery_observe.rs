@@ -11,6 +11,7 @@ use std::path::Path;
 pub(crate) struct DeliveryObserveOptions {
     pub(crate) now_ms: u64,
     pub(crate) limit: usize,
+    pub(crate) since: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -112,10 +113,12 @@ pub(crate) fn observe_snapshot(
     database: &Path,
     options: &DeliveryObserveOptions,
 ) -> Result<DeliveryObserveSnapshot> {
-    let mut deliveries = Vec::new();
-    let mut dead_letters = Vec::new();
+    if options.since.as_deref().is_some_and(str::is_empty) {
+        anyhow::bail!("observe since cursor must not be empty");
+    }
+    let mut delivery_records = Vec::new();
+    let mut dead_records = Vec::new();
     let mut queues = BTreeMap::<String, QueueAccumulator>::new();
-    let mut truncated = DeliveryObserveTruncated::default();
 
     store.scan_records(|record| {
         match record {
@@ -124,35 +127,43 @@ pub(crate) fn observe_snapshot(
                     .entry(record.queue.clone())
                     .or_default()
                     .observe_delivery(&record, options.now_ms);
-                if deliveries.len() < options.limit {
-                    deliveries.push(delivery_observe_entry(record, options.now_ms)?);
-                } else {
-                    truncated.deliveries = true;
-                }
+                delivery_records.push(record);
             }
             DeliveryScanRecord::Dead(record) => {
-                if dead_letters.len() < options.limit {
-                    dead_letters.push(dead_letter_observe_entry(record)?);
-                } else {
-                    truncated.dead_letters = true;
-                }
+                dead_records.push(record);
             }
         }
         Ok(())
     })?;
 
-    deliveries.sort_by(|left, right| {
+    delivery_records.sort_by(|left, right| {
         left.queue
             .cmp(&right.queue)
             .then_with(|| left.dept.cmp(&right.dept))
             .then_with(|| left.not_before_ms.cmp(&right.not_before_ms))
             .then_with(|| left.delivery_id.cmp(&right.delivery_id))
     });
-    dead_letters.sort_by(|left, right| {
+    dead_records.sort_by(|left, right| {
         left.dead_at_ms
             .cmp(&right.dead_at_ms)
             .then_with(|| left.delivery_id.cmp(&right.delivery_id))
     });
+    if let Some(since) = options.since.as_deref() {
+        trim_deliveries_after_cursor(&mut delivery_records, since);
+        trim_dead_letters_after_cursor(&mut dead_records, since);
+    }
+    let truncated = DeliveryObserveTruncated {
+        deliveries: apply_limit(&mut delivery_records, options.limit),
+        dead_letters: apply_limit(&mut dead_records, options.limit),
+    };
+    let deliveries = delivery_records
+        .into_iter()
+        .map(|record| delivery_observe_entry(record, options.now_ms))
+        .collect::<Result<Vec<_>>>()?;
+    let dead_letters = dead_records
+        .into_iter()
+        .map(dead_letter_observe_entry)
+        .collect::<Result<Vec<_>>>()?;
 
     Ok(DeliveryObserveSnapshot {
         schema_version: 1,
@@ -179,6 +190,34 @@ pub(crate) fn observe_snapshot(
         deliveries,
         dead_letters,
     })
+}
+
+fn trim_deliveries_after_cursor(entries: &mut Vec<DeliveryRecord>, since: &str) {
+    let Some(cursor) = entries
+        .iter()
+        .position(|entry| entry.delivery_id.as_str() == since)
+    else {
+        return;
+    };
+    entries.drain(0..=cursor);
+}
+
+fn trim_dead_letters_after_cursor(entries: &mut Vec<DeadRecord>, since: &str) {
+    let Some(cursor) = entries
+        .iter()
+        .position(|entry| entry.delivery_id.as_str() == since)
+    else {
+        return;
+    };
+    entries.drain(0..=cursor);
+}
+
+fn apply_limit<T>(entries: &mut Vec<T>, limit: usize) -> bool {
+    if entries.len() <= limit {
+        return false;
+    }
+    entries.truncate(limit);
+    true
 }
 
 #[derive(Clone, Debug, Default)]
@@ -383,6 +422,7 @@ mod tests {
             &DeliveryObserveOptions {
                 now_ms: 150,
                 limit: 10,
+                since: None,
             },
         )
         .unwrap();
@@ -443,6 +483,7 @@ mod tests {
             &DeliveryObserveOptions {
                 now_ms: 121,
                 limit: 10,
+                since: None,
             },
         )
         .unwrap();
@@ -472,11 +513,37 @@ mod tests {
             &DeliveryObserveOptions {
                 now_ms: 100,
                 limit: 1,
+                since: None,
             },
         )
         .unwrap();
 
         assert_eq!(snapshot.deliveries.len(), 1);
+        assert!(snapshot.truncated.deliveries);
+    }
+
+    #[test]
+    fn observe_snapshot_applies_since_before_limit() {
+        let temp = TempDir::new().unwrap();
+        let store = store(&temp);
+        store.enqueue(&record("delivery-001", 100)).unwrap();
+        store.enqueue(&record("delivery-002", 100)).unwrap();
+        store.enqueue(&record("delivery-003", 100)).unwrap();
+
+        let snapshot = observe_snapshot(
+            &store,
+            temp.path(),
+            &temp.path().join("delivery.redb"),
+            &DeliveryObserveOptions {
+                now_ms: 100,
+                limit: 1,
+                since: Some("delivery-001".to_string()),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(snapshot.deliveries.len(), 1);
+        assert_eq!(snapshot.deliveries[0].delivery_id, "delivery-002");
         assert!(snapshot.truncated.deliveries);
     }
 }

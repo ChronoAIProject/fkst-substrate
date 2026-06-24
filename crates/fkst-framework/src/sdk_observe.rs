@@ -7,7 +7,7 @@
 use fkst_common::DURABLE_ROOT_ENV;
 use mlua::{Lua, LuaSerdeExt, Table, Value};
 use serde_json::{Map as JsonMap, Value as JsonValue};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -56,12 +56,16 @@ pub(crate) fn register(lua: &Lua, mock_observe: Option<MockObserveState>) -> mlu
             let opts = ObserveSdkOptions::from_lua(opts)?;
             let snapshot = match &mock_observe {
                 Some(mock) => match mock.snapshot()? {
-                    Some(snapshot) => snapshot,
-                    None => real_observe(&opts)?,
+                    Some(snapshot) => opts.apply_to_mock(snapshot)?,
+                    None => {
+                        return Err(mlua::Error::external(
+                            "fkst.observe is not mocked in test mode",
+                        ))
+                    }
                 },
                 None => real_observe(&opts)?,
             };
-            let snapshot = opts.apply(snapshot)?;
+            let snapshot = opts.apply_include(snapshot)?;
             lua.to_value(&snapshot)
         })?
     })?;
@@ -89,9 +93,11 @@ fn real_observe(opts: &ObserveSdkOptions) -> mlua::Result<JsonValue> {
         .ok_or_else(|| {
             mlua::Error::external(format!("{DURABLE_ROOT_ENV} must be set for fkst.observe"))
         })?;
-    let snapshot =
-        crate::observe::snapshot_for_durable_root(PathBuf::from(durable_root), opts.limit)
-            .map_err(mlua::Error::external)?;
+    let snapshot = crate::observe::snapshot_for_durable_root(
+        PathBuf::from(durable_root),
+        &opts.snapshot_options(),
+    )
+    .map_err(mlua::Error::external)?;
     serde_json::to_value(snapshot).map_err(mlua::Error::external)
 }
 
@@ -116,21 +122,19 @@ impl ObserveSdkOptions {
     fn from_lua(opts: Option<Table>) -> mlua::Result<Self> {
         let Some(opts) = opts else {
             return Ok(Self {
-                limit: 500,
+                limit: crate::observe::DEFAULT_LIMIT,
                 include: None,
                 since: None,
             });
         };
         reject_unknown_options(&opts)?;
-        let limit = opts.get::<Option<usize>>("limit")?.unwrap_or(500);
+        let limit = opts
+            .get::<Option<usize>>("limit")?
+            .unwrap_or(crate::observe::DEFAULT_LIMIT);
         let limit = crate::observe::validate_limit(limit).map_err(mlua::Error::external)?;
         let include = parse_include(opts.get::<Option<Table>>("include")?)?;
         let since = opts.get::<Option<String>>("since")?;
-        if since.as_deref().is_some_and(str::is_empty) {
-            return Err(mlua::Error::external(
-                "fkst.observe since must not be empty",
-            ));
-        }
+        crate::observe::validate_since(since.as_deref()).map_err(mlua::Error::external)?;
         Ok(Self {
             limit,
             include,
@@ -138,10 +142,22 @@ impl ObserveSdkOptions {
         })
     }
 
-    fn apply(&self, mut snapshot: JsonValue) -> mlua::Result<JsonValue> {
+    fn snapshot_options(&self) -> crate::observe::ObserveSnapshotOptions {
+        crate::observe::ObserveSnapshotOptions {
+            limit: self.limit,
+            since: self.since.clone(),
+        }
+    }
+
+    fn apply_to_mock(&self, mut snapshot: JsonValue) -> mlua::Result<JsonValue> {
         if let Some(since) = &self.since {
             apply_since(&mut snapshot, since)?;
         }
+        apply_limit(&mut snapshot, self.limit)?;
+        Ok(snapshot)
+    }
+
+    fn apply_include(&self, mut snapshot: JsonValue) -> mlua::Result<JsonValue> {
         if let Some(include) = &self.include {
             snapshot = apply_include(snapshot, include)?;
         }
@@ -171,17 +187,43 @@ fn parse_include(include: Option<Table>) -> mlua::Result<Option<BTreeSet<String>
     let Some(include) = include else {
         return Ok(None);
     };
-    let mut sections = BTreeSet::new();
-    for value in include.sequence_values::<String>() {
-        let section = value?;
+    let mut ordered_sections = BTreeMap::new();
+    for pair in include.pairs::<Value, Value>() {
+        let (key, value) = pair?;
+        let Value::Integer(index) = key else {
+            return Err(mlua::Error::external(
+                "fkst.observe include keys must be positive contiguous integers",
+            ));
+        };
+        let index = usize::try_from(index).map_err(|_| {
+            mlua::Error::external("fkst.observe include keys must be positive contiguous integers")
+        })?;
+        if index == 0 {
+            return Err(mlua::Error::external(
+                "fkst.observe include keys must be positive contiguous integers",
+            ));
+        }
+        let Value::String(section) = value else {
+            return Err(mlua::Error::external(
+                "fkst.observe include values must be strings",
+            ));
+        };
+        let section = section.to_str()?.to_string();
         if !OBSERVE_SECTIONS.contains(&section.as_str()) {
             return Err(mlua::Error::external(format!(
                 "unsupported fkst.observe include section `{section}`"
             )));
         }
-        sections.insert(section);
+        ordered_sections.insert(index, section);
     }
-    Ok(Some(sections))
+    for (expected, actual) in (1..=ordered_sections.len()).zip(ordered_sections.keys()) {
+        if expected != *actual {
+            return Err(mlua::Error::external(
+                "fkst.observe include keys must be positive contiguous integers",
+            ));
+        }
+    }
+    Ok(Some(ordered_sections.into_values().collect()))
 }
 
 fn apply_since(snapshot: &mut JsonValue, since: &str) -> mlua::Result<()> {
@@ -191,6 +233,89 @@ fn apply_since(snapshot: &mut JsonValue, since: &str) -> mlua::Result<()> {
     trim_entries_after_cursor(object.get_mut("deliveries"), since, "deliveries")?;
     trim_entries_after_cursor(object.get_mut("dead_letters"), since, "dead_letters")?;
     Ok(())
+}
+
+fn apply_limit(snapshot: &mut JsonValue, limit: usize) -> mlua::Result<()> {
+    let object = snapshot.as_object_mut().ok_or_else(|| {
+        mlua::Error::external("fkst.observe snapshot must be an object when limit is set")
+    })?;
+    let deliveries_truncated = truncate_array(object.get_mut("deliveries"), limit, "deliveries")?;
+    let dead_letters_truncated =
+        truncate_array(object.get_mut("dead_letters"), limit, "dead_letters")?;
+    update_limits(object.get_mut("limits"), limit)?;
+    update_truncated(
+        object.get_mut("truncated"),
+        deliveries_truncated,
+        dead_letters_truncated,
+    )?;
+    Ok(())
+}
+
+fn truncate_array(
+    entries: Option<&mut JsonValue>,
+    limit: usize,
+    field: &str,
+) -> mlua::Result<bool> {
+    let Some(entries) = entries else {
+        return Ok(false);
+    };
+    let entries = entries.as_array_mut().ok_or_else(|| {
+        mlua::Error::external(format!(
+            "fkst.observe snapshot field `{field}` must be an array"
+        ))
+    })?;
+    if entries.len() <= limit {
+        return Ok(false);
+    }
+    entries.truncate(limit);
+    Ok(true)
+}
+
+fn update_limits(limits: Option<&mut JsonValue>, limit: usize) -> mlua::Result<()> {
+    let Some(limits) = limits else {
+        return Ok(());
+    };
+    let limits = limits.as_object_mut().ok_or_else(|| {
+        mlua::Error::external("fkst.observe snapshot field `limits` must be an object")
+    })?;
+    limits.insert("max_deliveries".to_string(), JsonValue::from(limit));
+    limits.insert("max_dead_letters".to_string(), JsonValue::from(limit));
+    Ok(())
+}
+
+fn update_truncated(
+    truncated: Option<&mut JsonValue>,
+    deliveries_truncated: bool,
+    dead_letters_truncated: bool,
+) -> mlua::Result<()> {
+    let Some(truncated) = truncated else {
+        return Ok(());
+    };
+    let truncated = truncated.as_object_mut().ok_or_else(|| {
+        mlua::Error::external("fkst.observe snapshot field `truncated` must be an object")
+    })?;
+    let deliveries_truncated = existing_truncated(truncated, "deliveries")? || deliveries_truncated;
+    let dead_letters_truncated =
+        existing_truncated(truncated, "dead_letters")? || dead_letters_truncated;
+    truncated.insert(
+        "deliveries".to_string(),
+        JsonValue::Bool(deliveries_truncated),
+    );
+    truncated.insert(
+        "dead_letters".to_string(),
+        JsonValue::Bool(dead_letters_truncated),
+    );
+    Ok(())
+}
+
+fn existing_truncated(truncated: &JsonMap<String, JsonValue>, field: &str) -> mlua::Result<bool> {
+    match truncated.get(field) {
+        Some(JsonValue::Bool(value)) => Ok(*value),
+        Some(_) => Err(mlua::Error::external(format!(
+            "fkst.observe snapshot truncated field `{field}` must be a boolean"
+        ))),
+        None => Ok(false),
+    }
 }
 
 fn trim_entries_after_cursor(
@@ -286,6 +411,22 @@ mod tests {
     }
 
     #[test]
+    fn observe_fails_closed_in_test_mode_without_mock() {
+        let lua = Lua::new();
+        let mock = MockObserveState::new();
+        register(&lua, Some(mock)).unwrap();
+
+        let err = lua
+            .load("return fkst.observe()")
+            .eval::<Value>()
+            .unwrap_err();
+
+        assert!(err
+            .to_string()
+            .contains("fkst.observe is not mocked in test mode"));
+    }
+
+    #[test]
     fn observe_rejects_unsupported_include_sections() {
         let lua = Lua::new();
         register(&lua, None).unwrap();
@@ -298,6 +439,68 @@ mod tests {
         assert!(err
             .to_string()
             .contains("unsupported fkst.observe include section"));
+    }
+
+    #[test]
+    fn observe_rejects_mapped_include_sections() {
+        let lua = Lua::new();
+        register(&lua, None).unwrap();
+
+        let err = lua
+            .load("return fkst.observe({ include = { idle = true } })")
+            .eval::<Value>()
+            .unwrap_err();
+
+        assert!(err
+            .to_string()
+            .contains("fkst.observe include keys must be positive contiguous integers"));
+    }
+
+    #[test]
+    fn observe_rejects_sparse_include_sections() {
+        let lua = Lua::new();
+        register(&lua, None).unwrap();
+
+        let err = lua
+            .load("return fkst.observe({ include = { [2] = 'queues' } })")
+            .eval::<Value>()
+            .unwrap_err();
+
+        assert!(err
+            .to_string()
+            .contains("fkst.observe include keys must be positive contiguous integers"));
+    }
+
+    #[test]
+    fn mock_observe_applies_since_before_limit() {
+        let lua = Lua::new();
+        let mock = MockObserveState::new();
+        register(&lua, Some(mock.clone())).unwrap();
+        mock.set(serde_json::json!({
+            "schema_version": 1,
+            "limits": {"max_deliveries": 10, "max_dead_letters": 10},
+            "truncated": {"deliveries": false, "dead_letters": false},
+            "deliveries": [
+                {"delivery_id": "delivery-one"},
+                {"delivery_id": "delivery-two"},
+                {"delivery_id": "delivery-three"}
+            ],
+            "dead_letters": []
+        }))
+        .unwrap();
+
+        let value: JsonValue = lua
+            .from_value(
+                lua.load("return fkst.observe({ since = 'delivery-one', limit = 1 })")
+                    .eval()
+                    .unwrap(),
+            )
+            .unwrap();
+
+        assert_eq!(value["deliveries"].as_array().unwrap().len(), 1);
+        assert_eq!(value["deliveries"][0]["delivery_id"], "delivery-two");
+        assert_eq!(value["limits"]["max_deliveries"], 1);
+        assert!(value["truncated"]["deliveries"].as_bool().unwrap());
     }
 
     #[test]

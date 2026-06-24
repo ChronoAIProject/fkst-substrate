@@ -85,7 +85,7 @@ now()
 
 `fkst.codex_runs()` is a read-only observability query for engine codex run records. It returns running and recent entries with `role`, `started_at`, `status` (`running`, `done`, or `failed`), bounded `output_tail`, and optional `exit_code`; it does not return runtime paths or unbounded stdout/stderr.
 
-`fkst.observe([opts]) -> table` is the in-process form of `fkst-framework observe --json`. It returns generic durable delivery observe facts: source metadata, limits, truncation flags, queue depth state, live delivery entries, and DLQ entries, with payloads summarized by schema, dedup key, byte count, and digest rather than full bodies. `opts` is optional and may only narrow generic observe data with `limit`, `include = {"queues","errors","events","entities"}`, and `since`; it must not encode business concepts such as idle, board, audit, skip, or workflow phases. Production reads `FKST_DURABLE_ROOT` and uses the same live owner-process socket / offline database projection as the CLI. Package-side helpers may interpret the generic facts, but the engine does not.
+`fkst.observe([opts]) -> table` is the in-process form of `fkst-framework observe --json`. It returns generic durable delivery observe facts: source metadata, limits, truncation flags, queue depth state, live delivery entries, and DLQ entries, with payloads summarized by schema, dedup key, byte count, and digest rather than full bodies. `opts` is optional and may only narrow generic observe data with `limit`, `include = {"queues","errors","events","entities"}`, and `since = <delivery_id>`; `since` is applied before `limit` truncation. It must not encode business concepts such as idle, board, audit, skip, or workflow phases. Production reads `FKST_DURABLE_ROOT` and uses the same live owner-process socket / offline database projection as the CLI. Package-side helpers may interpret the generic facts, but the engine does not.
 
 用户提纲里的 SDK 列表漏掉了当前已存在的 `list_orphan_worktrees(prefix)`。提纲中的其它 production primitive 均存在。没有发现额外 production SDK primitive。
 
@@ -134,7 +134,7 @@ fkst.test.with_command_cassette(opts, fn)
 fkst.test.command_calls()
 ```
 
-`fkst.test` 不存在于 `run`、`supervise`、`--self-test` 或 conformance production Lua state。`mock_command` 劫持 test mode 中的 `exec_sync`、codex SDK 与 git SDK 外部命令调用；未 mock 的外部命令 fail closed。`mock_observe(snapshot)` makes `fkst.observe()` return the provided deterministic snapshot for that test, including fresh Lua states spawned by `run_department`, `fire_raiser`, or `run_graph`.
+`fkst.test` 不存在于 `run`、`supervise`、`--self-test` 或 conformance production Lua state。`mock_command` 劫持 test mode 中的 `exec_sync`、codex SDK 与 git SDK 外部命令调用；未 mock 的外部命令 fail closed。`mock_observe(snapshot)` makes `fkst.observe()` use the provided deterministic raw snapshot for that test, including fresh Lua states spawned by `run_department`, `fire_raiser`, or `run_graph`; `fkst.observe(opts)` still applies `since`, `limit`, and `include` to the mock. Unmocked test-mode `fkst.observe()` fails closed.
 
 `fkst.test.with_command_cassette({ path, mode, redact? }, fn)` is the bounded VCR-style contract-test surface for external commands. It only exists in `fkst-framework test`; production `run`, `supervise`, `--self-test`, and conformance do not register it. `mode` is `"record"` or `"replay"`. `path` is resolved relative to the owner package root unless absolute. During the callback, explicit `mock_command` entries still take precedence; otherwise `exec_sync`, codex SDK, and git SDK calls use the active cassette.
 
