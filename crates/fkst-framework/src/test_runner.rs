@@ -22,6 +22,7 @@ pub(crate) fn run_tests(
     report_json: Option<PathBuf>,
     coverage_dir: Option<PathBuf>,
 ) -> Result<i32> {
+    crate::supervise::scrub_current_engine_binary_path_env();
     let files = discover_test_files(&roots)?;
     let _supervisor_pid_guard = TestModeSupervisorPidGuard::remove();
     let cache = TestRunCache::new(roots.clone())?;

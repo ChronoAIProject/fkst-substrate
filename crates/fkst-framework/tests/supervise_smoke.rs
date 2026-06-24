@@ -729,6 +729,44 @@ async fn spawn_framework_passes_codex_permit_slots_env() {
 }
 
 #[tokio::test]
+async fn spawn_framework_removes_engine_binary_path_env() {
+    let mut sandbox = ProcessSandbox::new();
+    sandbox
+        .set_env("BIN", "/tmp/fkst-framework-bin")
+        .set_env("FKST_FRAMEWORK_BIN", "/tmp/fkst-framework")
+        .set_env("FKST_CODEX_WORKER_BIN", "/tmp/fkst-worker");
+    let (_lock, _guard) = sandbox.enter();
+    let binary = fake_framework(
+        sandbox.root(),
+        r#"printf 'BIN=%s\nFKST_FRAMEWORK_BIN=%s\nFKST_CODEX_WORKER_BIN=%s\n' "$BIN" "$FKST_FRAMEWORK_BIN" "$FKST_CODEX_WORKER_BIN"; exit 0"#,
+    );
+    let lua_dummy = sandbox.temp_path("dept.lua");
+    fs::write(&lua_dummy, "return {}\n").unwrap();
+    let logs = sandbox.temp_path("logs");
+
+    let result = spawn_framework(
+        &binary,
+        &lua_dummy,
+        sandbox.root(),
+        &[sandbox.root().to_path_buf()],
+        "pkg",
+        "{}",
+        7,
+        "env-scrub",
+        &logs,
+        process_tree::ProcessGroupRegistry::default(),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(result.exit_code, 0);
+    assert_eq!(
+        result.stdout,
+        "BIN=\nFKST_FRAMEWORK_BIN=\nFKST_CODEX_WORKER_BIN=\n"
+    );
+}
+
+#[tokio::test]
 async fn framework_child_log_records_final_metadata_for_exit_modes() {
     let sandbox = ProcessSandbox::new();
     let lua_dummy = sandbox.temp_path("dept.lua");
