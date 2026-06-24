@@ -146,6 +146,7 @@ pub(crate) struct ExternalSourceCheckout {
 pub(crate) struct ExternalLibraryCheckout {
     pub(crate) name: String,
     pub(crate) unit: String,
+    pub(crate) publishable: bool,
 }
 
 pub(crate) fn lock_external_sources(
@@ -276,6 +277,7 @@ fn locked_source_checkout(
             Ok(ExternalLibraryCheckout {
                 name: library.name.clone(),
                 unit: library.unit.clone(),
+                publishable: publishable_library_at(&unit_root)?,
             })
         })
         .collect::<Result<Vec<_>>>()?;
@@ -561,6 +563,15 @@ fn available_library_names(checkout_root: &Path) -> Result<BTreeSet<String>> {
         }
     }
     Ok(names)
+}
+
+fn publishable_library_at(unit_root: &Path) -> Result<bool> {
+    let manifest = crate::manifest::UnitManifest::parse_file(&unit_root.join("fkst.toml"))?;
+    Ok(manifest
+        .library
+        .as_ref()
+        .map(|library| library.publishable)
+        .unwrap_or(false))
 }
 
 // A tree-hash entry is either a regular file (hashed by content) or a symlink
