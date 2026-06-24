@@ -47,9 +47,9 @@ pub(crate) fn scan_own_modules(unit: &CatalogUnit) -> Result<OwnModuleScan> {
         }
     }
     let public_modules = prefix_library_public_modules(unit, raw_public_modules)?;
-    manifest_exports::validate_public_export_patterns(
+    manifest_exports::validate_public_exports(
         unit.library_name(),
-        &unit.manifest().exports.public,
+        &unit.manifest().exports,
         &public_modules,
     )?;
 

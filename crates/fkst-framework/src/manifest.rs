@@ -161,6 +161,7 @@ pub(crate) struct UnitManifest {
     persistence_class: Option<PersistenceClass>,
     pub(crate) code_root: PathBuf,
     pub(crate) lib_deps: Vec<LibDep>,
+    pub(crate) dependency_constraints: DependencyConstraints,
     pub(crate) event_deps: Vec<EventDep>,
     pub(crate) library: Option<LibraryMeta>,
     pub(crate) visibility: Visibility,
@@ -211,6 +212,8 @@ struct UnitManifestToml {
     #[serde(default)]
     lib_deps: LibDepsToml,
     #[serde(default)]
+    dependency_constraints: DependencyConstraints,
+    #[serde(default)]
     event_deps: EventDepsToml,
     library: Option<LibraryMeta>,
     #[serde(default)]
@@ -226,6 +229,8 @@ impl UnitManifestToml {
         mode: ManifestParseMode,
     ) -> std::result::Result<UnitManifest, toml::de::Error> {
         validate_persistence_class(&self.kind, self.persistence_class)?;
+        self.dependency_constraints
+            .validate(&self.kind, &self.lib_deps.libraries)?;
         let conformance = match self.conformance {
             Some(raw) if matches!(mode, ManifestParseMode::Strict) => {
                 Some(raw.try_into::<ConformanceToml>()?.into_manifest())
@@ -239,6 +244,7 @@ impl UnitManifestToml {
             persistence_class: self.persistence_class,
             code_root: self.code.root,
             lib_deps: self.lib_deps.libraries,
+            dependency_constraints: self.dependency_constraints,
             event_deps: self.event_deps.packages,
             library: self.library,
             visibility: self.visibility,
@@ -297,6 +303,40 @@ impl ConformanceManifest {
 struct LibDepsToml {
     #[serde(default)]
     libraries: Vec<LibDep>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct DependencyConstraints {
+    allowed_lib_deps: Option<Vec<LibDep>>,
+}
+
+impl DependencyConstraints {
+    fn validate(
+        &self,
+        kind: &UnitKind,
+        lib_deps: &[LibDep],
+    ) -> std::result::Result<(), toml::de::Error> {
+        if !matches!(kind, UnitKind::Library) {
+            return Ok(());
+        }
+        let Some(allowed_lib_deps) = &self.allowed_lib_deps else {
+            return Ok(());
+        };
+        let allowed = allowed_lib_deps
+            .iter()
+            .map(LibDep::as_str)
+            .collect::<BTreeSet<_>>();
+        for dep in lib_deps {
+            if !allowed.contains(dep.as_str()) {
+                return Err(serde::de::Error::custom(format!(
+                    "library manifest declares lib_dep `{}` outside dependency_constraints.allowed_lib_deps",
+                    dep.as_str()
+                )));
+            }
+        }
+        Ok(())
+    }
 }
 
 #[derive(Default, Deserialize)]
