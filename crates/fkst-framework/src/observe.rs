@@ -1,6 +1,7 @@
-use crate::supervise::delivery_store::{
-    DeliveryObserveOptions, DeliveryObserveSnapshot, DeliveryStore,
+use crate::supervise::delivery_observe::{
+    observe_snapshot, DeliveryObserveOptions, DeliveryObserveSnapshot,
 };
+use crate::supervise::delivery_store::DeliveryStore;
 use anyhow::{Context, Result};
 use fkst_common::DurableLayout;
 use serde::{Deserialize, Serialize};
@@ -62,7 +63,8 @@ pub(crate) fn run(options: ObserveOptions) -> Result<i32> {
         Some(snapshot) => Ok(snapshot),
         None => {
             let store = DeliveryStore::open_existing(&database)?;
-            store.observe_snapshot(
+            observe_snapshot(
+                &store,
                 layout.durable_root(),
                 &database,
                 &DeliveryObserveOptions {
