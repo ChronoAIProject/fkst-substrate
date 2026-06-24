@@ -203,8 +203,7 @@ fn validation_catalogs(
     let mut seen_workspace_roots = BTreeSet::new();
     seen_workspace_roots.insert(host_catalog.workspace_root().to_path_buf());
     for package_root in package_roots {
-        if package_root == project_root || host_catalog.unit_name_for_root(package_root)?.is_some()
-        {
+        if package_root == project_root || is_under(package_root, project_root) {
             if host_catalog.unit_name_for_root(package_root)?.is_none() {
                 anyhow::bail!("no manifest unit owns {}", package_root.display());
             }
@@ -753,4 +752,8 @@ fn canonical_dirs(roots: Vec<PathBuf>, label: &str) -> Result<Vec<PathBuf>> {
         canonical_roots.push(canonical);
     }
     Ok(canonical_roots)
+}
+
+fn is_under(path: &Path, root: &Path) -> bool {
+    path != root && path.starts_with(root)
 }

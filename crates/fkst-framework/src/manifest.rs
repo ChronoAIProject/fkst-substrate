@@ -148,13 +148,10 @@ struct VisibilityToml {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
-#[serde(deny_unknown_fields)]
 pub(crate) struct LibraryMeta {
     pub(crate) name: String,
     pub(crate) stable_id: String,
     pub(crate) version: String,
-    #[serde(default)]
-    pub(crate) publishable: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -234,7 +231,6 @@ impl UnitManifestToml {
         validate_persistence_class(&self.kind, self.persistence_class)?;
         self.dependency_constraints
             .validate(&self.kind, &self.lib_deps.libraries)?;
-        validate_library_section(&self.kind, &self.library)?;
         let conformance = match self.conformance {
             Some(raw) if matches!(mode, ManifestParseMode::Strict) => {
                 Some(raw.try_into::<ConformanceToml>()?.into_manifest()?)
@@ -265,18 +261,6 @@ fn validate_persistence_class(
     match (kind, persistence_class) {
         (UnitKind::Library, Some(_)) => Err(serde::de::Error::custom(
             "library manifest must not declare `persistence_class`",
-        )),
-        _ => Ok(()),
-    }
-}
-
-fn validate_library_section(
-    kind: &UnitKind,
-    library: &Option<LibraryMeta>,
-) -> std::result::Result<(), toml::de::Error> {
-    match (kind, library) {
-        (UnitKind::Package(_), Some(_)) => Err(serde::de::Error::custom(
-            "package manifest must not declare `[library]`",
         )),
         _ => Ok(()),
     }
@@ -412,42 +396,6 @@ impl UnitCatalog {
         Self::from_workspace(workspace_root, workspace).map(Some)
     }
 
-    pub(crate) fn discover_workspace_root(start: &Path) -> Result<Option<PathBuf>> {
-        let Some(workspace_manifest_path) = find_workspace_manifest(start)? else {
-            return Ok(None);
-        };
-        let workspace_root = workspace_manifest_path
-            .parent()
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "workspace manifest has no parent: {}",
-                    workspace_manifest_path.display()
-                )
-            })?
-            .to_path_buf();
-        Ok(Some(workspace_root))
-    }
-
-    pub(crate) fn discover_excluding_roots(
-        start: &Path,
-        excluded_roots: &BTreeSet<PathBuf>,
-    ) -> Result<Option<Self>> {
-        let Some(workspace_manifest_path) = find_workspace_manifest(start)? else {
-            return Ok(None);
-        };
-        let workspace_root = workspace_manifest_path
-            .parent()
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "workspace manifest has no parent: {}",
-                    workspace_manifest_path.display()
-                )
-            })?
-            .to_path_buf();
-        let workspace = WorkspaceManifest::parse_file(&workspace_manifest_path)?;
-        Self::from_workspace_inner(workspace_root, workspace, true, None, excluded_roots).map(Some)
-    }
-
     pub(crate) fn discover_for_validation(start: &Path) -> Result<Option<Self>> {
         let Some(workspace_manifest_path) = find_workspace_manifest(start)? else {
             return Ok(None);
@@ -479,25 +427,18 @@ impl UnitCatalog {
             })?
             .to_path_buf();
         let workspace = WorkspaceManifest::parse_file(&workspace_manifest_path)?;
-        Self::from_workspace_inner(
-            workspace_root,
-            workspace,
-            true,
-            Some(lockfile),
-            &BTreeSet::new(),
-        )
-        .map(Some)
+        Self::from_workspace_inner(workspace_root, workspace, true, Some(lockfile)).map(Some)
     }
 
     fn from_workspace(workspace_root: PathBuf, workspace: WorkspaceManifest) -> Result<Self> {
-        Self::from_workspace_inner(workspace_root, workspace, true, None, &BTreeSet::new())
+        Self::from_workspace_inner(workspace_root, workspace, true, None)
     }
 
     fn from_workspace_for_validation(
         workspace_root: PathBuf,
         workspace: WorkspaceManifest,
     ) -> Result<Self> {
-        Self::from_workspace_inner(workspace_root, workspace, false, None, &BTreeSet::new())
+        Self::from_workspace_inner(workspace_root, workspace, false, None)
     }
 
     fn from_workspace_inner(
@@ -505,7 +446,6 @@ impl UnitCatalog {
         workspace: WorkspaceManifest,
         fail_closed: bool,
         lockfile_override: Option<Lockfile>,
-        excluded_roots: &BTreeSet<PathBuf>,
     ) -> Result<Self> {
         let lockfile_path = workspace_root.join(LOCKFILE);
         let lockfile = match lockfile_override {
@@ -513,15 +453,7 @@ impl UnitCatalog {
             None if lockfile_path.exists() => Lockfile::parse_file(&lockfile_path)?,
             None => Lockfile::default(),
         };
-        let unit_roots = discover_unit_roots(&workspace_root, workspace.discovered_units())?
-            .into_iter()
-            .filter(|unit_root| {
-                !excluded_roots.iter().any(|excluded| {
-                    excluded != &workspace_root
-                        && (unit_root == excluded || unit_root.starts_with(excluded))
-                })
-            })
-            .collect::<Vec<_>>();
+        let unit_roots = discover_unit_roots(&workspace_root, workspace.discovered_units())?;
         let mut units = BTreeMap::new();
         let mut library_units = BTreeMap::new();
 
@@ -972,9 +904,6 @@ fn add_external_units(
                     checkout.source_id,
                     library.name
                 );
-            }
-            if !library.publishable {
-                continue;
             }
             let code_root = canonical_unit_code_root(unit_root, manifest)?;
             ensure_catalog_path_under_workspace(&checkout.root, unit_root, "external unit root")?;
