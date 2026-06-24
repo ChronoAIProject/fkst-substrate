@@ -328,6 +328,7 @@ printf 'final output visible through bounded output_tail'
     opts.set("label", "review").unwrap();
     opts.set("role", "reviewer").unwrap();
     opts.set("proposal_id", "proposal-43").unwrap();
+    opts.set("timeout", 17).unwrap();
     let handle: AnyUserData = spawn.call(opts).unwrap();
     assert_eq!(read_fifo(&started_fifo), "started");
 
@@ -346,6 +347,16 @@ printf 'final output visible through bounded output_tail'
     );
     assert_eq!(active.get::<String>("dept").unwrap(), "pkg.reviewer");
     assert!(active.get::<u64>("elapsed_ms").is_ok());
+    let active_started_at_ms = active.get::<u64>("started_at_ms").unwrap();
+    assert_eq!(active.get::<i64>("timeout_seconds").unwrap(), 17);
+    assert_eq!(
+        active.get::<u64>("lease_expires_at_ms").unwrap(),
+        active_started_at_ms + 17_000
+    );
+    assert!(active
+        .get::<String>("lease_expires_at")
+        .unwrap()
+        .ends_with('Z'));
     assert!(active.get::<i64>("exit_code").is_err());
     assert_eq!(active.get::<String>("output_tail").unwrap(), "");
     assert!(active.get::<String>("output_excerpt").is_err());
@@ -374,6 +385,11 @@ printf 'final output visible through bounded output_tail'
     assert!(completed.get::<u64>("ended_at_ms").is_ok());
     assert!(
         completed.get::<u64>("elapsed_ms").unwrap() >= active.get::<u64>("elapsed_ms").unwrap()
+    );
+    assert_eq!(completed.get::<i64>("timeout_seconds").unwrap(), 17);
+    assert_eq!(
+        completed.get::<u64>("lease_expires_at_ms").unwrap(),
+        completed.get::<u64>("started_at_ms").unwrap() + 17_000
     );
     assert!(completed.get::<String>("output_excerpt").is_err());
     assert!(completed.get::<String>("log_path").is_err());
@@ -1557,6 +1573,7 @@ printf 'adoption-done'
             opts.set("worktree", worktree_arg).unwrap();
             opts.set("role", "implementer").unwrap();
             opts.set("proposal_id", "issue-74").unwrap();
+            opts.set("timeout", 19).unwrap();
             let result: Table = spawn.call(opts).unwrap();
             result_tx
                 .send(result.get::<String>("stdout").unwrap())
@@ -1598,6 +1615,16 @@ printf 'adoption-done'
         "issue-74"
     );
     assert_eq!(active.get::<String>("dept").unwrap(), "pkg.implementer");
+    let active_started_at_ms = active.get::<u64>("started_at_ms").unwrap();
+    assert_eq!(active.get::<i64>("timeout_seconds").unwrap(), 19);
+    assert_eq!(
+        active.get::<u64>("lease_expires_at_ms").unwrap(),
+        active_started_at_ms + 19_000
+    );
+    assert!(active
+        .get::<String>("lease_expires_at")
+        .unwrap()
+        .ends_with('Z'));
     assert_eq!(
         active.get::<String>("output_tail").unwrap(),
         "adoption-live-tail\n"
@@ -1643,6 +1670,7 @@ printf 'sensitive output body'
     let opts = lua_opts(&lua, "status");
     opts.set("label", "draft").unwrap();
     opts.set("proposal_id", "proposal-43").unwrap();
+    opts.set("timeout", 23).unwrap();
 
     let result: Table = spawn.call(opts).unwrap();
     assert_eq!(result.get::<i64>("exit_code").unwrap(), 0);
@@ -1666,6 +1694,15 @@ printf 'sensitive output body'
     );
     assert!(item.get::<String>("run_id").unwrap().starts_with("codex-"));
     assert!(item.get::<u64>("started_at_ms").unwrap() > 0);
+    assert_eq!(item.get::<i64>("timeout_seconds").unwrap(), 23);
+    assert_eq!(
+        item.get::<u64>("lease_expires_at_ms").unwrap(),
+        item.get::<u64>("started_at_ms").unwrap() + 23_000
+    );
+    assert!(item
+        .get::<String>("lease_expires_at")
+        .unwrap()
+        .ends_with('Z'));
     assert!(item.get::<u64>("ended_at_ms").unwrap() >= item.get::<u64>("started_at_ms").unwrap());
     assert!(item.get::<u64>("elapsed_ms").unwrap() <= 60_000);
     assert!(item.get::<String>("started_at").unwrap().ends_with('Z'));

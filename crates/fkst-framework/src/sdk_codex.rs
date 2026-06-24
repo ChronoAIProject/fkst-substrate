@@ -100,6 +100,8 @@ struct CodexStatusRecord {
     started_at: String,
     started_at_ms: u64,
     #[serde(default)]
+    timeout_seconds: Option<i64>,
+    #[serde(default)]
     ended_at: Option<String>,
     #[serde(default)]
     ended_at_ms: Option<u64>,
@@ -1649,6 +1651,7 @@ impl CodexStatusRecord {
             dedup_key: request.dedup_key.clone(),
             started_at: unix_millis_to_iso8601(request.started_at_ms),
             started_at_ms: request.started_at_ms,
+            timeout_seconds: Some(request.timeout_seconds),
             ended_at: None,
             ended_at_ms: None,
             elapsed_ms: None,
@@ -1714,6 +1717,18 @@ fn codex_status_record_table(lua: &Lua, record: &CodexStatusRecord, now_ms: u64)
     }
     table.set("started_at", record.started_at.clone())?;
     table.set("started_at_ms", record.started_at_ms)?;
+    if let Some(timeout_seconds) = record.timeout_seconds {
+        table.set("timeout_seconds", timeout_seconds)?;
+        if let Some(lease_expires_at_ms) =
+            lease_expires_at_ms(record.started_at_ms, timeout_seconds)
+        {
+            table.set("lease_expires_at_ms", lease_expires_at_ms)?;
+            table.set(
+                "lease_expires_at",
+                unix_millis_to_iso8601(lease_expires_at_ms),
+            )?;
+        }
+    }
     set_optional_string(&table, "ended_at", &record.ended_at)?;
     if let Some(ended_at_ms) = record.ended_at_ms {
         table.set("ended_at_ms", ended_at_ms)?;
@@ -1886,6 +1901,7 @@ fn codex_status_record_from_adoption(record: CodexAdoptionRecord) -> CodexStatus
         dedup_key: record.dedup_key.or(Some(record.key)),
         started_at: unix_millis_to_iso8601(record.started_at_ms),
         started_at_ms: record.started_at_ms,
+        timeout_seconds: Some(record.timeout_seconds),
         ended_at: ended_at_ms.map(unix_millis_to_iso8601),
         ended_at_ms,
         elapsed_ms: ended_at_ms.map(|ended| ended.saturating_sub(record.started_at_ms)),
@@ -1935,6 +1951,14 @@ fn latest_codex_status_records(records: Vec<CodexStatusRecord>) -> Vec<CodexStat
 
 fn status_record_time(record: &CodexStatusRecord) -> u64 {
     record.ended_at_ms.unwrap_or(record.started_at_ms)
+}
+
+fn lease_expires_at_ms(started_at_ms: u64, timeout_seconds: i64) -> Option<u64> {
+    u64::try_from(timeout_seconds)
+        .ok()
+        .filter(|seconds| *seconds > 0)
+        .and_then(|seconds| seconds.checked_mul(1000))
+        .and_then(|timeout_ms| started_at_ms.checked_add(timeout_ms))
 }
 
 fn run_codex_request_with_permit(mut request: CodexRequest, config: &ConfigContext) -> CodexResult {
