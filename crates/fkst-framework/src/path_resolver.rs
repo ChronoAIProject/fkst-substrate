@@ -155,6 +155,11 @@ impl PackageRoots {
         if let Some(catalog) = self.external_catalogs.get(&canonical) {
             return Ok(catalog);
         }
+        for catalog in self.external_catalogs.values() {
+            if catalog.unit_name_for_root(&canonical)?.is_some() {
+                return Ok(catalog);
+            }
+        }
         Ok(&self.catalog)
     }
 
