@@ -233,7 +233,7 @@ impl UnitManifestToml {
             .validate(&self.kind, &self.lib_deps.libraries)?;
         let conformance = match self.conformance {
             Some(raw) if matches!(mode, ManifestParseMode::Strict) => {
-                Some(raw.try_into::<ConformanceToml>()?.into_manifest())
+                Some(raw.try_into::<ConformanceToml>()?.into_manifest()?)
             }
             Some(raw) => Some(ConformanceManifest::from_value(raw)),
             None => None,
@@ -273,30 +273,52 @@ struct CodeToml {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ConformanceManifest {
-    pub(crate) pack: PathBuf,
+    pub(crate) pack: Option<PathBuf>,
+    pub(crate) function: Option<String>,
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ConformanceToml {
-    pack: PathBuf,
+    pack: Option<PathBuf>,
+    function: Option<String>,
 }
 
 impl ConformanceToml {
-    fn into_manifest(self) -> ConformanceManifest {
-        ConformanceManifest { pack: self.pack }
+    fn into_manifest(self) -> std::result::Result<ConformanceManifest, toml::de::Error> {
+        if let Some(function) = &self.function {
+            validate_conformance_function_ref(function)?;
+        }
+        Ok(ConformanceManifest {
+            pack: self.pack,
+            function: self.function,
+        })
     }
 }
 
 impl ConformanceManifest {
     fn from_value(value: Value) -> Self {
-        let pack = value
-            .get("pack")
+        let pack = value.get("pack").and_then(Value::as_str).map(PathBuf::from);
+        let function = value
+            .get("function")
             .and_then(Value::as_str)
-            .map(PathBuf::from)
-            .unwrap_or_default();
-        Self { pack }
+            .map(str::to_string);
+        Self { pack, function }
     }
+}
+
+fn validate_conformance_function_ref(value: &str) -> std::result::Result<(), toml::de::Error> {
+    let Some((module, function)) = value.rsplit_once('.') else {
+        return Err(serde::de::Error::custom(
+            "[conformance].function must use `<module>.<function>`",
+        ));
+    };
+    if module.is_empty() || function.is_empty() {
+        return Err(serde::de::Error::custom(
+            "[conformance].function must use `<module>.<function>`",
+        ));
+    }
+    Ok(())
 }
 
 #[derive(Default, Deserialize)]

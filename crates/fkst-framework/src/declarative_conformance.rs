@@ -48,11 +48,14 @@ impl DeclarativeRulePack {
         let Some(conformance) = manifest.conformance else {
             return None;
         };
+        let Some(pack_path) = conformance.pack else {
+            return None;
+        };
 
-        let rules = load_pack(&owner_root, &owner_package, &conformance.pack).map_err(|err| {
+        let rules = load_pack(&owner_root, &owner_package, &pack_path).map_err(|err| {
             format!(
                 "load declarative conformance pack for package `{owner_package}` at {}: {err:#}",
-                conformance.pack.display()
+                pack_path.display()
             )
         });
 

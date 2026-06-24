@@ -1,14 +1,22 @@
 use crate::manifest::{UnitKind, UnitManifest, UNIT_MANIFEST};
-use crate::path_resolver::{GraphRootKind, PackageRoots};
+use crate::path_resolver::{
+    GraphRoot, GraphRootKind, LibraryConformanceRoot, NameResolver, PackageRoots,
+};
 use crate::supervise;
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use fkst_common::runtime_layout::RUNTIME_ROOT_ENV;
 use fkst_common::validation::{validate_with_scope, ValidationScope};
 use fkst_common::RuntimeKind;
+use mlua::{Function, Table, Value};
 use serde::Serialize;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use crate::declarative_conformance::DeclarativeRulePack;
+
+const FUNCTION_CHECK_ID: &str = "conformance-function";
+const FUNCTION_LOADER_CHECK_ID: &str = "conformance-function-loader";
+const FUNCTION_GENERIC_ERROR_ID: &str = "conformance-function-error";
 
 pub(crate) struct HostConformanceOptions {
     pub(crate) roots: PackageRoots,
@@ -97,6 +105,22 @@ impl RulePackRegistry {
                 registry.register(Box::new(pack));
             }
         }
+        for graph_root in options.roots.graph_roots() {
+            if !matches!(
+                graph_root.kind,
+                GraphRootKind::Package | GraphRootKind::PackageAndHost
+            ) {
+                continue;
+            }
+            if let Some(pack) = SemanticLuaRulePack::from_graph_root(&graph_root) {
+                registry.register(Box::new(pack));
+            }
+        }
+        for library_root in options.roots.conformance_library_roots() {
+            if let Some(pack) = SemanticLuaRulePack::from_library_root(&library_root) {
+                registry.register(Box::new(pack));
+            }
+        }
         if let Some(config) = &options.config {
             let _config_path = &config.path;
             // Future rule packs, including a source-ratchet pack that migrates
@@ -127,6 +151,326 @@ impl RulePackRegistry {
 
         checks
     }
+}
+
+struct SemanticLuaRulePack {
+    name: String,
+    owner_package: String,
+    owner_root: PathBuf,
+    state: SemanticLuaRulePackState,
+    graph_owner: bool,
+}
+
+enum SemanticLuaRulePackState {
+    Function(ConformanceFunctionRef),
+    LoadError(String),
+}
+
+#[derive(Clone, Debug)]
+struct ConformanceFunctionRef {
+    raw: String,
+    module: String,
+    function: String,
+}
+
+#[derive(Clone, Debug)]
+struct SemanticLuaError {
+    id: String,
+    message: String,
+}
+
+impl SemanticLuaRulePack {
+    fn from_graph_root(graph_root: &GraphRoot) -> Option<Self> {
+        Self::from_root(graph_root.namespace.clone(), graph_root.root.clone(), true)
+    }
+
+    fn from_library_root(library_root: &LibraryConformanceRoot) -> Option<Self> {
+        Self::from_root(
+            library_root.namespace.clone(),
+            library_root.root.clone(),
+            false,
+        )
+    }
+
+    fn from_root(owner_package: String, owner_root: PathBuf, graph_owner: bool) -> Option<Self> {
+        let name = format!("semantic:{owner_package}");
+        let manifest_path = owner_root.join(UNIT_MANIFEST);
+        match manifest_declares_conformance_function(&manifest_path) {
+            Ok(true) => {}
+            Ok(false) => return None,
+            Err(err) if manifest_path.exists() => {
+                return Some(Self {
+                    name,
+                    owner_package,
+                    owner_root,
+                    state: SemanticLuaRulePackState::LoadError(format!(
+                        "load semantic conformance manifest {}: {err:#}",
+                        manifest_path.display()
+                    )),
+                    graph_owner,
+                });
+            }
+            Err(_) => return None,
+        }
+        let manifest = match UnitManifest::parse_file_strict(&manifest_path) {
+            Ok(manifest) => manifest,
+            Err(err) => {
+                return Some(Self {
+                    name,
+                    owner_package,
+                    owner_root,
+                    state: SemanticLuaRulePackState::LoadError(format!(
+                        "load semantic conformance manifest {}: {err:#}",
+                        manifest_path.display()
+                    )),
+                    graph_owner,
+                });
+            }
+        };
+        let Some(conformance) = manifest.conformance else {
+            return None;
+        };
+        let Some(function) = conformance.function else {
+            return None;
+        };
+        let state = match ConformanceFunctionRef::parse(&function) {
+            Ok(function_ref) => SemanticLuaRulePackState::Function(function_ref),
+            Err(err) => SemanticLuaRulePackState::LoadError(format!("{err:#}")),
+        };
+        Some(Self {
+            name,
+            owner_package,
+            owner_root,
+            state,
+            graph_owner,
+        })
+    }
+}
+
+impl RulePack for SemanticLuaRulePack {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn run(&self, context: &ConformanceContext<'_>) -> Vec<HostCheck> {
+        let SemanticLuaRulePackState::Function(function_ref) = &self.state else {
+            let SemanticLuaRulePackState::LoadError(message) = &self.state else {
+                unreachable!();
+            };
+            return vec![HostCheck::fail_for_package(
+                FUNCTION_LOADER_CHECK_ID,
+                self.owner_package.clone(),
+                message.clone(),
+            )];
+        };
+        match self.run_function(context, function_ref) {
+            Ok(errors) if errors.is_empty() => vec![HostCheck::pass_for_package(
+                FUNCTION_CHECK_ID,
+                self.owner_package.clone(),
+                format!(
+                    "[conformance].function `{}` returned no errors",
+                    function_ref.raw
+                ),
+            )],
+            Ok(errors) => errors
+                .into_iter()
+                .map(|error| {
+                    HostCheck::fail_for_package(error.id, self.owner_package.clone(), error.message)
+                })
+                .collect(),
+            Err(err) => vec![HostCheck::fail_for_package(
+                FUNCTION_LOADER_CHECK_ID,
+                self.owner_package.clone(),
+                format!(
+                    "run [conformance].function `{}` for package `{}` at {}: {err:#}",
+                    function_ref.raw,
+                    self.owner_package,
+                    self.owner_root.display()
+                ),
+            )],
+        }
+    }
+}
+
+impl SemanticLuaRulePack {
+    fn run_function(
+        &self,
+        context: &ConformanceContext<'_>,
+        function_ref: &ConformanceFunctionRef,
+    ) -> Result<Vec<SemanticLuaError>> {
+        let catalog = Arc::new(
+            context
+                .options
+                .roots
+                .catalog_for_owner_root(&self.owner_root)?
+                .clone(),
+        );
+        let owner_unit = catalog
+            .unit_name_for_root(&self.owner_root)?
+            .ok_or_else(|| {
+                anyhow::anyhow!("no manifest unit owns {}", self.owner_root.display())
+            })?;
+        let lua = crate::mlua_init::new_lua();
+        let resolver = if self.graph_owner {
+            context.options.roots.name_resolver()
+        } else {
+            NameResolver::new([self.owner_package.clone()])
+        };
+        crate::mlua_init::register_framework_sdk(
+            &lua,
+            crate::raise::RaiseBuffer::new(),
+            context.options.roots.host_root(),
+            &self.owner_root,
+            None,
+            resolver,
+            self.owner_package.clone(),
+            crate::raise::RaiseAuthority::new(std::collections::BTreeSet::new()),
+            Some(context.options.roots.clone()),
+            false,
+            None,
+        )
+        .context("register package SDK")?;
+        let env = crate::lua_require::install_scoped_require(&lua, catalog, &owner_unit)
+            .context("install scoped require")?;
+        let function = load_semantic_function(&lua, env, function_ref)
+            .with_context(|| format!("load function `{}`", function_ref.raw))?;
+        let value = function
+            .call::<Value>(())
+            .with_context(|| format!("call function `{}`", function_ref.raw))?;
+        let Value::Table(table) = value else {
+            bail!(
+                "function `{}` returned {}, expected table",
+                function_ref.raw,
+                value.type_name()
+            );
+        };
+        semantic_errors_from_table(table)
+            .with_context(|| format!("read errors from function `{}`", function_ref.raw))
+    }
+}
+
+fn manifest_declares_conformance_function(path: &Path) -> Result<bool> {
+    let raw = std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
+    let value: toml::Value =
+        toml::from_str(&raw).with_context(|| format!("parse {}", path.display()))?;
+    Ok(value
+        .get("conformance")
+        .and_then(toml::Value::as_table)
+        .and_then(|table| table.get("function"))
+        .is_some())
+}
+
+impl ConformanceFunctionRef {
+    fn parse(raw: &str) -> Result<Self> {
+        let Some((module, function)) = raw.rsplit_once('.') else {
+            bail!("[conformance].function must use `<module>.<function>`");
+        };
+        if module.is_empty() || function.is_empty() {
+            bail!("[conformance].function must use `<module>.<function>`");
+        }
+        Ok(Self {
+            raw: raw.to_string(),
+            module: module.to_string(),
+            function: function.to_string(),
+        })
+    }
+}
+
+fn load_semantic_function(
+    lua: &mlua::Lua,
+    env: Table,
+    function_ref: &ConformanceFunctionRef,
+) -> Result<Function> {
+    let loader = lua
+        .load(
+            r#"
+local module_name, function_name = ...
+local module = require(module_name)
+if type(module) ~= "table" then
+    error("module `" .. module_name .. "` returned " .. type(module) .. ", expected table", 0)
+end
+local fn = module[function_name]
+if type(fn) ~= "function" then
+    error("function `" .. function_name .. "` missing from module `" .. module_name .. "`", 0)
+end
+return fn
+"#,
+        )
+        .set_name("@conformance-function-loader")
+        .set_environment(env)
+        .into_function()
+        .context("compile conformance function loader")?;
+    loader
+        .call::<Function>((function_ref.module.clone(), function_ref.function.clone()))
+        .context("resolve conformance function")
+}
+
+fn semantic_errors_from_table(table: Table) -> Result<Vec<SemanticLuaError>> {
+    let mut entries = Vec::<(i64, Value)>::new();
+    for pair in table.pairs::<Value, Value>() {
+        let (key, value) = pair.context("read conformance error entry")?;
+        let Value::Integer(index) = key else {
+            bail!(
+                "conformance function must return an array table; found {} key",
+                key.type_name()
+            );
+        };
+        if index <= 0 {
+            bail!("conformance function returned non-positive array index {index}");
+        }
+        entries.push((index, value));
+    }
+    entries.sort_by_key(|(index, _)| *index);
+    let mut errors = Vec::new();
+    let mut expected_index = 1i64;
+    for (index, value) in entries {
+        if index != expected_index {
+            bail!(
+                "conformance function returned sparse array; expected index {expected_index}, got {index}"
+            );
+        }
+        errors.push(semantic_error_from_value(expected_index, value)?);
+        expected_index += 1;
+    }
+    Ok(errors)
+}
+
+fn semantic_error_from_value(index: i64, value: Value) -> Result<SemanticLuaError> {
+    match value {
+        Value::String(message) => Ok(SemanticLuaError {
+            id: FUNCTION_GENERIC_ERROR_ID.to_string(),
+            message: message.to_str()?.to_string(),
+        }),
+        Value::Table(table) => {
+            let id = table
+                .get::<Option<String>>("id")
+                .with_context(|| format!("read error record {index} id"))?
+                .unwrap_or_else(|| FUNCTION_GENERIC_ERROR_ID.to_string());
+            validate_semantic_error_id(&id)
+                .with_context(|| format!("validate error record {index} id"))?;
+            let message = table
+                .get::<String>("message")
+                .with_context(|| format!("read error record {index} message"))?;
+            Ok(SemanticLuaError { id, message })
+        }
+        other => bail!(
+            "conformance error record {index} is {}, expected table or string",
+            other.type_name()
+        ),
+    }
+}
+
+fn validate_semantic_error_id(id: &str) -> Result<()> {
+    if id.is_empty() {
+        bail!("conformance error id must not be empty");
+    }
+    if !id
+        .bytes()
+        .all(|byte| matches!(byte, b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'.' | b'_' | b'-'))
+    {
+        bail!("conformance error id `{id}` must match [A-Za-z0-9._-]+");
+    }
+    Ok(())
 }
 
 struct EngineRulePack;

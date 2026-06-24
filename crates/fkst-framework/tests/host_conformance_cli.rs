@@ -255,6 +255,80 @@ pack = "{pack_path}"
         .unwrap();
 }
 
+fn append_conformance_function_manifest(root: &std::path::Path, function_ref: &str) {
+    fs::OpenOptions::new()
+        .append(true)
+        .open(root.join("fkst.toml"))
+        .unwrap()
+        .write_all(
+            format!(
+                r#"
+[conformance]
+function = "{function_ref}"
+"#
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+}
+
+fn write_semantic_conformance_package(root: &std::path::Path, function_body: &str) {
+    write_package_manifest(root, "traveler", &[]);
+    write_workspace(root, &[root]);
+    append_conformance_function_manifest(root, "core.conformance_errors");
+    write_host_defaults(root);
+    fs::create_dir_all(root.join("core")).unwrap();
+    fs::create_dir_all(root.join("departments/consumer")).unwrap();
+    fs::create_dir_all(root.join("raisers")).unwrap();
+    fs::write(
+        root.join("core/init.lua"),
+        format!(
+            r#"
+local M = {{}}
+function M.conformance_errors()
+{function_body}
+end
+return M
+"#
+        ),
+    )
+    .unwrap();
+    fs::write(
+        root.join("departments/consumer/main.lua"),
+        r#"
+local M = {}
+M.spec = { consumes = { "tick" }, stall_window = "30s" }
+function pipeline(_) end
+return M
+"#,
+    )
+    .unwrap();
+    fs::write(
+        root.join("raisers/tick.lua"),
+        r#"return { type = "cron", interval = "10s", produces = "tick" }"#,
+    )
+    .unwrap();
+}
+
+fn write_semantic_conformance_library(root: &std::path::Path, name: &str, function_body: &str) {
+    write_library_manifest(root, name, &[]);
+    append_conformance_function_manifest(root, &format!("{name}.conformance_errors"));
+    fs::create_dir_all(root.join("public")).unwrap();
+    fs::write(
+        root.join("public/init.lua"),
+        format!(
+            r#"
+local M = {{}}
+function M.conformance_errors()
+{function_body}
+end
+return M
+"#
+        ),
+    )
+    .unwrap();
+}
+
 fn max_line_count_pack(max: usize) -> String {
     format!(
         r#"
@@ -2126,6 +2200,298 @@ fn package_without_conformance_section_does_not_register_declarative_pack() {
     assert_exit(&output, 0);
     let log = combined_log(&output);
     assert!(!log.contains("conformance-pack-loader"), "{log}");
+    let report = stdout_json_report(&output);
+    assert_eq!(report["ok"], true);
+    assert_eq!(report["counts"]["packs"], 1);
+}
+
+#[test]
+fn semantic_conformance_function_returning_empty_errors_passes() {
+    let package = tempfile::Builder::new()
+        .prefix("traveler")
+        .tempdir()
+        .unwrap();
+    write_semantic_conformance_package(package.path(), "    return {}\n");
+
+    let args = [
+        std::ffi::OsStr::new("--project-root"),
+        path_arg(package.path()),
+    ];
+    let output = run_conformance(&args, package.path());
+
+    assert_exit(&output, 0);
+    let log = combined_log(&output);
+    assert!(log.contains("PASS conformance-function"), "{log}");
+    let report = stdout_json_report(&output);
+    assert_eq!(report["ok"], true);
+    assert_eq!(report["counts"]["packs"], 2);
+    assert_eq!(report["violations"], serde_json::json!([]));
+}
+
+#[test]
+fn semantic_conformance_function_returning_error_record_fails_for_unit() {
+    let package = tempfile::Builder::new()
+        .prefix("traveler")
+        .tempdir()
+        .unwrap();
+    write_semantic_conformance_package(
+        package.path(),
+        r#"    return {{ id = "x", message = "bad" }}
+"#,
+    );
+
+    let args = [
+        std::ffi::OsStr::new("--project-root"),
+        path_arg(package.path()),
+    ];
+    let output = run_conformance(&args, package.path());
+
+    assert_exit(&output, 1);
+    let log = combined_log(&output);
+    assert!(log.contains("FAIL x bad"), "{log}");
+    let report = stdout_json_report(&output);
+    let package_name = unit_name(package.path());
+    assert_eq!(report["ok"], false);
+    assert_eq!(
+        report["violations"][0]["rule"],
+        format!("semantic:{package_name}.x")
+    );
+    assert_eq!(report["violations"][0]["package"], package_name);
+    assert_eq!(report["violations"][0]["detail"], "bad");
+}
+
+#[test]
+fn semantic_conformance_function_runs_for_library_unit() {
+    let host = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
+    write_minimal_host(host.path());
+    let library = host.path().join("libraries/stdlib");
+    write_semantic_conformance_library(
+        &library,
+        "stdlib",
+        r#"    return {{ id = "library.rule", message = "library bad" }}
+"#,
+    );
+    write_workspace(host.path(), &[host.path(), &library]);
+
+    let args = [
+        std::ffi::OsStr::new("--project-root"),
+        path_arg(host.path()),
+    ];
+    let output = run_conformance(&args, host.path());
+
+    assert_exit(&output, 1);
+    let log = combined_log(&output);
+    assert!(log.contains("FAIL library.rule library bad"), "{log}");
+    let report = stdout_json_report(&output);
+    assert_eq!(
+        report["violations"][0]["rule"],
+        "semantic:stdlib.library.rule"
+    );
+    assert_eq!(report["violations"][0]["package"], "stdlib");
+}
+
+#[test]
+fn semantic_conformance_function_missing_module_fails_closed() {
+    let package = tempfile::Builder::new()
+        .prefix("traveler")
+        .tempdir()
+        .unwrap();
+    write_semantic_conformance_package(package.path(), "    return {}\n");
+    fs::OpenOptions::new()
+        .write(true)
+        .truncate(true)
+        .open(package.path().join("fkst.toml"))
+        .unwrap()
+        .write_all(
+            r#"
+kind = "package"
+name = "traveler"
+persistence_class = "stateless_adapter"
+
+[code]
+root = "."
+
+[lib_deps]
+libraries = []
+
+[conformance]
+function = "missing.conformance_errors"
+"#
+            .as_bytes(),
+        )
+        .unwrap();
+
+    let args = [
+        std::ffi::OsStr::new("--project-root"),
+        path_arg(package.path()),
+    ];
+    let output = run_conformance(&args, package.path());
+
+    assert_fail_closed(
+        &output,
+        &[
+            "FAIL conformance-function-loader",
+            "require.denied module `missing`",
+            "conformance-function-loader",
+        ],
+    );
+}
+
+#[test]
+fn semantic_manifest_malformed_function_field_fails_closed() {
+    let package = tempfile::Builder::new()
+        .prefix("traveler")
+        .tempdir()
+        .unwrap();
+    write_semantic_conformance_package(package.path(), "    return {}\n");
+    fs::OpenOptions::new()
+        .write(true)
+        .truncate(true)
+        .open(package.path().join("fkst.toml"))
+        .unwrap()
+        .write_all(
+            r#"
+kind = "package"
+name = "traveler"
+persistence_class = "stateless_adapter"
+
+[code]
+root = "."
+
+[lib_deps]
+libraries = []
+
+[conformance]
+function = 42
+"#
+            .as_bytes(),
+        )
+        .unwrap();
+
+    let args = [
+        std::ffi::OsStr::new("--project-root"),
+        path_arg(package.path()),
+    ];
+    let output = run_conformance(&args, package.path());
+
+    assert_fail_closed(
+        &output,
+        &[
+            "FAIL conformance-function-loader",
+            "invalid type: integer `42`",
+            "conformance-function-loader",
+        ],
+    );
+}
+
+#[test]
+fn semantic_conformance_function_missing_function_fails_closed() {
+    let package = tempfile::Builder::new()
+        .prefix("traveler")
+        .tempdir()
+        .unwrap();
+    write_semantic_conformance_package(package.path(), "    return {}\n");
+    fs::OpenOptions::new()
+        .append(true)
+        .open(package.path().join("fkst.toml"))
+        .unwrap()
+        .write_all(
+            br#"
+# keep the original conformance table unchanged
+"#,
+        )
+        .unwrap();
+    fs::OpenOptions::new()
+        .write(true)
+        .truncate(true)
+        .open(package.path().join("core/init.lua"))
+        .unwrap()
+        .write_all(
+            br#"
+return {}
+"#,
+        )
+        .unwrap();
+
+    let args = [
+        std::ffi::OsStr::new("--project-root"),
+        path_arg(package.path()),
+    ];
+    let output = run_conformance(&args, package.path());
+
+    assert_fail_closed(
+        &output,
+        &[
+            "FAIL conformance-function-loader",
+            "function `conformance_errors` missing from module `core`",
+            "conformance-function-loader",
+        ],
+    );
+}
+
+#[test]
+fn semantic_conformance_function_returning_non_table_fails_closed() {
+    let package = tempfile::Builder::new()
+        .prefix("traveler")
+        .tempdir()
+        .unwrap();
+    write_semantic_conformance_package(package.path(), r#"    return "not-table""#);
+
+    let args = [
+        std::ffi::OsStr::new("--project-root"),
+        path_arg(package.path()),
+    ];
+    let output = run_conformance(&args, package.path());
+
+    assert_fail_closed(
+        &output,
+        &[
+            "FAIL conformance-function-loader",
+            "returned string, expected table",
+            "conformance-function-loader",
+        ],
+    );
+}
+
+#[test]
+fn semantic_conformance_function_raised_error_fails_closed() {
+    let package = tempfile::Builder::new()
+        .prefix("traveler")
+        .tempdir()
+        .unwrap();
+    write_semantic_conformance_package(package.path(), r#"    error("semantic exploded")"#);
+
+    let args = [
+        std::ffi::OsStr::new("--project-root"),
+        path_arg(package.path()),
+    ];
+    let output = run_conformance(&args, package.path());
+
+    assert_fail_closed(
+        &output,
+        &[
+            "FAIL conformance-function-loader",
+            "semantic exploded",
+            "conformance-function-loader",
+        ],
+    );
+}
+
+#[test]
+fn package_without_conformance_function_does_not_register_semantic_pack() {
+    let host = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
+    write_minimal_host(host.path());
+
+    let args = [
+        std::ffi::OsStr::new("--project-root"),
+        path_arg(host.path()),
+    ];
+    let output = run_conformance(&args, host.path());
+
+    assert_exit(&output, 0);
+    let log = combined_log(&output);
+    assert!(!log.contains("conformance-function"), "{log}");
+    assert!(!log.contains("semantic:"), "{log}");
     let report = stdout_json_report(&output);
     assert_eq!(report["ok"], true);
     assert_eq!(report["counts"]["packs"], 1);
