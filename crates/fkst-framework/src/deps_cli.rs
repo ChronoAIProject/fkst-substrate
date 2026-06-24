@@ -244,7 +244,6 @@ fn validate_catalog(
             scan_actual_library_requires(unit, &validation_catalog, &library_names, failures)?;
         validate_actual_requires(unit, &required, &library_names, failures, warnings);
         actual_requires.insert(unit.catalog_name().to_string(), required);
-        validate_composed_deps(unit, failures)?;
     }
 
     let units = unit_reports(&validation_catalog, &actual_requires);
@@ -441,35 +440,6 @@ fn validate_actual_requires(
     }
 }
 
-fn validate_composed_deps(unit: &CatalogUnit, failures: &mut Vec<Diagnostic>) -> Result<()> {
-    let path = unit.unit_root().join("composed.deps");
-    if !path.exists() {
-        return Ok(());
-    }
-    let actual = parse_composed_deps(&path)?;
-    let declared = unit
-        .manifest()
-        .event_deps
-        .iter()
-        .map(|dep| dep.as_str().to_string())
-        .collect::<BTreeSet<_>>();
-    if actual != declared {
-        failures.push(Diagnostic::fail(
-            "event-deps",
-            Some(unit.name()),
-            None,
-            None,
-            format!(
-                "{} event_deps {:?} do not match composed.deps {:?}",
-                unit.name(),
-                declared,
-                actual
-            ),
-        ));
-    }
-    Ok(())
-}
-
 fn scan_actual_library_requires(
     unit: &CatalogUnit,
     catalog: &UnitCatalog,
@@ -632,16 +602,6 @@ fn skip_space(bytes: &[u8], mut i: usize) -> usize {
 
 fn is_ident_byte(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || byte == b'_'
-}
-
-fn parse_composed_deps(path: &Path) -> Result<BTreeSet<String>> {
-    let raw = fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
-    Ok(raw
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty() && !line.starts_with('#'))
-        .map(str::to_string)
-        .collect())
 }
 
 fn library_names(catalog: &UnitCatalog) -> BTreeSet<String> {

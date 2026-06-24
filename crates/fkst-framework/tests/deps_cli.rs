@@ -598,10 +598,6 @@ local json = require("std.fkst.json")
 return json
 "#,
     );
-    write(
-        &temp.path().join("packages/valid/composed.deps"),
-        "unused\n",
-    );
     package(temp.path(), "unused", &["extra"], &[]);
     write(&temp.path().join("packages/unused/main.lua"), "return {}\n");
     library(temp.path(), "std", &[], None);
@@ -656,7 +652,6 @@ local missing = require("restricted.missing")
 return { json = json, missing = missing }
 "#,
     );
-    write(&temp.path().join("packages/bad/composed.deps"), "valid\n");
     package(temp.path(), "two-libs", &["alpha", "beta"], &[]);
     write(
         &temp.path().join("packages/two-libs/main.lua"),
@@ -712,7 +707,6 @@ return { alpha = alpha, beta = beta }
     assert!(out.contains("[undeclared-require]"), "{out}");
     assert!(out.contains("bad requires library `std`"), "{out}");
     assert!(out.contains("[missing-export]"), "{out}");
-    assert!(out.contains("[event-deps]"), "{out}");
     assert!(stderr(&output).is_empty(), "stderr: {}", stderr(&output));
 }
 
@@ -850,7 +844,6 @@ local json = require("std.fkst.json")
 return json
 "#,
     );
-    write(&external_package.join("composed.deps"), "actual\n");
     library(&external, "std", &[], None);
     write(
         &external.join("libraries/std/public/fkst/json.lua"),
@@ -872,13 +865,6 @@ return json
     let out = stdout(&output);
     assert!(out.contains("fkst deps: FAIL"), "{out}");
     assert!(out.contains("platform-pkg requires library `std`"), "{out}");
-    assert!(out.contains("[event-deps]"), "{out}");
-    assert!(
-        out.contains(
-            r#"platform-pkg event_deps {"declared"} do not match composed.deps {"actual"}"#
-        ),
-        "{out}"
-    );
 }
 
 #[test]
