@@ -70,6 +70,56 @@ packages = ["b", "a"]
 }
 
 #[test]
+fn composed_manifest_underscore_alias_prints_event_deps_in_declared_order() {
+    let temp = tempfile::tempdir().unwrap();
+    let manifest = temp.path().join("fkst.toml");
+    write(
+        &manifest,
+        r#"
+kind = "package_composed"
+name = "app"
+
+[code]
+root = "."
+
+[event_deps]
+packages = ["b", "a"]
+"#,
+    );
+
+    let output = manifest_composed_deps(&manifest).output().unwrap();
+
+    assert_exit(&output, 0);
+    assert_eq!(stdout(&output), "b\na\n");
+    assert!(stderr(&output).is_empty(), "stderr: {}", stderr(&output));
+}
+
+#[test]
+fn composed_manifest_hyphen_alias_prints_event_deps_in_declared_order() {
+    let temp = tempfile::tempdir().unwrap();
+    let manifest = temp.path().join("fkst.toml");
+    write(
+        &manifest,
+        r#"
+kind = "composed-package"
+name = "app"
+
+[code]
+root = "."
+
+[event_deps]
+packages = ["b", "a"]
+"#,
+    );
+
+    let output = manifest_composed_deps(&manifest).output().unwrap();
+
+    assert_exit(&output, 0);
+    assert_eq!(stdout(&output), "b\na\n");
+    assert!(stderr(&output).is_empty(), "stderr: {}", stderr(&output));
+}
+
+#[test]
 fn flat_manifest_exits_ten_with_empty_stdout() {
     let temp = tempfile::tempdir().unwrap();
     let manifest = temp.path().join("fkst.toml");
