@@ -22,7 +22,14 @@ pub(crate) fn run_tests(
     report_json: Option<PathBuf>,
     coverage_dir: Option<PathBuf>,
 ) -> Result<i32> {
-    crate::supervise::scrub_current_engine_binary_path_env();
+    // NOTE: do NOT scrub the engine binary path env (BIN/...) here. run_tests is the
+    // TEST HARNESS process, not a package runtime: integration tests legitimately read
+    // BIN to spawn the engine as a subprocess (e.g. github-devloop-integration's
+    // branch-scan serialization test). #191's intent ("package runtime must not receive
+    // BIN") is enforced for real department runtimes by the spawner scrub
+    // (cmd.env_remove, covered by spawn_framework_removes_engine_binary_path_env) and by
+    // run_pipeline's scrub for `run` mode — scrubbing the whole test process here was
+    // over-broad and broke harness-level engine spawning.
     let files = discover_test_files(&roots)?;
     let _supervisor_pid_guard = TestModeSupervisorPidGuard::remove();
     let cache = TestRunCache::new(roots.clone())?;
