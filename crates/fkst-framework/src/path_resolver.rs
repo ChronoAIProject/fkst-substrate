@@ -227,6 +227,15 @@ impl PackageRoots {
                 }
             })
     }
+
+    pub(crate) fn conformance_library_roots(&self) -> Vec<LibraryConformanceRoot> {
+        let mut roots = BTreeMap::new();
+        collect_conformance_library_roots(self.catalog.units(), &mut roots);
+        for catalog in self.external_catalogs.values() {
+            collect_conformance_library_roots(catalog.units(), &mut roots);
+        }
+        roots.into_values().collect()
+    }
 }
 
 struct PackageRootInput {
@@ -238,6 +247,12 @@ struct PackageRootInput {
 pub(crate) struct GraphRoot {
     pub(crate) root: PathBuf,
     pub(crate) kind: GraphRootKind,
+    pub(crate) namespace: String,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct LibraryConformanceRoot {
+    pub(crate) root: PathBuf,
     pub(crate) namespace: String,
 }
 
@@ -363,6 +378,23 @@ fn external_package_catalogs(
         catalogs.insert(package_root.clone(), catalog);
     }
     Ok(catalogs)
+}
+
+fn collect_conformance_library_roots<'a>(
+    units: impl Iterator<Item = &'a crate::manifest::CatalogUnit>,
+    roots: &mut BTreeMap<(String, PathBuf), LibraryConformanceRoot>,
+) {
+    for unit in units {
+        if !unit.is_library() {
+            continue;
+        }
+        let namespace = unit.library_name().to_string();
+        let root = unit.unit_root().to_path_buf();
+        roots.insert(
+            (namespace.clone(), root.clone()),
+            LibraryConformanceRoot { root, namespace },
+        );
+    }
 }
 
 fn is_under(path: &Path, root: &Path) -> bool {
