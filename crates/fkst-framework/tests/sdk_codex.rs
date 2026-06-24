@@ -327,7 +327,7 @@ printf 'final output visible through bounded output_tail'
     let opts = lua_opts(&lua, "status");
     opts.set("label", "review").unwrap();
     opts.set("role", "reviewer").unwrap();
-    opts.set("proposal_id", "proposal-43").unwrap();
+    opts.set("dedup_key", "status-43").unwrap();
     let handle: AnyUserData = spawn.call(opts).unwrap();
     assert_eq!(read_fifo(&started_fifo), "started");
 
@@ -339,11 +339,7 @@ printf 'final output visible through bounded output_tail'
     assert_eq!(active.get::<String>("status").unwrap(), "running");
     assert_eq!(active.get::<String>("role").unwrap(), "reviewer");
     assert_eq!(active.get::<String>("label").unwrap(), "review");
-    assert_eq!(active.get::<String>("proposal_id").unwrap(), "proposal-43");
-    assert_eq!(
-        active.get::<String>("proposal_id_or_key").unwrap(),
-        "proposal-43"
-    );
+    assert_eq!(active.get::<String>("dedup_key").unwrap(), "status-43");
     assert_eq!(active.get::<String>("dept").unwrap(), "pkg.reviewer");
     assert!(active.get::<u64>("elapsed_ms").is_ok());
     assert!(active.get::<i64>("exit_code").is_err());
@@ -474,7 +470,7 @@ read _ < "$RELEASE_FIFO"
             let active: Table = running.get(1).unwrap();
             assert_eq!(active.get::<String>("status").unwrap(), "running");
             observed_role = active.get::<String>("role").unwrap();
-            observed_key = active.get::<String>("proposal_id_or_key").unwrap();
+            observed_key = active.get::<String>("dedup_key").unwrap();
             observed_tail = active.get::<String>("output_tail").unwrap();
             observed_log_path_is_hidden = active.get::<String>("log_path").is_err();
             if observed_tail.contains("line-60") {
@@ -979,10 +975,7 @@ printf 'intent-ok'
     assert_eq!(running.raw_len(), 1);
     let active: Table = running.get(1).unwrap();
     assert_eq!(active.get::<String>("status").unwrap(), "running");
-    assert_eq!(
-        active.get::<String>("proposal_id_or_key").unwrap(),
-        "visible-intent"
-    );
+    assert_eq!(active.get::<String>("dedup_key").unwrap(), "visible-intent");
 
     std::fs::remove_file(&intent_gate).unwrap();
     assert_eq!(
@@ -1556,7 +1549,7 @@ printf 'adoption-done'
             let opts = lua_opts(&lua, "adoption status");
             opts.set("worktree", worktree_arg).unwrap();
             opts.set("role", "implementer").unwrap();
-            opts.set("proposal_id", "issue-74").unwrap();
+            opts.set("dedup_key", "issue-74").unwrap();
             let result: Table = spawn.call(opts).unwrap();
             result_tx
                 .send(result.get::<String>("stdout").unwrap())
@@ -1592,11 +1585,7 @@ printf 'adoption-done'
     let active = active.expect("running adoption status with live output tail");
     assert_eq!(active.get::<String>("status").unwrap(), "running");
     assert_eq!(active.get::<String>("role").unwrap(), "implementer");
-    assert_eq!(active.get::<String>("proposal_id").unwrap(), "issue-74");
-    assert_eq!(
-        active.get::<String>("proposal_id_or_key").unwrap(),
-        "issue-74"
-    );
+    assert_eq!(active.get::<String>("dedup_key").unwrap(), "issue-74");
     assert_eq!(active.get::<String>("dept").unwrap(), "pkg.implementer");
     assert_eq!(
         active.get::<String>("output_tail").unwrap(),
@@ -1642,7 +1631,7 @@ printf 'sensitive output body'
     let spawn: mlua::Function = lua.globals().get("spawn_codex_sync").unwrap();
     let opts = lua_opts(&lua, "status");
     opts.set("label", "draft").unwrap();
-    opts.set("proposal_id", "proposal-43").unwrap();
+    opts.set("dedup_key", "status-43").unwrap();
 
     let result: Table = spawn.call(opts).unwrap();
     assert_eq!(result.get::<i64>("exit_code").unwrap(), 0);
@@ -1657,7 +1646,7 @@ printf 'sensitive output body'
     let item: Table = recent.get(1).unwrap();
     assert_eq!(item.get::<String>("label").unwrap(), "draft");
     assert_eq!(item.get::<String>("dept").unwrap(), "pkg.writer");
-    assert_eq!(item.get::<String>("proposal_id").unwrap(), "proposal-43");
+    assert_eq!(item.get::<String>("dedup_key").unwrap(), "status-43");
     assert_eq!(item.get::<String>("status").unwrap(), "done");
     assert_eq!(item.get::<i64>("exit_code").unwrap(), 0);
     assert_eq!(

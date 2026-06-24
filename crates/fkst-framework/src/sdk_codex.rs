@@ -62,7 +62,6 @@ struct CodexRequest {
     output_tail_path: PathBuf,
     role: Option<String>,
     label: Option<String>,
-    proposal_id: Option<String>,
     dedup_key: Option<String>,
     dept: Option<String>,
     started_at_ms: u64,
@@ -94,8 +93,6 @@ struct CodexStatusRecord {
     #[serde(default)]
     dept: Option<String>,
     #[serde(default)]
-    proposal_id: Option<String>,
-    #[serde(default)]
     dedup_key: Option<String>,
     started_at: String,
     started_at_ms: u64,
@@ -123,8 +120,6 @@ struct CodexAdoptionRecord {
     label: Option<String>,
     #[serde(default)]
     dept: Option<String>,
-    #[serde(default)]
-    proposal_id: Option<String>,
     #[serde(default)]
     dedup_key: Option<String>,
     status: String,
@@ -439,7 +434,6 @@ fn codex_request_from_opts(opts: Table, runtime_dept: Option<String>) -> CodexRe
     let worktree: Option<String> = opts.get("worktree").ok();
     let role: Option<String> = opts.get("role").ok();
     let label: Option<String> = opts.get("label").ok();
-    let proposal_id: Option<String> = opts.get("proposal_id").ok();
     let dedup_key: Option<String> = opts.get("dedup_key").ok();
     let dept: Option<String> = opts.get("dept").ok().or(runtime_dept);
     let timeout: Option<i64> = opts.get("timeout").ok();
@@ -459,7 +453,6 @@ fn codex_request_from_opts(opts: Table, runtime_dept: Option<String>) -> CodexRe
         output_tail_path,
         role,
         label,
-        proposal_id,
         dedup_key,
         dept,
         started_at_ms,
@@ -1080,7 +1073,6 @@ fn adoption_record_from_request(
         role: request.role.clone(),
         label: request.label.clone(),
         dept: request.dept.clone(),
-        proposal_id: request.proposal_id.clone(),
         dedup_key: request.dedup_key.clone(),
         status: status.to_string(),
         started_at_ms: request.started_at_ms,
@@ -1166,10 +1158,6 @@ fn codex_worker_args(
     if let Some(role) = request.role.as_deref() {
         args.push("--role".to_string());
         args.push(role.to_string());
-    }
-    if let Some(proposal_id) = request.proposal_id.as_deref() {
-        args.push("--proposal-id".to_string());
-        args.push(proposal_id.to_string());
     }
     if let Some(dedup_key) = request.dedup_key.as_deref() {
         args.push("--dedup-key".to_string());
@@ -1277,7 +1265,6 @@ pub(crate) struct CodexWorkerOptions {
     worktree: Option<String>,
     role: Option<String>,
     label: Option<String>,
-    proposal_id: Option<String>,
     dedup_key: Option<String>,
     dept: Option<String>,
 }
@@ -1302,7 +1289,6 @@ pub(crate) fn parse_worker_args(args: Vec<String>) -> anyhow::Result<CodexWorker
     let worktree = parser.optional_string("--worktree");
     let role = parser.optional_string("--role");
     let label = parser.optional_string("--label");
-    let proposal_id = parser.optional_string("--proposal-id");
     let dedup_key = parser.optional_string("--dedup-key");
     let dept = parser.optional_string("--dept");
     parser.finish()?;
@@ -1325,7 +1311,6 @@ pub(crate) fn parse_worker_args(args: Vec<String>) -> anyhow::Result<CodexWorker
         worktree,
         role,
         label,
-        proposal_id,
         dedup_key,
         dept,
     })
@@ -1344,7 +1329,6 @@ pub(crate) fn run_codex_worker(options: CodexWorkerOptions) -> anyhow::Result<i3
         output_tail_path: codex_output_tail_path(&options.log_path),
         role: options.role.clone(),
         label: options.label.clone(),
-        proposal_id: options.proposal_id.clone(),
         dedup_key: options.dedup_key.clone(),
         dept: options.dept.clone(),
         started_at_ms: options.started_at_ms,
@@ -1359,7 +1343,6 @@ pub(crate) fn run_codex_worker(options: CodexWorkerOptions) -> anyhow::Result<i3
         role: options.role.clone(),
         label: options.label.clone(),
         dept: options.dept.clone(),
-        proposal_id: options.proposal_id.clone(),
         dedup_key: options.dedup_key.clone(),
         status: CODEX_ADOPTION_STATUS_RUNNING.to_string(),
         started_at_ms: options.started_at_ms,
@@ -1645,7 +1628,6 @@ impl CodexStatusRecord {
             role: request.role.clone().or_else(|| request.label.clone()),
             label: request.label.clone(),
             dept: request.dept.clone(),
-            proposal_id: request.proposal_id.clone(),
             dedup_key: request.dedup_key.clone(),
             started_at: unix_millis_to_iso8601(request.started_at_ms),
             started_at_ms: request.started_at_ms,
@@ -1707,11 +1689,7 @@ fn codex_status_record_table(lua: &Lua, record: &CodexStatusRecord, now_ms: u64)
     }
     set_optional_string(&table, "label", &record.label)?;
     set_optional_string(&table, "dept", &record.dept)?;
-    set_optional_string(&table, "proposal_id", &record.proposal_id)?;
     set_optional_string(&table, "dedup_key", &record.dedup_key)?;
-    if let Some(key) = record.proposal_id.as_ref().or(record.dedup_key.as_ref()) {
-        table.set("proposal_id_or_key", key.as_str())?;
-    }
     table.set("started_at", record.started_at.clone())?;
     table.set("started_at_ms", record.started_at_ms)?;
     set_optional_string(&table, "ended_at", &record.ended_at)?;
@@ -1882,7 +1860,6 @@ fn codex_status_record_from_adoption(record: CodexAdoptionRecord) -> CodexStatus
         role: record.role,
         label: record.label,
         dept: record.dept,
-        proposal_id: record.proposal_id,
         dedup_key: record.dedup_key.or(Some(record.key)),
         started_at: unix_millis_to_iso8601(record.started_at_ms),
         started_at_ms: record.started_at_ms,
