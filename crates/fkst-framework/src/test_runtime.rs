@@ -405,6 +405,7 @@ fn final_state(store: &DeliveryStore) -> mlua::Result<FinalState> {
         &DeliveryObserveOptions {
             now_ms: TEST_OBSERVED_AT_MS,
             limit: MAX_TRACE_DELIVERIES,
+            since: None,
         },
     )
     .map_err(mlua::Error::external)?;
