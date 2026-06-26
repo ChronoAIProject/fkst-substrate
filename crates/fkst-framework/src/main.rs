@@ -18,7 +18,6 @@
 //!   124 = codex subprocess timed out and was killed by SIGKILL -pgid
 
 use anyhow::{Context, Result};
-use capabilities::CapabilityMode;
 use host_conformance::{HostConformanceConfig, HostConformanceOptions};
 use path_resolver::PackageRoots;
 use serde_json::Value as JsonValue;
@@ -570,6 +569,7 @@ fn run_pipeline(
     }
     let raised_auth_token = std::env::var(RAISED_AUTH_TOKEN_ENV).ok();
     std::env::remove_var(RAISED_AUTH_TOKEN_ENV);
+    let lua = mlua_init::new_lua();
     let raise_buf = RaiseBuffer::new();
     let owner_root = roots
         .owner_root_for_namespace(&owner_namespace)
@@ -580,35 +580,9 @@ fn run_pipeline(
     let owner_unit = catalog
         .unit_name_for_root(owner_root)?
         .ok_or_else(|| anyhow::anyhow!("no manifest unit owns {}", owner_root.display()))?;
-    let capability_mode = catalog
-        .unit_for_root(owner_root)?
-        .map(|unit| {
-            CapabilityMode::for_manifest_with_generator_grant(
-                unit.manifest(),
-                roots.generator_grant_for_owner(&owner_namespace, &owner_unit),
-                &format!("[generators.{owner_namespace}]"),
-            )
-        })
-        .transpose()?
-        .unwrap_or(CapabilityMode::Full);
-    let lua = match &capability_mode {
-        CapabilityMode::Full => mlua_init::new_lua(),
-        CapabilityMode::StatelessGenerator(_) => mlua_init::new_lua_restricted()
-            .map_err(|err| anyhow::anyhow!("stateless_generator_restricted_lua_init: {err}"))?,
-    };
     let catalog = Arc::new(catalog);
     let graph_json_authorized =
         sdk_graph::department_authorized(&roots, owner_root, &lua_path).unwrap_or(false);
-    reject_stateless_generator_event_wiring(
-        &capability_mode,
-        &roots,
-        owner_root,
-        &owner_namespace,
-        &lua_path,
-        catalog.clone(),
-        &owner_unit,
-    )
-    .with_context(|| format!("validate generator event wiring for {}", lua_path.display()))?;
     let declared_produces = department_declared_resolved_produces(
         &roots,
         owner_root,
@@ -621,7 +595,6 @@ fn run_pipeline(
 
     mlua_init::register_framework_sdk(
         &lua,
-        capability_mode,
         raise_buf.clone(),
         roots.host_root(),
         owner_root,
@@ -658,50 +631,6 @@ fn run_pipeline(
         raise_buf.emit_stdout();
     }
     Ok(exit_code)
-}
-
-fn reject_stateless_generator_event_wiring(
-    capability_mode: &CapabilityMode,
-    roots: &PackageRoots,
-    owner_root: &Path,
-    owner_namespace: &str,
-    lua_path: &Path,
-    catalog: Arc<manifest::UnitCatalog>,
-    owner_unit: &str,
-) -> Result<()> {
-    if !matches!(capability_mode, CapabilityMode::StatelessGenerator(_)) {
-        return Ok(());
-    }
-    let lua_path = lua_path
-        .canonicalize()
-        .with_context(|| format!("canonicalize {}", lua_path.display()))?;
-    let chunk_cache = mlua_init::LuaChunkCache::default();
-    let consumes = spec_queues::declared_raw_spec_queues(
-        owner_root,
-        &lua_path,
-        catalog.clone(),
-        owner_unit,
-        &chunk_cache,
-        "consumes",
-    )
-    .map_err(anyhow::Error::from)?;
-    let produces = spec_queues::declared_resolved_produces(
-        roots,
-        owner_namespace,
-        owner_root,
-        &lua_path,
-        catalog,
-        owner_unit,
-        &chunk_cache,
-    )
-    .map_err(anyhow::Error::from)?;
-    if !consumes.is_empty() || !produces.is_empty() {
-        anyhow::bail!(
-            "stateless_generator_event_wiring_denied: stateless_generator department {} must not declare consumes or produces",
-            lua_path.display()
-        );
-    }
-    Ok(())
 }
 
 fn department_declared_resolved_produces(
