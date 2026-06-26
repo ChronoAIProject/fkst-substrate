@@ -20,6 +20,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::config_registry::{ConfigContext, ConfigKey, ConfigValueType};
+use crate::manifest::PersistenceClass;
 use crate::path_resolver::{
     validate_name_segment, GraphRoot, GraphRootKind, NameResolver, PackageRoots,
 };
@@ -233,6 +234,13 @@ fn scan_departments(
     if !dept_dir.is_dir() {
         return Ok(());
     }
+    let stateless_generator = catalog
+        .units()
+        .find(|unit| unit.catalog_name() == owner_unit)
+        .map(|unit| {
+            unit.manifest().persistence_class() == Some(PersistenceClass::StatelessGenerator)
+        })
+        .unwrap_or(false);
 
     for path in sorted_dirs(&dept_dir).with_context(|| format!("read {}", dept_dir.display()))? {
         let name = file_name(&path)?;
@@ -260,6 +268,7 @@ fn scan_departments(
             .with_context(|| format!("resolve `{}.spec.consumes`", name))?;
         let produces = resolve_queues(resolver, &graph_root.namespace, spec.produces)
             .with_context(|| format!("resolve `{}.spec.produces`", name))?;
+        reject_stateless_generator_event_wiring(stateless_generator, &name, &consumes, &produces)?;
         reject_engine_dead_letter_produces(&produces, &name)
             .with_context(|| format!("validate `{}.spec.produces`", name))?;
         let fanout = resolve_queues(resolver, &graph_root.namespace, spec.fanout)
@@ -437,6 +446,21 @@ fn reject_engine_dead_letter_produces(produces: &[String], department_name: &str
             department_name,
             queue,
             contract.provider
+        );
+    }
+    Ok(())
+}
+
+fn reject_stateless_generator_event_wiring(
+    stateless_generator: bool,
+    department_name: &str,
+    consumes: &[String],
+    produces: &[String],
+) -> Result<()> {
+    if stateless_generator && (!consumes.is_empty() || !produces.is_empty()) {
+        bail!(
+            "stateless_generator_event_wiring_denied: department `{}` in a stateless_generator package must not declare consumes or produces",
+            department_name
         );
     }
     Ok(())

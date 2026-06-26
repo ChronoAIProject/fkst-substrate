@@ -328,6 +328,7 @@ impl SemanticLuaRulePack {
             Some(context.options.roots.clone()),
             false,
             None,
+            crate::capabilities::CapabilityMode::Full,
         )
         .context("register package SDK")?;
         let env = crate::lua_require::install_scoped_require(&lua, catalog, &owner_unit)

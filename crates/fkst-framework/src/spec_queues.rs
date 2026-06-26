@@ -58,6 +58,24 @@ pub(crate) fn declared_qualified_spec_queues(
         .collect())
 }
 
+pub(crate) fn declared_raw_spec_queues(
+    owner_root: &Path,
+    lua_path: &Path,
+    catalog: Arc<crate::manifest::UnitCatalog>,
+    owner_unit: &str,
+    chunk_cache: &crate::mlua_init::LuaChunkCache,
+    field: &str,
+) -> mlua::Result<BTreeSet<String>> {
+    declared_spec_queues(
+        owner_root,
+        lua_path,
+        catalog,
+        owner_unit,
+        chunk_cache,
+        field,
+    )
+}
+
 fn declared_spec_queues(
     owner_root: &Path,
     lua_path: &Path,

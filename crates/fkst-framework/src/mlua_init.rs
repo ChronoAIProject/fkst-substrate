@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
+use crate::capabilities::CapabilityMode;
 use crate::config_registry::ConfigContext;
 use crate::external_command::MockCommandState;
 use crate::manifest::UnitCatalog;
@@ -32,30 +33,42 @@ pub fn register_framework_sdk(
     graph_roots: Option<PackageRoots>,
     graph_json_authorized: bool,
     raised_auth_token: Option<String>,
+    capability_mode: CapabilityMode,
 ) -> mlua::Result<()> {
     let config = ConfigContext::from_host_root(host_root).map_err(mlua::Error::external)?;
     crate::rate_pool::RatePoolRegistry::from_config(&config).map_err(mlua::Error::external)?;
     crate::sdk_log::register(lua)?;
     crate::sdk_i18n::register(lua, owner_root)?;
-    crate::sdk_basic::register_with_runner(lua, config.clone(), None)?;
-    crate::sdk_strings::register(lua)?;
-    crate::sdk_restricted_lua::register(lua)?;
-    crate::sdk_graph::register(lua, graph_roots, graph_json_authorized)?;
-    crate::sdk_fs::register(lua)?;
-    crate::sdk_json::register(lua)?;
-    crate::sdk_git::register(lua, host_root, config.clone())?;
-    crate::sdk_mark::register(lua, host_root)?;
-    crate::sdk_cache::register(lua, host_root)?;
-    crate::sdk_observe::register(lua, None)?;
-    crate::sdk_codex::register(
-        lua,
-        host_root,
-        config,
-        dept,
-        raise_buf.clone(),
-        raised_auth_token,
-    )?;
-    crate::raise::register(lua, raise_buf, resolver, owner_namespace, raise_authority)?;
+    match capability_mode {
+        CapabilityMode::Full => {
+            crate::sdk_basic::register_with_runner(lua, config.clone(), None)?;
+            crate::sdk_strings::register(lua)?;
+            crate::sdk_restricted_lua::register(lua)?;
+            crate::sdk_graph::register(lua, graph_roots, graph_json_authorized)?;
+            crate::sdk_fs::register(lua)?;
+            crate::sdk_json::register(lua)?;
+            crate::sdk_git::register(lua, host_root, config.clone())?;
+            crate::sdk_mark::register(lua, host_root)?;
+            crate::sdk_cache::register(lua, host_root)?;
+            crate::sdk_observe::register(lua, None)?;
+            crate::sdk_codex::register(
+                lua,
+                host_root,
+                config,
+                dept,
+                raise_buf.clone(),
+                raised_auth_token,
+            )?;
+            crate::raise::register(lua, raise_buf, resolver, owner_namespace, raise_authority)?;
+        }
+        CapabilityMode::StatelessGenerator(policy) => {
+            crate::sdk_strings::register(lua)?;
+            crate::sdk_json::register(lua)?;
+            let fs_policy =
+                crate::sdk_fs::FsPolicy::new(owner_root, policy.output_roots, policy.input_roots)?;
+            crate::sdk_fs::register_with_policy(lua, fs_policy)?;
+        }
+    }
     Ok(())
 }
 
@@ -73,31 +86,43 @@ pub(crate) fn register_framework_sdk_with_runner(
     graph_json_authorized: bool,
     raised_auth_token: Option<String>,
     mock_observe: Option<crate::sdk_observe::MockObserveState>,
+    capability_mode: CapabilityMode,
 ) -> mlua::Result<()> {
     let config = ConfigContext::from_host_root(host_root).map_err(mlua::Error::external)?;
     crate::rate_pool::RatePoolRegistry::from_config(&config).map_err(mlua::Error::external)?;
     crate::sdk_log::register(lua)?;
     crate::sdk_i18n::register(lua, owner_root)?;
-    crate::sdk_basic::register_with_runner(lua, config.clone(), runner.clone())?;
-    crate::sdk_strings::register(lua)?;
-    crate::sdk_restricted_lua::register(lua)?;
-    crate::sdk_graph::register(lua, graph_roots, graph_json_authorized)?;
-    crate::sdk_fs::register(lua)?;
-    crate::sdk_json::register(lua)?;
-    crate::sdk_git::register_with_runner(lua, host_root, config.clone(), runner.clone())?;
-    crate::sdk_mark::register(lua, host_root)?;
-    crate::sdk_cache::register(lua, host_root)?;
-    crate::sdk_observe::register(lua, mock_observe)?;
-    crate::sdk_codex::register_with_runner(
-        lua,
-        host_root,
-        config,
-        dept,
-        runner,
-        raise_buf.clone(),
-        raised_auth_token,
-    )?;
-    crate::raise::register(lua, raise_buf, resolver, owner_namespace, raise_authority)?;
+    match capability_mode {
+        CapabilityMode::Full => {
+            crate::sdk_basic::register_with_runner(lua, config.clone(), runner.clone())?;
+            crate::sdk_strings::register(lua)?;
+            crate::sdk_restricted_lua::register(lua)?;
+            crate::sdk_graph::register(lua, graph_roots, graph_json_authorized)?;
+            crate::sdk_fs::register(lua)?;
+            crate::sdk_json::register(lua)?;
+            crate::sdk_git::register_with_runner(lua, host_root, config.clone(), runner.clone())?;
+            crate::sdk_mark::register(lua, host_root)?;
+            crate::sdk_cache::register(lua, host_root)?;
+            crate::sdk_observe::register(lua, mock_observe)?;
+            crate::sdk_codex::register_with_runner(
+                lua,
+                host_root,
+                config,
+                dept,
+                runner,
+                raise_buf.clone(),
+                raised_auth_token,
+            )?;
+            crate::raise::register(lua, raise_buf, resolver, owner_namespace, raise_authority)?;
+        }
+        CapabilityMode::StatelessGenerator(policy) => {
+            crate::sdk_strings::register(lua)?;
+            crate::sdk_json::register(lua)?;
+            let fs_policy =
+                crate::sdk_fs::FsPolicy::new(owner_root, policy.output_roots, policy.input_roots)?;
+            crate::sdk_fs::register_with_policy(lua, fs_policy)?;
+        }
+    }
     Ok(())
 }
 
@@ -316,6 +341,7 @@ pub(crate) fn run_dept_with_package_path_chunk_cache_and_name_root(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::capabilities::{CapabilityMode, GeneratorCapabilityPolicy};
     use std::time::{Duration, UNIX_EPOCH};
     use tempfile::TempDir;
 
@@ -349,6 +375,127 @@ root = "."
     fn force_mtime(path: &Path, millis_since_epoch: u64) {
         let time = UNIX_EPOCH + Duration::from_millis(millis_since_epoch);
         filetime::set_file_mtime(path, filetime::FileTime::from_system_time(time)).unwrap();
+    }
+
+    fn register_test_sdk(lua: &Lua, root: &Path, capability_mode: CapabilityMode) {
+        register_framework_sdk(
+            lua,
+            RaiseBuffer::new(),
+            root,
+            root,
+            Some("pkg.test".to_string()),
+            NameResolver::new(["pkg".to_string()]),
+            "pkg".to_string(),
+            RaiseAuthority::new(Default::default()),
+            None,
+            false,
+            None,
+            capability_mode,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn stateless_generator_omits_effect_primitives() {
+        let lua = new_lua();
+        let dir = TempDir::new().unwrap();
+        let out = dir.path().join("generated");
+        std::fs::create_dir_all(&out).unwrap();
+        register_test_sdk(
+            &lua,
+            dir.path(),
+            CapabilityMode::StatelessGenerator(GeneratorCapabilityPolicy {
+                output_roots: vec![out],
+                input_roots: Vec::new(),
+            }),
+        );
+
+        let absent: bool = lua
+            .load(
+                r#"
+                return raise == nil
+                    and exec_argv == nil
+                    and exec_sync == nil
+                    and cache_set == nil
+                    and spawn_codex_sync == nil
+                    and with_lock == nil
+                    and now == nil
+                "#,
+            )
+            .eval()
+            .unwrap();
+
+        assert!(absent);
+    }
+
+    #[test]
+    fn stateless_generator_confined_fs_allows_only_policy_roots() {
+        let lua = new_lua();
+        let dir = TempDir::new().unwrap();
+        let out = dir.path().join("generated");
+        let input = dir.path().join("fixtures");
+        let outside = dir.path().join("outside");
+        std::fs::create_dir_all(&out).unwrap();
+        std::fs::create_dir_all(&input).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(input.join("seed.txt"), "seed").unwrap();
+        register_test_sdk(
+            &lua,
+            dir.path(),
+            CapabilityMode::StatelessGenerator(GeneratorCapabilityPolicy {
+                output_roots: vec![PathBuf::from("generated")],
+                input_roots: vec![PathBuf::from("fixtures")],
+            }),
+        );
+
+        lua.load(r#"file.write("generated/out.txt", "ok")"#)
+            .exec()
+            .unwrap();
+        assert_eq!(std::fs::read_to_string(out.join("out.txt")).unwrap(), "ok");
+
+        let read_input: String = lua
+            .load(r#"return file.read("fixtures/seed.txt")"#)
+            .eval()
+            .unwrap();
+        assert_eq!(read_input, "seed");
+
+        let outside_write = lua
+            .load(r#"file.write("outside/out.txt", "no")"#)
+            .exec()
+            .unwrap_err()
+            .to_string();
+        assert!(outside_write.contains("stateless_generator_fs_write_denied"));
+
+        let outside_read = lua
+            .load(r#"return file.exists("outside/out.txt")"#)
+            .eval::<bool>()
+            .unwrap_err()
+            .to_string();
+        assert!(outside_read.contains("stateless_generator_fs_read_denied"));
+    }
+
+    #[test]
+    fn full_capability_mode_keeps_current_primitives() {
+        let lua = new_lua();
+        let dir = TempDir::new().unwrap();
+        register_test_sdk(&lua, dir.path(), CapabilityMode::Full);
+
+        let present: bool = lua
+            .load(
+                r#"
+                return type(raise) == "function"
+                    and type(exec_argv) == "function"
+                    and type(exec_sync) == "function"
+                    and type(cache_set) == "function"
+                    and type(spawn_codex_sync) == "function"
+                    and type(with_lock) == "function"
+                    and type(now) == "function"
+                "#,
+            )
+            .eval()
+            .unwrap();
+
+        assert!(present);
     }
 
     #[test]

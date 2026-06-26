@@ -1,6 +1,6 @@
 use super::*;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 fn write(path: &Path, body: &str) {
     if let Some(parent) = path.parent() {
@@ -1004,6 +1004,7 @@ fn package_manifest_parses_valid_persistence_classes() {
     for (raw, class) in [
         ("saga", PersistenceClass::Saga),
         ("stateless_adapter", PersistenceClass::StatelessAdapter),
+        ("stateless_generator", PersistenceClass::StatelessGenerator),
         ("judgment_pipeline", PersistenceClass::JudgmentPipeline),
         (
             "composed_judgment_pipeline",
@@ -1011,6 +1012,15 @@ fn package_manifest_parses_valid_persistence_classes() {
         ),
     ] {
         let temp = tempfile::tempdir().unwrap();
+        let generator = if class == PersistenceClass::StatelessGenerator {
+            fs::create_dir_all(temp.path().join("generated")).unwrap();
+            r#"
+[generator]
+output_roots = ["generated"]
+"#
+        } else {
+            ""
+        };
         write(
             &temp.path().join("fkst.toml"),
             &format!(
@@ -1021,6 +1031,7 @@ persistence_class = "{raw}"
 
 [code]
 root = "."
+{generator}
 "#
             ),
         );
@@ -1029,6 +1040,58 @@ root = "."
 
         assert_eq!(manifest.persistence_class(), Some(class));
     }
+}
+
+#[test]
+fn stateless_generator_manifest_requires_output_roots() {
+    let temp = tempfile::tempdir().unwrap();
+    write(
+        &temp.path().join("fkst.toml"),
+        r#"
+kind = "package"
+name = "app"
+persistence_class = "stateless_generator"
+
+[code]
+root = "."
+"#,
+    );
+
+    for parse in [UnitManifest::parse_file, UnitManifest::parse_file_strict] {
+        let err = parse(&temp.path().join("fkst.toml")).unwrap_err();
+        let msg = format!("{err:#}");
+
+        assert!(
+            msg.contains("stateless_generator manifest requires `[generator].output_roots`"),
+            "{msg}"
+        );
+    }
+}
+
+#[test]
+fn stateless_generator_manifest_parses_generator_roots() {
+    let temp = tempfile::tempdir().unwrap();
+    write(
+        &temp.path().join("fkst.toml"),
+        r#"
+kind = "package"
+name = "app"
+persistence_class = "stateless_generator"
+
+[code]
+root = "."
+
+[generator]
+output_roots = ["generated"]
+input_roots = ["fixtures"]
+"#,
+    );
+
+    let manifest = UnitManifest::parse_file(&temp.path().join("fkst.toml")).unwrap();
+    let generator = manifest.generator().unwrap();
+
+    assert_eq!(generator.output_roots, vec![PathBuf::from("generated")]);
+    assert_eq!(generator.input_roots, vec![PathBuf::from("fixtures")]);
 }
 
 #[test]

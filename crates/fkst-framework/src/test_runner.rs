@@ -69,6 +69,7 @@ pub(crate) fn run_tests(
             false,
             None,
             Some(mock_observe.clone()),
+            crate::capabilities::CapabilityMode::Full,
         )
         .with_context(|| format!("register SDK for {}", relpath))?;
         register_test_sdk(
@@ -627,6 +628,7 @@ pub(crate) fn run_department_core(
         graph_json_authorized,
         None,
         Some(mock_observe),
+        crate::capabilities::CapabilityMode::Full,
     )?;
     if let Some(coverage) = &coverage {
         coverage.install(&dept_lua)?;

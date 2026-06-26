@@ -44,6 +44,7 @@ pub(crate) enum PackageKind {
 pub(crate) enum PersistenceClass {
     Saga,
     StatelessAdapter,
+    StatelessGenerator,
     JudgmentPipeline,
     ComposedJudgmentPipeline,
 }
@@ -162,6 +163,7 @@ pub(crate) struct UnitManifest {
     pub(crate) kind: UnitKind,
     pub(crate) name: String,
     persistence_class: Option<PersistenceClass>,
+    generator: Option<GeneratorManifest>,
     pub(crate) code_root: PathBuf,
     pub(crate) lib_deps: Vec<LibDep>,
     pub(crate) dependency_constraints: DependencyConstraints,
@@ -198,6 +200,18 @@ impl UnitManifest {
     pub(crate) fn persistence_class(&self) -> Option<PersistenceClass> {
         self.persistence_class
     }
+
+    pub(crate) fn generator(&self) -> Option<&GeneratorManifest> {
+        self.generator.as_ref()
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct GeneratorManifest {
+    pub(crate) output_roots: Vec<PathBuf>,
+    #[serde(default)]
+    pub(crate) input_roots: Vec<PathBuf>,
 }
 
 #[derive(Clone, Copy)]
@@ -211,6 +225,7 @@ struct UnitManifestToml {
     kind: UnitKind,
     name: String,
     persistence_class: Option<PersistenceClass>,
+    generator: Option<GeneratorManifest>,
     code: CodeToml,
     #[serde(default)]
     lib_deps: LibDepsToml,
@@ -232,6 +247,7 @@ impl UnitManifestToml {
         mode: ManifestParseMode,
     ) -> std::result::Result<UnitManifest, toml::de::Error> {
         validate_persistence_class(&self.kind, self.persistence_class)?;
+        validate_generator_section(&self.kind, self.persistence_class, &self.generator)?;
         self.dependency_constraints
             .validate(&self.kind, &self.lib_deps.libraries)?;
         validate_library_section(&self.kind, &self.library)?;
@@ -246,6 +262,7 @@ impl UnitManifestToml {
             kind: self.kind,
             name: self.name,
             persistence_class: self.persistence_class,
+            generator: self.generator,
             code_root: self.code.root,
             lib_deps: self.lib_deps.libraries,
             dependency_constraints: self.dependency_constraints,
@@ -267,6 +284,27 @@ fn validate_persistence_class(
             "library manifest must not declare `persistence_class`",
         )),
         _ => Ok(()),
+    }
+}
+
+fn validate_generator_section(
+    kind: &UnitKind,
+    persistence_class: Option<PersistenceClass>,
+    generator: &Option<GeneratorManifest>,
+) -> std::result::Result<(), toml::de::Error> {
+    if matches!(kind, UnitKind::Library) && generator.is_some() {
+        return Err(serde::de::Error::custom(
+            "library manifest must not declare `[generator]`",
+        ));
+    }
+    if persistence_class != Some(PersistenceClass::StatelessGenerator) {
+        return Ok(());
+    }
+    match generator {
+        Some(generator) if !generator.output_roots.is_empty() => Ok(()),
+        _ => Err(serde::de::Error::custom(
+            "stateless_generator manifest requires `[generator].output_roots`",
+        )),
     }
 }
 

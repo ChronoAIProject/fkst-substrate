@@ -1,4 +1,5 @@
 use crate::manifest::{PersistenceClass, UnitManifest};
+use std::path::PathBuf;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[allow(dead_code)]
@@ -14,6 +15,35 @@ impl UnitCapabilities {
             saga_recovery: manifest.persistence_class() == Some(PersistenceClass::Saga),
         }
     }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum CapabilityMode {
+    Full,
+    StatelessGenerator(GeneratorCapabilityPolicy),
+}
+
+impl CapabilityMode {
+    pub(crate) fn for_manifest(manifest: &UnitManifest) -> Self {
+        match manifest.persistence_class() {
+            Some(PersistenceClass::StatelessGenerator) => {
+                let generator = manifest
+                    .generator()
+                    .expect("stateless_generator manifest must have generator policy");
+                Self::StatelessGenerator(GeneratorCapabilityPolicy {
+                    output_roots: generator.output_roots.clone(),
+                    input_roots: generator.input_roots.clone(),
+                })
+            }
+            _ => Self::Full,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct GeneratorCapabilityPolicy {
+    pub(crate) output_roots: Vec<PathBuf>,
+    pub(crate) input_roots: Vec<PathBuf>,
 }
 
 #[cfg(test)]

@@ -1,6 +1,7 @@
 //! SDK: file system helpers. file.read, file.write, file.exists, file.list.
 
 use mlua::{Lua, Result};
+use std::path::{Component, Path, PathBuf};
 
 // expose filesystem helpers through the fixed `file.*` SDK table.
 pub fn register(lua: &Lua) -> Result<()> {
@@ -53,6 +54,239 @@ pub fn register(lua: &Lua) -> Result<()> {
         })?,
     )?;
     lua.globals().set("file", file)?;
+    Ok(())
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct FsPolicy {
+    owner_root: PathBuf,
+    output_roots: Vec<PathBuf>,
+    input_roots: Vec<PathBuf>,
+}
+
+impl FsPolicy {
+    pub(crate) fn new(
+        owner_root: &Path,
+        output_roots: Vec<PathBuf>,
+        input_roots: Vec<PathBuf>,
+    ) -> Result<Self> {
+        let owner_root = owner_root.canonicalize().map_err(mlua::Error::external)?;
+        let output_roots = canonical_policy_roots(&owner_root, output_roots, "output_roots")?;
+        let input_roots = canonical_policy_roots(&owner_root, input_roots, "input_roots")?;
+        Ok(Self {
+            owner_root,
+            output_roots,
+            input_roots,
+        })
+    }
+
+    fn read_roots(&self) -> Vec<PathBuf> {
+        let mut roots = self.input_roots.clone();
+        roots.extend(self.output_roots.clone());
+        roots
+    }
+}
+
+pub(crate) fn register_with_policy(lua: &Lua, policy: FsPolicy) -> Result<()> {
+    let file = lua.create_table()?;
+
+    let read_policy = policy.clone();
+    file.set(
+        "read",
+        lua.create_function(move |_, path: String| {
+            let path = read_policy.require_read_file_path(&path)?;
+            std::fs::read_to_string(&path).map_err(mlua::Error::external)
+        })?,
+    )?;
+
+    let write_policy = policy.clone();
+    file.set(
+        "write",
+        lua.create_function(move |_, (path, content): (String, String)| {
+            let path = write_policy.require_write_path(&path)?;
+            std::fs::write(&path, content).map_err(mlua::Error::external)?;
+            Ok(())
+        })?,
+    )?;
+
+    let exists_policy = policy.clone();
+    file.set(
+        "exists",
+        lua.create_function(move |_, path: String| {
+            let path = exists_policy.require_existing_or_parent_path(&path)?;
+            Ok(path.exists())
+        })?,
+    )?;
+
+    let list_policy = policy;
+    file.set(
+        "list",
+        lua.create_function(move |lua, dir: String| {
+            let root = list_policy.require_list_path(&dir)?;
+            let mut out: Vec<String> = Vec::new();
+            if root.is_dir() {
+                let mut stack = vec![root];
+                while let Some(d) = stack.pop() {
+                    for entry in std::fs::read_dir(&d).map_err(mlua::Error::external)? {
+                        let entry = entry.map_err(mlua::Error::external)?;
+                        let ft = entry.file_type().map_err(mlua::Error::external)?;
+                        let path = entry.path();
+                        if ft.is_dir() {
+                            stack.push(path);
+                        } else if ft.is_file() {
+                            out.push(path.to_string_lossy().to_string());
+                        }
+                    }
+                }
+            }
+            out.sort();
+            lua.create_sequence_from(out)
+        })?,
+    )?;
+
+    lua.globals().set("file", file)?;
+    Ok(())
+}
+
+impl FsPolicy {
+    fn require_read_file_path(&self, raw: &str) -> Result<PathBuf> {
+        self.require_existing_or_parent_path_with_class(raw, "stateless_generator_fs_read_denied")
+    }
+
+    fn require_existing_or_parent_path(&self, raw: &str) -> Result<PathBuf> {
+        self.require_existing_or_parent_path_with_class(raw, "stateless_generator_fs_read_denied")
+    }
+
+    fn require_existing_or_parent_path_with_class(
+        &self,
+        raw: &str,
+        error_class: &str,
+    ) -> Result<PathBuf> {
+        let roots = self.read_roots();
+        self.require_existing_or_parent_path_under(raw, &roots, error_class)
+    }
+
+    fn require_list_path(&self, raw: &str) -> Result<PathBuf> {
+        let roots = self.read_roots();
+        let path = resolve_policy_path(&self.owner_root, raw)?;
+        reject_parent_component(&path, "stateless_generator_fs_read_denied")?;
+        if let Ok(canonical) = path.canonicalize() {
+            if roots.iter().any(|root| canonical.starts_with(root)) {
+                return Ok(path);
+            }
+            return Err(mlua::Error::external(format!(
+                "stateless_generator_fs_read_denied: {} is outside configured generator roots",
+                path.display()
+            )));
+        }
+        self.require_existing_or_parent_path_under(
+            raw,
+            &roots,
+            "stateless_generator_fs_read_denied",
+        )
+    }
+
+    fn require_write_path(&self, raw: &str) -> Result<PathBuf> {
+        self.require_existing_parent_path_under(
+            raw,
+            &self.output_roots,
+            "stateless_generator_fs_write_denied",
+        )
+    }
+
+    fn require_existing_or_parent_path_under(
+        &self,
+        raw: &str,
+        roots: &[PathBuf],
+        error_class: &str,
+    ) -> Result<PathBuf> {
+        let path = resolve_policy_path(&self.owner_root, raw)?;
+        reject_parent_component(&path, error_class)?;
+        if let Ok(canonical) = path.canonicalize() {
+            if roots.iter().any(|root| canonical.starts_with(root)) {
+                return Ok(path);
+            }
+            return Err(mlua::Error::external(format!(
+                "{error_class}: {} is outside configured generator roots",
+                path.display()
+            )));
+        }
+        self.require_existing_parent_path_under(raw, roots, error_class)
+    }
+
+    fn require_existing_parent_path_under(
+        &self,
+        raw: &str,
+        roots: &[PathBuf],
+        error_class: &str,
+    ) -> Result<PathBuf> {
+        let path = resolve_policy_path(&self.owner_root, raw)?;
+        reject_parent_component(&path, error_class)?;
+        let parent = path.parent().ok_or_else(|| {
+            mlua::Error::external(format!(
+                "{error_class}: path has no parent: {}",
+                path.display()
+            ))
+        })?;
+        let canonical_parent = parent.canonicalize().map_err(|err| {
+            mlua::Error::external(format!(
+                "{error_class}: canonicalize parent {}: {err}",
+                parent.display()
+            ))
+        })?;
+        if roots.iter().any(|root| canonical_parent.starts_with(root)) {
+            Ok(path)
+        } else {
+            Err(mlua::Error::external(format!(
+                "{error_class}: {} is outside configured generator roots",
+                path.display()
+            )))
+        }
+    }
+}
+
+fn canonical_policy_roots(
+    owner_root: &Path,
+    roots: Vec<PathBuf>,
+    label: &str,
+) -> Result<Vec<PathBuf>> {
+    roots
+        .into_iter()
+        .map(|root| {
+            let resolved = resolve_policy_path(owner_root, &root.to_string_lossy())?;
+            reject_parent_component(
+                &resolved,
+                &format!("stateless_generator_fs_policy_invalid_{label}"),
+            )?;
+            resolved.canonicalize().map_err(|err| {
+                mlua::Error::external(format!(
+                    "stateless_generator_fs_policy_invalid_{label}: canonicalize {}: {err}",
+                    resolved.display()
+                ))
+            })
+        })
+        .collect()
+}
+
+fn resolve_policy_path(owner_root: &Path, raw: &str) -> Result<PathBuf> {
+    let path = PathBuf::from(raw);
+    Ok(if path.is_absolute() {
+        path
+    } else {
+        owner_root.join(path)
+    })
+}
+
+fn reject_parent_component(path: &Path, error_class: &str) -> Result<()> {
+    if path
+        .components()
+        .any(|component| matches!(component, Component::ParentDir))
+    {
+        return Err(mlua::Error::external(format!(
+            "{error_class}: path must not contain `..`: {}",
+            path.display()
+        )));
+    }
     Ok(())
 }
 

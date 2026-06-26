@@ -175,6 +175,25 @@ return M
     )
 }
 
+fn write_stateless_generator_manifest(root: &std::path::Path) {
+    fs::create_dir_all(root.join("generated")).unwrap();
+    fs::write(
+        root.join("fkst.toml"),
+        r#"
+kind = "package"
+name = "generator"
+persistence_class = "stateless_generator"
+
+[code]
+root = "."
+
+[generator]
+output_roots = ["generated"]
+"#,
+    )
+    .unwrap();
+}
+
 fn dept_with_fanout(consumes: &str, produces: &str, fanout: &str) -> String {
     format!(
         r#"
@@ -218,6 +237,20 @@ fn write_package_helper(root: &std::path::Path) {
         r#"return { stall_window = function() return "45s" end }"#,
     )
     .unwrap();
+}
+
+#[test]
+fn stateless_generator_department_consumes_is_rejected_at_graph_scan() {
+    let dir = write_repo(&[("generate", &dept(r#""tick""#, ""))], &[]);
+    write_stateless_generator_manifest(dir.path());
+
+    let err = load(dir.path()).unwrap_err();
+    let msg = format!("{err:#}");
+
+    assert!(
+        msg.contains("stateless_generator_event_wiring_denied"),
+        "{msg}"
+    );
 }
 
 #[test]
