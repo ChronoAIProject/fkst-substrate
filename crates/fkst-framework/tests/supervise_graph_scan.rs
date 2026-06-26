@@ -225,7 +225,7 @@ persistence_class = "stateless_generator"
 root = "."
 
 [generator]
-output_roots = ["dist"]
+suggested_output_roots = ["dist"]
 "#,
     )
     .unwrap();

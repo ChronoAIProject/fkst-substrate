@@ -32,6 +32,16 @@ Composed package event dependencies are declared canonically in `fkst.toml` unde
 
 `composed.deps` is removed from the package-repo contract. It is not a dependency resolver, version resolver, override mechanism, ordering DSL, or cross-package `require` mechanism.
 
+Stateless generator packages declare intent in their package `fkst.toml`, not authority. A package with `persistence_class = "stateless_generator"` must declare `[generator]`; `[generator].suggested_output_roots` is optional advisory package metadata, and `[generator].package_input_roots` grants read-only package-bundled inputs relative to the package owner root. Effective write and host/project read authority is granted only by the host workspace manifest:
+
+```toml
+[generators.<package-namespace>]
+output_roots = ["dist"]
+project_input_roots = ["content"]
+```
+
+`output_roots` and `project_input_roots` are relative to the host root. `output_roots = ["."]` is rejected unless the same host grant sets `allow_host_source_mutation = true`. The removed package-side `[generator].output_roots` and `[generator].input_roots` fields are not accepted.
+
 ## 2. 固定 Lua SDK surface
 
 当前 production Lua SDK surface 是：
@@ -282,6 +292,7 @@ schema-validation
 | independent host root 下 package basename 不能是 `host` | engine path resolver |
 | `package.lua`、`FKST_STDLIB_ROOT`、`FKST_RUNTIME_PACKAGE_ROOT`、`FKST_GRAPH_ROOTS` removed surface | engine graph scan / path resolver |
 | owner-scoped `package.path` 与 package-root require isolation | engine graph scan / run / test-mode runner |
+| stateless generator package metadata can only request roots; effective `output_roots` / `project_input_roots` come from host `[generators.<package-namespace>]`, and `output_roots = ["."]` requires `allow_host_source_mutation = true` | engine manifest parser / run / test-mode runner / confined file SDK |
 | `M.spec` unknown fields 拒绝 | engine graph scan |
 | `M.spec.consumes` / `produces` / `fanout` queue 解析 | engine graph scan |
 | `M.spec.published_seam` 必须引用本 package consumed queue；sibling Department / Raiser `produces` 只能指向 own queues 或 sibling published seam | engine graph scan |

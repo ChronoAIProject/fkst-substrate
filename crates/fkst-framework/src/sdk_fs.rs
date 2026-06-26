@@ -12,13 +12,16 @@ pub fn register(lua: &Lua) -> Result<()> {
 pub(crate) fn register_confined(
     lua: &Lua,
     owner_root: &Path,
+    host_root: &Path,
     policy: StatelessGeneratorPolicy,
 ) -> Result<()> {
     let owner_root = owner_root.canonicalize().map_err(mlua::Error::external)?;
+    let host_root = host_root.canonicalize().map_err(mlua::Error::external)?;
     register_with_policy(
         lua,
         FilePolicy::Confined(ConfinedFilePolicy {
             owner_root,
+            host_root,
             read_roots: read_roots(&policy),
             output_roots: policy.output_roots,
         }),
@@ -34,6 +37,7 @@ enum FilePolicy {
 #[derive(Clone)]
 struct ConfinedFilePolicy {
     owner_root: PathBuf,
+    host_root: PathBuf,
     read_roots: Vec<PathBuf>,
     output_roots: Vec<PathBuf>,
 }
@@ -107,10 +111,15 @@ fn register_with_policy(lua: &Lua, policy: FilePolicy) -> Result<()> {
 }
 
 fn read_roots(policy: &StatelessGeneratorPolicy) -> Vec<PathBuf> {
-    let mut roots = policy.input_roots.clone();
-    for output_root in &policy.output_roots {
-        if !roots.iter().any(|root| root == output_root) {
-            roots.push(output_root.clone());
+    let mut roots = Vec::new();
+    for root in policy
+        .package_input_roots
+        .iter()
+        .chain(policy.project_input_roots.iter())
+        .chain(policy.output_roots.iter())
+    {
+        if !roots.iter().any(|existing| existing == root) {
+            roots.push(root.clone());
         }
     }
     roots
@@ -141,7 +150,7 @@ fn existing_or_parent_confined_path(policy: &FilePolicy, raw: &str) -> Result<Pa
     match policy {
         FilePolicy::Full => Ok(PathBuf::from(raw)),
         FilePolicy::Confined(policy) => {
-            let path = resolve_confined_input(policy, raw)?;
+            let path = resolve_confined_input(policy, raw, &policy.read_roots)?;
             match path.canonicalize() {
                 Ok(canonical) => {
                     ensure_under_any_root(
@@ -208,14 +217,14 @@ fn confined_existing_path(
     raw: &str,
     roots: &[PathBuf],
 ) -> Result<PathBuf> {
-    let path = resolve_confined_input(policy, raw)?;
+    let path = resolve_confined_input(policy, raw, roots)?;
     let canonical = path.canonicalize().map_err(mlua::Error::external)?;
     ensure_under_any_root(&canonical, roots, raw, "stateless_generator_fs_read_denied")?;
     Ok(canonical)
 }
 
 fn confined_write_path(policy: &ConfinedFilePolicy, raw: &str) -> Result<PathBuf> {
-    let path = resolve_confined_input(policy, raw)?;
+    let path = resolve_confined_input(policy, raw, &policy.output_roots)?;
     let parent = path.parent().ok_or_else(|| {
         mlua::Error::external(format!("file.write target `{raw}` has no parent directory"))
     })?;
@@ -234,7 +243,7 @@ fn confined_write_path(policy: &ConfinedFilePolicy, raw: &str) -> Result<PathBuf
 }
 
 fn confined_mkdir_path(policy: &ConfinedFilePolicy, raw: &str) -> Result<PathBuf> {
-    let path = resolve_confined_input(policy, raw)?;
+    let path = resolve_confined_input(policy, raw, &policy.output_roots)?;
     if let Ok(canonical) = path.canonicalize() {
         ensure_under_any_root(
             &canonical,
@@ -283,15 +292,41 @@ fn mkdir_with_policy(policy: &FilePolicy, raw: &str) -> std::io::Result<()> {
     }
 }
 
-fn resolve_confined_input(policy: &ConfinedFilePolicy, raw: &str) -> Result<PathBuf> {
+fn resolve_confined_input(
+    policy: &ConfinedFilePolicy,
+    raw: &str,
+    roots: &[PathBuf],
+) -> Result<PathBuf> {
     let path = PathBuf::from(raw);
     reject_parent_components(raw, &path)?;
-    let resolved = if path.is_absolute() {
-        path
+    if path.is_absolute() {
+        return Ok(path);
+    }
+
+    let owner_candidate = policy.owner_root.join(&path);
+    if path_candidate_can_resolve_under(&owner_candidate, roots) {
+        return Ok(owner_candidate);
+    }
+
+    let host_candidate = policy.host_root.join(&path);
+    if path_candidate_can_resolve_under(&host_candidate, roots) {
+        return Ok(host_candidate);
+    }
+
+    if roots.iter().any(|root| root.starts_with(&policy.host_root)) {
+        Ok(host_candidate)
     } else {
-        policy.owner_root.join(path)
-    };
-    Ok(resolved)
+        Ok(owner_candidate)
+    }
+}
+
+fn path_candidate_can_resolve_under(path: &Path, roots: &[PathBuf]) -> bool {
+    if let Ok(canonical) = path.canonicalize() {
+        return roots.iter().any(|root| canonical.starts_with(root));
+    }
+    nearest_existing_parent(path)
+        .map(|parent| roots.iter().any(|root| parent.starts_with(root)))
+        .unwrap_or(false)
 }
 
 fn reject_parent_components(raw: &str, path: &Path) -> Result<()> {
@@ -491,10 +526,11 @@ mod tests {
 
     fn confined_policy(root: &Path, outputs: &[&str], inputs: &[&str]) -> StatelessGeneratorPolicy {
         StatelessGeneratorPolicy {
-            input_roots: inputs
+            package_input_roots: inputs
                 .iter()
                 .map(|path| root.join(path).canonicalize().unwrap())
                 .collect(),
+            project_input_roots: Vec::new(),
             output_roots: outputs
                 .iter()
                 .map(|path| root.join(path).canonicalize().unwrap())
@@ -603,7 +639,7 @@ mod tests {
         std::fs::create_dir(tmp.path().join("input")).unwrap();
         std::fs::create_dir(tmp.path().join("dist")).unwrap();
         let policy = confined_policy(tmp.path(), &["dist"], &["input"]);
-        register_confined(&lua, tmp.path(), policy).unwrap();
+        register_confined(&lua, tmp.path(), tmp.path(), policy).unwrap();
 
         lua.load(r#"file.write("dist/nested/out.txt", "ok")"#)
             .exec()
@@ -637,7 +673,7 @@ mod tests {
         )
         .unwrap();
         let policy = confined_policy(tmp.path(), &["dist"], &[]);
-        register_confined(&lua, tmp.path(), policy).unwrap();
+        register_confined(&lua, tmp.path(), tmp.path(), policy).unwrap();
 
         let err = lua
             .load(r#"file.write("dist/out.txt", "escape")"#)
@@ -660,7 +696,7 @@ mod tests {
         std::fs::create_dir_all(tmp.path().join("dist")).unwrap();
         std::fs::create_dir_all(tmp.path().join("outside")).unwrap();
         let policy = confined_policy(tmp.path(), &["dist"], &[]);
-        register_confined(&lua, tmp.path(), policy).unwrap();
+        register_confined(&lua, tmp.path(), tmp.path(), policy).unwrap();
 
         lua.load(r#"file.mkdir("dist/assets/css")"#).exec().unwrap();
         assert!(tmp.path().join("dist/assets/css").is_dir());
@@ -682,7 +718,7 @@ mod tests {
         std::fs::write(tmp.path().join("input/source.txt"), "source").unwrap();
         std::fs::write(tmp.path().join("outside.txt"), "outside").unwrap();
         let policy = confined_policy(tmp.path(), &["dist"], &["input"]);
-        register_confined(&lua, tmp.path(), policy).unwrap();
+        register_confined(&lua, tmp.path(), tmp.path(), policy).unwrap();
 
         let content: String = lua
             .load(r#"return file.read("input/source.txt")"#)
@@ -725,7 +761,7 @@ mod tests {
         )
         .unwrap();
         let policy = confined_policy(tmp.path(), &["dist"], &["input"]);
-        register_confined(&lua, tmp.path(), policy).unwrap();
+        register_confined(&lua, tmp.path(), tmp.path(), policy).unwrap();
 
         let err = lua
             .load(r#"return file.list("input")"#)
@@ -744,7 +780,7 @@ mod tests {
         let tmp = tempdir().unwrap();
         std::fs::create_dir(tmp.path().join("dist")).unwrap();
         let policy = confined_policy(tmp.path(), &["dist"], &[]);
-        register_confined(&lua, tmp.path(), policy).unwrap();
+        register_confined(&lua, tmp.path(), tmp.path(), policy).unwrap();
 
         let err = lua
             .load(r#"return file.write("dist/../x.txt", "bad")"#)
