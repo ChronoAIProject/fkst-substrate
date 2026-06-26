@@ -133,6 +133,7 @@ fn check_sdk_registration(host_root: &std::path::Path) -> Result<()> {
     let lua = crate::mlua_init::new_lua();
     crate::mlua_init::register_framework_sdk(
         &lua,
+        crate::capabilities::CapabilityMode::Full,
         RaiseBuffer::new(),
         host_root,
         host_root,
@@ -143,7 +144,6 @@ fn check_sdk_registration(host_root: &std::path::Path) -> Result<()> {
         None,
         false,
         None,
-        crate::capabilities::CapabilityMode::Full,
     )
     .context("register framework SDK")?;
     lua.load(

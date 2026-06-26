@@ -1012,7 +1012,7 @@ fn package_manifest_parses_valid_persistence_classes() {
         ),
     ] {
         let temp = tempfile::tempdir().unwrap();
-        let generator = if class == PersistenceClass::StatelessGenerator {
+        let generator_section = if class == PersistenceClass::StatelessGenerator {
             fs::create_dir_all(temp.path().join("generated")).unwrap();
             r#"
 [generator]
@@ -1031,8 +1031,8 @@ persistence_class = "{raw}"
 
 [code]
 root = "."
-{generator}
-"#
+{generator_section}
+"#,
             ),
         );
 
@@ -1061,10 +1061,7 @@ root = "."
         let err = parse(&temp.path().join("fkst.toml")).unwrap_err();
         let msg = format!("{err:#}");
 
-        assert!(
-            msg.contains("stateless_generator manifest requires `[generator].output_roots`"),
-            "{msg}"
-        );
+        assert!(msg.contains("requires `[generator].output_roots`"), "{msg}");
     }
 }
 
@@ -1092,6 +1089,88 @@ input_roots = ["fixtures"]
 
     assert_eq!(generator.output_roots, vec![PathBuf::from("generated")]);
     assert_eq!(generator.input_roots, vec![PathBuf::from("fixtures")]);
+}
+
+#[test]
+fn stateless_generator_manifest_rejects_empty_output_roots() {
+    let temp = tempfile::tempdir().unwrap();
+    write(
+        &temp.path().join("fkst.toml"),
+        r#"
+kind = "package"
+name = "app"
+persistence_class = "stateless_generator"
+
+[code]
+root = "."
+
+[generator]
+output_roots = []
+"#,
+    );
+
+    let err = UnitManifest::parse_file_strict(&temp.path().join("fkst.toml")).unwrap_err();
+    let msg = format!("{err:#}");
+
+    assert!(msg.contains("must contain at least one path"), "{msg}");
+}
+
+#[test]
+fn generator_section_requires_stateless_generator_class() {
+    let temp = tempfile::tempdir().unwrap();
+    write(
+        &temp.path().join("fkst.toml"),
+        r#"
+kind = "package"
+name = "app"
+persistence_class = "stateless_adapter"
+
+[code]
+root = "."
+
+[generator]
+output_roots = ["dist"]
+"#,
+    );
+
+    let err = UnitManifest::parse_file_strict(&temp.path().join("fkst.toml")).unwrap_err();
+    let msg = format!("{err:#}");
+
+    assert!(
+        msg.contains("requires `persistence_class = \"stateless_generator\"`"),
+        "{msg}"
+    );
+}
+
+#[test]
+fn generator_roots_must_stay_relative() {
+    for root in ["/tmp/out", "../out"] {
+        let temp = tempfile::tempdir().unwrap();
+        write(
+            &temp.path().join("fkst.toml"),
+            &format!(
+                r#"
+kind = "package"
+name = "app"
+persistence_class = "stateless_generator"
+
+[code]
+root = "."
+
+[generator]
+output_roots = ["{root}"]
+"#
+            ),
+        );
+
+        let err = UnitManifest::parse_file_strict(&temp.path().join("fkst.toml")).unwrap_err();
+        let msg = format!("{err:#}");
+
+        assert!(
+            msg.contains("relative to the unit root") || msg.contains("must not contain `..`"),
+            "{msg}"
+        );
+    }
 }
 
 #[test]

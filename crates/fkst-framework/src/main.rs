@@ -580,13 +580,10 @@ fn run_pipeline(
     let owner_unit = catalog
         .unit_name_for_root(owner_root)?
         .ok_or_else(|| anyhow::anyhow!("no manifest unit owns {}", owner_root.display()))?;
-    let owner_manifest = catalog
-        .units()
-        .find(|unit| unit.catalog_name() == owner_unit)
-        .ok_or_else(|| anyhow::anyhow!("manifest catalog missing unit `{owner_unit}`"))?
-        .manifest()
-        .clone();
-    let capability_mode = CapabilityMode::for_manifest(&owner_manifest);
+    let capability_mode = catalog
+        .unit_for_root(owner_root)?
+        .map(|unit| CapabilityMode::from_manifest(unit.manifest()))
+        .unwrap_or(CapabilityMode::Full);
     let lua = match &capability_mode {
         CapabilityMode::Full => mlua_init::new_lua(),
         CapabilityMode::StatelessGenerator(_) => mlua_init::new_lua_restricted()
@@ -617,6 +614,7 @@ fn run_pipeline(
 
     mlua_init::register_framework_sdk(
         &lua,
+        capability_mode,
         raise_buf.clone(),
         roots.host_root(),
         owner_root,
@@ -629,7 +627,6 @@ fn run_pipeline(
         Some(roots.clone()),
         graph_json_authorized,
         raised_auth_token.clone(),
-        capability_mode,
     )?;
 
     let exit_code = match mlua_init::run_dept_with_require_roots(

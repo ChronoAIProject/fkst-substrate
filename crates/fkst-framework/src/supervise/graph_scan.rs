@@ -20,7 +20,6 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::config_registry::{ConfigContext, ConfigKey, ConfigValueType};
-use crate::manifest::PersistenceClass;
 use crate::path_resolver::{
     validate_name_segment, GraphRoot, GraphRootKind, NameResolver, PackageRoots,
 };
@@ -219,7 +218,8 @@ fn is_stateless_generator_unit(catalog: &crate::manifest::UnitCatalog, owner_uni
         .units()
         .find(|unit| unit.catalog_name() == owner_unit)
         .map(|unit| {
-            unit.manifest().persistence_class() == Some(PersistenceClass::StatelessGenerator)
+            crate::capabilities::CapabilityMode::from_manifest(unit.manifest())
+                .is_stateless_generator()
         })
         .unwrap_or(false)
 }
@@ -306,7 +306,8 @@ fn scan_departments(
             .with_context(|| format!("resolve `{}.spec.consumes`", name))?;
         let produces = resolve_queues(resolver, &graph_root.namespace, spec.produces)
             .with_context(|| format!("resolve `{}.spec.produces`", name))?;
-        reject_stateless_generator_event_wiring(stateless_generator, &name, &consumes, &produces)?;
+        reject_stateless_generator_wiring(stateless_generator, &name, &consumes, &produces)
+            .with_context(|| format!("validate `{}.spec`", name))?;
         reject_engine_dead_letter_produces(&produces, &name)
             .with_context(|| format!("validate `{}.spec.produces`", name))?;
         let fanout = resolve_queues(resolver, &graph_root.namespace, spec.fanout)
@@ -348,6 +349,24 @@ fn scan_departments(
         department_published_seam.insert(canonical_name, published_seam);
     }
 
+    Ok(())
+}
+
+fn reject_stateless_generator_wiring(
+    stateless_generator: bool,
+    department_name: &str,
+    consumes: &[String],
+    produces: &[String],
+) -> Result<()> {
+    if !stateless_generator {
+        return Ok(());
+    }
+    if !consumes.is_empty() || !produces.is_empty() {
+        bail!(
+            "stateless_generator_event_wiring_denied: stateless_generator department `{}` must not declare M.spec.consumes or M.spec.produces",
+            department_name
+        );
+    }
     Ok(())
 }
 
@@ -491,21 +510,6 @@ fn reject_engine_dead_letter_produces(produces: &[String], department_name: &str
             department_name,
             queue,
             contract.provider
-        );
-    }
-    Ok(())
-}
-
-fn reject_stateless_generator_event_wiring(
-    stateless_generator: bool,
-    department_name: &str,
-    consumes: &[String],
-    produces: &[String],
-) -> Result<()> {
-    if stateless_generator && (!consumes.is_empty() || !produces.is_empty()) {
-        bail!(
-            "stateless_generator_event_wiring_denied: department `{}` in a stateless_generator package must not declare consumes or produces",
-            department_name
         );
     }
     Ok(())

@@ -163,7 +163,7 @@ pub(crate) struct UnitManifest {
     pub(crate) kind: UnitKind,
     pub(crate) name: String,
     persistence_class: Option<PersistenceClass>,
-    generator: Option<GeneratorManifest>,
+    pub(crate) generator: Option<GeneratorManifest>,
     pub(crate) code_root: PathBuf,
     pub(crate) lib_deps: Vec<LibDep>,
     pub(crate) dependency_constraints: DependencyConstraints,
@@ -287,27 +287,6 @@ fn validate_persistence_class(
     }
 }
 
-fn validate_generator_section(
-    kind: &UnitKind,
-    persistence_class: Option<PersistenceClass>,
-    generator: &Option<GeneratorManifest>,
-) -> std::result::Result<(), toml::de::Error> {
-    if matches!(kind, UnitKind::Library) && generator.is_some() {
-        return Err(serde::de::Error::custom(
-            "library manifest must not declare `[generator]`",
-        ));
-    }
-    if persistence_class != Some(PersistenceClass::StatelessGenerator) {
-        return Ok(());
-    }
-    match generator {
-        Some(generator) if !generator.output_roots.is_empty() => Ok(()),
-        _ => Err(serde::de::Error::custom(
-            "stateless_generator manifest requires `[generator].output_roots`",
-        )),
-    }
-}
-
 fn validate_library_section(
     kind: &UnitKind,
     library: &Option<LibraryMeta>,
@@ -318,6 +297,69 @@ fn validate_library_section(
         )),
         _ => Ok(()),
     }
+}
+
+fn validate_generator_section(
+    kind: &UnitKind,
+    persistence_class: Option<PersistenceClass>,
+    generator: &Option<GeneratorManifest>,
+) -> std::result::Result<(), toml::de::Error> {
+    if generator.is_some() && !matches!(kind, UnitKind::Package(_)) {
+        return Err(serde::de::Error::custom(
+            "library manifest must not declare `[generator]`",
+        ));
+    }
+    if generator.is_some() && persistence_class != Some(PersistenceClass::StatelessGenerator) {
+        return Err(serde::de::Error::custom(
+            "`[generator]` requires `persistence_class = \"stateless_generator\"`",
+        ));
+    }
+    if persistence_class == Some(PersistenceClass::StatelessGenerator) {
+        let Some(generator) = generator else {
+            return Err(serde::de::Error::custom(
+                "`persistence_class = \"stateless_generator\"` requires `[generator].output_roots`",
+            ));
+        };
+        if generator.output_roots.is_empty() {
+            return Err(serde::de::Error::custom(
+                "`[generator].output_roots` must contain at least one path",
+            ));
+        }
+        for path in generator
+            .output_roots
+            .iter()
+            .chain(generator.input_roots.iter())
+        {
+            validate_generator_root_path(path)?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_generator_root_path(path: &Path) -> std::result::Result<(), toml::de::Error> {
+    if path.as_os_str().is_empty() {
+        return Err(serde::de::Error::custom(
+            "generator root path must not be empty",
+        ));
+    }
+    if path.is_absolute() {
+        return Err(serde::de::Error::custom(
+            "generator root path must be relative to the unit root",
+        ));
+    }
+    if path.components().any(|component| {
+        matches!(
+            component,
+            std::path::Component::ParentDir
+                | std::path::Component::RootDir
+                | std::path::Component::Prefix(_)
+        )
+    }) {
+        return Err(serde::de::Error::custom(
+            "generator root path must not contain `..`",
+        ));
+    }
+    Ok(())
 }
 
 #[derive(Deserialize)]
@@ -652,6 +694,16 @@ impl UnitCatalog {
                 None
             }
         }))
+    }
+
+    pub(crate) fn unit_for_root(&self, owner_root: &Path) -> Result<Option<&CatalogUnit>> {
+        let canonical = owner_root
+            .canonicalize()
+            .with_context(|| format!("canonicalize {}", owner_root.display()))?;
+        Ok(self
+            .units
+            .values()
+            .find(|unit| unit.unit_root == canonical || unit.code_root == canonical))
     }
 
     pub(crate) fn module_index_for_unit(&self, unit_name: &str) -> Option<&ModuleIndex> {

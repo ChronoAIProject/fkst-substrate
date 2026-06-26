@@ -318,6 +318,7 @@ impl SemanticLuaRulePack {
         };
         crate::mlua_init::register_framework_sdk(
             &lua,
+            crate::capabilities::CapabilityMode::Full,
             crate::raise::RaiseBuffer::new(),
             context.options.roots.host_root(),
             &self.owner_root,
@@ -328,7 +329,6 @@ impl SemanticLuaRulePack {
             Some(context.options.roots.clone()),
             false,
             None,
-            crate::capabilities::CapabilityMode::Full,
         )
         .context("register package SDK")?;
         let env = crate::lua_require::install_scoped_require(&lua, catalog, &owner_unit)

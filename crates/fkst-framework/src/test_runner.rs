@@ -57,6 +57,7 @@ pub(crate) fn run_tests(
         let lua = crate::mlua_init::new_lua();
         crate::mlua_init::register_framework_sdk_with_runner(
             &lua,
+            crate::capabilities::CapabilityMode::Full,
             RaiseBuffer::new(),
             roots.host_root(),
             &file.owner_root,
@@ -69,7 +70,6 @@ pub(crate) fn run_tests(
             false,
             None,
             Some(mock_observe.clone()),
-            crate::capabilities::CapabilityMode::Full,
         )
         .with_context(|| format!("register SDK for {}", relpath))?;
         register_test_sdk(
@@ -597,6 +597,7 @@ pub(crate) fn run_department_core(
 ) -> mlua::Result<DepartmentRunOutcome> {
     let _guard = DeptRunEnvGuard::apply(opts)?;
     let owner_unit = cache.owner_unit_for_root(owner_root)?;
+    let capability_mode = cache.capability_mode_for_root(owner_root)?;
     let graph_json_authorized =
         crate::sdk_graph::department_authorized(roots, owner_root, &lua_path).unwrap_or(false);
     let qualified_consumes = cache.declared_qualified_consumes(owner_root, &lua_path)?;
@@ -614,6 +615,7 @@ pub(crate) fn run_department_core(
     let raise_buf = RaiseBuffer::new();
     crate::mlua_init::register_framework_sdk_with_runner(
         &dept_lua,
+        capability_mode,
         raise_buf.clone(),
         roots.host_root(),
         owner_root,
@@ -628,7 +630,6 @@ pub(crate) fn run_department_core(
         graph_json_authorized,
         None,
         Some(mock_observe),
-        crate::capabilities::CapabilityMode::Full,
     )?;
     if let Some(coverage) = &coverage {
         coverage.install(&dept_lua)?;
@@ -759,6 +760,20 @@ impl TestRunCache {
             .map_err(|_| mlua::Error::runtime("test run cache lock poisoned"))?;
         inner.owner_units.insert(owner_root, unit.clone());
         Ok(unit)
+    }
+
+    fn capability_mode_for_root(
+        &self,
+        owner_root: &Path,
+    ) -> mlua::Result<crate::capabilities::CapabilityMode> {
+        Ok(self
+            .roots
+            .catalog_for_owner_root(owner_root)
+            .map_err(mlua::Error::external)?
+            .unit_for_root(owner_root)
+            .map_err(mlua::Error::external)?
+            .map(|unit| crate::capabilities::CapabilityMode::from_manifest(unit.manifest()))
+            .unwrap_or(crate::capabilities::CapabilityMode::Full))
     }
 
     fn declared_resolved_produces(

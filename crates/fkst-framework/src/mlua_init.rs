@@ -51,6 +51,7 @@ fn remove_restricted_generator_globals(lua: &Lua) -> mlua::Result<()> {
 /// Register the framework SDK globals in the same order for every entry point.
 pub fn register_framework_sdk(
     lua: &Lua,
+    capability_mode: CapabilityMode,
     raise_buf: RaiseBuffer,
     host_root: &Path,
     owner_root: &Path,
@@ -61,20 +62,19 @@ pub fn register_framework_sdk(
     graph_roots: Option<PackageRoots>,
     graph_json_authorized: bool,
     raised_auth_token: Option<String>,
-    capability_mode: CapabilityMode,
 ) -> mlua::Result<()> {
     let config = ConfigContext::from_host_root(host_root).map_err(mlua::Error::external)?;
     crate::rate_pool::RatePoolRegistry::from_config(&config).map_err(mlua::Error::external)?;
     crate::sdk_log::register(lua)?;
     crate::sdk_i18n::register(lua, owner_root)?;
+    crate::sdk_strings::register(lua)?;
+    crate::sdk_json::register(lua)?;
     match capability_mode {
         CapabilityMode::Full => {
             crate::sdk_basic::register_with_runner(lua, config.clone(), None)?;
-            crate::sdk_strings::register(lua)?;
             crate::sdk_restricted_lua::register(lua)?;
             crate::sdk_graph::register(lua, graph_roots, graph_json_authorized)?;
             crate::sdk_fs::register(lua)?;
-            crate::sdk_json::register(lua)?;
             crate::sdk_git::register(lua, host_root, config.clone())?;
             crate::sdk_mark::register(lua, host_root)?;
             crate::sdk_cache::register(lua, host_root)?;
@@ -90,11 +90,10 @@ pub fn register_framework_sdk(
             crate::raise::register(lua, raise_buf, resolver, owner_namespace, raise_authority)?;
         }
         CapabilityMode::StatelessGenerator(policy) => {
-            crate::sdk_strings::register(lua)?;
-            crate::sdk_json::register(lua)?;
-            let fs_policy =
-                crate::sdk_fs::FsPolicy::new(owner_root, policy.output_roots, policy.input_roots)?;
-            crate::sdk_fs::register_with_policy(lua, fs_policy)?;
+            let policy = policy
+                .canonicalize_under(owner_root)
+                .map_err(mlua::Error::external)?;
+            crate::sdk_fs::register_confined(lua, owner_root, policy)?;
         }
     }
     Ok(())
@@ -102,6 +101,7 @@ pub fn register_framework_sdk(
 
 pub(crate) fn register_framework_sdk_with_runner(
     lua: &Lua,
+    capability_mode: CapabilityMode,
     raise_buf: RaiseBuffer,
     host_root: &Path,
     owner_root: &Path,
@@ -114,20 +114,19 @@ pub(crate) fn register_framework_sdk_with_runner(
     graph_json_authorized: bool,
     raised_auth_token: Option<String>,
     mock_observe: Option<crate::sdk_observe::MockObserveState>,
-    capability_mode: CapabilityMode,
 ) -> mlua::Result<()> {
     let config = ConfigContext::from_host_root(host_root).map_err(mlua::Error::external)?;
     crate::rate_pool::RatePoolRegistry::from_config(&config).map_err(mlua::Error::external)?;
     crate::sdk_log::register(lua)?;
     crate::sdk_i18n::register(lua, owner_root)?;
+    crate::sdk_strings::register(lua)?;
+    crate::sdk_json::register(lua)?;
     match capability_mode {
         CapabilityMode::Full => {
             crate::sdk_basic::register_with_runner(lua, config.clone(), runner.clone())?;
-            crate::sdk_strings::register(lua)?;
             crate::sdk_restricted_lua::register(lua)?;
             crate::sdk_graph::register(lua, graph_roots, graph_json_authorized)?;
             crate::sdk_fs::register(lua)?;
-            crate::sdk_json::register(lua)?;
             crate::sdk_git::register_with_runner(lua, host_root, config.clone(), runner.clone())?;
             crate::sdk_mark::register(lua, host_root)?;
             crate::sdk_cache::register(lua, host_root)?;
@@ -144,11 +143,10 @@ pub(crate) fn register_framework_sdk_with_runner(
             crate::raise::register(lua, raise_buf, resolver, owner_namespace, raise_authority)?;
         }
         CapabilityMode::StatelessGenerator(policy) => {
-            crate::sdk_strings::register(lua)?;
-            crate::sdk_json::register(lua)?;
-            let fs_policy =
-                crate::sdk_fs::FsPolicy::new(owner_root, policy.output_roots, policy.input_roots)?;
-            crate::sdk_fs::register_with_policy(lua, fs_policy)?;
+            let policy = policy
+                .canonicalize_under(owner_root)
+                .map_err(mlua::Error::external)?;
+            crate::sdk_fs::register_confined(lua, owner_root, policy)?;
         }
     }
     Ok(())
@@ -369,7 +367,7 @@ pub(crate) fn run_dept_with_package_path_chunk_cache_and_name_root(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::capabilities::{CapabilityMode, GeneratorCapabilityPolicy};
+    use crate::capabilities::{CapabilityMode, StatelessGeneratorPolicy};
     use std::time::{Duration, UNIX_EPOCH};
     use tempfile::TempDir;
 
@@ -408,6 +406,7 @@ root = "."
     fn register_test_sdk(lua: &Lua, root: &Path, capability_mode: CapabilityMode) {
         register_framework_sdk(
             lua,
+            capability_mode,
             RaiseBuffer::new(),
             root,
             root,
@@ -418,7 +417,6 @@ root = "."
             None,
             false,
             None,
-            capability_mode,
         )
         .unwrap();
     }
@@ -432,7 +430,7 @@ root = "."
         register_test_sdk(
             &lua,
             dir.path(),
-            CapabilityMode::StatelessGenerator(GeneratorCapabilityPolicy {
+            CapabilityMode::StatelessGenerator(StatelessGeneratorPolicy {
                 output_roots: vec![out],
                 input_roots: Vec::new(),
             }),
@@ -521,7 +519,7 @@ root = "."
             register_test_sdk(
                 &lua,
                 dir.path(),
-                CapabilityMode::StatelessGenerator(GeneratorCapabilityPolicy {
+                CapabilityMode::StatelessGenerator(StatelessGeneratorPolicy {
                     output_roots: vec![PathBuf::from("generated")],
                     input_roots: Vec::new(),
                 }),
@@ -549,7 +547,7 @@ root = "."
         register_test_sdk(
             &lua,
             dir.path(),
-            CapabilityMode::StatelessGenerator(GeneratorCapabilityPolicy {
+            CapabilityMode::StatelessGenerator(StatelessGeneratorPolicy {
                 output_roots: vec![PathBuf::from("generated")],
                 input_roots: vec![PathBuf::from("fixtures")],
             }),
@@ -626,7 +624,7 @@ root = "."
         register_test_sdk(
             &lua,
             dir.path(),
-            CapabilityMode::StatelessGenerator(GeneratorCapabilityPolicy {
+            CapabilityMode::StatelessGenerator(StatelessGeneratorPolicy {
                 output_roots: vec![PathBuf::from("generated")],
                 input_roots: Vec::new(),
             }),
