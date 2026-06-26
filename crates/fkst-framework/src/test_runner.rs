@@ -69,6 +69,7 @@ pub(crate) fn run_tests(
             false,
             None,
             Some(mock_observe.clone()),
+            crate::capabilities::UnitCapabilities::empty(),
         )
         .with_context(|| format!("register SDK for {}", relpath))?;
         register_test_sdk(
@@ -596,6 +597,7 @@ pub(crate) fn run_department_core(
 ) -> mlua::Result<DepartmentRunOutcome> {
     let _guard = DeptRunEnvGuard::apply(opts)?;
     let owner_unit = cache.owner_unit_for_root(owner_root)?;
+    let capabilities = cache.owner_capabilities_for_root(owner_root)?;
     let graph_json_authorized =
         crate::sdk_graph::department_authorized(roots, owner_root, &lua_path).unwrap_or(false);
     let qualified_consumes = cache.declared_qualified_consumes(owner_root, &lua_path)?;
@@ -627,6 +629,7 @@ pub(crate) fn run_department_core(
         graph_json_authorized,
         None,
         Some(mock_observe),
+        capabilities,
     )?;
     if let Some(coverage) = &coverage {
         coverage.install(&dept_lua)?;
@@ -757,6 +760,25 @@ impl TestRunCache {
             .map_err(|_| mlua::Error::runtime("test run cache lock poisoned"))?;
         inner.owner_units.insert(owner_root, unit.clone());
         Ok(unit)
+    }
+
+    fn owner_capabilities_for_root(
+        &self,
+        owner_root: &Path,
+    ) -> mlua::Result<crate::capabilities::UnitCapabilities> {
+        let catalog = self
+            .roots
+            .catalog_for_owner_root(owner_root)
+            .map_err(mlua::Error::external)?;
+        let unit = catalog
+            .unit_for_root(owner_root)
+            .map_err(mlua::Error::external)?
+            .ok_or_else(|| {
+                mlua::Error::external(format!("no manifest unit owns {}", owner_root.display()))
+            })?;
+        Ok(crate::capabilities::UnitCapabilities::for_manifest(
+            unit.manifest(),
+        ))
     }
 
     fn declared_resolved_produces(

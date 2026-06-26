@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
+use crate::capabilities::UnitCapabilities;
 use crate::config_registry::ConfigContext;
 use crate::external_command::MockCommandState;
 use crate::manifest::UnitCatalog;
@@ -32,6 +33,7 @@ pub fn register_framework_sdk(
     graph_roots: Option<PackageRoots>,
     graph_json_authorized: bool,
     raised_auth_token: Option<String>,
+    capabilities: UnitCapabilities,
 ) -> mlua::Result<()> {
     let config = ConfigContext::from_host_root(host_root).map_err(mlua::Error::external)?;
     crate::rate_pool::RatePoolRegistry::from_config(&config).map_err(mlua::Error::external)?;
@@ -44,7 +46,7 @@ pub fn register_framework_sdk(
     crate::sdk_fs::register(lua)?;
     crate::sdk_json::register(lua)?;
     crate::sdk_git::register(lua, host_root, config.clone())?;
-    crate::sdk_mark::register(lua, host_root)?;
+    crate::sdk_mark::register(lua, host_root, capabilities.saga_recovery)?;
     crate::sdk_cache::register(lua, host_root)?;
     crate::sdk_observe::register(lua, None)?;
     crate::sdk_codex::register(
@@ -73,6 +75,7 @@ pub(crate) fn register_framework_sdk_with_runner(
     graph_json_authorized: bool,
     raised_auth_token: Option<String>,
     mock_observe: Option<crate::sdk_observe::MockObserveState>,
+    capabilities: UnitCapabilities,
 ) -> mlua::Result<()> {
     let config = ConfigContext::from_host_root(host_root).map_err(mlua::Error::external)?;
     crate::rate_pool::RatePoolRegistry::from_config(&config).map_err(mlua::Error::external)?;
@@ -85,7 +88,7 @@ pub(crate) fn register_framework_sdk_with_runner(
     crate::sdk_fs::register(lua)?;
     crate::sdk_json::register(lua)?;
     crate::sdk_git::register_with_runner(lua, host_root, config.clone(), runner.clone())?;
-    crate::sdk_mark::register(lua, host_root)?;
+    crate::sdk_mark::register(lua, host_root, capabilities.saga_recovery)?;
     crate::sdk_cache::register(lua, host_root)?;
     crate::sdk_observe::register(lua, mock_observe)?;
     crate::sdk_codex::register_with_runner(
