@@ -1,4 +1,3 @@
-use crate::manifest::PersistenceClass;
 use crate::path_resolver::PackageRoots;
 use mlua::{Table, Value};
 use std::collections::BTreeSet;
@@ -59,24 +58,6 @@ pub(crate) fn declared_qualified_spec_queues(
         .collect())
 }
 
-pub(crate) fn declared_raw_spec_queues(
-    owner_root: &Path,
-    lua_path: &Path,
-    catalog: Arc<crate::manifest::UnitCatalog>,
-    owner_unit: &str,
-    chunk_cache: &crate::mlua_init::LuaChunkCache,
-    field: &str,
-) -> mlua::Result<BTreeSet<String>> {
-    declared_spec_queues(
-        owner_root,
-        lua_path,
-        catalog,
-        owner_unit,
-        chunk_cache,
-        field,
-    )
-}
-
 fn declared_spec_queues(
     owner_root: &Path,
     lua_path: &Path,
@@ -89,18 +70,7 @@ fn declared_spec_queues(
         return Ok(BTreeSet::new());
     }
 
-    let lua = if catalog
-        .units()
-        .find(|unit| unit.catalog_name() == owner_unit)
-        .map(|unit| {
-            unit.manifest().persistence_class() == Some(PersistenceClass::StatelessGenerator)
-        })
-        .unwrap_or(false)
-    {
-        crate::mlua_init::new_lua_restricted()?
-    } else {
-        crate::mlua_init::new_lua()
-    };
+    let lua = crate::mlua_init::new_lua();
     let env = crate::lua_require::unit_environment(&lua, catalog, owner_unit)?;
     let value = match chunk_cache.eval_cached_chunk_with_env(&lua, lua_path, owner_root, env) {
         Ok(value) => value,

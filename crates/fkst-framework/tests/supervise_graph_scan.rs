@@ -213,24 +213,6 @@ return M
     )
 }
 
-fn write_stateless_generator_manifest(root: &std::path::Path) {
-    fs::write(
-        root.join("fkst.toml"),
-        r#"
-kind = "package"
-name = "generator"
-persistence_class = "stateless_generator"
-
-[code]
-root = "."
-
-[generator]
-suggested_output_roots = ["dist"]
-"#,
-    )
-    .unwrap();
-}
-
 fn write_package_helper(root: &std::path::Path) {
     fs::create_dir_all(root.join("fkst")).unwrap();
     fs::write(
@@ -238,20 +220,6 @@ fn write_package_helper(root: &std::path::Path) {
         r#"return { stall_window = function() return "45s" end }"#,
     )
     .unwrap();
-}
-
-#[test]
-fn stateless_generator_department_consumes_is_rejected_at_graph_scan() {
-    let dir = write_repo(&[("generate", &dept(r#""tick""#, ""))], &[]);
-    write_stateless_generator_manifest(dir.path());
-
-    let err = load(dir.path()).unwrap_err();
-    let msg = format!("{err:#}");
-
-    assert!(
-        msg.contains("stateless_generator_event_wiring_denied"),
-        "{msg}"
-    );
 }
 
 #[test]
@@ -601,33 +569,6 @@ return M
 
     assert!(msg.contains("exec_sync"), "got: {msg}");
     assert!(msg.contains("eval department `hello`"), "got: {msg}");
-}
-
-#[test]
-fn stateless_generator_rejects_event_loop_wiring() {
-    let dir = write_repo(
-        &[(
-            "generate",
-            r#"
-local M = {}
-M.spec = { consumes = {"tick"}, produces = {"done"}, stall_window = "30s" }
-function pipeline(_) end
-return M
-"#,
-        )],
-        &[(
-            "cron_a",
-            r#"return { type = "cron", interval = "10s", produces = "tick" }"#,
-        )],
-    );
-    write_stateless_generator_manifest(dir.path());
-
-    let err = load(dir.path()).unwrap_err();
-    let msg = format!("{err:#}");
-
-    assert!(msg.contains("stateless_generator department"), "got: {msg}");
-    assert!(msg.contains("M.spec.consumes"), "got: {msg}");
-    assert!(msg.contains("M.spec.produces"), "got: {msg}");
 }
 
 #[test]

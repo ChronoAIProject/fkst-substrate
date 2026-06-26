@@ -46,14 +46,6 @@ pub async fn spawn_consumer(
     process_groups: ProcessGroupRegistry,
     journal: SupervisorJournal,
 ) -> JoinHandle<()> {
-    if department_is_stateless_generator(&roots, &decl) {
-        return tokio::spawn(async move {
-            error!(
-                dept = %name,
-                "stateless_generator department cannot be dispatched as an event consumer"
-            );
-        });
-    }
     let reliable_queues: Vec<String> = decl
         .consumes
         .iter()
@@ -211,18 +203,6 @@ pub async fn spawn_consumer(
             }
         }
     })
-}
-
-fn department_is_stateless_generator(roots: &PackageRoots, decl: &DepartmentDecl) -> bool {
-    roots
-        .catalog_for_owner_root(&decl.owner_root)
-        .ok()
-        .and_then(|catalog| catalog.unit_for_root(&decl.owner_root).ok().flatten())
-        .map(|unit| {
-            unit.manifest().persistence_class()
-                == Some(crate::manifest::PersistenceClass::StatelessGenerator)
-        })
-        .unwrap_or(false)
 }
 
 async fn recv_reliable_wake(rx: &mut Option<mpsc::Receiver<()>>) -> Option<()> {

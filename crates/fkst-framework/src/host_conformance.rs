@@ -318,7 +318,6 @@ impl SemanticLuaRulePack {
         };
         crate::mlua_init::register_framework_sdk(
             &lua,
-            crate::capabilities::CapabilityMode::Full,
             crate::raise::RaiseBuffer::new(),
             context.options.roots.host_root(),
             &self.owner_root,
