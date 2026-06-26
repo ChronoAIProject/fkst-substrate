@@ -1,14 +1,17 @@
 use crate::manifest::{PersistenceClass, UnitManifest};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[allow(dead_code)]
 pub(crate) struct UnitCapabilities {
-    /// Follow-up: gate saga-recovery marker primitives on capabilities.saga_recovery.
     pub(crate) saga_recovery: bool,
 }
 
-#[allow(dead_code)]
 impl UnitCapabilities {
+    pub(crate) fn empty() -> Self {
+        Self {
+            saga_recovery: false,
+        }
+    }
+
     pub(crate) fn for_manifest(manifest: &UnitManifest) -> Self {
         Self {
             saga_recovery: manifest.persistence_class() == Some(PersistenceClass::Saga),

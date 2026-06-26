@@ -374,6 +374,89 @@ return M
     .unwrap();
 }
 
+fn write_saga_manifest(root: &std::path::Path, include_conformance_function: bool) {
+    let conformance = if include_conformance_function {
+        r#"
+[conformance]
+function = "core.conformance.restart_transition_errors"
+"#
+    } else {
+        ""
+    };
+    fs::write(
+        root.join("fkst.toml"),
+        format!(
+            r#"
+kind = "package"
+name = "{}"
+persistence_class = "saga"
+
+[code]
+root = "."
+
+[lib_deps]
+libraries = []
+{conformance}
+"#,
+            unit_name(root)
+        ),
+    )
+    .unwrap();
+}
+
+fn write_saga_department(root: &std::path::Path) {
+    fs::create_dir_all(root.join("workflow")).unwrap();
+    fs::write(
+        root.join("workflow/saga.lua"),
+        r#"
+local M = {}
+function M.department(spec)
+  return spec
+end
+return M
+"#,
+    )
+    .unwrap();
+    fs::create_dir_all(root.join("departments/hello")).unwrap();
+    fs::write(
+        root.join("departments/hello/main.lua"),
+        r#"
+local saga = require("workflow.saga")
+
+local M = {}
+M.spec = { consumes = {"tick"}, stall_window = "30s" }
+saga.department(M)
+function pipeline(_) end
+return M
+"#,
+    )
+    .unwrap();
+}
+
+fn write_saga_conformance_function(root: &std::path::Path, no_errors: bool) {
+    fs::create_dir_all(root.join("core")).unwrap();
+    let body = if no_errors {
+        "  return {}"
+    } else {
+        r#"  return {
+    { id = "restart-transition-table", message = "restart transition proof missing" },
+  }"#
+    };
+    fs::write(
+        root.join("core/conformance.lua"),
+        format!(
+            r#"
+local M = {{}}
+function M.restart_transition_errors()
+{body}
+end
+return M
+"#
+        ),
+    )
+    .unwrap();
+}
+
 fn write_semantic_conformance_library(root: &std::path::Path, name: &str, function_body: &str) {
     write_library_manifest(root, name, &[]);
     append_conformance_function_manifest(root, &format!("{name}.conformance_errors"));
@@ -615,6 +698,76 @@ return M
     let report = stdout_json_report(&output);
     assert_eq!(report["ok"], true);
     assert_eq!(report["violations"], serde_json::json!([]));
+}
+
+#[test]
+fn saga_persistence_class_selects_proof_obligations() {
+    let host = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
+    write_minimal_host(host.path());
+    write_saga_manifest(host.path(), true);
+    write_saga_department(host.path());
+    write_saga_conformance_function(host.path(), true);
+
+    let args = [
+        std::ffi::OsStr::new("--project-root"),
+        path_arg(host.path()),
+    ];
+    let output = run_conformance(&args, host.path());
+
+    assert_exit(&output, 0);
+    let log = combined_log(&output);
+    assert!(log.contains("PASS persistence-class"), "{log}");
+    assert!(log.contains("PASS conformance-function"), "{log}");
+    let report = stdout_json_report(&output);
+    assert_eq!(report["ok"], true);
+}
+
+#[test]
+fn saga_persistence_class_requires_conformance_function() {
+    let host = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
+    write_minimal_host(host.path());
+    write_saga_manifest(host.path(), false);
+    write_saga_department(host.path());
+    write_saga_conformance_function(host.path(), false);
+
+    let args = [
+        std::ffi::OsStr::new("--project-root"),
+        path_arg(host.path()),
+    ];
+    let output = run_conformance(&args, host.path());
+
+    assert_fail_closed(
+        &output,
+        &[
+            "FAIL saga-proof-obligations",
+            "persistence_class `saga` must declare `[conformance].function`",
+            "engine.saga-proof-obligations",
+        ],
+    );
+}
+
+#[test]
+fn saga_persistence_class_requires_saga_code_shape() {
+    let host = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
+    write_minimal_host(host.path());
+    write_saga_manifest(host.path(), true);
+    write_saga_conformance_function(host.path(), true);
+
+    let args = [
+        std::ffi::OsStr::new("--project-root"),
+        path_arg(host.path()),
+    ];
+    let output = run_conformance(&args, host.path());
+
+    assert_fail_closed(
+        &output,
+        &[
+            "FAIL saga-proof-obligations",
+            "require(\"workflow.saga\")",
+            "`.department`",
+            "engine.saga-proof-obligations",
+        ],
+    );
 }
 
 #[test]

@@ -32,6 +32,8 @@ Composed package event dependencies are declared canonically in `fkst.toml` unde
 
 `composed.deps` is removed from the package-repo contract. It is not a dependency resolver, version resolver, override mechanism, ordering DSL, or cross-package `require` mechanism.
 
+`persistence_class` is the package manifest's typed persistence declaration. `persistence_class = "saga"` derives the `saga_recovery` capability, which is required to call `once(key, fn)`. The declaration selects proof obligations instead of replacing them: Saga packages must include saga-shaped Department code (`require("workflow.saga")` and `.department`) and declare `[conformance].function` for restart-transition proof obligations. Non-Saga packages cannot use `once`.
+
 Stateless generator packages declare intent in their package `fkst.toml`, not authority. A package with `persistence_class = "stateless_generator"` must declare `[generator]`; `[generator].suggested_output_roots` is optional advisory package metadata, and `[generator].package_input_roots` grants read-only package-bundled inputs relative to the package owner root. Effective write and host/project read authority is granted only by the host workspace manifest:
 
 ```toml

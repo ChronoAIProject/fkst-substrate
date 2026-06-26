@@ -580,6 +580,10 @@ fn run_pipeline(
     let owner_unit = catalog
         .unit_name_for_root(owner_root)?
         .ok_or_else(|| anyhow::anyhow!("no manifest unit owns {}", owner_root.display()))?;
+    let capabilities = catalog
+        .unit_for_root(owner_root)?
+        .map(|unit| capabilities::UnitCapabilities::for_manifest(unit.manifest()))
+        .ok_or_else(|| anyhow::anyhow!("no manifest unit owns {}", owner_root.display()))?;
     let catalog = Arc::new(catalog);
     let graph_json_authorized =
         sdk_graph::department_authorized(&roots, owner_root, &lua_path).unwrap_or(false);
@@ -607,6 +611,7 @@ fn run_pipeline(
         Some(roots.clone()),
         graph_json_authorized,
         raised_auth_token.clone(),
+        capabilities,
     )?;
 
     let exit_code = match mlua_init::run_dept_with_require_roots(

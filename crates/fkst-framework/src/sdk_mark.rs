@@ -10,16 +10,23 @@ use std::path::Path;
 
 use crate::{runtime_context, sdk_log};
 
-pub fn register(lua: &Lua, host_root: &Path) -> Result<()> {
+pub fn register(lua: &Lua, host_root: &Path, saga_recovery: bool) -> Result<()> {
     let host_root = host_root.to_path_buf();
     lua.globals().set(
         "once",
-        lua.create_function(move |_, (key, f): (String, Function)| once(&host_root, key, f))?,
+        lua.create_function(move |_, (key, f): (String, Function)| {
+            once(&host_root, saga_recovery, key, f)
+        })?,
     )?;
     Ok(())
 }
 
-fn once(host_root: &Path, key: String, f: Function) -> Result<bool> {
+fn once(host_root: &Path, saga_recovery: bool, key: String, f: Function) -> Result<bool> {
+    if !saga_recovery {
+        return Err(mlua::Error::external(anyhow::anyhow!(
+            "once requires saga_recovery capability"
+        )));
+    }
     let key = validate_runtime_key(&key).map_err(mlua::Error::external)?;
     let layout =
         runtime_context::layout_from_host_root(host_root).map_err(mlua::Error::external)?;

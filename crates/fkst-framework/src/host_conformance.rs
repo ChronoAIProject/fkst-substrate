@@ -1,4 +1,4 @@
-use crate::manifest::{UnitKind, UnitManifest, UNIT_MANIFEST};
+use crate::manifest::{PersistenceClass, UnitKind, UnitManifest, UNIT_MANIFEST};
 use crate::path_resolver::{
     GraphRoot, GraphRootKind, LibraryConformanceRoot, NameResolver, PackageRoots,
 };
@@ -328,6 +328,7 @@ impl SemanticLuaRulePack {
             Some(context.options.roots.clone()),
             false,
             None,
+            crate::capabilities::UnitCapabilities::empty(),
         )
         .context("register package SDK")?;
         let env = crate::lua_require::install_scoped_require(&lua, catalog, &owner_unit)
@@ -633,7 +634,7 @@ impl EngineRulePack {
                 Err(err) => {
                     checks.push(HostCheck::fail_for_package(
                         "persistence-class",
-                        graph_root.namespace,
+                        graph_root.namespace.clone(),
                         format!(
                             "package manifest {} failed persistence_class validation: {err:#}",
                             manifest_path.display()
@@ -645,7 +646,7 @@ impl EngineRulePack {
             if !matches!(manifest.kind, UnitKind::Package(_)) {
                 checks.push(HostCheck::fail_for_package(
                     "persistence-class",
-                    graph_root.namespace,
+                    graph_root.namespace.clone(),
                     format!(
                         "active package root {} resolved to non-package manifest kind",
                         graph_root.root.display()
@@ -653,12 +654,22 @@ impl EngineRulePack {
                 ));
                 continue;
             }
-            if manifest.persistence_class().is_none() {
-                checks.push(HostCheck::fail_for_package(
-                    "persistence-class",
-                    graph_root.namespace,
-                    "package manifest must declare `persistence_class`".to_string(),
-                ));
+            match manifest.persistence_class() {
+                None => {
+                    checks.push(HostCheck::fail_for_package(
+                        "persistence-class",
+                        graph_root.namespace.clone(),
+                        "package manifest must declare `persistence_class`".to_string(),
+                    ));
+                }
+                Some(PersistenceClass::Saga) => {
+                    checks.extend(self.check_saga_proof_obligations(
+                        graph_root.namespace.clone(),
+                        &graph_root.root,
+                        &manifest,
+                    ));
+                }
+                Some(_) => {}
             }
         }
 
@@ -670,6 +681,48 @@ impl EngineRulePack {
         } else {
             checks
         }
+    }
+
+    fn check_saga_proof_obligations(
+        &self,
+        package: String,
+        package_root: &Path,
+        manifest: &UnitManifest,
+    ) -> Vec<HostCheck> {
+        let mut checks = Vec::new();
+
+        if !manifest
+            .conformance
+            .as_ref()
+            .and_then(|conformance| conformance.function.as_ref())
+            .map(|function| !function.trim().is_empty())
+            .unwrap_or(false)
+        {
+            checks.push(HostCheck::fail_for_package(
+                "saga-proof-obligations",
+                package.clone(),
+                "persistence_class `saga` must declare `[conformance].function` for restart-transition proof obligations".to_string(),
+            ));
+        }
+
+        match saga_shape_modules(package_root) {
+            Ok(SagaShape {
+                workflow_saga_require,
+                saga_department,
+            }) if workflow_saga_require && saga_department => {}
+            Ok(_) => checks.push(HostCheck::fail_for_package(
+                "saga-proof-obligations",
+                package,
+                "persistence_class `saga` must include saga-shaped department code: require(\"workflow.saga\") and `.department`".to_string(),
+            )),
+            Err(err) => checks.push(HostCheck::fail_for_package(
+                "saga-proof-obligations",
+                package,
+                format!("scan saga proof obligations failed: {err:#}"),
+            )),
+        }
+
+        checks
     }
 
     fn check_department_non_empty(&self, cfg: &fkst_common::config::Config) -> HostCheck {
@@ -710,6 +763,49 @@ impl EngineRulePack {
             Err(err) => HostCheck::fail("schema-validation", format!("{err}")),
         }
     }
+}
+
+#[derive(Default)]
+struct SagaShape {
+    workflow_saga_require: bool,
+    saga_department: bool,
+}
+
+fn saga_shape_modules(package_root: &Path) -> Result<SagaShape> {
+    let mut shape = SagaShape::default();
+    let departments = package_root.join("departments");
+    if !departments.exists() {
+        return Ok(shape);
+    }
+    scan_saga_shape_dir(&departments, &mut shape)?;
+    Ok(shape)
+}
+
+fn scan_saga_shape_dir(dir: &Path, shape: &mut SagaShape) -> Result<()> {
+    let mut entries = std::fs::read_dir(dir)
+        .with_context(|| format!("read {}", dir.display()))?
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .with_context(|| format!("read {}", dir.display()))?;
+    entries.sort_by_key(|entry| entry.path());
+    for entry in entries {
+        let path = entry.path();
+        let metadata = entry
+            .metadata()
+            .with_context(|| format!("stat {}", path.display()))?;
+        if metadata.is_dir() {
+            scan_saga_shape_dir(&path, shape)?;
+        } else if path.extension().and_then(|ext| ext.to_str()) == Some("lua") {
+            let source = std::fs::read_to_string(&path)
+                .with_context(|| format!("read {}", path.display()))?;
+            shape.workflow_saga_require |= contains_workflow_saga_require(&source);
+            shape.saga_department |= source.contains(".department");
+        }
+    }
+    Ok(())
+}
+
+fn contains_workflow_saga_require(source: &str) -> bool {
+    source.contains("require(\"workflow.saga\")") || source.contains("require('workflow.saga')")
 }
 
 impl HostCheck {
