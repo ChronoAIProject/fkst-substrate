@@ -164,6 +164,7 @@ pub(crate) struct UnitManifest {
     pub(crate) name: String,
     persistence_class: Option<PersistenceClass>,
     pub(crate) generator: Option<GeneratorManifest>,
+    pub(crate) generated: Option<GeneratedManifest>,
     pub(crate) code_root: PathBuf,
     pub(crate) lib_deps: Vec<LibDep>,
     pub(crate) dependency_constraints: DependencyConstraints,
@@ -214,6 +215,12 @@ pub(crate) struct GeneratorManifest {
     pub(crate) input_roots: Vec<PathBuf>,
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct GeneratedManifest {
+    pub(crate) root: PathBuf,
+}
+
 #[derive(Clone, Copy)]
 enum ManifestParseMode {
     Runtime,
@@ -226,6 +233,7 @@ struct UnitManifestToml {
     name: String,
     persistence_class: Option<PersistenceClass>,
     generator: Option<GeneratorManifest>,
+    generated: Option<GeneratedManifest>,
     code: CodeToml,
     #[serde(default)]
     lib_deps: LibDepsToml,
@@ -248,6 +256,7 @@ impl UnitManifestToml {
     ) -> std::result::Result<UnitManifest, toml::de::Error> {
         validate_persistence_class(&self.kind, self.persistence_class)?;
         validate_generator_section(&self.kind, self.persistence_class, &self.generator)?;
+        validate_generated_section(&self.kind, &self.generated)?;
         self.dependency_constraints
             .validate(&self.kind, &self.lib_deps.libraries)?;
         validate_library_section(&self.kind, &self.library)?;
@@ -263,6 +272,7 @@ impl UnitManifestToml {
             name: self.name,
             persistence_class: self.persistence_class,
             generator: self.generator,
+            generated: self.generated,
             code_root: self.code.root,
             lib_deps: self.lib_deps.libraries,
             dependency_constraints: self.dependency_constraints,
@@ -344,7 +354,7 @@ fn validate_generator_root_path(path: &Path) -> std::result::Result<(), toml::de
     }
     if path.is_absolute() {
         return Err(serde::de::Error::custom(
-            "generator root path must be relative to the unit root",
+            "generator root path must be relative",
         ));
     }
     if path.components().any(|component| {
@@ -357,6 +367,55 @@ fn validate_generator_root_path(path: &Path) -> std::result::Result<(), toml::de
     }) {
         return Err(serde::de::Error::custom(
             "generator root path must not contain `..`",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_generated_section(
+    kind: &UnitKind,
+    generated: &Option<GeneratedManifest>,
+) -> std::result::Result<(), toml::de::Error> {
+    if generated.is_some() && !matches!(kind, UnitKind::Package(_)) {
+        return Err(serde::de::Error::custom(
+            "library manifest must not declare `[generated]`",
+        ));
+    }
+    if let Some(generated) = generated {
+        validate_generated_root_path(&generated.root)?;
+    }
+    Ok(())
+}
+
+fn validate_generated_root_path(path: &Path) -> std::result::Result<(), toml::de::Error> {
+    if path.as_os_str().is_empty() {
+        return Err(serde::de::Error::custom(
+            "[generated].root must not be empty",
+        ));
+    }
+    if path.is_absolute() {
+        return Err(serde::de::Error::custom(
+            "[generated].root must be relative to the host root",
+        ));
+    }
+    if !path
+        .components()
+        .any(|component| matches!(component, std::path::Component::Normal(_)))
+    {
+        return Err(serde::de::Error::custom(
+            "[generated].root must name a directory under the host root",
+        ));
+    }
+    if path.components().any(|component| {
+        matches!(
+            component,
+            std::path::Component::ParentDir
+                | std::path::Component::RootDir
+                | std::path::Component::Prefix(_)
+        )
+    }) {
+        return Err(serde::de::Error::custom(
+            "[generated].root must not contain `..`",
         ));
     }
     Ok(())

@@ -1092,6 +1092,65 @@ input_roots = ["fixtures"]
 }
 
 #[test]
+fn package_manifest_parses_generated_root() {
+    let temp = tempfile::tempdir().unwrap();
+    write(
+        &temp.path().join("fkst.toml"),
+        r#"
+kind = "package"
+name = "app"
+persistence_class = "stateless_adapter"
+
+[code]
+root = "."
+
+[generated]
+root = "src/_generated"
+"#,
+    );
+
+    let manifest = UnitManifest::parse_file_strict(&temp.path().join("fkst.toml")).unwrap();
+
+    assert_eq!(
+        manifest.generated.unwrap().root,
+        PathBuf::from("src/_generated")
+    );
+}
+
+#[test]
+fn generated_root_must_stay_relative() {
+    for root in ["/tmp/out", "../out", "."] {
+        let temp = tempfile::tempdir().unwrap();
+        write(
+            &temp.path().join("fkst.toml"),
+            &format!(
+                r#"
+kind = "package"
+name = "app"
+persistence_class = "stateless_adapter"
+
+[code]
+root = "."
+
+[generated]
+root = "{root}"
+"#
+            ),
+        );
+
+        let err = UnitManifest::parse_file_strict(&temp.path().join("fkst.toml")).unwrap_err();
+        let msg = format!("{err:#}");
+
+        assert!(
+            msg.contains("relative to the host root")
+                || msg.contains("must not contain `..`")
+                || msg.contains("must name a directory"),
+            "{msg}"
+        );
+    }
+}
+
+#[test]
 fn stateless_generator_manifest_rejects_empty_output_roots() {
     let temp = tempfile::tempdir().unwrap();
     write(
@@ -1167,7 +1226,8 @@ output_roots = ["{root}"]
         let msg = format!("{err:#}");
 
         assert!(
-            msg.contains("relative to the unit root") || msg.contains("must not contain `..`"),
+            msg.contains("generator root path must be relative")
+                || msg.contains("must not contain `..`"),
             "{msg}"
         );
     }
