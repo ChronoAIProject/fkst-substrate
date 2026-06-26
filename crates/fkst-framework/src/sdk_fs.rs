@@ -81,8 +81,7 @@ fn register_with_policy(lua: &Lua, policy: FilePolicy) -> Result<()> {
                 while let Some(d) = stack.pop() {
                     for entry in std::fs::read_dir(&d).map_err(mlua::Error::external)? {
                         let entry = entry.map_err(mlua::Error::external)?;
-                        let ft = entry.file_type().map_err(mlua::Error::external)?;
-                        let path = entry.path();
+                        let (path, ft) = authorize_list_child(&list_policy, entry)?;
                         if ft.is_dir() {
                             stack.push(path);
                         } else if ft.is_file() {
@@ -143,6 +142,28 @@ fn existing_or_parent_confined_path(policy: &FilePolicy, raw: &str) -> Result<Pa
                 }
                 Err(err) => Err(mlua::Error::external(err)),
             }
+        }
+    }
+}
+
+fn authorize_list_child(
+    policy: &FilePolicy,
+    entry: std::fs::DirEntry,
+) -> Result<(PathBuf, std::fs::FileType)> {
+    match policy {
+        FilePolicy::Full => {
+            let ft = entry.file_type().map_err(mlua::Error::external)?;
+            Ok((entry.path(), ft))
+        }
+        FilePolicy::Confined(policy) => {
+            let path = entry.path();
+            let raw = path.to_string_lossy().to_string();
+            let canonical = path.canonicalize().map_err(mlua::Error::external)?;
+            ensure_under_any_root(&canonical, &policy.read_roots, &raw)?;
+            let ft = std::fs::metadata(&canonical)
+                .map_err(mlua::Error::external)?
+                .file_type();
+            Ok((canonical, ft))
         }
     }
 }
@@ -421,6 +442,35 @@ mod tests {
             .load(r#"return file.read("outside.txt")"#)
             .eval::<String>()
             .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("outside stateless_generator roots"),
+            "{err}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn confined_file_list_rejects_symlinked_child_outside_read_roots() {
+        let lua = Lua::new();
+        let tmp = tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join("input")).unwrap();
+        std::fs::create_dir(tmp.path().join("dist")).unwrap();
+        std::fs::create_dir(tmp.path().join("outside")).unwrap();
+        std::fs::write(tmp.path().join("input/source.txt"), "source").unwrap();
+        std::fs::write(tmp.path().join("outside/secret.txt"), "secret").unwrap();
+        std::os::unix::fs::symlink(
+            tmp.path().join("outside"),
+            tmp.path().join("input/outside-link"),
+        )
+        .unwrap();
+        let policy = StatelessGeneratorPolicy {
+            input_roots: vec![tmp.path().join("input").canonicalize().unwrap()],
+            output_roots: vec![tmp.path().join("dist").canonicalize().unwrap()],
+        };
+        register_confined(&lua, tmp.path(), policy).unwrap();
+
+        let err = lua.load(r#"return file.list("input")"#).eval::<Vec<String>>().unwrap_err();
         assert!(
             err.to_string()
                 .contains("outside stateless_generator roots"),
