@@ -1,6 +1,6 @@
 //! Resolve fixed package roots, host graph inputs, and package-local names.
 
-use crate::manifest::UnitCatalog;
+use crate::manifest::{GeneratorGrant, UnitCatalog};
 use anyhow::{bail, Context, Result};
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
@@ -248,6 +248,17 @@ impl PackageRoots {
                         .unwrap_or(self.host_root.as_path())
                 }
             })
+    }
+
+    pub(crate) fn generator_grant_for_owner(
+        &self,
+        owner_namespace: &str,
+        owner_unit: &str,
+    ) -> Option<&GeneratorGrant> {
+        self.catalog
+            .workspace()
+            .generator_grant(owner_namespace)
+            .or_else(|| self.catalog.workspace().generator_grant(owner_unit))
     }
 
     pub(crate) fn conformance_library_roots(&self) -> Vec<LibraryConformanceRoot> {

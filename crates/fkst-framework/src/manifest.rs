@@ -21,7 +21,7 @@ pub(crate) use manifest_exports::Exports;
 use manifest_modules::{
     canonical_unit_code_root, insert_module_entry, scan_own_modules, unit_manifest_path,
 };
-pub(crate) use manifest_workspace::{ExternalSourceDecl, WorkspaceManifest};
+pub(crate) use manifest_workspace::{ExternalSourceDecl, GeneratorGrant, WorkspaceManifest};
 
 const WORKSPACE_MANIFEST: &str = "fkst.workspace.toml";
 pub(crate) const UNIT_MANIFEST: &str = "fkst.toml";
@@ -209,9 +209,10 @@ impl UnitManifest {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct GeneratorManifest {
-    pub(crate) output_roots: Vec<PathBuf>,
     #[serde(default)]
-    pub(crate) input_roots: Vec<PathBuf>,
+    pub(crate) suggested_output_roots: Vec<PathBuf>,
+    #[serde(default)]
+    pub(crate) package_input_roots: Vec<PathBuf>,
 }
 
 #[derive(Clone, Copy)]
@@ -317,18 +318,13 @@ fn validate_generator_section(
     if persistence_class == Some(PersistenceClass::StatelessGenerator) {
         let Some(generator) = generator else {
             return Err(serde::de::Error::custom(
-                "`persistence_class = \"stateless_generator\"` requires `[generator].output_roots`",
+                "`persistence_class = \"stateless_generator\"` requires `[generator]`",
             ));
         };
-        if generator.output_roots.is_empty() {
-            return Err(serde::de::Error::custom(
-                "`[generator].output_roots` must contain at least one path",
-            ));
-        }
         for path in generator
-            .output_roots
+            .suggested_output_roots
             .iter()
-            .chain(generator.input_roots.iter())
+            .chain(generator.package_input_roots.iter())
         {
             validate_generator_root_path(path)?;
         }

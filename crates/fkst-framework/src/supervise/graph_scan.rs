@@ -826,7 +826,7 @@ persistence_class = "stateless_generator"
 root = "."
 
 [generator]
-output_roots = ["generated"]
+suggested_output_roots = ["generated"]
 "#,
         );
         std::fs::create_dir_all(root.join("generated")).unwrap();
