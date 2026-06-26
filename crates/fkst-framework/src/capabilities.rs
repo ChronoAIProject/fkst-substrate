@@ -1,4 +1,4 @@
-use crate::manifest::{PersistenceClass, UnitManifest, UNIT_MANIFEST};
+use crate::manifest::{GeneratorGrant, PersistenceClass, UnitManifest, UNIT_MANIFEST};
 use anyhow::{bail, Context, Result};
 use std::path::{Component, Path, PathBuf};
 
@@ -12,11 +12,15 @@ pub(crate) struct UnitCapabilities {
 
 impl UnitCapabilities {
     #[allow(dead_code)]
-    pub(crate) fn for_manifest(manifest: &UnitManifest) -> Self {
-        Self {
+    pub(crate) fn for_manifest_with_generator_grant(
+        manifest: &UnitManifest,
+        grant: Option<&GeneratorGrant>,
+        grant_label: &str,
+    ) -> Result<Self> {
+        Ok(Self {
             saga_recovery: manifest.persistence_class() == Some(PersistenceClass::Saga),
-            mode: CapabilityMode::from_manifest(manifest),
-        }
+            mode: CapabilityMode::for_manifest_with_generator_grant(manifest, grant, grant_label)?,
+        })
     }
 }
 
@@ -27,35 +31,44 @@ pub(crate) enum CapabilityMode {
 }
 
 impl CapabilityMode {
-    pub(crate) fn from_manifest(manifest: &UnitManifest) -> Self {
+    pub(crate) fn for_manifest_with_generator_grant(
+        manifest: &UnitManifest,
+        grant: Option<&GeneratorGrant>,
+        grant_label: &str,
+    ) -> Result<Self> {
         match manifest.persistence_class() {
-            Some(PersistenceClass::StatelessGenerator) => CapabilityMode::StatelessGenerator(
-                StatelessGeneratorPolicy::from_manifest(manifest),
-            ),
-            _ => CapabilityMode::Full,
+            Some(PersistenceClass::StatelessGenerator) => {
+                let Some(grant) = grant else {
+                    bail!(
+                        "stateless_generator_host_grant_missing: `{grant_label}` must declare `output_roots`"
+                    );
+                };
+                Ok(CapabilityMode::StatelessGenerator(
+                    StatelessGeneratorPolicy::from_manifest_and_grant(manifest, grant),
+                ))
+            }
+            _ => Ok(CapabilityMode::Full),
         }
-    }
-
-    pub(crate) fn is_stateless_generator(&self) -> bool {
-        matches!(self, CapabilityMode::StatelessGenerator(_))
     }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct StatelessGeneratorPolicy {
-    pub(crate) input_roots: Vec<PathBuf>,
+    pub(crate) package_input_roots: Vec<PathBuf>,
+    pub(crate) project_input_roots: Vec<PathBuf>,
     pub(crate) output_roots: Vec<PathBuf>,
 }
 
 impl StatelessGeneratorPolicy {
-    fn from_manifest(manifest: &UnitManifest) -> Self {
+    fn from_manifest_and_grant(manifest: &UnitManifest, grant: &GeneratorGrant) -> Self {
         let generator = manifest
             .generator
             .as_ref()
             .expect("manifest validation requires [generator]");
         Self {
-            input_roots: generator.input_roots.clone(),
-            output_roots: generator.output_roots.clone(),
+            package_input_roots: generator.package_input_roots.clone(),
+            project_input_roots: grant.project_input_roots.clone(),
+            output_roots: grant.output_roots.clone(),
         }
     }
 
@@ -65,18 +78,29 @@ impl StatelessGeneratorPolicy {
             host_root,
             &self.output_roots,
             "output",
+            "host",
             MissingRoot::Create,
             Some(&generated_root),
         )?;
-        let input_roots = canonicalize_roots(
+        let package_input_roots = canonicalize_roots(
             owner_root,
-            &self.input_roots,
-            "input",
+            &self.package_input_roots,
+            "package_input",
+            "owner",
+            MissingRoot::Fail,
+            None,
+        )?;
+        let project_input_roots = canonicalize_roots(
+            host_root,
+            &self.project_input_roots,
+            "project_input",
+            "host",
             MissingRoot::Fail,
             None,
         )?;
         Ok(Self {
-            input_roots,
+            package_input_roots,
+            project_input_roots,
             output_roots,
         })
     }
@@ -89,25 +113,29 @@ enum MissingRoot {
 }
 
 fn canonicalize_roots(
-    base_root: &Path,
+    authority_root: &Path,
     roots: &[PathBuf],
     label: &str,
+    authority_label: &str,
     missing: MissingRoot,
     namespace_root: Option<&Path>,
 ) -> Result<Vec<PathBuf>> {
-    let base_root = base_root
-        .canonicalize()
-        .with_context(|| format!("canonicalize {label} base root {}", base_root.display()))?;
+    let authority_root = authority_root.canonicalize().with_context(|| {
+        format!(
+            "canonicalize {authority_label} root {}",
+            authority_root.display()
+        )
+    })?;
     roots
         .iter()
         .map(|root| {
             ensure_relative_root_path(root, label)?;
             if let Some(namespace_root) = namespace_root {
-                ensure_relative_root_under_namespace(&base_root, root, namespace_root, label)?;
+                ensure_relative_root_under_namespace(&authority_root, root, namespace_root, label)?;
             }
-            let joined = base_root.join(root);
+            let joined = authority_root.join(root);
             if matches!(missing, MissingRoot::Create) {
-                create_dir_all_relative_no_symlink(&base_root, root, label)?;
+                create_dir_all_relative_no_symlink(&authority_root, root, label)?;
             }
             let canonical = joined.canonicalize().with_context(|| {
                 format!(
@@ -115,11 +143,11 @@ fn canonicalize_roots(
                     joined.display()
                 )
             })?;
-            if !canonical.starts_with(&base_root) {
+            if !canonical.starts_with(&authority_root) {
                 bail!(
-                    "stateless_generator {label}_root {} escapes base root {}",
+                    "stateless_generator {label}_root {} escapes {authority_label} root {}",
                     canonical.display(),
-                    base_root.display()
+                    authority_root.display()
                 );
             }
             if let Some(namespace_root) = namespace_root {
@@ -301,8 +329,15 @@ root = "."
     fn saga_manifest_enables_saga_recovery() {
         let manifest = manifest_with_persistence_class("saga");
 
+        let capabilities = UnitCapabilities::for_manifest_with_generator_grant(
+            &manifest,
+            None,
+            "[generators.unit]",
+        )
+        .unwrap();
+
         assert_eq!(
-            UnitCapabilities::for_manifest(&manifest),
+            capabilities,
             UnitCapabilities {
                 saga_recovery: true,
                 mode: CapabilityMode::Full
@@ -324,13 +359,30 @@ root = "."
                 manifest_with_persistence_class(persistence_class)
             };
 
+            let grant = if persistence_class == "stateless_generator" {
+                Some(GeneratorGrant {
+                    output_roots: vec![PathBuf::from("dist")],
+                    project_input_roots: Vec::new(),
+                    allow_host_source_mutation: false,
+                })
+            } else {
+                None
+            };
+            let capabilities = UnitCapabilities::for_manifest_with_generator_grant(
+                &manifest,
+                grant.as_ref(),
+                "[generators.unit]",
+            )
+            .unwrap();
+
             assert_eq!(
-                UnitCapabilities::for_manifest(&manifest),
+                capabilities,
                 UnitCapabilities {
                     saga_recovery: false,
                     mode: if persistence_class == "stateless_generator" {
                         CapabilityMode::StatelessGenerator(StatelessGeneratorPolicy {
-                            input_roots: Vec::new(),
+                            package_input_roots: Vec::new(),
+                            project_input_roots: Vec::new(),
                             output_roots: vec![PathBuf::from("dist")],
                         })
                     } else {
@@ -345,12 +397,34 @@ root = "."
     fn missing_persistence_class_disables_saga_recovery() {
         let manifest = manifest_without_persistence_class();
 
+        let capabilities = UnitCapabilities::for_manifest_with_generator_grant(
+            &manifest,
+            None,
+            "[generators.unit]",
+        )
+        .unwrap();
+
         assert_eq!(
-            UnitCapabilities::for_manifest(&manifest),
+            capabilities,
             UnitCapabilities {
                 saga_recovery: false,
                 mode: CapabilityMode::Full
             }
+        );
+    }
+
+    #[test]
+    fn stateless_generator_capability_mode_requires_host_grant() {
+        let manifest = manifest_with_stateless_generator();
+
+        let err =
+            CapabilityMode::for_manifest_with_generator_grant(&manifest, None, "[generators.unit]")
+                .unwrap_err();
+        let msg = format!("{err:#}");
+
+        assert!(
+            msg.contains("stateless_generator_host_grant_missing"),
+            "{msg}"
         );
     }
 
@@ -367,7 +441,7 @@ persistence_class = "stateless_generator"
 root = "."
 
 [generator]
-output_roots = ["dist"]
+suggested_output_roots = ["dist"]
 "#,
         )
         .unwrap();

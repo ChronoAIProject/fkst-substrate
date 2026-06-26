@@ -20,12 +20,43 @@ fn write(path: &Path, body: &str) {
 }
 
 fn write_host(root: &Path, generated_root: Option<&str>) {
+    let output_root = generated_root.unwrap_or("src/_generated");
+    write_host_with_generator_grant(
+        root,
+        generated_root,
+        &format!(r#"["{output_root}"]"#),
+        Some(r#"["content"]"#),
+        false,
+    );
+}
+
+fn write_host_with_generator_grant(
+    root: &Path,
+    generated_root: Option<&str>,
+    output_roots: &str,
+    project_input_roots: Option<&str>,
+    allow_host_source_mutation: bool,
+) {
+    let project_input_roots = project_input_roots
+        .map(|roots| format!("project_input_roots = {roots}\n"))
+        .unwrap_or_default();
+    let allow_host_source_mutation = if allow_host_source_mutation {
+        "allow_host_source_mutation = true\n"
+    } else {
+        ""
+    };
     write(
         &root.join("fkst.workspace.toml"),
-        r#"
+        &format!(
+            r#"
 [workspace]
 units = ["."]
+
+[generators.generator]
+output_roots = {output_roots}
+{project_input_roots}{allow_host_source_mutation}
 "#,
+        ),
     );
     let generated_section = generated_root
         .map(|root| format!("\n[generated]\nroot = \"{root}\"\n"))
@@ -47,18 +78,16 @@ root = "."
     if let Some(generated_root) = generated_root {
         fs::create_dir_all(root.join(generated_root)).unwrap();
     }
+    fs::create_dir_all(root.join("content")).unwrap();
+    fs::write(root.join("content/project.txt"), "project").unwrap();
 }
 
 fn write_generator_package(root: &Path) {
-    write_generator_package_with_roots(root, ".", r#"["src/_generated"]"#);
+    write_generator_package_with_code_root(root, ".");
 }
 
 fn write_generator_package_with_code_root(root: &Path, code_root: &str) {
-    write_generator_package_with_roots(root, code_root, r#"["src/_generated"]"#);
-}
-
-fn write_generator_package_with_output_roots(root: &Path, output_roots: &str) {
-    write_generator_package_with_roots(root, ".", output_roots);
+    write_generator_package_with_roots(root, code_root, r#"["dist"]"#);
 }
 
 fn write_generator_package_with_roots(root: &Path, code_root: &str, output_roots: &str) {
@@ -67,6 +96,10 @@ fn write_generator_package_with_roots(root: &Path, code_root: &str, output_roots
         r#"
 [workspace]
 units = ["."]
+
+[generators.generator]
+output_roots = ["dist"]
+project_input_roots = ["content"]
 "#,
     );
     let manifest = format!(
@@ -78,15 +111,21 @@ persistence_class = "stateless_generator"
 [code]
 root = "{code_root}"
 
+[generated]
+root = "dist"
+
 [generator]
-output_roots = {output_roots}
-input_roots = ["inputs"]
+suggested_output_roots = {output_roots}
+package_input_roots = ["inputs"]
 "#
     );
     write(&root.join("fkst.toml"), &manifest);
     fs::create_dir_all(root.join("inputs")).unwrap();
+    fs::create_dir_all(root.join("content")).unwrap();
+    fs::create_dir_all(root.join("dist")).unwrap();
     fs::create_dir_all(root.join(code_root)).unwrap();
     fs::write(root.join("inputs/source.txt"), "source").unwrap();
+    fs::write(root.join("content/project.txt"), "project").unwrap();
 }
 
 fn write_full_package(root: &Path) {
@@ -126,12 +165,69 @@ fn run_department(host: &Path, package: &Path, department: &str) -> Output {
         .unwrap()
 }
 
+fn run_department_with_host(host: &Path, package: &Path, department: &str) -> Output {
+    framework_command()
+        .arg("run")
+        .arg(package.join(format!("departments/{department}/main.lua")))
+        .arg("--project-root")
+        .arg(host)
+        .arg("--package-root")
+        .arg(package)
+        .arg("--event")
+        .arg(r#"{"queue":"generator","payload":{}}"#)
+        .current_dir(host)
+        .env("FKST_RUNTIME_ROOT", host.join(".fkst/runtime"))
+        .output()
+        .unwrap()
+}
+
 fn stdout(output: &Output) -> String {
     String::from_utf8_lossy(&output.stdout).to_string()
 }
 
 fn stderr(output: &Output) -> String {
     String::from_utf8_lossy(&output.stderr).to_string()
+}
+
+#[test]
+fn stateless_generator_splits_package_inputs_from_host_granted_outputs() {
+    let host = tempfile::Builder::new()
+        .prefix("stateless-generator-host")
+        .tempdir()
+        .unwrap();
+    let package = tempfile::Builder::new()
+        .prefix("generator")
+        .tempdir()
+        .unwrap();
+    write_host(host.path(), Some("dist"));
+    write_generator_package(package.path());
+    write(
+        &package.path().join("departments/generate/main.lua"),
+        r#"
+local M = {}
+M.spec = {}
+function M.pipeline(_)
+  assert(file.read("inputs/source.txt") == "source")
+  assert(file.read("content/project.txt") == "project")
+  file.write("dist/generated/out.txt", "ok")
+end
+return M
+"#,
+    );
+
+    let output = run_department_with_host(host.path(), package.path(), "generate");
+
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}",
+        stdout(&output),
+        stderr(&output)
+    );
+    assert_eq!(
+        fs::read_to_string(host.path().join("dist/generated/out.txt")).unwrap(),
+        "ok"
+    );
+    assert!(!package.path().join("dist/generated/out.txt").exists());
 }
 
 #[test]
@@ -161,6 +257,7 @@ function M.pipeline(_)
   assert(with_lock == nil, "with_lock must be omitted")
   assert(now == nil, "now must be omitted")
   assert(file.read("inputs/source.txt") == "source")
+  assert(file.read("content/project.txt") == "project")
   file.write("src/_generated/generated/out.txt", "ok")
 end
 return M
@@ -223,7 +320,123 @@ return M
 }
 
 #[test]
-fn stateless_generator_output_roots_are_host_root_relative_not_code_root_relative() {
+fn stateless_generator_requires_host_output_grant() {
+    let package = tempfile::Builder::new()
+        .prefix("stateless-generator-no-grant")
+        .tempdir()
+        .unwrap();
+    write_generator_package(package.path());
+    write(
+        &package.path().join("fkst.workspace.toml"),
+        r#"
+[workspace]
+units = ["."]
+"#,
+    );
+    write(
+        &package.path().join("departments/generate/main.lua"),
+        r#"
+local M = {}
+M.spec = {}
+function M.pipeline(_)
+  file.write("dist/generated/out.txt", "ok")
+end
+return M
+"#,
+    );
+
+    let output = run_department(package.path(), package.path(), "generate");
+
+    assert!(!output.status.success(), "stdout: {}", stdout(&output));
+    assert!(
+        stderr(&output).contains("stateless_generator_host_grant_missing"),
+        "stderr: {}",
+        stderr(&output)
+    );
+}
+
+#[test]
+fn stateless_generator_denies_project_input_without_host_grant() {
+    let package = tempfile::Builder::new()
+        .prefix("stateless-generator-project-input-deny")
+        .tempdir()
+        .unwrap();
+    write_generator_package(package.path());
+    write(
+        &package.path().join("fkst.workspace.toml"),
+        r#"
+[workspace]
+units = ["."]
+
+[generators.generator]
+output_roots = ["dist"]
+"#,
+    );
+    write(
+        &package.path().join("departments/generate/main.lua"),
+        r#"
+local M = {}
+M.spec = {}
+function M.pipeline(_)
+  file.read("content/project.txt")
+end
+return M
+"#,
+    );
+
+    let output = run_department(package.path(), package.path(), "generate");
+
+    assert!(!output.status.success(), "stdout: {}", stdout(&output));
+    assert!(
+        stderr(&output).contains("stateless_generator_fs_read_denied"),
+        "stderr: {}",
+        stderr(&output)
+    );
+}
+
+#[test]
+fn stateless_generator_rejects_host_source_mutation_even_with_opt_in() {
+    let package = tempfile::Builder::new()
+        .prefix("stateless-generator-host-source-opt-in")
+        .tempdir()
+        .unwrap();
+    write_generator_package(package.path());
+    write(
+        &package.path().join("fkst.workspace.toml"),
+        r#"
+[workspace]
+units = ["."]
+
+[generators.generator]
+output_roots = ["."]
+allow_host_source_mutation = true
+"#,
+    );
+    write(
+        &package.path().join("departments/generate/main.lua"),
+        r#"
+local M = {}
+M.spec = {}
+function M.pipeline(_)
+  file.write("host-owned.txt", "ok")
+end
+return M
+"#,
+    );
+
+    let output = run_department(package.path(), package.path(), "generate");
+
+    assert!(!output.status.success(), "stdout: {}", stdout(&output));
+    assert!(
+        stderr(&output).contains("escapes generated namespace"),
+        "stderr: {}",
+        stderr(&output)
+    );
+    assert!(!package.path().join("host-owned.txt").exists());
+}
+
+#[test]
+fn stateless_generator_host_grants_are_host_root_relative_not_code_root_relative() {
     let package = tempfile::Builder::new()
         .prefix("stateless-generator-code-root")
         .tempdir()
@@ -267,7 +480,11 @@ return M
 
 #[test]
 fn stateless_generator_rejects_output_roots_outside_host_generated_namespace() {
-    for output_roots in [r#"["."]"#, r#"["src"]"#, r#"["../x"]"#] {
+    for (output_roots, allow_host_source_mutation) in [
+        (r#"["."]"#, true),
+        (r#"["src"]"#, false),
+        (r#"["../x"]"#, false),
+    ] {
         let package = tempfile::Builder::new()
             .prefix("stateless-generator-escape")
             .tempdir()
@@ -276,8 +493,14 @@ fn stateless_generator_rejects_output_roots_outside_host_generated_namespace() {
             .prefix("stateless-generator-escape-host")
             .tempdir()
             .unwrap();
-        write_host(host.path(), Some("src/_generated"));
-        write_generator_package_with_output_roots(package.path(), output_roots);
+        write_host_with_generator_grant(
+            host.path(),
+            Some("src/_generated"),
+            output_roots,
+            Some(r#"["content"]"#),
+            allow_host_source_mutation,
+        );
+        write_generator_package(package.path());
         write(
             &package.path().join("departments/generate/main.lua"),
             r#"

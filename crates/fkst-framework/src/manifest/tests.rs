@@ -218,6 +218,122 @@ packages = ["host"]
 }
 
 #[test]
+fn workspace_manifest_parses_generator_grants() {
+    let temp = tempfile::tempdir().unwrap();
+    write(
+        &temp.path().join("fkst.workspace.toml"),
+        r#"
+[workspace]
+units = []
+
+[generators.site]
+output_roots = ["dist"]
+project_input_roots = ["content"]
+"#,
+    );
+
+    let workspace =
+        WorkspaceManifest::parse_file(&temp.path().join("fkst.workspace.toml")).unwrap();
+    let grant = workspace.generator_grant("site").unwrap();
+
+    assert_eq!(grant.output_roots, vec![PathBuf::from("dist")]);
+    assert_eq!(grant.project_input_roots, vec![PathBuf::from("content")]);
+    assert!(!grant.allow_host_source_mutation);
+}
+
+#[test]
+fn workspace_generator_grant_requires_output_roots() {
+    let temp = tempfile::tempdir().unwrap();
+    write(
+        &temp.path().join("fkst.workspace.toml"),
+        r#"
+[workspace]
+units = []
+
+[generators.site]
+project_input_roots = ["content"]
+"#,
+    );
+
+    let err = WorkspaceManifest::parse_file(&temp.path().join("fkst.workspace.toml")).unwrap_err();
+    let msg = format!("{err:#}");
+
+    assert!(msg.contains("missing field `output_roots`"), "{msg}");
+}
+
+#[test]
+fn workspace_generator_grant_rejects_empty_output_roots() {
+    let temp = tempfile::tempdir().unwrap();
+    write(
+        &temp.path().join("fkst.workspace.toml"),
+        r#"
+[workspace]
+units = []
+
+[generators.site]
+output_roots = []
+"#,
+    );
+
+    let err = WorkspaceManifest::parse_file(&temp.path().join("fkst.workspace.toml")).unwrap_err();
+    let msg = format!("{err:#}");
+
+    assert!(
+        msg.contains("`[generators.site].output_roots` must contain at least one path"),
+        "{msg}"
+    );
+}
+
+#[test]
+fn workspace_generator_grant_rejects_host_source_mutation_without_opt_in() {
+    let temp = tempfile::tempdir().unwrap();
+    write(
+        &temp.path().join("fkst.workspace.toml"),
+        r#"
+[workspace]
+units = []
+
+[generators.site]
+output_roots = ["."]
+"#,
+    );
+
+    let err = WorkspaceManifest::parse_file(&temp.path().join("fkst.workspace.toml")).unwrap_err();
+    let msg = format!("{err:#}");
+
+    assert!(
+        msg.contains("requires `allow_host_source_mutation = true`"),
+        "{msg}"
+    );
+}
+
+#[test]
+fn workspace_generator_grant_allows_explicit_host_source_mutation() {
+    let temp = tempfile::tempdir().unwrap();
+    write(
+        &temp.path().join("fkst.workspace.toml"),
+        r#"
+[workspace]
+units = []
+
+[generators.site]
+output_roots = ["."]
+allow_host_source_mutation = true
+"#,
+    );
+
+    let workspace =
+        WorkspaceManifest::parse_file(&temp.path().join("fkst.workspace.toml")).unwrap();
+
+    assert!(
+        workspace
+            .generator_grant("site")
+            .unwrap()
+            .allow_host_source_mutation
+    );
+}
+
+#[test]
 fn parses_legacy_workspace_units() {
     let temp = tempfile::tempdir().unwrap();
     write_workspace(temp.path());
@@ -1016,7 +1132,7 @@ fn package_manifest_parses_valid_persistence_classes() {
             fs::create_dir_all(temp.path().join("generated")).unwrap();
             r#"
 [generator]
-output_roots = ["generated"]
+suggested_output_roots = ["generated"]
 "#
         } else {
             ""
@@ -1043,7 +1159,7 @@ root = "."
 }
 
 #[test]
-fn stateless_generator_manifest_requires_output_roots() {
+fn stateless_generator_manifest_requires_generator_section() {
     let temp = tempfile::tempdir().unwrap();
     write(
         &temp.path().join("fkst.toml"),
@@ -1061,7 +1177,7 @@ root = "."
         let err = parse(&temp.path().join("fkst.toml")).unwrap_err();
         let msg = format!("{err:#}");
 
-        assert!(msg.contains("requires `[generator].output_roots`"), "{msg}");
+        assert!(msg.contains("requires `[generator]`"), "{msg}");
     }
 }
 
@@ -1079,16 +1195,22 @@ persistence_class = "stateless_generator"
 root = "."
 
 [generator]
-output_roots = ["generated"]
-input_roots = ["fixtures"]
+suggested_output_roots = ["generated"]
+package_input_roots = ["fixtures"]
 "#,
     );
 
     let manifest = UnitManifest::parse_file(&temp.path().join("fkst.toml")).unwrap();
     let generator = manifest.generator().unwrap();
 
-    assert_eq!(generator.output_roots, vec![PathBuf::from("generated")]);
-    assert_eq!(generator.input_roots, vec![PathBuf::from("fixtures")]);
+    assert_eq!(
+        generator.suggested_output_roots,
+        vec![PathBuf::from("generated")]
+    );
+    assert_eq!(
+        generator.package_input_roots,
+        vec![PathBuf::from("fixtures")]
+    );
 }
 
 #[test]
@@ -1151,7 +1273,7 @@ root = "{root}"
 }
 
 #[test]
-fn stateless_generator_manifest_rejects_empty_output_roots() {
+fn stateless_generator_manifest_allows_empty_suggested_output_roots() {
     let temp = tempfile::tempdir().unwrap();
     write(
         &temp.path().join("fkst.toml"),
@@ -1164,14 +1286,44 @@ persistence_class = "stateless_generator"
 root = "."
 
 [generator]
-output_roots = []
+suggested_output_roots = []
 "#,
     );
 
-    let err = UnitManifest::parse_file_strict(&temp.path().join("fkst.toml")).unwrap_err();
-    let msg = format!("{err:#}");
+    let manifest = UnitManifest::parse_file_strict(&temp.path().join("fkst.toml")).unwrap();
 
-    assert!(msg.contains("must contain at least one path"), "{msg}");
+    assert_eq!(
+        manifest.generator().unwrap().suggested_output_roots,
+        Vec::<PathBuf>::new()
+    );
+}
+
+#[test]
+fn stateless_generator_manifest_rejects_removed_generator_root_fields() {
+    for removed_field in ["output_roots", "input_roots"] {
+        let temp = tempfile::tempdir().unwrap();
+        write(
+            &temp.path().join("fkst.toml"),
+            &format!(
+                r#"
+kind = "package"
+name = "app"
+persistence_class = "stateless_generator"
+
+[code]
+root = "."
+
+[generator]
+{removed_field} = ["dist"]
+"#
+            ),
+        );
+
+        let err = UnitManifest::parse_file_strict(&temp.path().join("fkst.toml")).unwrap_err();
+        let msg = format!("{err:#}");
+
+        assert!(msg.contains("unknown field"), "{removed_field}: {msg}");
+    }
 }
 
 #[test]
@@ -1188,7 +1340,7 @@ persistence_class = "stateless_adapter"
 root = "."
 
 [generator]
-output_roots = ["dist"]
+suggested_output_roots = ["dist"]
 "#,
     );
 
@@ -1217,7 +1369,7 @@ persistence_class = "stateless_generator"
 root = "."
 
 [generator]
-output_roots = ["{root}"]
+suggested_output_roots = ["{root}"]
 "#
             ),
         );

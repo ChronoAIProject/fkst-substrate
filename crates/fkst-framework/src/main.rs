@@ -582,7 +582,14 @@ fn run_pipeline(
         .ok_or_else(|| anyhow::anyhow!("no manifest unit owns {}", owner_root.display()))?;
     let capability_mode = catalog
         .unit_for_root(owner_root)?
-        .map(|unit| CapabilityMode::from_manifest(unit.manifest()))
+        .map(|unit| {
+            CapabilityMode::for_manifest_with_generator_grant(
+                unit.manifest(),
+                roots.generator_grant_for_owner(&owner_namespace, &owner_unit),
+                &format!("[generators.{owner_namespace}]"),
+            )
+        })
+        .transpose()?
         .unwrap_or(CapabilityMode::Full);
     let lua = match &capability_mode {
         CapabilityMode::Full => mlua_init::new_lua(),

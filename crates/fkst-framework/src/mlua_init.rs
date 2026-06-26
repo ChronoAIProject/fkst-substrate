@@ -435,7 +435,8 @@ root = "generated"
             dir.path(),
             CapabilityMode::StatelessGenerator(StatelessGeneratorPolicy {
                 output_roots: vec![PathBuf::from("generated")],
-                input_roots: Vec::new(),
+                package_input_roots: Vec::new(),
+                project_input_roots: Vec::new(),
             }),
         );
 
@@ -524,7 +525,8 @@ root = "generated"
                 dir.path(),
                 CapabilityMode::StatelessGenerator(StatelessGeneratorPolicy {
                     output_roots: vec![PathBuf::from("generated")],
-                    input_roots: Vec::new(),
+                    package_input_roots: Vec::new(),
+                    project_input_roots: Vec::new(),
                 }),
             );
 
@@ -553,7 +555,8 @@ root = "generated"
             dir.path(),
             CapabilityMode::StatelessGenerator(StatelessGeneratorPolicy {
                 output_roots: vec![PathBuf::from("generated")],
-                input_roots: vec![PathBuf::from("fixtures")],
+                package_input_roots: vec![PathBuf::from("fixtures")],
+                project_input_roots: Vec::new(),
             }),
         );
 
@@ -630,7 +633,8 @@ root = "generated"
             dir.path(),
             CapabilityMode::StatelessGenerator(StatelessGeneratorPolicy {
                 output_roots: vec![PathBuf::from("generated")],
-                input_roots: Vec::new(),
+                package_input_roots: Vec::new(),
+                project_input_roots: Vec::new(),
             }),
         );
 
