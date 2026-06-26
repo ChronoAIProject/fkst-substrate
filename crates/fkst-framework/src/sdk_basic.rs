@@ -49,9 +49,13 @@ pub(crate) fn register_with_runner(
     config: ConfigContext,
     runner: Option<MockCommandState>,
 ) -> Result<()> {
-    let rate_pools = RatePoolRegistry::from_config(&config).map_err(mlua::Error::external)?;
-    let host_root = config.host_root().to_path_buf();
-    let coalesce_clock = CoalesceClock::system();
+    register_now(lua)?;
+    register_exec_argv_with_runner(lua, config.clone(), runner.clone())?;
+    register_exec_sync_with_runner(lua, config, runner)?;
+    Ok(())
+}
+
+pub(crate) fn register_now(lua: &Lua) -> Result<()> {
     lua.globals().set(
         "now",
         lua.create_function(|_, ()| {
@@ -62,6 +66,16 @@ pub(crate) fn register_with_runner(
             Ok(secs)
         })?,
     )?;
+    Ok(())
+}
+
+pub(crate) fn register_exec_argv_with_runner(
+    lua: &Lua,
+    config: ConfigContext,
+    runner: Option<MockCommandState>,
+) -> Result<()> {
+    let rate_pools = RatePoolRegistry::from_config(&config).map_err(mlua::Error::external)?;
+    let host_root = config.host_root().to_path_buf();
 
     // `exec_argv` is the shell-free, structured-argv egress (no `/bin/sh`). It shares the
     // mock/coalesce/rate/audit dispatch with `exec_sync` via `run_spec_with_context`, but
@@ -73,7 +87,17 @@ pub(crate) fn register_with_runner(
         host_root.clone(),
         CoalesceClock::system(),
     )?;
+    Ok(())
+}
 
+pub(crate) fn register_exec_sync_with_runner(
+    lua: &Lua,
+    config: ConfigContext,
+    runner: Option<MockCommandState>,
+) -> Result<()> {
+    let rate_pools = RatePoolRegistry::from_config(&config).map_err(mlua::Error::external)?;
+    let host_root = config.host_root().to_path_buf();
+    let coalesce_clock = CoalesceClock::system();
     lua.globals().set(
         "exec_sync",
         lua.create_function(move |lua, arg: Value| {

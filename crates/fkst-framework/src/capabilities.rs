@@ -1,7 +1,6 @@
+use crate::manifest::{PersistenceClass, UnitManifest};
 use anyhow::{bail, Context, Result};
 use std::path::{Path, PathBuf};
-
-use crate::manifest::{PersistenceClass, UnitManifest};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[allow(dead_code)]

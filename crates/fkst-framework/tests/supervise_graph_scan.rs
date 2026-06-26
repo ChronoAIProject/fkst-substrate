@@ -241,6 +241,20 @@ fn write_package_helper(root: &std::path::Path) {
 }
 
 #[test]
+fn stateless_generator_department_consumes_is_rejected_at_graph_scan() {
+    let dir = write_repo(&[("generate", &dept(r#""tick""#, ""))], &[]);
+    write_stateless_generator_manifest(dir.path());
+
+    let err = load(dir.path()).unwrap_err();
+    let msg = format!("{err:#}");
+
+    assert!(
+        msg.contains("stateless_generator_event_wiring_denied"),
+        "{msg}"
+    );
+}
+
+#[test]
 fn external_explicit_package_root_uses_its_own_manifest_catalog() {
     let root = tempfile::Builder::new()
         .prefix("external-manifest")

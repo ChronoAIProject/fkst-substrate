@@ -1,6 +1,6 @@
 use super::*;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 fn write(path: &Path, body: &str) {
     if let Some(parent) = path.parent() {
@@ -1012,10 +1012,11 @@ fn package_manifest_parses_valid_persistence_classes() {
         ),
     ] {
         let temp = tempfile::tempdir().unwrap();
-        let generator_section = if raw == "stateless_generator" {
+        let generator_section = if class == PersistenceClass::StatelessGenerator {
+            fs::create_dir_all(temp.path().join("generated")).unwrap();
             r#"
 [generator]
-output_roots = ["dist"]
+output_roots = ["generated"]
 "#
         } else {
             ""
@@ -1056,10 +1057,38 @@ root = "."
 "#,
     );
 
-    let err = UnitManifest::parse_file_strict(&temp.path().join("fkst.toml")).unwrap_err();
-    let msg = format!("{err:#}");
+    for parse in [UnitManifest::parse_file, UnitManifest::parse_file_strict] {
+        let err = parse(&temp.path().join("fkst.toml")).unwrap_err();
+        let msg = format!("{err:#}");
 
-    assert!(msg.contains("requires `[generator].output_roots`"), "{msg}");
+        assert!(msg.contains("requires `[generator].output_roots`"), "{msg}");
+    }
+}
+
+#[test]
+fn stateless_generator_manifest_parses_generator_roots() {
+    let temp = tempfile::tempdir().unwrap();
+    write(
+        &temp.path().join("fkst.toml"),
+        r#"
+kind = "package"
+name = "app"
+persistence_class = "stateless_generator"
+
+[code]
+root = "."
+
+[generator]
+output_roots = ["generated"]
+input_roots = ["fixtures"]
+"#,
+    );
+
+    let manifest = UnitManifest::parse_file(&temp.path().join("fkst.toml")).unwrap();
+    let generator = manifest.generator().unwrap();
+
+    assert_eq!(generator.output_roots, vec![PathBuf::from("generated")]);
+    assert_eq!(generator.input_roots, vec![PathBuf::from("fixtures")]);
 }
 
 #[test]

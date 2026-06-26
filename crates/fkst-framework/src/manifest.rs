@@ -200,6 +200,18 @@ impl UnitManifest {
     pub(crate) fn persistence_class(&self) -> Option<PersistenceClass> {
         self.persistence_class
     }
+
+    pub(crate) fn generator(&self) -> Option<&GeneratorManifest> {
+        self.generator.as_ref()
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct GeneratorManifest {
+    pub(crate) output_roots: Vec<PathBuf>,
+    #[serde(default)]
+    pub(crate) input_roots: Vec<PathBuf>,
 }
 
 #[derive(Clone, Copy)]
@@ -285,14 +297,6 @@ fn validate_library_section(
         )),
         _ => Ok(()),
     }
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct GeneratorManifest {
-    pub(crate) output_roots: Vec<PathBuf>,
-    #[serde(default)]
-    pub(crate) input_roots: Vec<PathBuf>,
 }
 
 fn validate_generator_section(

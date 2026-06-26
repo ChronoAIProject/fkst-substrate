@@ -1,4 +1,4 @@
-//! SDK: file system helpers. file.read, file.write, file.exists, file.list.
+//! SDK: file system helpers. file.read, file.write, file.exists, file.list, file.mkdir.
 
 use crate::capabilities::StatelessGeneratorPolicy;
 use mlua::{Lua, Result};
@@ -53,6 +53,14 @@ fn register_with_policy(lua: &Lua, policy: FilePolicy) -> Result<()> {
         "write",
         lua.create_function(move |_, (path, content): (String, String)| {
             write_file_with_policy(&write_policy, &path, content).map_err(mlua::Error::external)?;
+            Ok(())
+        })?,
+    )?;
+    let mkdir_policy = policy.clone();
+    file.set(
+        "mkdir",
+        lua.create_function(move |_, path: String| {
+            mkdir_with_policy(&mkdir_policy, &path).map_err(mlua::Error::external)?;
             Ok(())
         })?,
     )?;
@@ -122,6 +130,13 @@ fn writable_path(policy: &FilePolicy, raw: &str) -> Result<PathBuf> {
     }
 }
 
+fn mkdir_path(policy: &FilePolicy, raw: &str) -> Result<PathBuf> {
+    match policy {
+        FilePolicy::Full => Ok(PathBuf::from(raw)),
+        FilePolicy::Confined(policy) => confined_mkdir_path(policy, raw),
+    }
+}
+
 fn existing_or_parent_confined_path(policy: &FilePolicy, raw: &str) -> Result<PathBuf> {
     match policy {
         FilePolicy::Full => Ok(PathBuf::from(raw)),
@@ -129,15 +144,30 @@ fn existing_or_parent_confined_path(policy: &FilePolicy, raw: &str) -> Result<Pa
             let path = resolve_confined_input(policy, raw)?;
             match path.canonicalize() {
                 Ok(canonical) => {
-                    ensure_under_any_root(&canonical, &policy.read_roots, raw)?;
+                    ensure_under_any_root(
+                        &canonical,
+                        &policy.read_roots,
+                        raw,
+                        "stateless_generator_fs_read_denied",
+                    )?;
                     Ok(canonical)
                 }
                 Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
                     let parent = path.parent().ok_or_else(|| {
                         mlua::Error::external(format!("file path `{raw}` has no parent directory"))
                     })?;
-                    let parent = parent.canonicalize().map_err(mlua::Error::external)?;
-                    ensure_under_any_root(&parent, &policy.read_roots, raw)?;
+                    let parent = parent.canonicalize().map_err(|err| {
+                        mlua::Error::external(format!(
+                            "stateless_generator_fs_read_denied: canonicalize parent {}: {err}",
+                            parent.display()
+                        ))
+                    })?;
+                    ensure_under_any_root(
+                        &parent,
+                        &policy.read_roots,
+                        raw,
+                        "stateless_generator_fs_read_denied",
+                    )?;
                     Ok(path)
                 }
                 Err(err) => Err(mlua::Error::external(err)),
@@ -159,7 +189,12 @@ fn authorize_list_child(
             let path = entry.path();
             let raw = path.to_string_lossy().to_string();
             let canonical = path.canonicalize().map_err(mlua::Error::external)?;
-            ensure_under_any_root(&canonical, &policy.read_roots, &raw)?;
+            ensure_under_any_root(
+                &canonical,
+                &policy.read_roots,
+                &raw,
+                "stateless_generator_fs_read_denied",
+            )?;
             let ft = std::fs::metadata(&canonical)
                 .map_err(mlua::Error::external)?
                 .file_type();
@@ -175,7 +210,7 @@ fn confined_existing_path(
 ) -> Result<PathBuf> {
     let path = resolve_confined_input(policy, raw)?;
     let canonical = path.canonicalize().map_err(mlua::Error::external)?;
-    ensure_under_any_root(&canonical, roots, raw)?;
+    ensure_under_any_root(&canonical, roots, raw, "stateless_generator_fs_read_denied")?;
     Ok(canonical)
 }
 
@@ -184,12 +219,47 @@ fn confined_write_path(policy: &ConfinedFilePolicy, raw: &str) -> Result<PathBuf
     let parent = path.parent().ok_or_else(|| {
         mlua::Error::external(format!("file.write target `{raw}` has no parent directory"))
     })?;
-    let existing_parent = nearest_existing_parent(parent)?;
-    ensure_under_any_root(&existing_parent, &policy.output_roots, raw)?;
     let file_name = path.file_name().ok_or_else(|| {
         mlua::Error::external(format!("file.write target `{raw}` has no file name"))
     })?;
-    Ok(parent.join(file_name))
+    let canonical_parent = ensure_creatable_parent_under(
+        parent,
+        &policy.output_roots,
+        raw,
+        "stateless_generator_fs_write_denied",
+    )?;
+    let target = canonical_parent.join(file_name);
+    reject_final_symlink(&target, "stateless_generator_fs_write_denied")?;
+    Ok(target)
+}
+
+fn confined_mkdir_path(policy: &ConfinedFilePolicy, raw: &str) -> Result<PathBuf> {
+    let path = resolve_confined_input(policy, raw)?;
+    if let Ok(canonical) = path.canonicalize() {
+        ensure_under_any_root(
+            &canonical,
+            &policy.output_roots,
+            raw,
+            "stateless_generator_fs_write_denied",
+        )?;
+        reject_final_symlink(&path, "stateless_generator_fs_write_denied")?;
+        return Ok(canonical);
+    }
+    let parent = path.parent().ok_or_else(|| {
+        mlua::Error::external(format!("file.mkdir target `{raw}` has no parent directory"))
+    })?;
+    let final_component = path.file_name().ok_or_else(|| {
+        mlua::Error::external(format!("file.mkdir target `{raw}` has no final component"))
+    })?;
+    let canonical_parent = ensure_creatable_parent_under(
+        parent,
+        &policy.output_roots,
+        raw,
+        "stateless_generator_fs_write_denied",
+    )?;
+    let target = canonical_parent.join(final_component);
+    reject_final_symlink(&target, "stateless_generator_fs_write_denied")?;
+    Ok(target)
 }
 
 fn write_file_with_policy(policy: &FilePolicy, raw: &str, content: String) -> std::io::Result<()> {
@@ -197,7 +267,18 @@ fn write_file_with_policy(policy: &FilePolicy, raw: &str, content: String) -> st
         FilePolicy::Full => std::fs::write(raw, content),
         FilePolicy::Confined(_) => {
             let path = writable_path(policy, raw).map_err(std::io::Error::other)?;
-            write_file_atomic(&path, content)
+            write_file_atomic_no_follow(&path, &content)
+        }
+    }
+}
+
+fn mkdir_with_policy(policy: &FilePolicy, raw: &str) -> std::io::Result<()> {
+    match policy {
+        FilePolicy::Full => std::fs::create_dir_all(raw),
+        FilePolicy::Confined(_) => {
+            let path = mkdir_path(policy, raw).map_err(std::io::Error::other)?;
+            create_final_dir_no_symlink(&path, "stateless_generator_fs_write_denied")
+                .map_err(std::io::Error::other)
         }
     }
 }
@@ -214,17 +295,6 @@ fn resolve_confined_input(policy: &ConfinedFilePolicy, raw: &str) -> Result<Path
 }
 
 fn reject_parent_components(raw: &str, path: &Path) -> Result<()> {
-    if path.components().any(|component| {
-        matches!(
-            component,
-            Component::ParentDir | Component::Prefix(_) | Component::RootDir
-        )
-    }) && !path.is_absolute()
-    {
-        return Err(mlua::Error::external(format!(
-            "file path `{raw}` must not contain `..`"
-        )));
-    }
     if path
         .components()
         .any(|component| matches!(component, Component::ParentDir))
@@ -236,13 +306,59 @@ fn reject_parent_components(raw: &str, path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn ensure_under_any_root(path: &Path, roots: &[PathBuf], raw: &str) -> Result<()> {
+fn ensure_under_any_root(
+    path: &Path,
+    roots: &[PathBuf],
+    raw: &str,
+    error_class: &str,
+) -> Result<()> {
     if roots.iter().any(|root| path.starts_with(root)) {
         return Ok(());
     }
     Err(mlua::Error::external(format!(
-        "file path `{raw}` is outside stateless_generator roots"
+        "{error_class}: file path `{raw}` is outside stateless_generator roots"
     )))
+}
+
+fn ensure_creatable_parent_under(
+    parent: &Path,
+    roots: &[PathBuf],
+    raw: &str,
+    error_class: &str,
+) -> Result<PathBuf> {
+    let anchor = nearest_existing_parent(parent)?;
+    ensure_under_any_root(&anchor, roots, raw, error_class)?;
+    let mut current = anchor.clone();
+    let missing = parent.strip_prefix(&anchor).map_err(|err| {
+        mlua::Error::external(format!(
+            "{error_class}: resolve missing path under {}: {err}",
+            anchor.display()
+        ))
+    })?;
+    for component in missing.components() {
+        match component {
+            Component::Normal(name) => {
+                current.push(name);
+                create_dir_component_no_symlink(&current, error_class)?;
+            }
+            Component::CurDir => {}
+            _ => {
+                return Err(mlua::Error::external(format!(
+                    "{error_class}: invalid path component in {}",
+                    parent.display()
+                )));
+            }
+        }
+    }
+
+    let canonical_parent = current.canonicalize().map_err(|err| {
+        mlua::Error::external(format!(
+            "{error_class}: canonicalize parent {}: {err}",
+            current.display()
+        ))
+    })?;
+    ensure_under_any_root(&canonical_parent, roots, raw, error_class)?;
+    Ok(canonical_parent)
 }
 
 fn nearest_existing_parent(path: &Path) -> Result<PathBuf> {
@@ -253,7 +369,7 @@ fn nearest_existing_parent(path: &Path) -> Result<PathBuf> {
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
                 current = current.parent().ok_or_else(|| {
                     mlua::Error::external(format!(
-                        "file.write parent `{}` has no existing ancestor",
+                        "file path `{}` has no existing ancestor",
                         path.display()
                     ))
                 })?;
@@ -263,10 +379,78 @@ fn nearest_existing_parent(path: &Path) -> Result<PathBuf> {
     }
 }
 
-fn write_file_atomic(path: &Path, content: String) -> std::io::Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
+fn create_dir_component_no_symlink(path: &Path, error_class: &str) -> Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => Err(mlua::Error::external(format!(
+            "{error_class}: symlink path component denied: {}",
+            path.display()
+        ))),
+        Ok(metadata) if metadata.is_dir() => Ok(()),
+        Ok(_) => Err(mlua::Error::external(format!(
+            "{error_class}: path component is not a directory: {}",
+            path.display()
+        ))),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => match std::fs::create_dir(path) {
+            Ok(()) => Ok(()),
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                create_dir_component_no_symlink(path, error_class)
+            }
+            Err(err) => Err(mlua::Error::external(format!(
+                "{error_class}: create directory {}: {err}",
+                path.display()
+            ))),
+        },
+        Err(err) => Err(mlua::Error::external(format!(
+            "{error_class}: inspect directory {}: {err}",
+            path.display()
+        ))),
     }
+}
+
+fn create_final_dir_no_symlink(path: &Path, error_class: &str) -> Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => Err(mlua::Error::external(format!(
+            "{error_class}: final path symlink denied: {}",
+            path.display()
+        ))),
+        Ok(metadata) if metadata.is_dir() => Ok(()),
+        Ok(_) => Err(mlua::Error::external(format!(
+            "{error_class}: final path is not a directory: {}",
+            path.display()
+        ))),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => match std::fs::create_dir(path) {
+            Ok(()) => Ok(()),
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                create_final_dir_no_symlink(path, error_class)
+            }
+            Err(err) => Err(mlua::Error::external(format!(
+                "{error_class}: create directory {}: {err}",
+                path.display()
+            ))),
+        },
+        Err(err) => Err(mlua::Error::external(format!(
+            "{error_class}: inspect path {}: {err}",
+            path.display()
+        ))),
+    }
+}
+
+fn reject_final_symlink(path: &Path, error_class: &str) -> Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => Err(mlua::Error::external(format!(
+            "{error_class}: final path symlink denied: {}",
+            path.display()
+        ))),
+        Ok(_) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(mlua::Error::external(format!(
+            "{error_class}: inspect path {}: {err}",
+            path.display()
+        ))),
+    }
+}
+
+fn write_file_atomic_no_follow(path: &Path, content: &str) -> std::io::Result<()> {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     let file_name = path
         .file_name()
@@ -277,9 +461,26 @@ fn write_file_atomic(path: &Path, content: String) -> std::io::Result<()> {
         std::process::id(),
         ulid::Ulid::new()
     ));
-    std::fs::write(&temp, content)?;
-    std::fs::rename(temp, path)?;
-    Ok(())
+    let write_result =
+        write_file_no_follow(&temp, content.as_bytes()).and_then(|()| std::fs::rename(&temp, path));
+    if write_result.is_err() {
+        let _ = std::fs::remove_file(&temp);
+    }
+    write_result
+}
+
+fn write_file_no_follow(path: &Path, content: &[u8]) -> std::io::Result<()> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(nix::fcntl::OFlag::O_NOFOLLOW.bits());
+    }
+    let mut file = options.open(path)?;
+    use std::io::Write;
+    file.write_all(content)?;
+    file.sync_all()
 }
 
 #[cfg(test)]
@@ -287,6 +488,19 @@ mod tests {
     use super::*;
     use mlua::Lua;
     use tempfile::tempdir;
+
+    fn confined_policy(root: &Path, outputs: &[&str], inputs: &[&str]) -> StatelessGeneratorPolicy {
+        StatelessGeneratorPolicy {
+            input_roots: inputs
+                .iter()
+                .map(|path| root.join(path).canonicalize().unwrap())
+                .collect(),
+            output_roots: outputs
+                .iter()
+                .map(|path| root.join(path).canonicalize().unwrap())
+                .collect(),
+        }
+    }
 
     #[test]
     fn file_table_roundtrip() {
@@ -297,6 +511,11 @@ mod tests {
         lua.load(format!(r#"file.write("{}", "hello\n")"#, p))
             .exec()
             .unwrap();
+        let dir = tmp.path().join("nested").to_string_lossy().to_string();
+        lua.load(format!(r#"file.mkdir("{}")"#, dir))
+            .exec()
+            .unwrap();
+        assert!(tmp.path().join("nested").is_dir());
         let exists: bool = lua
             .load(format!(r#"return file.exists("{}")"#, p))
             .eval()
@@ -382,13 +601,8 @@ mod tests {
         let lua = Lua::new();
         let tmp = tempdir().unwrap();
         std::fs::create_dir(tmp.path().join("input")).unwrap();
-        let policy = StatelessGeneratorPolicy {
-            input_roots: vec![tmp.path().join("input").canonicalize().unwrap()],
-            output_roots: vec![tmp.path().join("dist").canonicalize().unwrap_or_else(|_| {
-                std::fs::create_dir(tmp.path().join("dist")).unwrap();
-                tmp.path().join("dist").canonicalize().unwrap()
-            })],
-        };
+        std::fs::create_dir(tmp.path().join("dist")).unwrap();
+        let policy = confined_policy(tmp.path(), &["dist"], &["input"]);
         register_confined(&lua, tmp.path(), policy).unwrap();
 
         lua.load(r#"file.write("dist/nested/out.txt", "ok")"#)
@@ -403,11 +617,60 @@ mod tests {
             .load(r#"return file.write("main.lua", "bad")"#)
             .eval::<()>()
             .unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("outside stateless_generator roots"),
-            "{err}"
-        );
+        let msg = err.to_string();
+        assert!(msg.contains("stateless_generator_fs_write_denied"), "{msg}");
+        assert!(msg.contains("outside stateless_generator roots"), "{msg}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn confined_file_write_rejects_final_symlink_escape() {
+        use std::os::unix::fs::symlink;
+
+        let lua = Lua::new();
+        let tmp = tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("dist")).unwrap();
+        std::fs::create_dir_all(tmp.path().join("outside")).unwrap();
+        symlink(
+            tmp.path().join("outside/escaped.txt"),
+            tmp.path().join("dist/out.txt"),
+        )
+        .unwrap();
+        let policy = confined_policy(tmp.path(), &["dist"], &[]);
+        register_confined(&lua, tmp.path(), policy).unwrap();
+
+        let err = lua
+            .load(r#"file.write("dist/out.txt", "escape")"#)
+            .exec()
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("stateless_generator_fs_write_denied"), "{err}");
+        assert!(!tmp.path().join("outside/escaped.txt").exists());
+        assert!(std::fs::symlink_metadata(tmp.path().join("dist/out.txt"))
+            .unwrap()
+            .file_type()
+            .is_symlink());
+    }
+
+    #[test]
+    fn confined_file_mkdir_is_limited_to_output_root() {
+        let lua = Lua::new();
+        let tmp = tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("dist")).unwrap();
+        std::fs::create_dir_all(tmp.path().join("outside")).unwrap();
+        let policy = confined_policy(tmp.path(), &["dist"], &[]);
+        register_confined(&lua, tmp.path(), policy).unwrap();
+
+        lua.load(r#"file.mkdir("dist/assets/css")"#).exec().unwrap();
+        assert!(tmp.path().join("dist/assets/css").is_dir());
+
+        let err = lua
+            .load(r#"file.mkdir("outside/assets")"#)
+            .exec()
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("stateless_generator_fs_write_denied"), "{err}");
     }
 
     #[test]
@@ -418,10 +681,7 @@ mod tests {
         std::fs::create_dir(tmp.path().join("dist")).unwrap();
         std::fs::write(tmp.path().join("input/source.txt"), "source").unwrap();
         std::fs::write(tmp.path().join("outside.txt"), "outside").unwrap();
-        let policy = StatelessGeneratorPolicy {
-            input_roots: vec![tmp.path().join("input").canonicalize().unwrap()],
-            output_roots: vec![tmp.path().join("dist").canonicalize().unwrap()],
-        };
+        let policy = confined_policy(tmp.path(), &["dist"], &["input"]);
         register_confined(&lua, tmp.path(), policy).unwrap();
 
         let content: String = lua
@@ -464,13 +724,13 @@ mod tests {
             tmp.path().join("input/outside-link"),
         )
         .unwrap();
-        let policy = StatelessGeneratorPolicy {
-            input_roots: vec![tmp.path().join("input").canonicalize().unwrap()],
-            output_roots: vec![tmp.path().join("dist").canonicalize().unwrap()],
-        };
+        let policy = confined_policy(tmp.path(), &["dist"], &["input"]);
         register_confined(&lua, tmp.path(), policy).unwrap();
 
-        let err = lua.load(r#"return file.list("input")"#).eval::<Vec<String>>().unwrap_err();
+        let err = lua
+            .load(r#"return file.list("input")"#)
+            .eval::<Vec<String>>()
+            .unwrap_err();
         assert!(
             err.to_string()
                 .contains("outside stateless_generator roots"),
@@ -483,10 +743,7 @@ mod tests {
         let lua = Lua::new();
         let tmp = tempdir().unwrap();
         std::fs::create_dir(tmp.path().join("dist")).unwrap();
-        let policy = StatelessGeneratorPolicy {
-            input_roots: Vec::new(),
-            output_roots: vec![tmp.path().join("dist").canonicalize().unwrap()],
-        };
+        let policy = confined_policy(tmp.path(), &["dist"], &[]);
         register_confined(&lua, tmp.path(), policy).unwrap();
 
         let err = lua
