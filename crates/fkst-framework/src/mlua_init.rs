@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
+use crate::capabilities::CapabilityMode;
 use crate::config_registry::ConfigContext;
 use crate::external_command::MockCommandState;
 use crate::manifest::UnitCatalog;
@@ -22,6 +23,7 @@ pub fn new_lua() -> Lua {
 /// Register the framework SDK globals in the same order for every entry point.
 pub fn register_framework_sdk(
     lua: &Lua,
+    capability_mode: CapabilityMode,
     raise_buf: RaiseBuffer,
     host_root: &Path,
     owner_root: &Path,
@@ -37,30 +39,41 @@ pub fn register_framework_sdk(
     crate::rate_pool::RatePoolRegistry::from_config(&config).map_err(mlua::Error::external)?;
     crate::sdk_log::register(lua)?;
     crate::sdk_i18n::register(lua, owner_root)?;
-    crate::sdk_basic::register_with_runner(lua, config.clone(), None)?;
     crate::sdk_strings::register(lua)?;
-    crate::sdk_restricted_lua::register(lua)?;
-    crate::sdk_graph::register(lua, graph_roots, graph_json_authorized)?;
-    crate::sdk_fs::register(lua)?;
     crate::sdk_json::register(lua)?;
-    crate::sdk_git::register(lua, host_root, config.clone())?;
-    crate::sdk_mark::register(lua, host_root)?;
-    crate::sdk_cache::register(lua, host_root)?;
-    crate::sdk_observe::register(lua, None)?;
-    crate::sdk_codex::register(
-        lua,
-        host_root,
-        config,
-        dept,
-        raise_buf.clone(),
-        raised_auth_token,
-    )?;
-    crate::raise::register(lua, raise_buf, resolver, owner_namespace, raise_authority)?;
+    match capability_mode {
+        CapabilityMode::Full => {
+            crate::sdk_basic::register_with_runner(lua, config.clone(), None)?;
+            crate::sdk_restricted_lua::register(lua)?;
+            crate::sdk_graph::register(lua, graph_roots, graph_json_authorized)?;
+            crate::sdk_fs::register(lua)?;
+            crate::sdk_git::register(lua, host_root, config.clone())?;
+            crate::sdk_mark::register(lua, host_root)?;
+            crate::sdk_cache::register(lua, host_root)?;
+            crate::sdk_observe::register(lua, None)?;
+            crate::sdk_codex::register(
+                lua,
+                host_root,
+                config,
+                dept,
+                raise_buf.clone(),
+                raised_auth_token,
+            )?;
+            crate::raise::register(lua, raise_buf, resolver, owner_namespace, raise_authority)?;
+        }
+        CapabilityMode::StatelessGenerator(policy) => {
+            let policy = policy
+                .canonicalize_under(owner_root)
+                .map_err(mlua::Error::external)?;
+            crate::sdk_fs::register_confined(lua, owner_root, policy)?;
+        }
+    }
     Ok(())
 }
 
 pub(crate) fn register_framework_sdk_with_runner(
     lua: &Lua,
+    capability_mode: CapabilityMode,
     raise_buf: RaiseBuffer,
     host_root: &Path,
     owner_root: &Path,
@@ -78,26 +91,36 @@ pub(crate) fn register_framework_sdk_with_runner(
     crate::rate_pool::RatePoolRegistry::from_config(&config).map_err(mlua::Error::external)?;
     crate::sdk_log::register(lua)?;
     crate::sdk_i18n::register(lua, owner_root)?;
-    crate::sdk_basic::register_with_runner(lua, config.clone(), runner.clone())?;
     crate::sdk_strings::register(lua)?;
-    crate::sdk_restricted_lua::register(lua)?;
-    crate::sdk_graph::register(lua, graph_roots, graph_json_authorized)?;
-    crate::sdk_fs::register(lua)?;
     crate::sdk_json::register(lua)?;
-    crate::sdk_git::register_with_runner(lua, host_root, config.clone(), runner.clone())?;
-    crate::sdk_mark::register(lua, host_root)?;
-    crate::sdk_cache::register(lua, host_root)?;
-    crate::sdk_observe::register(lua, mock_observe)?;
-    crate::sdk_codex::register_with_runner(
-        lua,
-        host_root,
-        config,
-        dept,
-        runner,
-        raise_buf.clone(),
-        raised_auth_token,
-    )?;
-    crate::raise::register(lua, raise_buf, resolver, owner_namespace, raise_authority)?;
+    match capability_mode {
+        CapabilityMode::Full => {
+            crate::sdk_basic::register_with_runner(lua, config.clone(), runner.clone())?;
+            crate::sdk_restricted_lua::register(lua)?;
+            crate::sdk_graph::register(lua, graph_roots, graph_json_authorized)?;
+            crate::sdk_fs::register(lua)?;
+            crate::sdk_git::register_with_runner(lua, host_root, config.clone(), runner.clone())?;
+            crate::sdk_mark::register(lua, host_root)?;
+            crate::sdk_cache::register(lua, host_root)?;
+            crate::sdk_observe::register(lua, mock_observe)?;
+            crate::sdk_codex::register_with_runner(
+                lua,
+                host_root,
+                config,
+                dept,
+                runner,
+                raise_buf.clone(),
+                raised_auth_token,
+            )?;
+            crate::raise::register(lua, raise_buf, resolver, owner_namespace, raise_authority)?;
+        }
+        CapabilityMode::StatelessGenerator(policy) => {
+            let policy = policy
+                .canonicalize_under(owner_root)
+                .map_err(mlua::Error::external)?;
+            crate::sdk_fs::register_confined(lua, owner_root, policy)?;
+        }
+    }
     Ok(())
 }
 
