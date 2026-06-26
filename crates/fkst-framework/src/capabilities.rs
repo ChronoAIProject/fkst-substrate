@@ -12,11 +12,15 @@ pub(crate) struct UnitCapabilities {
 
 impl UnitCapabilities {
     #[allow(dead_code)]
-    pub(crate) fn for_manifest(manifest: &UnitManifest) -> Self {
-        Self {
+    pub(crate) fn for_manifest_with_generator_grant(
+        manifest: &UnitManifest,
+        grant: Option<&GeneratorGrant>,
+        grant_label: &str,
+    ) -> Result<Self> {
+        Ok(Self {
             saga_recovery: manifest.persistence_class() == Some(PersistenceClass::Saga),
-            mode: CapabilityMode::from_manifest(manifest),
-        }
+            mode: CapabilityMode::for_manifest_with_generator_grant(manifest, grant, grant_label)?,
+        })
     }
 }
 
@@ -27,15 +31,6 @@ pub(crate) enum CapabilityMode {
 }
 
 impl CapabilityMode {
-    pub(crate) fn from_manifest(manifest: &UnitManifest) -> Self {
-        match manifest.persistence_class() {
-            Some(PersistenceClass::StatelessGenerator) => CapabilityMode::StatelessGenerator(
-                StatelessGeneratorPolicy::from_manifest_without_host_grant(manifest),
-            ),
-            _ => CapabilityMode::Full,
-        }
-    }
-
     pub(crate) fn for_manifest_with_generator_grant(
         manifest: &UnitManifest,
         grant: Option<&GeneratorGrant>,
@@ -55,10 +50,6 @@ impl CapabilityMode {
             _ => Ok(CapabilityMode::Full),
         }
     }
-
-    pub(crate) fn is_stateless_generator(&self) -> bool {
-        matches!(self, CapabilityMode::StatelessGenerator(_))
-    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -69,18 +60,6 @@ pub(crate) struct StatelessGeneratorPolicy {
 }
 
 impl StatelessGeneratorPolicy {
-    fn from_manifest_without_host_grant(manifest: &UnitManifest) -> Self {
-        let generator = manifest
-            .generator
-            .as_ref()
-            .expect("manifest validation requires [generator]");
-        Self {
-            package_input_roots: generator.package_input_roots.clone(),
-            project_input_roots: Vec::new(),
-            output_roots: generator.suggested_output_roots.clone(),
-        }
-    }
-
     fn from_manifest_and_grant(manifest: &UnitManifest, grant: &GeneratorGrant) -> Self {
         let generator = manifest
             .generator
@@ -219,8 +198,12 @@ root = "."
     fn saga_manifest_enables_saga_recovery() {
         let manifest = manifest_with_persistence_class("saga");
 
+        let capabilities =
+            UnitCapabilities::for_manifest_with_generator_grant(&manifest, None, "[generators.unit]")
+                .unwrap();
+
         assert_eq!(
-            UnitCapabilities::for_manifest(&manifest),
+            capabilities,
             UnitCapabilities {
                 saga_recovery: true,
                 mode: CapabilityMode::Full
@@ -242,8 +225,24 @@ root = "."
                 manifest_with_persistence_class(persistence_class)
             };
 
+            let grant = if persistence_class == "stateless_generator" {
+                Some(GeneratorGrant {
+                    output_roots: vec![PathBuf::from("dist")],
+                    project_input_roots: Vec::new(),
+                    allow_host_source_mutation: false,
+                })
+            } else {
+                None
+            };
+            let capabilities = UnitCapabilities::for_manifest_with_generator_grant(
+                &manifest,
+                grant.as_ref(),
+                "[generators.unit]",
+            )
+            .unwrap();
+
             assert_eq!(
-                UnitCapabilities::for_manifest(&manifest),
+                capabilities,
                 UnitCapabilities {
                     saga_recovery: false,
                     mode: if persistence_class == "stateless_generator" {
@@ -264,13 +263,32 @@ root = "."
     fn missing_persistence_class_disables_saga_recovery() {
         let manifest = manifest_without_persistence_class();
 
+        let capabilities =
+            UnitCapabilities::for_manifest_with_generator_grant(&manifest, None, "[generators.unit]")
+                .unwrap();
+
         assert_eq!(
-            UnitCapabilities::for_manifest(&manifest),
+            capabilities,
             UnitCapabilities {
                 saga_recovery: false,
                 mode: CapabilityMode::Full
             }
         );
+    }
+
+    #[test]
+    fn stateless_generator_capability_mode_requires_host_grant() {
+        let manifest = manifest_with_stateless_generator();
+
+        let err = CapabilityMode::for_manifest_with_generator_grant(
+            &manifest,
+            None,
+            "[generators.unit]",
+        )
+        .unwrap_err();
+        let msg = format!("{err:#}");
+
+        assert!(msg.contains("stateless_generator_host_grant_missing"), "{msg}");
     }
 
     fn manifest_with_stateless_generator() -> UnitManifest {

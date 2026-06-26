@@ -218,8 +218,8 @@ fn is_stateless_generator_unit(catalog: &crate::manifest::UnitCatalog, owner_uni
         .units()
         .find(|unit| unit.catalog_name() == owner_unit)
         .map(|unit| {
-            crate::capabilities::CapabilityMode::from_manifest(unit.manifest())
-                .is_stateless_generator()
+            unit.manifest().persistence_class()
+                == Some(crate::manifest::PersistenceClass::StatelessGenerator)
         })
         .unwrap_or(false)
 }
