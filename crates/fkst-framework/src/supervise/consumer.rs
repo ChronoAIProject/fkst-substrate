@@ -219,8 +219,8 @@ fn department_is_stateless_generator(roots: &PackageRoots, decl: &DepartmentDecl
         .ok()
         .and_then(|catalog| catalog.unit_for_root(&decl.owner_root).ok().flatten())
         .map(|unit| {
-            crate::capabilities::CapabilityMode::from_manifest(unit.manifest())
-                .is_stateless_generator()
+            unit.manifest().persistence_class()
+                == Some(crate::manifest::PersistenceClass::StatelessGenerator)
         })
         .unwrap_or(false)
 }

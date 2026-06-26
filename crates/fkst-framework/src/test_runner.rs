@@ -597,7 +597,7 @@ pub(crate) fn run_department_core(
 ) -> mlua::Result<DepartmentRunOutcome> {
     let _guard = DeptRunEnvGuard::apply(opts)?;
     let owner_unit = cache.owner_unit_for_root(owner_root)?;
-    let capability_mode = cache.capability_mode_for_root(owner_root)?;
+    let capability_mode = cache.capability_mode_for_root(owner_root, owner_namespace)?;
     let graph_json_authorized =
         crate::sdk_graph::department_authorized(roots, owner_root, &lua_path).unwrap_or(false);
     let qualified_consumes = cache.declared_qualified_consumes(owner_root, &lua_path)?;
@@ -765,15 +765,25 @@ impl TestRunCache {
     fn capability_mode_for_root(
         &self,
         owner_root: &Path,
+        owner_namespace: &str,
     ) -> mlua::Result<crate::capabilities::CapabilityMode> {
-        Ok(self
-            .roots
+        let owner_unit = self.owner_unit_for_root(owner_root)?;
+        self.roots
             .catalog_for_owner_root(owner_root)
             .map_err(mlua::Error::external)?
             .unit_for_root(owner_root)
             .map_err(mlua::Error::external)?
-            .map(|unit| crate::capabilities::CapabilityMode::from_manifest(unit.manifest()))
-            .unwrap_or(crate::capabilities::CapabilityMode::Full))
+            .map(|unit| {
+                crate::capabilities::CapabilityMode::for_manifest_with_generator_grant(
+                    unit.manifest(),
+                    self.roots
+                        .generator_grant_for_owner(owner_namespace, &owner_unit),
+                    &format!("[generators.{owner_namespace}]"),
+                )
+            })
+            .transpose()
+            .map_err(mlua::Error::external)
+            .map(|mode| mode.unwrap_or(crate::capabilities::CapabilityMode::Full))
     }
 
     fn declared_resolved_produces(

@@ -91,9 +91,9 @@ pub fn register_framework_sdk(
         }
         CapabilityMode::StatelessGenerator(policy) => {
             let policy = policy
-                .canonicalize_under(owner_root)
+                .canonicalize_under(owner_root, host_root)
                 .map_err(mlua::Error::external)?;
-            crate::sdk_fs::register_confined(lua, owner_root, policy)?;
+            crate::sdk_fs::register_confined(lua, owner_root, host_root, policy)?;
         }
     }
     Ok(())
@@ -144,9 +144,9 @@ pub(crate) fn register_framework_sdk_with_runner(
         }
         CapabilityMode::StatelessGenerator(policy) => {
             let policy = policy
-                .canonicalize_under(owner_root)
+                .canonicalize_under(owner_root, host_root)
                 .map_err(mlua::Error::external)?;
-            crate::sdk_fs::register_confined(lua, owner_root, policy)?;
+            crate::sdk_fs::register_confined(lua, owner_root, host_root, policy)?;
         }
     }
     Ok(())
@@ -432,7 +432,8 @@ root = "."
             dir.path(),
             CapabilityMode::StatelessGenerator(StatelessGeneratorPolicy {
                 output_roots: vec![out],
-                input_roots: Vec::new(),
+                package_input_roots: Vec::new(),
+                project_input_roots: Vec::new(),
             }),
         );
 
@@ -521,7 +522,8 @@ root = "."
                 dir.path(),
                 CapabilityMode::StatelessGenerator(StatelessGeneratorPolicy {
                     output_roots: vec![PathBuf::from("generated")],
-                    input_roots: Vec::new(),
+                    package_input_roots: Vec::new(),
+                    project_input_roots: Vec::new(),
                 }),
             );
 
@@ -549,7 +551,8 @@ root = "."
             dir.path(),
             CapabilityMode::StatelessGenerator(StatelessGeneratorPolicy {
                 output_roots: vec![PathBuf::from("generated")],
-                input_roots: vec![PathBuf::from("fixtures")],
+                package_input_roots: vec![PathBuf::from("fixtures")],
+                project_input_roots: Vec::new(),
             }),
         );
 
@@ -626,7 +629,8 @@ root = "."
             dir.path(),
             CapabilityMode::StatelessGenerator(StatelessGeneratorPolicy {
                 output_roots: vec![PathBuf::from("generated")],
-                input_roots: Vec::new(),
+                package_input_roots: Vec::new(),
+                project_input_roots: Vec::new(),
             }),
         );
 
