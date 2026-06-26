@@ -59,6 +59,12 @@ fn init_package_repo_materializes_empty_repo() {
 
     assert!(repo.path().join("scripts/run.sh").is_file());
     assert!(repo.path().join("scripts/check_repo.py").is_file());
+    let check_repo = std::fs::read_to_string(repo.path().join("scripts/check_repo.py")).unwrap();
+    assert!(check_repo.contains("tomllib.loads"), "{check_repo}");
+    assert!(
+        check_repo.contains("check_saga_obligations"),
+        "{check_repo}"
+    );
     assert!(repo.path().join(".github/workflows/ci.yml").is_file());
     assert_eq!(
         std::fs::read_to_string(repo.path().join(".fkst-substrate-ref")).unwrap(),

@@ -46,11 +46,38 @@ fn copy_minimal_package(host: &Path) {
 fn write_runtime_touch_package(package: &Path) {
     let dept = package.join("departments/probe");
     fs::create_dir_all(&dept).unwrap();
+    fs::create_dir_all(package.join("workflow")).unwrap();
+    fs::write(
+        package.join("workflow/saga.lua"),
+        r#"
+local M = {}
+function M.department(spec)
+  return spec
+end
+return M
+"#,
+    )
+    .unwrap();
+    fs::create_dir_all(package.join("core")).unwrap();
+    fs::write(
+        package.join("core/conformance.lua"),
+        r#"
+local M = {}
+function M.restart_transition_errors()
+  return {}
+end
+return M
+"#,
+    )
+    .unwrap();
     fs::write(
         dept.join("main.lua"),
         r#"
+local saga = require("workflow.saga")
+
 local M = {}
 M.spec = { consumes = {"tick"}, produces = {} }
+saga.department(M)
 function pipeline(event)
   once("runtime-root-probe", function() end)
 end
@@ -147,6 +174,16 @@ fn relative_runtime_root_anchors_to_git_root_not_package_project_root() {
     git(&repo, ["init"]);
     write_runtime_touch_package(&package);
     write_package_manifest(&package, "pkg", &[]);
+    let manifest_path = package.join("fkst.toml");
+    let manifest = fs::read_to_string(&manifest_path).unwrap();
+    fs::write(
+        &manifest_path,
+        manifest.replace(
+            "persistence_class = \"stateless_adapter\"",
+            "persistence_class = \"saga\"",
+        ) + "\n[conformance]\nfunction = \"core.conformance.restart_transition_errors\"\n",
+    )
+    .unwrap();
     write_workspace(&repo, &[&package]);
 
     let output = Command::new(framework_bin())

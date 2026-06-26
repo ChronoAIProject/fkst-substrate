@@ -27,7 +27,34 @@ fn in_sandbox<T>(
 }
 
 fn register_for_host(lua: &Lua, host_root: &Path) {
-    sdk_mark::register(lua, host_root).unwrap();
+    sdk_mark::register(lua, host_root, true).unwrap();
+}
+
+fn register_without_saga_recovery(lua: &Lua, host_root: &Path) {
+    sdk_mark::register(lua, host_root, false).unwrap();
+}
+
+#[test]
+fn once_requires_saga_recovery_capability() {
+    let lua = Lua::new();
+    let host = tempdir().unwrap();
+    let runtime = tempdir().unwrap();
+    register_without_saga_recovery(&lua, host.path());
+
+    let err = in_sandbox(
+        host.path(),
+        |sandbox| {
+            sandbox.runtime_root(runtime.path());
+        },
+        || {
+            lua.load(r#"return once("github-proxy/issue/owner/repo/42", function() end)"#)
+                .eval::<bool>()
+                .unwrap_err()
+        },
+    );
+
+    assert!(err.to_string().contains("saga_recovery"), "{err}");
+    assert!(!runtime.path().join("marks").exists());
 }
 
 #[test]

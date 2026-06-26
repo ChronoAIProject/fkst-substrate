@@ -341,7 +341,7 @@ Codex SDK 也把 `codex exec` 放入 process group。`spawn_codex_sync` 与 `spa
 
 `with_lock(name, fn)` 是跨 pipeline 互斥 primitive。它把校验后的锁名解析到 `<RT>/locks/<name>/=lock` 并打开，获取 exclusive flock，执行 Lua function，释放 file handle。进程死时 lock 自动释放。
 
-`once(key, fn)` 是 best-effort per-key de-bounce primitive。它把校验后的 key 作为相对路径，在 `<RT>/locks/once/<key>/=lock` 上获取 exclusive flock 后检查 `<RT>/marks/<key>/=mark`；marker 存在则返回 `false`，不存在则执行 `fn`，成功后写 marker 并返回 `true`。marker 是 host-local scratch，不是 durable state；runtime root 被清空或换 host 后，`fn` 会重新运行，这由 at-least-once、下游 / package 幂等和从 durable 源重新推导来容纳。`fn` 失败时不写 marker，后续调用会重试。
+`once(key, fn)` is a `saga_recovery` capability-gated, best-effort, per-key debounce primitive. Only an owner package manifest with `persistence_class = "saga"` derives `saga_recovery`; other owners fail closed when calling `once`. It resolves the validated key as a relative path, takes an exclusive flock at `<RT>/locks/once/<key>/=lock`, and then checks `<RT>/marks/<key>/=mark`. If the marker exists, it returns `false`; if the marker is absent, it runs `fn`, writes the marker after success, and returns `true`. The marker is host-local scratch, not durable state; if the runtime root is cleared or the host changes, `fn` can run again, which is covered by at-least-once semantics, downstream/package idempotence, and re-derivation from durable sources. If `fn` fails, no marker is written and later calls retry.
 
 `once` 决策通过 engine log 观察：`once decision=skip-marked key=...` 与 `once decision=ran-marked key=...` 提供可 grep trail。marker 内容只含人工提示（`key`、`marked_at`），不被解析；LIVE lock holder 用 `lsof <RT>/locks/once/<key>/=lock` 查看。
 

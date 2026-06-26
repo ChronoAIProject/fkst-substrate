@@ -48,6 +48,7 @@ from pathlib import Path
 import os
 import stat
 import sys
+import tomllib
 
 
 REQUIRED_FILES = [
@@ -62,6 +63,32 @@ REQUIRED_FILES = [
 def fail(message: str) -> None:
     print(f"check_repo.py: {message}", file=sys.stderr)
     sys.exit(1)
+
+
+def read_manifest(root: Path) -> dict:
+    try:
+        return tomllib.loads((root / "fkst.toml").read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        fail("missing required manifest: fkst.toml")
+    except tomllib.TOMLDecodeError as err:
+        fail(f"fkst.toml is invalid TOML: {err}")
+
+
+def check_saga_obligations(root: Path, manifest: dict) -> None:
+    if manifest.get("persistence_class") != "saga":
+        return
+    conformance = manifest.get("conformance")
+    if not isinstance(conformance, dict) or not conformance.get("function"):
+        fail('persistence_class "saga" requires [conformance].function')
+
+    found_require = False
+    found_department = False
+    for path in sorted((root / "departments").glob("**/*.lua")):
+        source = path.read_text(encoding="utf-8")
+        found_require = found_require or 'require("workflow.saga")' in source or "require('workflow.saga')" in source
+        found_department = found_department or ".department" in source
+    if not found_require or not found_department:
+        fail('persistence_class "saga" requires require("workflow.saga") and .department in department code')
 
 
 def main() -> None:
@@ -81,6 +108,8 @@ def main() -> None:
     mode = stat.S_IMODE(os.stat(run_sh).st_mode)
     if mode & stat.S_IXUSR == 0:
         fail("scripts/run.sh must be executable")
+
+    check_saga_obligations(root, read_manifest(root))
 
 
 if __name__ == "__main__":
