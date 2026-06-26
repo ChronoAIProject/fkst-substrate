@@ -175,6 +175,7 @@ fn check_sdk_registration(host_root: &std::path::Path) -> Result<()> {
         expect_type("file", file, "table")
         expect_type("file.read", file.read, "function")
         expect_type("file.write", file.write, "function")
+        expect_type("file.mkdir", file.mkdir, "function")
         expect_type("file.exists", file.exists, "function")
         expect_type("with_lock", with_lock, "function")
         expect_type("once", once, "function")

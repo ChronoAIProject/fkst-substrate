@@ -1,7 +1,7 @@
 //! Initialize a Lua 5.4 state, expose SDK globals, load + run a lua file.
 
 use anyhow::{Context, Result};
-use mlua::{Lua, LuaSerdeExt, Value as LuaValue};
+use mlua::{Lua, LuaOptions, LuaSerdeExt, StdLib, Value as LuaValue};
 use serde_json::Value as JsonValue;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -18,6 +18,34 @@ use crate::raise::{RaiseAuthority, RaiseBuffer};
 /// Create a Lua state with stdlib enabled.
 pub fn new_lua() -> Lua {
     Lua::new()
+}
+
+/// Create a Lua state for stateless generator execution.
+pub fn new_lua_restricted() -> mlua::Result<Lua> {
+    let lua = Lua::new_with(
+        StdLib::STRING | StdLib::TABLE | StdLib::MATH | StdLib::UTF8,
+        LuaOptions::default(),
+    )?;
+    remove_restricted_generator_globals(&lua)?;
+    Ok(lua)
+}
+
+fn remove_restricted_generator_globals(lua: &Lua) -> mlua::Result<()> {
+    let globals = lua.globals();
+    for name in [
+        "os",
+        "io",
+        "package",
+        "debug",
+        "require",
+        "dofile",
+        "loadfile",
+        "load",
+        "loadstring",
+    ] {
+        globals.set(name, LuaValue::Nil)?;
+    }
+    Ok(())
 }
 
 /// Register the framework SDK globals in the same order for every entry point.
@@ -397,7 +425,7 @@ root = "."
 
     #[test]
     fn stateless_generator_omits_effect_primitives() {
-        let lua = new_lua();
+        let lua = new_lua_restricted().unwrap();
         let dir = TempDir::new().unwrap();
         let out = dir.path().join("generated");
         std::fs::create_dir_all(&out).unwrap();
@@ -429,8 +457,87 @@ root = "."
     }
 
     #[test]
+    fn stateless_generator_restricted_lua_removes_ambient_stdlib_escape_hatches() {
+        let lua = new_lua_restricted().unwrap();
+
+        let absent: bool = lua
+            .load(
+                r#"
+                return os == nil
+                    and io == nil
+                    and package == nil
+                    and debug == nil
+                    and require == nil
+                    and load == nil
+                    and loadfile == nil
+                    and dofile == nil
+                    and loadstring == nil
+                "#,
+            )
+            .eval()
+            .unwrap();
+
+        assert!(absent);
+        for expr in [
+            "os.execute('true')",
+            "io.open('/tmp/fkst-generator-bypass', 'w')",
+            "io.popen('true')",
+            "loadfile('/tmp/nope.lua')",
+            "dofile('/tmp/nope.lua')",
+            "load('return 1')",
+        ] {
+            let err = lua.load(expr).exec().unwrap_err().to_string();
+            assert!(err.contains("nil value"), "{expr}: {err}");
+        }
+    }
+
+    #[test]
+    fn stateless_generator_pipeline_rejects_ambient_stdlib_escape_hatches() {
+        for (name, expr) in [
+            ("os_execute", "os.execute('true')"),
+            ("io_open", "io.open('/tmp/fkst-generator-bypass', 'w')"),
+            ("io_popen", "io.popen('true')"),
+            ("loadfile", "loadfile('/tmp/nope.lua')"),
+            ("dofile", "dofile('/tmp/nope.lua')"),
+            ("load", "load('return 1')"),
+        ] {
+            let lua = new_lua_restricted().unwrap();
+            let dir = TempDir::new().unwrap();
+            write_package_manifest(dir.path());
+            std::fs::create_dir_all(dir.path().join("generated")).unwrap();
+            let main = dir.path().join(format!("departments/{name}/main.lua"));
+            write(
+                &main,
+                &format!(
+                    r#"
+                    local M = {{}}
+                    function M.pipeline(_)
+                        {expr}
+                    end
+                    return M
+                    "#
+                ),
+            );
+            register_test_sdk(
+                &lua,
+                dir.path(),
+                CapabilityMode::StatelessGenerator(GeneratorCapabilityPolicy {
+                    output_roots: vec![PathBuf::from("generated")],
+                    input_roots: Vec::new(),
+                }),
+            );
+
+            let err = run_dept_with_package_root(&lua, &main, &serde_json::json!({}), dir.path())
+                .unwrap_err();
+            let msg = format!("{err:#}");
+
+            assert!(msg.contains("nil value"), "{name}: {msg}");
+        }
+    }
+
+    #[test]
     fn stateless_generator_confined_fs_allows_only_policy_roots() {
-        let lua = new_lua();
+        let lua = new_lua_restricted().unwrap();
         let dir = TempDir::new().unwrap();
         let out = dir.path().join("generated");
         let input = dir.path().join("fixtures");
@@ -452,6 +559,17 @@ root = "."
             .exec()
             .unwrap();
         assert_eq!(std::fs::read_to_string(out.join("out.txt")).unwrap(), "ok");
+        lua.load(r#"file.mkdir("generated/assets/css")"#)
+            .exec()
+            .unwrap();
+        assert!(out.join("assets/css").is_dir());
+        lua.load(r#"file.write("generated/deep/page.txt", "deep")"#)
+            .exec()
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(out.join("deep/page.txt")).unwrap(),
+            "deep"
+        );
 
         let read_input: String = lua
             .load(r#"return file.read("fixtures/seed.txt")"#)
@@ -475,6 +593,60 @@ root = "."
     }
 
     #[test]
+    fn stateless_generator_can_require_module_and_write_output() {
+        let lua = new_lua_restricted().unwrap();
+        let dir = TempDir::new().unwrap();
+        write_package_manifest(dir.path());
+        std::fs::create_dir_all(dir.path().join("generated")).unwrap();
+        write(
+            &dir.path().join("core.lua"),
+            r#"
+            return {
+                render = function(value)
+                    local words = { string.upper(value), tostring(math.floor(2.8)) }
+                    table.insert(words, utf8.len("ok"))
+                    return table.concat(words, ":")
+                end
+            }
+            "#,
+        );
+        let main = dir.path().join("departments/generate/main.lua");
+        write(
+            &main,
+            r#"
+            local core = require("core")
+            local M = {}
+            function M.pipeline(event)
+                file.mkdir("generated/site")
+                file.write("generated/site/index.txt", core.render(event.name))
+            end
+            return M
+            "#,
+        );
+        register_test_sdk(
+            &lua,
+            dir.path(),
+            CapabilityMode::StatelessGenerator(GeneratorCapabilityPolicy {
+                output_roots: vec![PathBuf::from("generated")],
+                input_roots: Vec::new(),
+            }),
+        );
+
+        run_dept_with_package_root(
+            &lua,
+            &main,
+            &serde_json::json!({"name": "site"}),
+            dir.path(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("generated/site/index.txt")).unwrap(),
+            "SITE:2:2"
+        );
+    }
+
+    #[test]
     fn full_capability_mode_keeps_current_primitives() {
         let lua = new_lua();
         let dir = TempDir::new().unwrap();
@@ -490,12 +662,40 @@ root = "."
                     and type(spawn_codex_sync) == "function"
                     and type(with_lock) == "function"
                     and type(now) == "function"
+                    and type(os.execute) == "function"
+                    and type(io.open) == "function"
                 "#,
             )
             .eval()
             .unwrap();
 
         assert!(present);
+    }
+
+    #[test]
+    fn full_capability_pipeline_keeps_os_and_io_stdlib() {
+        let lua = new_lua();
+        let dir = TempDir::new().unwrap();
+        write_package_manifest(dir.path());
+        let main = dir.path().join("departments/full/main.lua");
+        write(
+            &main,
+            r#"
+            local M = {}
+            function M.pipeline(_)
+                assert(type(os.execute) == "function")
+                assert(type(io.open) == "function")
+                called = true
+            end
+            return M
+            "#,
+        );
+        register_test_sdk(&lua, dir.path(), CapabilityMode::Full);
+
+        run_dept_with_package_root(&lua, &main, &serde_json::json!({}), dir.path()).unwrap();
+
+        let called: bool = lua.globals().get("called").unwrap();
+        assert!(called);
     }
 
     #[test]

@@ -570,7 +570,6 @@ fn run_pipeline(
     }
     let raised_auth_token = std::env::var(RAISED_AUTH_TOKEN_ENV).ok();
     std::env::remove_var(RAISED_AUTH_TOKEN_ENV);
-    let lua = mlua_init::new_lua();
     let raise_buf = RaiseBuffer::new();
     let owner_root = roots
         .owner_root_for_namespace(&owner_namespace)
@@ -588,6 +587,11 @@ fn run_pipeline(
         .manifest()
         .clone();
     let capability_mode = CapabilityMode::for_manifest(&owner_manifest);
+    let lua = match &capability_mode {
+        CapabilityMode::Full => mlua_init::new_lua(),
+        CapabilityMode::StatelessGenerator(_) => mlua_init::new_lua_restricted()
+            .map_err(|err| anyhow::anyhow!("stateless_generator_restricted_lua_init: {err}"))?,
+    };
     let catalog = Arc::new(catalog);
     let graph_json_authorized =
         sdk_graph::department_authorized(&roots, owner_root, &lua_path).unwrap_or(false);

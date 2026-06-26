@@ -13,7 +13,7 @@
 use anyhow::{anyhow, bail, Context, Result};
 use fkst_common::built_in_provider::{built_in_provider_for_queue, BUILT_IN_DEAD_LETTER_PROVIDER};
 use fkst_common::config::{Config, DepartmentDecl, LimitsDecl, QueueDecl, RaiserDecl, RetryDecl};
-use mlua::{Lua, LuaSerdeExt, Table, Value as LuaValue};
+use mlua::{Lua, LuaOptions, LuaSerdeExt, StdLib, Table, Value as LuaValue};
 use serde::Deserialize;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -141,9 +141,6 @@ pub fn load_roots(roots: &PackageRoots) -> Result<Config> {
     let mut department_published_seam: HashMap<String, Vec<String>> = HashMap::new();
 
     for graph_root in &graph_roots {
-        let lua = Lua::new();
-        register_spec_eval_pure_primitives(&lua, &graph_root.root)
-            .context("register graph-scan pure primitives")?;
         let owner_unit = match roots.unit_name_for_owner_root(&graph_root.root)? {
             Some(unit) => unit,
             None => {
@@ -166,11 +163,16 @@ pub fn load_roots(roots: &PackageRoots) -> Result<Config> {
             }
         };
         let catalog = Arc::new(roots.catalog_for_owner_root(&graph_root.root)?.clone());
+        let stateless_generator = is_stateless_generator_unit(&catalog, &owner_unit);
+        let lua = new_spec_eval_lua(stateless_generator)?;
+        register_spec_eval_pure_primitives(&lua, &graph_root.root)
+            .context("register graph-scan pure primitives")?;
         scan_departments(
             &lua,
             graph_root,
             catalog.clone(),
             &owner_unit,
+            stateless_generator,
             &resolver,
             &subscribe_resolver,
             &defaults,
@@ -183,6 +185,7 @@ pub fn load_roots(roots: &PackageRoots) -> Result<Config> {
             graph_root,
             catalog.clone(),
             &owner_unit,
+            stateless_generator,
             &resolver,
             &mut raisers,
         )?;
@@ -211,6 +214,47 @@ fn reject_removed_surfaces(graph_root: &GraphRoot) -> Result<()> {
     Ok(())
 }
 
+fn is_stateless_generator_unit(catalog: &crate::manifest::UnitCatalog, owner_unit: &str) -> bool {
+    catalog
+        .units()
+        .find(|unit| unit.catalog_name() == owner_unit)
+        .map(|unit| {
+            unit.manifest().persistence_class() == Some(PersistenceClass::StatelessGenerator)
+        })
+        .unwrap_or(false)
+}
+
+fn new_spec_eval_lua(stateless_generator: bool) -> Result<Lua> {
+    if !stateless_generator {
+        return Ok(Lua::new());
+    }
+    let lua = Lua::new_with(
+        StdLib::STRING | StdLib::TABLE | StdLib::MATH | StdLib::UTF8,
+        LuaOptions::default(),
+    )
+    .context("create restricted graph-scan Lua")?;
+    remove_restricted_generator_globals(&lua).context("restrict graph-scan Lua globals")?;
+    Ok(lua)
+}
+
+fn remove_restricted_generator_globals(lua: &Lua) -> mlua::Result<()> {
+    let globals = lua.globals();
+    for name in [
+        "os",
+        "io",
+        "package",
+        "debug",
+        "require",
+        "dofile",
+        "loadfile",
+        "load",
+        "loadstring",
+    ] {
+        globals.set(name, LuaValue::Nil)?;
+    }
+    Ok(())
+}
+
 fn register_spec_eval_pure_primitives(lua: &Lua, owner_root: &Path) -> mlua::Result<()> {
     crate::sdk_strings::register_truncate_utf8(lua)?;
     crate::sdk_i18n::register(lua, owner_root)?;
@@ -222,6 +266,7 @@ fn scan_departments(
     graph_root: &GraphRoot,
     catalog: Arc<crate::manifest::UnitCatalog>,
     owner_unit: &str,
+    stateless_generator: bool,
     resolver: &NameResolver,
     subscribe_resolver: &NameResolver,
     defaults: &HostGraphDefaults,
@@ -234,13 +279,6 @@ fn scan_departments(
     if !dept_dir.is_dir() {
         return Ok(());
     }
-    let stateless_generator = catalog
-        .units()
-        .find(|unit| unit.catalog_name() == owner_unit)
-        .map(|unit| {
-            unit.manifest().persistence_class() == Some(PersistenceClass::StatelessGenerator)
-        })
-        .unwrap_or(false);
 
     for path in sorted_dirs(&dept_dir).with_context(|| format!("read {}", dept_dir.display()))? {
         let name = file_name(&path)?;
@@ -364,6 +402,7 @@ fn scan_raisers(
     graph_root: &GraphRoot,
     catalog: Arc<crate::manifest::UnitCatalog>,
     owner_unit: &str,
+    stateless_generator: bool,
     resolver: &NameResolver,
     raisers: &mut BTreeMap<String, RaiserDecl>,
 ) -> Result<()> {
@@ -371,6 +410,12 @@ fn scan_raisers(
     let raisers_dir = repo_root.join("raisers");
     if !raisers_dir.is_dir() {
         return Ok(());
+    }
+    if stateless_generator {
+        bail!(
+            "stateless_generator_raiser_denied: stateless_generator package `{}` must not declare raisers",
+            graph_root.namespace
+        );
     }
 
     for path in
@@ -743,5 +788,74 @@ fn parse_duration_millis(raw: &str) -> Option<u128> {
         'm' => Some(value.saturating_mul(60_000)),
         'h' => Some(value.saturating_mul(3_600_000)),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn write(path: &Path, body: &str) {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(path, body).unwrap();
+    }
+
+    fn write_stateless_generator(root: &Path) {
+        write(
+            &root.join("fkst.workspace.toml"),
+            r#"
+[workspace]
+units = ["."]
+"#,
+        );
+        write(
+            &root.join("fkst.toml"),
+            r#"
+kind = "package"
+name = "generator"
+persistence_class = "stateless_generator"
+
+[code]
+root = "."
+
+[generator]
+output_roots = ["generated"]
+"#,
+        );
+        std::fs::create_dir_all(root.join("generated")).unwrap();
+        write(
+            &root.join("fkst.env"),
+            "FKST_QUEUE_CAPACITY=100\nFKST_DEPARTMENT_DEFAULT_STALL_WINDOW=30m\nFKST_CODEX_PERMIT_SLOTS=20\n",
+        );
+    }
+
+    #[test]
+    fn stateless_generator_raiser_is_rejected_before_eval() {
+        let dir = TempDir::new().unwrap();
+        write_stateless_generator(dir.path());
+        write(
+            &dir.path().join("departments/generate/main.lua"),
+            r#"
+local M = {}
+M.spec = { stall_window = "30s" }
+function M.pipeline(_) end
+return M
+"#,
+        );
+        write(
+            &dir.path().join("raisers/tick.lua"),
+            r#"
+error("raiser should not be evaluated")
+"#,
+        );
+
+        let err = load(dir.path()).unwrap_err();
+        let msg = format!("{err:#}");
+
+        assert!(msg.contains("stateless_generator_raiser_denied"), "{msg}");
+        assert!(!msg.contains("raiser should not be evaluated"), "{msg}");
     }
 }

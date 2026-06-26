@@ -1,4 +1,4 @@
-//! SDK: file system helpers. file.read, file.write, file.exists, file.list.
+//! SDK: file system helpers. file.read, file.write, file.exists, file.list, file.mkdir.
 
 use mlua::{Lua, Result};
 use std::path::{Component, Path, PathBuf};
@@ -16,6 +16,13 @@ pub fn register(lua: &Lua) -> Result<()> {
         "write",
         lua.create_function(|_, (path, content): (String, String)| {
             std::fs::write(&path, content).map_err(mlua::Error::external)?;
+            Ok(())
+        })?,
+    )?;
+    file.set(
+        "mkdir",
+        lua.create_function(|_, path: String| {
+            std::fs::create_dir_all(&path).map_err(mlua::Error::external)?;
             Ok(())
         })?,
     )?;
@@ -104,7 +111,18 @@ pub(crate) fn register_with_policy(lua: &Lua, policy: FsPolicy) -> Result<()> {
         "write",
         lua.create_function(move |_, (path, content): (String, String)| {
             let path = write_policy.require_write_path(&path)?;
-            std::fs::write(&path, content).map_err(mlua::Error::external)?;
+            write_policy.create_parent_dir(&path)?;
+            atomic_write(&path, content.as_bytes()).map_err(mlua::Error::external)?;
+            Ok(())
+        })?,
+    )?;
+
+    let mkdir_policy = policy.clone();
+    file.set(
+        "mkdir",
+        lua.create_function(move |_, path: String| {
+            let path = mkdir_policy.require_mkdir_path(&path)?;
+            std::fs::create_dir_all(&path).map_err(mlua::Error::external)?;
             Ok(())
         })?,
     )?;
@@ -187,11 +205,29 @@ impl FsPolicy {
     }
 
     fn require_write_path(&self, raw: &str) -> Result<PathBuf> {
-        self.require_existing_parent_path_under(
+        self.require_creatable_path_under(
             raw,
             &self.output_roots,
             "stateless_generator_fs_write_denied",
         )
+    }
+
+    fn require_mkdir_path(&self, raw: &str) -> Result<PathBuf> {
+        self.require_creatable_path_under(
+            raw,
+            &self.output_roots,
+            "stateless_generator_fs_write_denied",
+        )
+    }
+
+    fn create_parent_dir(&self, path: &Path) -> Result<()> {
+        let Some(parent) = path.parent() else {
+            return Err(mlua::Error::external(format!(
+                "stateless_generator_fs_write_denied: path has no parent: {}",
+                path.display()
+            )));
+        };
+        std::fs::create_dir_all(parent).map_err(mlua::Error::external)
     }
 
     fn require_existing_or_parent_path_under(
@@ -243,6 +279,100 @@ impl FsPolicy {
             )))
         }
     }
+
+    fn require_creatable_path_under(
+        &self,
+        raw: &str,
+        roots: &[PathBuf],
+        error_class: &str,
+    ) -> Result<PathBuf> {
+        let path = resolve_policy_path(&self.owner_root, raw)?;
+        reject_parent_component(&path, error_class)?;
+        if let Ok(canonical) = path.canonicalize() {
+            if roots.iter().any(|root| canonical.starts_with(root)) {
+                return Ok(path);
+            }
+            return Err(mlua::Error::external(format!(
+                "{error_class}: {} is outside configured generator roots",
+                path.display()
+            )));
+        }
+        let canonical_anchor = existing_ancestor(&path).canonicalize().map_err(|err| {
+            mlua::Error::external(format!(
+                "{error_class}: canonicalize existing ancestor for {}: {err}",
+                path.display()
+            ))
+        })?;
+        if roots.iter().any(|root| canonical_anchor.starts_with(root)) {
+            Ok(path)
+        } else {
+            Err(mlua::Error::external(format!(
+                "{error_class}: {} is outside configured generator roots",
+                path.display()
+            )))
+        }
+    }
+}
+
+fn existing_ancestor(path: &Path) -> &Path {
+    let mut current = path;
+    while !current.exists() {
+        match current.parent() {
+            Some(parent) => current = parent,
+            None => return current,
+        }
+    }
+    current
+}
+
+fn atomic_write(path: &Path, content: &[u8]) -> std::io::Result<()> {
+    let parent = path.parent().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("path has no parent: {}", path.display()),
+        )
+    })?;
+    let stem = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("file");
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    for attempt in 0_u32..1024 {
+        let tmp = parent.join(format!(
+            ".{stem}.tmp.{}.{}.{}",
+            std::process::id(),
+            nonce,
+            attempt
+        ));
+        let mut file = match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)
+        {
+            Ok(file) => file,
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(err) => return Err(err),
+        };
+
+        let write_result = (|| {
+            use std::io::Write;
+            file.write_all(content)?;
+            file.sync_all()?;
+            drop(file);
+            std::fs::rename(&tmp, path)
+        })();
+        if write_result.is_err() {
+            let _ = std::fs::remove_file(&tmp);
+        }
+        return write_result;
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        format!("could not create temp file for {}", path.display()),
+    ))
 }
 
 fn canonical_policy_roots(
@@ -305,6 +435,11 @@ mod tests {
         lua.load(format!(r#"file.write("{}", "hello\n")"#, p))
             .exec()
             .unwrap();
+        let dir = tmp.path().join("nested").to_string_lossy().to_string();
+        lua.load(format!(r#"file.mkdir("{}")"#, dir))
+            .exec()
+            .unwrap();
+        assert!(tmp.path().join("nested").is_dir());
         let exists: bool = lua
             .load(format!(r#"return file.exists("{}")"#, p))
             .eval()
@@ -315,6 +450,48 @@ mod tests {
             .eval()
             .unwrap();
         assert_eq!(content, "hello\n");
+    }
+
+    #[test]
+    fn confined_file_write_creates_parents_atomically_under_output_root() {
+        let lua = Lua::new();
+        let tmp = tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("generated")).unwrap();
+        let policy =
+            FsPolicy::new(tmp.path(), vec![PathBuf::from("generated")], Vec::new()).unwrap();
+        register_with_policy(&lua, policy).unwrap();
+
+        lua.load(r#"file.write("generated/deep/site/index.html", "ok")"#)
+            .exec()
+            .unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("generated/deep/site/index.html")).unwrap(),
+            "ok"
+        );
+    }
+
+    #[test]
+    fn confined_file_mkdir_is_limited_to_output_root() {
+        let lua = Lua::new();
+        let tmp = tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("generated")).unwrap();
+        std::fs::create_dir_all(tmp.path().join("outside")).unwrap();
+        let policy =
+            FsPolicy::new(tmp.path(), vec![PathBuf::from("generated")], Vec::new()).unwrap();
+        register_with_policy(&lua, policy).unwrap();
+
+        lua.load(r#"file.mkdir("generated/assets/css")"#)
+            .exec()
+            .unwrap();
+        assert!(tmp.path().join("generated/assets/css").is_dir());
+
+        let err = lua
+            .load(r#"file.mkdir("outside/assets")"#)
+            .exec()
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("stateless_generator_fs_write_denied"), "{err}");
     }
 
     #[test]

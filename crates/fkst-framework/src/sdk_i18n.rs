@@ -1,7 +1,7 @@
 //! SDK: key-based locale catalogs and `t(key[, vars])`.
 
 use anyhow::{anyhow, bail, Context, Result};
-use mlua::{Lua, Table, Value};
+use mlua::{Lua, LuaOptions, StdLib, Table, Value};
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::Arc;
@@ -196,7 +196,7 @@ fn load_catalog_file(path: &Path) -> Result<BTreeMap<String, String>> {
         .with_context(|| format!("read locale catalog {}", path.display()))?;
     reject_forbidden_source_patterns(path, &source)?;
 
-    let lua = Lua::new();
+    let lua = new_catalog_lua()?;
     let value = lua
         .load(&source)
         .set_name(path.display().to_string())
@@ -236,6 +236,31 @@ fn load_catalog_file(path: &Path) -> Result<BTreeMap<String, String>> {
         catalog.insert(key, value);
     }
     Ok(catalog)
+}
+
+fn new_catalog_lua() -> Result<Lua> {
+    let lua = Lua::new_with(
+        StdLib::STRING | StdLib::TABLE | StdLib::MATH | StdLib::UTF8,
+        LuaOptions::default(),
+    )
+    .context("create locale catalog Lua")?;
+    let globals = lua.globals();
+    for name in [
+        "os",
+        "io",
+        "package",
+        "debug",
+        "require",
+        "dofile",
+        "loadfile",
+        "load",
+        "loadstring",
+    ] {
+        globals
+            .set(name, Value::Nil)
+            .with_context(|| format!("remove locale catalog global `{name}`"))?;
+    }
+    Ok(lua)
 }
 
 fn reject_forbidden_source_patterns(path: &Path, source: &str) -> Result<()> {
@@ -481,6 +506,23 @@ mod tests {
         let err = validate_graph_root_catalogs(dir.path()).unwrap_err();
 
         assert!(format!("{err:#}").contains("forbidden decode helper pattern"));
+    }
+
+    #[test]
+    fn locale_catalog_eval_has_no_ambient_os_io_or_load() {
+        for source in [
+            r#"return { a = tostring(os.execute("true")) }"#,
+            r#"return { a = tostring(io.open("/tmp/fkst-i18n-bypass", "w")) }"#,
+            r#"return { a = tostring(load("return 1")) }"#,
+        ] {
+            let dir = TempDir::new().unwrap();
+            write_catalog(dir.path(), "en", source);
+
+            let err = validate_graph_root_catalogs(dir.path()).unwrap_err();
+            let msg = format!("{err:#}");
+
+            assert!(msg.contains("nil value"), "{msg}");
+        }
     }
 
     #[test]
