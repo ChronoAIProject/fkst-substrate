@@ -111,8 +111,12 @@ pub(crate) fn register_with_policy(lua: &Lua, policy: FsPolicy) -> Result<()> {
         "write",
         lua.create_function(move |_, (path, content): (String, String)| {
             let path = write_policy.require_write_path(&path)?;
-            write_policy.create_parent_dir(&path)?;
-            atomic_write(&path, content.as_bytes()).map_err(mlua::Error::external)?;
+            write_file_no_follow(&path, content.as_bytes()).map_err(|err| {
+                mlua::Error::external(format!(
+                    "stateless_generator_fs_write_denied: write {}: {err}",
+                    path.display()
+                ))
+            })?;
             Ok(())
         })?,
     )?;
@@ -122,7 +126,7 @@ pub(crate) fn register_with_policy(lua: &Lua, policy: FsPolicy) -> Result<()> {
         "mkdir",
         lua.create_function(move |_, path: String| {
             let path = mkdir_policy.require_mkdir_path(&path)?;
-            std::fs::create_dir_all(&path).map_err(mlua::Error::external)?;
+            create_final_dir_no_symlink(&path, "stateless_generator_fs_write_denied")?;
             Ok(())
         })?,
     )?;
@@ -205,7 +209,7 @@ impl FsPolicy {
     }
 
     fn require_write_path(&self, raw: &str) -> Result<PathBuf> {
-        self.require_creatable_path_under(
+        self.require_creatable_path_parent_under(
             raw,
             &self.output_roots,
             "stateless_generator_fs_write_denied",
@@ -213,21 +217,11 @@ impl FsPolicy {
     }
 
     fn require_mkdir_path(&self, raw: &str) -> Result<PathBuf> {
-        self.require_creatable_path_under(
+        self.require_creatable_path_parent_under(
             raw,
             &self.output_roots,
             "stateless_generator_fs_write_denied",
         )
-    }
-
-    fn create_parent_dir(&self, path: &Path) -> Result<()> {
-        let Some(parent) = path.parent() else {
-            return Err(mlua::Error::external(format!(
-                "stateless_generator_fs_write_denied: path has no parent: {}",
-                path.display()
-            )));
-        };
-        std::fs::create_dir_all(parent).map_err(mlua::Error::external)
     }
 
     fn require_existing_or_parent_path_under(
@@ -280,7 +274,7 @@ impl FsPolicy {
         }
     }
 
-    fn require_creatable_path_under(
+    fn require_creatable_path_parent_under(
         &self,
         raw: &str,
         roots: &[PathBuf],
@@ -288,27 +282,79 @@ impl FsPolicy {
     ) -> Result<PathBuf> {
         let path = resolve_policy_path(&self.owner_root, raw)?;
         reject_parent_component(&path, error_class)?;
-        if let Ok(canonical) = path.canonicalize() {
-            if roots.iter().any(|root| canonical.starts_with(root)) {
-                return Ok(path);
-            }
+        let Some(parent) = path.parent() else {
             return Err(mlua::Error::external(format!(
-                "{error_class}: {} is outside configured generator roots",
+                "{error_class}: path has no parent: {}",
                 path.display()
             )));
-        }
-        let canonical_anchor = existing_ancestor(&path).canonicalize().map_err(|err| {
+        };
+        let Some(final_component) = path.file_name() else {
+            return Err(mlua::Error::external(format!(
+                "{error_class}: path has no final component: {}",
+                path.display()
+            )));
+        };
+        let canonical_parent = self.ensure_creatable_parent_under(parent, roots, error_class)?;
+        let target = canonical_parent.join(final_component);
+        reject_final_symlink(&target, error_class)?;
+        Ok(target)
+    }
+
+    fn ensure_creatable_parent_under(
+        &self,
+        parent: &Path,
+        roots: &[PathBuf],
+        error_class: &str,
+    ) -> Result<PathBuf> {
+        let anchor = existing_ancestor(parent);
+        let canonical_anchor = anchor.canonicalize().map_err(|err| {
             mlua::Error::external(format!(
                 "{error_class}: canonicalize existing ancestor for {}: {err}",
-                path.display()
+                parent.display()
             ))
         })?;
-        if roots.iter().any(|root| canonical_anchor.starts_with(root)) {
-            Ok(path)
+        if !roots.iter().any(|root| canonical_anchor.starts_with(root)) {
+            return Err(mlua::Error::external(format!(
+                "{error_class}: {} is outside configured generator roots",
+                parent.display()
+            )));
+        }
+
+        let mut current = canonical_anchor;
+        let missing = parent.strip_prefix(anchor).map_err(|err| {
+            mlua::Error::external(format!(
+                "{error_class}: resolve missing path under {}: {err}",
+                anchor.display()
+            ))
+        })?;
+        for component in missing.components() {
+            match component {
+                Component::Normal(name) => {
+                    current.push(name);
+                    create_dir_component_no_symlink(&current, error_class)?;
+                }
+                Component::CurDir => {}
+                _ => {
+                    return Err(mlua::Error::external(format!(
+                        "{error_class}: invalid path component in {}",
+                        parent.display()
+                    )));
+                }
+            }
+        }
+
+        let canonical_parent = current.canonicalize().map_err(|err| {
+            mlua::Error::external(format!(
+                "{error_class}: canonicalize parent {}: {err}",
+                current.display()
+            ))
+        })?;
+        if roots.iter().any(|root| canonical_parent.starts_with(root)) {
+            Ok(canonical_parent)
         } else {
             Err(mlua::Error::external(format!(
                 "{error_class}: {} is outside configured generator roots",
-                path.display()
+                parent.display()
             )))
         }
     }
@@ -325,54 +371,89 @@ fn existing_ancestor(path: &Path) -> &Path {
     current
 }
 
-fn atomic_write(path: &Path, content: &[u8]) -> std::io::Result<()> {
-    let parent = path.parent().ok_or_else(|| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            format!("path has no parent: {}", path.display()),
-        )
-    })?;
-    let stem = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("file");
-    let nonce = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_nanos())
-        .unwrap_or(0);
-    for attempt in 0_u32..1024 {
-        let tmp = parent.join(format!(
-            ".{stem}.tmp.{}.{}.{}",
-            std::process::id(),
-            nonce,
-            attempt
-        ));
-        let mut file = match std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&tmp)
-        {
-            Ok(file) => file,
-            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(err) => return Err(err),
-        };
-
-        let write_result = (|| {
-            use std::io::Write;
-            file.write_all(content)?;
-            file.sync_all()?;
-            drop(file);
-            std::fs::rename(&tmp, path)
-        })();
-        if write_result.is_err() {
-            let _ = std::fs::remove_file(&tmp);
-        }
-        return write_result;
+fn create_dir_component_no_symlink(path: &Path, error_class: &str) -> Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => Err(mlua::Error::external(format!(
+            "{error_class}: symlink path component denied: {}",
+            path.display()
+        ))),
+        Ok(metadata) if metadata.is_dir() => Ok(()),
+        Ok(_) => Err(mlua::Error::external(format!(
+            "{error_class}: path component is not a directory: {}",
+            path.display()
+        ))),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => match std::fs::create_dir(path) {
+            Ok(()) => Ok(()),
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                create_dir_component_no_symlink(path, error_class)
+            }
+            Err(err) => Err(mlua::Error::external(format!(
+                "{error_class}: create directory {}: {err}",
+                path.display()
+            ))),
+        },
+        Err(err) => Err(mlua::Error::external(format!(
+            "{error_class}: inspect directory {}: {err}",
+            path.display()
+        ))),
     }
-    Err(std::io::Error::new(
-        std::io::ErrorKind::AlreadyExists,
-        format!("could not create temp file for {}", path.display()),
-    ))
+}
+
+fn create_final_dir_no_symlink(path: &Path, error_class: &str) -> Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => Err(mlua::Error::external(format!(
+            "{error_class}: final path symlink denied: {}",
+            path.display()
+        ))),
+        Ok(metadata) if metadata.is_dir() => Ok(()),
+        Ok(_) => Err(mlua::Error::external(format!(
+            "{error_class}: final path is not a directory: {}",
+            path.display()
+        ))),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => match std::fs::create_dir(path) {
+            Ok(()) => Ok(()),
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                create_final_dir_no_symlink(path, error_class)
+            }
+            Err(err) => Err(mlua::Error::external(format!(
+                "{error_class}: create directory {}: {err}",
+                path.display()
+            ))),
+        },
+        Err(err) => Err(mlua::Error::external(format!(
+            "{error_class}: inspect path {}: {err}",
+            path.display()
+        ))),
+    }
+}
+
+fn reject_final_symlink(path: &Path, error_class: &str) -> Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => Err(mlua::Error::external(format!(
+            "{error_class}: final path symlink denied: {}",
+            path.display()
+        ))),
+        Ok(_) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(mlua::Error::external(format!(
+            "{error_class}: inspect path {}: {err}",
+            path.display()
+        ))),
+    }
+}
+
+fn write_file_no_follow(path: &Path, content: &[u8]) -> std::io::Result<()> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(nix::fcntl::OFlag::O_NOFOLLOW.bits());
+    }
+    let mut file = options.open(path)?;
+    use std::io::Write;
+    file.write_all(content)?;
+    file.sync_all()
 }
 
 fn canonical_policy_roots(
@@ -468,6 +549,40 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(tmp.path().join("generated/deep/site/index.html")).unwrap(),
             "ok"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn confined_file_write_rejects_final_symlink_escape() {
+        use std::os::unix::fs::symlink;
+
+        let lua = Lua::new();
+        let tmp = tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("generated")).unwrap();
+        std::fs::create_dir_all(tmp.path().join("outside")).unwrap();
+        symlink(
+            tmp.path().join("outside/escaped.txt"),
+            tmp.path().join("generated/out.txt"),
+        )
+        .unwrap();
+        let policy =
+            FsPolicy::new(tmp.path(), vec![PathBuf::from("generated")], Vec::new()).unwrap();
+        register_with_policy(&lua, policy).unwrap();
+
+        let err = lua
+            .load(r#"file.write("generated/out.txt", "escape")"#)
+            .exec()
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("stateless_generator_fs_write_denied"), "{err}");
+        assert!(!tmp.path().join("outside/escaped.txt").exists());
+        assert!(
+            std::fs::symlink_metadata(tmp.path().join("generated/out.txt"))
+                .unwrap()
+                .file_type()
+                .is_symlink()
         );
     }
 
