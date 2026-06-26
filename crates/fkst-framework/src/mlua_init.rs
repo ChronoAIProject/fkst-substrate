@@ -91,7 +91,7 @@ pub fn register_framework_sdk(
         }
         CapabilityMode::StatelessGenerator(policy) => {
             let policy = policy
-                .canonicalize_under(owner_root, host_root)
+                .canonicalize_for_run(owner_root, host_root)
                 .map_err(mlua::Error::external)?;
             crate::sdk_fs::register_confined(lua, owner_root, host_root, policy)?;
         }
@@ -144,7 +144,7 @@ pub(crate) fn register_framework_sdk_with_runner(
         }
         CapabilityMode::StatelessGenerator(policy) => {
             let policy = policy
-                .canonicalize_under(owner_root, host_root)
+                .canonicalize_for_run(owner_root, host_root)
                 .map_err(mlua::Error::external)?;
             crate::sdk_fs::register_confined(lua, owner_root, host_root, policy)?;
         }
@@ -394,6 +394,9 @@ name = "pkg"
 
 [code]
 root = "."
+
+[generated]
+root = "generated"
 "#,
         );
     }
@@ -425,13 +428,13 @@ root = "."
     fn stateless_generator_omits_effect_primitives() {
         let lua = new_lua_restricted().unwrap();
         let dir = TempDir::new().unwrap();
-        let out = dir.path().join("generated");
-        std::fs::create_dir_all(&out).unwrap();
+        write_package_manifest(dir.path());
+        std::fs::create_dir_all(dir.path().join("generated")).unwrap();
         register_test_sdk(
             &lua,
             dir.path(),
             CapabilityMode::StatelessGenerator(StatelessGeneratorPolicy {
-                output_roots: vec![out],
+                output_roots: vec![PathBuf::from("generated")],
                 package_input_roots: Vec::new(),
                 project_input_roots: Vec::new(),
             }),
@@ -539,6 +542,7 @@ root = "."
     fn stateless_generator_confined_fs_allows_only_policy_roots() {
         let lua = new_lua_restricted().unwrap();
         let dir = TempDir::new().unwrap();
+        write_package_manifest(dir.path());
         let out = dir.path().join("generated");
         let input = dir.path().join("fixtures");
         let outside = dir.path().join("outside");
