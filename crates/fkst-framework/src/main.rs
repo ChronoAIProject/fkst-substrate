@@ -580,6 +580,10 @@ fn run_pipeline(
     let owner_unit = catalog
         .unit_name_for_root(owner_root)?
         .ok_or_else(|| anyhow::anyhow!("no manifest unit owns {}", owner_root.display()))?;
+    let capability_mode = catalog
+        .unit_for_root(owner_root)?
+        .map(|unit| crate::capabilities::CapabilityMode::from_manifest(unit.manifest()))
+        .unwrap_or(crate::capabilities::CapabilityMode::Full);
     let catalog = Arc::new(catalog);
     let graph_json_authorized =
         sdk_graph::department_authorized(&roots, owner_root, &lua_path).unwrap_or(false);
@@ -595,6 +599,7 @@ fn run_pipeline(
 
     mlua_init::register_framework_sdk(
         &lua,
+        capability_mode,
         raise_buf.clone(),
         roots.host_root(),
         owner_root,

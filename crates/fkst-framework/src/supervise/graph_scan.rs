@@ -256,10 +256,14 @@ fn scan_departments(
         let spec: DeptSpec = lua
             .from_value(LuaValue::Table(spec_tbl))
             .with_context(|| format!("parse `{}.spec`", name))?;
+        let stateless_generator = department_is_stateless_generator(catalog.as_ref(), owner_unit)
+            .with_context(|| format!("derive `{}` capability mode", name))?;
         let consumes = resolve_queues(subscribe_resolver, &graph_root.namespace, spec.consumes)
             .with_context(|| format!("resolve `{}.spec.consumes`", name))?;
         let produces = resolve_queues(resolver, &graph_root.namespace, spec.produces)
             .with_context(|| format!("resolve `{}.spec.produces`", name))?;
+        reject_stateless_generator_wiring(stateless_generator, &name, &consumes, &produces)
+            .with_context(|| format!("validate `{}.spec`", name))?;
         reject_engine_dead_letter_produces(&produces, &name)
             .with_context(|| format!("validate `{}.spec.produces`", name))?;
         let fanout = resolve_queues(resolver, &graph_root.namespace, spec.fanout)
@@ -301,6 +305,41 @@ fn scan_departments(
         department_published_seam.insert(canonical_name, published_seam);
     }
 
+    Ok(())
+}
+
+fn department_is_stateless_generator(
+    catalog: &crate::manifest::UnitCatalog,
+    owner_unit: &str,
+) -> Result<bool> {
+    let scope = catalog
+        .require_scope_for_unit(owner_unit)
+        .with_context(|| format!("resolve unit `{owner_unit}`"))?;
+    let unit = catalog
+        .units()
+        .find(|unit| unit.catalog_name() == scope.owner_unit())
+        .ok_or_else(|| anyhow!("unknown unit `{owner_unit}`"))?;
+    Ok(
+        crate::capabilities::CapabilityMode::from_manifest(unit.manifest())
+            .is_stateless_generator(),
+    )
+}
+
+fn reject_stateless_generator_wiring(
+    stateless_generator: bool,
+    department_name: &str,
+    consumes: &[String],
+    produces: &[String],
+) -> Result<()> {
+    if !stateless_generator {
+        return Ok(());
+    }
+    if !consumes.is_empty() || !produces.is_empty() {
+        bail!(
+            "stateless_generator department `{}` must not declare M.spec.consumes or M.spec.produces",
+            department_name
+        );
+    }
     Ok(())
 }
 
