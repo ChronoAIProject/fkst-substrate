@@ -16,7 +16,9 @@ mod manifest_modules;
 #[path = "manifest_workspace.rs"]
 mod manifest_workspace;
 
-use crate::manifest_external::{fetch_locked_sources, ExternalSourceCheckout, Lockfile};
+use crate::manifest_external::{
+    fetch_locked_sources, fetch_locked_sources_with_local_roots, ExternalSourceCheckout, Lockfile,
+};
 pub(crate) use manifest_exports::Exports;
 use manifest_modules::{
     canonical_unit_code_root, insert_module_entry, scan_own_modules, unit_manifest_path,
@@ -432,6 +434,14 @@ impl UnitCatalog {
         start: &Path,
         excluded_roots: &BTreeSet<PathBuf>,
     ) -> Result<Option<Self>> {
+        Self::discover_excluding_roots_with_local_sources(start, excluded_roots, BTreeMap::new())
+    }
+
+    pub(crate) fn discover_excluding_roots_with_local_sources(
+        start: &Path,
+        excluded_roots: &BTreeSet<PathBuf>,
+        local_source_roots: BTreeMap<String, PathBuf>,
+    ) -> Result<Option<Self>> {
         let Some(workspace_manifest_path) = find_workspace_manifest(start)? else {
             return Ok(None);
         };
@@ -445,7 +455,15 @@ impl UnitCatalog {
             })?
             .to_path_buf();
         let workspace = WorkspaceManifest::parse_file(&workspace_manifest_path)?;
-        Self::from_workspace_inner(workspace_root, workspace, true, None, excluded_roots).map(Some)
+        Self::from_workspace_inner(
+            workspace_root,
+            workspace,
+            true,
+            None,
+            excluded_roots,
+            &local_source_roots,
+        )
+        .map(Some)
     }
 
     pub(crate) fn discover_for_validation(start: &Path) -> Result<Option<Self>> {
@@ -462,10 +480,26 @@ impl UnitCatalog {
             })?
             .to_path_buf();
         let workspace = WorkspaceManifest::parse_file(&workspace_manifest_path)?;
-        Self::from_workspace_for_validation(workspace_root, workspace).map(Some)
+        Self::from_workspace_inner(
+            workspace_root,
+            workspace,
+            false,
+            None,
+            &BTreeSet::new(),
+            &BTreeMap::new(),
+        )
+        .map(Some)
     }
 
     pub(crate) fn discover_with_lock(start: &Path, lockfile: Lockfile) -> Result<Option<Self>> {
+        Self::discover_with_lock_and_local_sources(start, lockfile, BTreeMap::new())
+    }
+
+    pub(crate) fn discover_with_lock_and_local_sources(
+        start: &Path,
+        lockfile: Lockfile,
+        local_source_roots: BTreeMap<String, PathBuf>,
+    ) -> Result<Option<Self>> {
         let Some(workspace_manifest_path) = find_workspace_manifest(start)? else {
             return Ok(None);
         };
@@ -485,19 +519,20 @@ impl UnitCatalog {
             true,
             Some(lockfile),
             &BTreeSet::new(),
+            &local_source_roots,
         )
         .map(Some)
     }
 
     fn from_workspace(workspace_root: PathBuf, workspace: WorkspaceManifest) -> Result<Self> {
-        Self::from_workspace_inner(workspace_root, workspace, true, None, &BTreeSet::new())
-    }
-
-    fn from_workspace_for_validation(
-        workspace_root: PathBuf,
-        workspace: WorkspaceManifest,
-    ) -> Result<Self> {
-        Self::from_workspace_inner(workspace_root, workspace, false, None, &BTreeSet::new())
+        Self::from_workspace_inner(
+            workspace_root,
+            workspace,
+            true,
+            None,
+            &BTreeSet::new(),
+            &BTreeMap::new(),
+        )
     }
 
     fn from_workspace_inner(
@@ -506,6 +541,7 @@ impl UnitCatalog {
         fail_closed: bool,
         lockfile_override: Option<Lockfile>,
         excluded_roots: &BTreeSet<PathBuf>,
+        local_source_roots: &BTreeMap<String, PathBuf>,
     ) -> Result<Self> {
         let lockfile_path = workspace_root.join(LOCKFILE);
         let lockfile = match lockfile_override {
@@ -561,8 +597,14 @@ impl UnitCatalog {
             .collect::<Vec<_>>();
         let external_checkouts = if external_library_sources.is_empty() {
             Vec::new()
-        } else {
+        } else if local_source_roots.is_empty() {
             fetch_locked_sources(&external_library_sources, &lockfile)?
+        } else {
+            fetch_locked_sources_with_local_roots(
+                &external_library_sources,
+                &lockfile,
+                local_source_roots,
+            )?
         };
         add_external_units(
             &workspace_root,

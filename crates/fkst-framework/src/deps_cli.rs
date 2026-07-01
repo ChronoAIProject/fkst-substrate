@@ -1,7 +1,10 @@
 //! Dependency graph validator for manifest workspaces.
 
 use crate::manifest::{CatalogUnit, UnitCatalog, UnitKind, Visibility};
-use crate::manifest_external::{lock_external_sources, Lockfile};
+use crate::manifest_external::{
+    fetch_locked_sources_with_local_roots, local_source_roots_for_package_roots,
+    lock_external_sources_with_local_roots, Lockfile,
+};
 use anyhow::{Context, Result};
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
@@ -20,6 +23,7 @@ pub(crate) struct DepsOptions {
 #[derive(Clone, Debug)]
 pub(crate) struct HostLockOptions {
     pub(crate) project_root: PathBuf,
+    pub(crate) package_roots: Vec<PathBuf>,
     pub(crate) json: bool,
 }
 
@@ -119,8 +123,8 @@ pub(crate) fn run(options: DepsOptions) -> Result<i32> {
     let package_roots = canonical_dirs(options.package_roots, "--package-root")?;
     let lockfile = match options.mode {
         DepsMode::Check => None,
-        DepsMode::Lock => Some(write_lockfile(&project_root)?),
-        DepsMode::Fetch => Some(read_lockfile(&project_root)?),
+        DepsMode::Lock => Some(write_lockfile(&project_root, &package_roots)?),
+        DepsMode::Fetch => Some(read_lockfile(&project_root, &package_roots)?),
     };
     let report = validate(&project_root, &package_roots, lockfile, options.locked)?;
     if options.json {
@@ -133,7 +137,8 @@ pub(crate) fn run(options: DepsOptions) -> Result<i32> {
 
 pub(crate) fn run_host_lock(options: HostLockOptions) -> Result<i32> {
     let project_root = canonical_dir(&options.project_root, "--project-root")?;
-    let _lockfile = write_lockfile(&project_root)?;
+    let package_roots = canonical_dirs(options.package_roots, "--package-root")?;
+    let _lockfile = write_lockfile(&project_root, &package_roots)?;
     let report = HostLockReport {
         ok: true,
         workspace_root: project_root.display().to_string(),
@@ -147,15 +152,24 @@ pub(crate) fn run_host_lock(options: HostLockOptions) -> Result<i32> {
     Ok(0)
 }
 
-fn write_lockfile(project_root: &Path) -> Result<Lockfile> {
+fn write_lockfile(project_root: &Path, package_roots: &[PathBuf]) -> Result<Lockfile> {
     let workspace =
         crate::manifest::WorkspaceManifest::parse_file(&project_root.join("fkst.workspace.toml"))?;
-    let lockfile = lock_external_sources(project_root, workspace.external_sources())?;
+    let local_sources = local_source_roots_for_package_roots(
+        project_root,
+        workspace.external_sources(),
+        package_roots,
+    )?;
+    let lockfile = lock_external_sources_with_local_roots(
+        project_root,
+        workspace.external_sources(),
+        &local_sources,
+    )?;
     lockfile.write_file(&project_root.join("fkst.lock"))?;
     Ok(lockfile)
 }
 
-fn read_lockfile(project_root: &Path) -> Result<Lockfile> {
+fn read_lockfile(project_root: &Path, package_roots: &[PathBuf]) -> Result<Lockfile> {
     let path = project_root.join("fkst.lock");
     if !path.exists() {
         anyhow::bail!("fkst.lock is required for deps fetch");
@@ -163,8 +177,16 @@ fn read_lockfile(project_root: &Path) -> Result<Lockfile> {
     let lockfile = Lockfile::parse_file(&path)?;
     let workspace =
         crate::manifest::WorkspaceManifest::parse_file(&project_root.join("fkst.workspace.toml"))?;
-    let _ =
-        crate::manifest_external::fetch_locked_sources(workspace.external_sources(), &lockfile)?;
+    let local_sources = local_source_roots_for_package_roots(
+        project_root,
+        workspace.external_sources(),
+        package_roots,
+    )?;
+    let _ = fetch_locked_sources_with_local_roots(
+        workspace.external_sources(),
+        &lockfile,
+        &local_sources,
+    )?;
     Ok(lockfile)
 }
 
@@ -209,7 +231,20 @@ fn validation_catalogs(
 ) -> Result<Vec<UnitCatalog>> {
     let host_catalog = match lockfile {
         Some(lockfile) => {
-            UnitCatalog::discover_with_lock(project_root, lockfile)?.ok_or_else(|| {
+            let workspace = crate::manifest::WorkspaceManifest::parse_file(
+                &project_root.join("fkst.workspace.toml"),
+            )?;
+            let local_sources = local_source_roots_for_package_roots(
+                project_root,
+                workspace.external_sources(),
+                package_roots,
+            )?;
+            UnitCatalog::discover_with_lock_and_local_sources(
+                project_root,
+                lockfile,
+                local_sources,
+            )?
+            .ok_or_else(|| {
                 anyhow::anyhow!("manifest catalog is required: missing fkst.workspace.toml")
             })?
         }
@@ -220,7 +255,20 @@ fn validation_catalogs(
             } else {
                 Lockfile::default()
             };
-            UnitCatalog::discover_with_lock(project_root, lockfile)?.ok_or_else(|| {
+            let workspace = crate::manifest::WorkspaceManifest::parse_file(
+                &project_root.join("fkst.workspace.toml"),
+            )?;
+            let local_sources = local_source_roots_for_package_roots(
+                project_root,
+                workspace.external_sources(),
+                package_roots,
+            )?;
+            UnitCatalog::discover_with_lock_and_local_sources(
+                project_root,
+                lockfile,
+                local_sources,
+            )?
+            .ok_or_else(|| {
                 anyhow::anyhow!("manifest catalog is required: missing fkst.workspace.toml")
             })?
         }

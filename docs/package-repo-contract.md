@@ -11,10 +11,10 @@
 Host `[[external_sources]] packages = [...]` is the platform package selector for external package roots. Entries are package-root basenames, and validation reports all explicit external package roots missing from that selector in one diagnostic. Hosts with `[[external_sources]]` generate the required `fkst.lock` through the deterministic resolver command:
 
 ```text
-fkst-framework host lock --project-root <HOST>
+fkst-framework host lock --project-root <HOST> [--package-root <PACKAGE_ROOT> ...]
 ```
 
-`host lock` reads `<HOST>/fkst.workspace.toml`, resolves declared external sources, writes `<HOST>/fkst.lock`, and reuses the same lock format consumed by `supervise`, `run`, `test`, `conformance`, and `deps --locked`.
+`host lock` reads `<HOST>/fkst.workspace.toml`, resolves declared external sources, writes `<HOST>/fkst.lock`, and reuses the same lock format consumed by `supervise`, `run`, `test`, `conformance`, and `deps --locked`. Without explicit package roots it resolves declared external sources from their declared `git` source and `rev` / `tag`. With explicit external `--package-root` inputs, it resolves the owning declared external source to the local source workspace `HEAD`; runtime commands that receive the same explicit package roots validate `fkst.lock` fail-closed against that local `HEAD` and tree hash.
 
 ```text
 <PACKAGE_ROOT>/
