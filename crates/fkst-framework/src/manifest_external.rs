@@ -214,7 +214,10 @@ fn locked_source_checkout(
 ) -> Result<ExternalSourceCheckout> {
     validate_source_decl(source)?;
     let Some(lock) = lockfile.external_source(&source.id) else {
-        bail!("external source `{}` is missing from fkst.lock", source.id);
+        bail!(
+            "external source `{}` is missing from fkst.lock; run `fkst-framework host lock --project-root <root>`",
+            source.id
+        );
     };
     validate_lock_matches_manifest(source, lock)?;
     let cache = cache_root();
@@ -372,7 +375,7 @@ fn validate_lock_matches_manifest(
             .any(|library| &library.name == allowed)
         {
             bail!(
-                "external source `{}` library `{}` is allowed by the workspace manifest but missing from fkst.lock; run `deps lock`",
+                "external source `{}` library `{}` is allowed by the workspace manifest but missing from fkst.lock; run `fkst-framework host lock --project-root <root>`",
                 source.id,
                 allowed
             );
