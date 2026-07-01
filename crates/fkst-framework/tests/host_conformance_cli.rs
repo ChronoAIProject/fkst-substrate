@@ -949,6 +949,7 @@ units = ["packages/*"]
 id = "fkst-platform"
 git = "__PLATFORM_GIT__"
 rev = "__PLATFORM_REV__"
+packages = ["idle-detector"]
 libraries = ["contract", "workflow", "testkit"]
 "#,
     )
@@ -1164,6 +1165,7 @@ libraries = [".fkst/std"]
 id = "fkst-platform"
 git = "__PLATFORM_GIT__"
 rev = "__PLATFORM_REV__"
+packages = ["idle-detector"]
 libraries = ["contract"]
 "#,
     )
