@@ -8,6 +8,8 @@
 
 一个 fkst package-repo 提供一个或多个 package root。package root 是引擎扫描与运行 Lua graph 的输入目录；它不是 Rust crate。当前 library-dependency contract 要求每个 package root 是 `fkst.workspace.toml` 发现的 manifest unit；显式传入且位于 `--project-root` 外部的 platform package root 使用自身向上发现的 workspace catalog，而不是由 host workspace 拥有。标准布局如下：
 
+Host `[[external_sources]] packages = [...]` is the platform package selector for external package roots. Entries are package-root basenames, and validation reports all explicit external package roots missing from that selector in one diagnostic.
+
 ```text
 <PACKAGE_ROOT>/
 ├── core.lua

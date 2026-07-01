@@ -553,10 +553,16 @@ impl UnitCatalog {
             units.insert(unit.catalog_name().to_string(), unit);
         }
 
-        let external_checkouts = if workspace.external_sources().is_empty() {
+        let external_library_sources = workspace
+            .external_sources()
+            .iter()
+            .filter(|source| !source.libraries.is_empty())
+            .cloned()
+            .collect::<Vec<_>>();
+        let external_checkouts = if external_library_sources.is_empty() {
             Vec::new()
         } else {
-            fetch_locked_sources(workspace.external_sources(), &lockfile)?
+            fetch_locked_sources(&external_library_sources, &lockfile)?
         };
         add_external_units(
             &workspace_root,
