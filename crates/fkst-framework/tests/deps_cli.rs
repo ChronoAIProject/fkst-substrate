@@ -245,6 +245,68 @@ return {
     );
 }
 
+fn consumer_workspace_with_external_packages(
+    root: &Path,
+    source_root: &Path,
+    rev: &str,
+    packages: &[&str],
+    libraries: &[&str],
+) {
+    write(
+        &root.join("fkst.workspace.toml"),
+        &format!(
+            r#"
+[workspace]
+units = []
+
+[[external_sources]]
+id = "fkst-platform"
+git = "{}"
+rev = "{rev}"
+packages = [{}]
+libraries = [{}]
+"#,
+            source_root.display(),
+            quoted(packages),
+            quoted(libraries)
+        ),
+    );
+}
+
+fn init_platform_package_repo(root: &Path) -> String {
+    workspace(root, &["packages/platform-pkg", "libraries/contract"]);
+    package(root, "platform-pkg", &["contract"], &[]);
+    write(
+        &root.join("packages/platform-pkg/departments/probe/main.lua"),
+        r#"
+local contract = require("contract.api")
+return {
+  spec = { consumes = { "tick" }, produces = {} },
+  pipeline = function(event)
+    assert(contract.value == "external-contract", contract.value)
+  end,
+}
+"#,
+    );
+    library_with_publishable(root, "contract", &[], None, true);
+    write(
+        &root.join("libraries/contract/public/api.lua"),
+        r#"return { value = "external-contract" }"#,
+    );
+    let init = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .arg("init")
+        .output()
+        .unwrap();
+    assert_exit(&init, 0);
+    git(root, &["config", "user.email", "fkst-test@example.invalid"]);
+    git(root, &["config", "user.name", "fkst test"]);
+    git(root, &["add", "."]);
+    git(root, &["commit", "-m", "Add platform package"]);
+    git(root, &["rev-parse", "HEAD"])
+}
+
 fn consumer_workspace_with_external_tag(
     root: &Path,
     source_root: &Path,
@@ -321,6 +383,113 @@ fn host_lock_writes_lockfile_for_declared_external_sources() {
         .unwrap();
 
     assert_exit(&locked_output, 0);
+}
+
+#[test]
+fn host_lock_with_package_root_pins_local_source_head() {
+    let temp = tempfile::tempdir().unwrap();
+    let cache = temp.path().join("cache");
+    let remote = temp.path().join("remote");
+    let local = temp.path().join("local-platform");
+    let consumer = temp.path().join("consumer");
+    let remote_rev = init_platform_package_repo(&remote);
+    let clone = Command::new("git")
+        .arg("clone")
+        .arg(&remote)
+        .arg(&local)
+        .output()
+        .unwrap();
+    assert_exit(&clone, 0);
+    git(&local, &["config", "user.email", "fkst-test@example.invalid"]);
+    git(&local, &["config", "user.name", "fkst test"]);
+    write(
+        &local.join("libraries/contract/public/api.lua"),
+        r#"return { value = "local-contract" }"#,
+    );
+    git(&local, &["add", "."]);
+    git(&local, &["commit", "-m", "Advance local platform"]);
+    let local_rev = git(&local, &["rev-parse", "HEAD"]);
+    assert_ne!(remote_rev, local_rev);
+    consumer_workspace_with_external_packages(
+        &consumer,
+        &remote,
+        &remote_rev,
+        &["platform-pkg"],
+        &["contract"],
+    );
+
+    let lock_output = host_lock(&consumer)
+        .arg("--package-root")
+        .arg(local.join("packages/platform-pkg"))
+        .env("FKST_CACHE_ROOT", &cache)
+        .output()
+        .unwrap();
+
+    assert_exit(&lock_output, 0);
+    let lock = fs::read_to_string(consumer.join("fkst.lock")).unwrap();
+    assert!(lock.contains(&format!(r#"rev = "{remote_rev}""#)), "{lock}");
+    assert!(lock.contains(&format!(r#"rev = "{local_rev}""#)), "{lock}");
+}
+
+#[test]
+fn locked_package_root_head_mismatch_fails_closed() {
+    let temp = tempfile::tempdir().unwrap();
+    let cache = temp.path().join("cache");
+    let remote = temp.path().join("remote");
+    let local = temp.path().join("local-platform");
+    let consumer = temp.path().join("consumer");
+    let remote_rev = init_platform_package_repo(&remote);
+    let clone = Command::new("git")
+        .arg("clone")
+        .arg(&remote)
+        .arg(&local)
+        .output()
+        .unwrap();
+    assert_exit(&clone, 0);
+    git(&local, &["config", "user.email", "fkst-test@example.invalid"]);
+    git(&local, &["config", "user.name", "fkst test"]);
+    consumer_workspace_with_external_packages(
+        &consumer,
+        &remote,
+        &remote_rev,
+        &["platform-pkg"],
+        &["contract"],
+    );
+
+    let lock_output = host_lock(&consumer)
+        .arg("--package-root")
+        .arg(local.join("packages/platform-pkg"))
+        .env("FKST_CACHE_ROOT", &cache)
+        .output()
+        .unwrap();
+    assert_exit(&lock_output, 0);
+
+    write(
+        &local.join("libraries/contract/public/api.lua"),
+        r#"return { value = "advanced-local-contract" }"#,
+    );
+    git(&local, &["add", "."]);
+    git(
+        &local,
+        &["commit", "-m", "Advance local platform after lock"],
+    );
+    let advanced_rev = git(&local, &["rev-parse", "HEAD"]);
+
+    let output = deps(&consumer)
+        .arg("--package-root")
+        .arg(local.join("packages/platform-pkg"))
+        .arg("--locked")
+        .env("FKST_CACHE_ROOT", &cache)
+        .output()
+        .unwrap();
+
+    assert_exit(&output, 2);
+    let err = stderr(&output);
+    assert!(
+        err.contains("fkst.lock external_source(id=fkst-platform) resolved.rev does not match explicit --package-root source HEAD"),
+        "{err}"
+    );
+    assert!(err.contains(&advanced_rev), "{err}");
 }
 
 #[test]

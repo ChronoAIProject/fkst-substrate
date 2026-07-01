@@ -149,31 +149,50 @@ pub(crate) struct ExternalLibraryCheckout {
     pub(crate) publishable: bool,
 }
 
-pub(crate) fn lock_external_sources(
+pub(crate) fn lock_external_sources_with_local_roots(
     workspace_root: &Path,
     sources: &[ExternalSourceDecl],
+    local_roots: &BTreeMap<String, PathBuf>,
 ) -> Result<Lockfile> {
+    validate_local_source_ids(sources, local_roots)?;
     let cache = cache_root();
     let mut locked_sources = Vec::new();
     for source in sources {
         validate_source_decl(source)?;
-        let resolved_rev = resolve_source_rev(source)?;
-        let checkout_root = export_source_tree(&cache, source, &resolved_rev)?;
+        let local_root = local_roots.get(&source.id).cloned();
+        let resolved_rev = if let Some(local_root) = &local_root {
+            resolve_local_source_rev(source, local_root)?
+        } else {
+            resolve_source_rev(source)?
+        };
+        let checkout_root = if let Some(local_root) = local_root {
+            canonical_dir(
+                &local_root,
+                &format!("external source `{}` local root", source.id),
+            )?
+        } else {
+            export_source_tree(&cache, source, &resolved_rev)?
+        };
         let tree_sha256 = prefixed_tree_sha256(&checkout_root)?;
-        let store_root = cache.store_checkout(&tree_sha256);
-        fs::create_dir_all(store_root.parent().unwrap())
-            .with_context(|| format!("create {}", store_root.parent().unwrap().display()))?;
-        if store_root.exists() {
-            remove_dir_all(&store_root)?;
-        }
-        fs::rename(&checkout_root, &store_root).with_context(|| {
-            format!(
-                "move source checkout {} to {}",
-                checkout_root.display(),
-                store_root.display()
-            )
-        })?;
-        let libraries = catalog_allowed_libraries(source, &store_root)?;
+        let source_root = if local_roots.contains_key(&source.id) {
+            checkout_root
+        } else {
+            let store_root = cache.store_checkout(&tree_sha256);
+            fs::create_dir_all(store_root.parent().unwrap())
+                .with_context(|| format!("create {}", store_root.parent().unwrap().display()))?;
+            if store_root.exists() {
+                remove_dir_all(&store_root)?;
+            }
+            fs::rename(&checkout_root, &store_root).with_context(|| {
+                format!(
+                    "move source checkout {} to {}",
+                    checkout_root.display(),
+                    store_root.display()
+                )
+            })?;
+            store_root
+        };
+        let libraries = catalog_allowed_libraries(source, &source_root)?;
         locked_sources.push(ExternalSourceLock {
             id: source.id.clone(),
             git: source.git.clone(),
@@ -202,15 +221,92 @@ pub(crate) fn fetch_locked_sources(
     sources: &[ExternalSourceDecl],
     lockfile: &Lockfile,
 ) -> Result<Vec<ExternalSourceCheckout>> {
+    fetch_locked_sources_with_local_roots(sources, lockfile, &BTreeMap::new())
+}
+
+pub(crate) fn fetch_locked_sources_with_local_roots(
+    sources: &[ExternalSourceDecl],
+    lockfile: &Lockfile,
+    local_roots: &BTreeMap<String, PathBuf>,
+) -> Result<Vec<ExternalSourceCheckout>> {
     sources
         .iter()
-        .map(|source| locked_source_checkout(source, lockfile))
+        .map(|source| locked_source_checkout(source, lockfile, local_roots))
         .collect()
+}
+
+pub(crate) fn validate_locked_local_sources(
+    sources: &[ExternalSourceDecl],
+    lockfile: &Lockfile,
+    local_roots: &BTreeMap<String, PathBuf>,
+) -> Result<()> {
+    validate_local_source_ids(sources, local_roots)?;
+    for source in sources {
+        if local_roots.contains_key(&source.id) {
+            let _ = locked_source_checkout(source, lockfile, local_roots)?;
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn local_source_roots_for_package_roots(
+    host_root: &Path,
+    sources: &[ExternalSourceDecl],
+    package_roots: &[PathBuf],
+) -> Result<BTreeMap<String, PathBuf>> {
+    if sources.is_empty() || package_roots.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+    let declarations = external_package_declarations(sources)?;
+    let mut local_roots = BTreeMap::new();
+    let mut missing = Vec::new();
+    for package_root in package_roots {
+        let Some(workspace_root) =
+            crate::manifest::UnitCatalog::discover_workspace_root(package_root)?
+        else {
+            continue;
+        };
+        if workspace_root == host_root {
+            continue;
+        }
+        let package = package_root
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| {
+                anyhow::anyhow!("package root has no basename: {}", package_root.display())
+            })?
+            .to_string();
+        validate_name("package root basename", &package)?;
+        let Some(source_id) = declarations.get(&package) else {
+            missing.push(package);
+            continue;
+        };
+        match local_roots.insert(source_id.clone(), workspace_root.clone()) {
+            Some(previous) if previous != workspace_root => {
+                bail!(
+                    "external source `{source_id}` selected from multiple local --package-root workspace roots: {} and {}",
+                    previous.display(),
+                    workspace_root.display()
+                );
+            }
+            _ => {}
+        }
+    }
+    if !missing.is_empty() {
+        missing.sort();
+        missing.dedup();
+        bail!(
+            "target fkst.workspace.toml does not declare platform packages in [[external_sources]].packages: {}; add them to the external source block that owns these package roots",
+            missing.join(", ")
+        );
+    }
+    Ok(local_roots)
 }
 
 fn locked_source_checkout(
     source: &ExternalSourceDecl,
     lockfile: &Lockfile,
+    local_roots: &BTreeMap<String, PathBuf>,
 ) -> Result<ExternalSourceCheckout> {
     validate_source_decl(source)?;
     let Some(lock) = lockfile.external_source(&source.id) else {
@@ -220,6 +316,9 @@ fn locked_source_checkout(
         );
     };
     validate_lock_matches_manifest(source, lock)?;
+    if let Some(local_root) = local_roots.get(&source.id) {
+        return locked_local_source_checkout(source, lock, local_root);
+    }
     let cache = cache_root();
     let store_root = cache.store_checkout(&lock.resolved.tree_sha256);
     if !store_root.exists() {
@@ -255,8 +354,59 @@ fn locked_source_checkout(
             actual_tree
         );
     }
-    let libraries = lock
-        .libraries
+    let libraries = locked_libraries(source, lock, &store_root)?;
+    let available_libraries = available_library_names(&store_root)?;
+    Ok(ExternalSourceCheckout {
+        source_id: source.id.clone(),
+        root: store_root,
+        libraries,
+        available_libraries,
+    })
+}
+
+fn locked_local_source_checkout(
+    source: &ExternalSourceDecl,
+    lock: &ExternalSourceLock,
+    local_root: &Path,
+) -> Result<ExternalSourceCheckout> {
+    let local_root = canonical_dir(
+        local_root,
+        &format!("external source `{}` local root", source.id),
+    )?;
+    let actual_rev = resolve_local_source_rev(source, &local_root)?;
+    if actual_rev != lock.resolved.rev {
+        bail!(
+            "fkst.lock external_source(id={}) resolved.rev does not match explicit --package-root source HEAD: lock has {}, local HEAD is {}",
+            source.id,
+            lock.resolved.rev,
+            actual_rev
+        );
+    }
+    let actual_tree = prefixed_tree_sha256(&local_root)?;
+    if actual_tree != lock.resolved.tree_sha256 {
+        bail!(
+            "external source `{}` local tree hash mismatch: lock has {}, local source has {}",
+            source.id,
+            lock.resolved.tree_sha256,
+            actual_tree
+        );
+    }
+    let libraries = locked_libraries(source, lock, &local_root)?;
+    let available_libraries = available_library_names(&local_root)?;
+    Ok(ExternalSourceCheckout {
+        source_id: source.id.clone(),
+        root: local_root,
+        libraries,
+        available_libraries,
+    })
+}
+
+fn locked_libraries(
+    source: &ExternalSourceDecl,
+    lock: &ExternalSourceLock,
+    source_root: &Path,
+) -> Result<Vec<ExternalLibraryCheckout>> {
+    lock.libraries
         .iter()
         .map(|library| {
             if !source.libraries.iter().any(|allowed| allowed == &library.name) {
@@ -266,7 +416,7 @@ fn locked_source_checkout(
                     library.name
                 );
             }
-            let unit_root = store_root.join(&library.unit);
+            let unit_root = source_root.join(&library.unit);
             let actual_exports = prefixed_exports_sha256(&unit_root)?;
             if actual_exports != library.exports_sha256 {
                 bail!(
@@ -283,14 +433,7 @@ fn locked_source_checkout(
                 publishable: publishable_library_at(&unit_root)?,
             })
         })
-        .collect::<Result<Vec<_>>>()?;
-    let available_libraries = available_library_names(&store_root)?;
-    Ok(ExternalSourceCheckout {
-        source_id: source.id.clone(),
-        root: store_root,
-        libraries,
-        available_libraries,
-    })
+        .collect::<Result<Vec<_>>>()
 }
 
 fn validate_source_decl(source: &ExternalSourceDecl) -> Result<()> {
@@ -340,6 +483,50 @@ fn validate_source_decl(source: &ExternalSourceDecl) -> Result<()> {
     Ok(())
 }
 
+fn validate_local_source_ids(
+    sources: &[ExternalSourceDecl],
+    local_roots: &BTreeMap<String, PathBuf>,
+) -> Result<()> {
+    let source_ids = sources
+        .iter()
+        .map(|source| &source.id)
+        .collect::<BTreeSet<_>>();
+    for source_id in local_roots.keys() {
+        if !source_ids.contains(source_id) {
+            bail!("local external source `{source_id}` is not declared in fkst.workspace.toml");
+        }
+    }
+    Ok(())
+}
+
+fn external_package_declarations(
+    sources: &[ExternalSourceDecl],
+) -> Result<BTreeMap<String, String>> {
+    let mut declared_packages = BTreeMap::new();
+    for source in sources {
+        validate_name("external source id", &source.id)?;
+        let mut source_seen = BTreeSet::new();
+        for package in &source.packages {
+            validate_name("external source package", package)?;
+            if !source_seen.insert(package.clone()) {
+                bail!(
+                    "external source `{}` declares duplicate platform package `{package}`",
+                    source.id
+                );
+            }
+            if let Some(previous_source) =
+                declared_packages.insert(package.clone(), source.id.clone())
+            {
+                bail!(
+                    "ambiguous target fkst.workspace.toml platform package `{package}` declared by external sources `{previous_source}` and `{}`",
+                    source.id
+                );
+            }
+        }
+    }
+    Ok(declared_packages)
+}
+
 fn validate_lock_matches_manifest(
     source: &ExternalSourceDecl,
     lock: &ExternalSourceLock,
@@ -382,6 +569,30 @@ fn validate_lock_matches_manifest(
         }
     }
     Ok(())
+}
+
+fn resolve_local_source_rev(source: &ExternalSourceDecl, local_root: &Path) -> Result<String> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(local_root)
+        .args(["rev-parse", "--verify", "HEAD^{commit}"])
+        .output()
+        .with_context(|| {
+            format!(
+                "resolve explicit --package-root source HEAD for external source `{}`",
+                source.id
+            )
+        })?;
+    if !output.status.success() {
+        bail!(
+            "external source `{}` local --package-root source HEAD resolve failed: {}",
+            source.id,
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    let rev = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    validate_full_sha(&rev)?;
+    Ok(rev)
 }
 
 fn resolve_source_rev(source: &ExternalSourceDecl) -> Result<String> {
@@ -753,4 +964,14 @@ fn validate_prefixed_hash(value: &str) -> Result<()> {
         bail!("hash `{value}` must be sha256- plus 64 hex chars");
     }
     Ok(())
+}
+
+fn canonical_dir(path: &Path, label: &str) -> Result<PathBuf> {
+    let canonical = path
+        .canonicalize()
+        .with_context(|| format!("canonicalize {label} {}", path.display()))?;
+    if !canonical.is_dir() {
+        bail!("{label} is not a directory: {}", canonical.display());
+    }
+    Ok(canonical)
 }

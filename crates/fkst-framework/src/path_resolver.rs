@@ -1,6 +1,9 @@
 //! Resolve fixed package roots, host graph inputs, and package-local names.
 
 use crate::manifest::UnitCatalog;
+use crate::manifest_external::{
+    local_source_roots_for_package_roots, validate_locked_local_sources, Lockfile,
+};
 use anyhow::{bail, Context, Result};
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
@@ -132,10 +135,30 @@ impl PackageRoots {
         } else {
             BTreeSet::new()
         };
-        let catalog = UnitCatalog::discover_excluding_roots(&host_root, &excluded_roots)?
+        let mut catalog = UnitCatalog::discover_excluding_roots(&host_root, &excluded_roots)?
             .ok_or_else(|| {
                 anyhow::anyhow!("manifest catalog is required: missing fkst.workspace.toml")
             })?;
+        let local_source_roots = if package_roots_are_explicit {
+            local_source_roots_for_package_roots(
+                &host_root,
+                catalog.workspace().external_sources(),
+                &package_roots,
+            )?
+        } else {
+            BTreeMap::new()
+        };
+        if !local_source_roots.is_empty() {
+            catalog = UnitCatalog::discover_excluding_roots_with_local_sources(
+                &host_root,
+                &excluded_roots,
+                local_source_roots.clone(),
+            )?
+            .ok_or_else(|| {
+                anyhow::anyhow!("manifest catalog is required: missing fkst.workspace.toml")
+            })?;
+        }
+        validate_locked_local_package_sources(&catalog, &local_source_roots)?;
         let (external_catalogs, external_package_catalog_roots) = if package_roots_are_explicit {
             validate_external_package_declarations(&host_root, &catalog, &package_roots)?;
             external_package_catalogs(&host_root, &catalog, &package_roots)?
@@ -499,6 +522,27 @@ fn external_package_declarations(host_catalog: &UnitCatalog) -> Result<BTreeMap<
     Ok(declared_packages)
 }
 
+fn validate_locked_local_package_sources(
+    host_catalog: &UnitCatalog,
+    local_source_roots: &BTreeMap<String, PathBuf>,
+) -> Result<()> {
+    if local_source_roots.is_empty() {
+        return Ok(());
+    }
+    let lockfile_path = host_catalog.workspace_root().join("fkst.lock");
+    if !lockfile_path.exists() {
+        bail!(
+            "fkst.lock is required for explicit external --package-root sources; run `fkst-framework host lock --project-root <root> --package-root <root> ...`"
+        );
+    }
+    let lockfile = Lockfile::parse_file(&lockfile_path)?;
+    validate_locked_local_sources(
+        host_catalog.workspace().external_sources(),
+        &lockfile,
+        local_source_roots,
+    )
+}
+
 fn collect_conformance_library_roots<'a>(
     units: impl Iterator<Item = &'a crate::manifest::CatalogUnit>,
     roots: &mut BTreeMap<(String, PathBuf), LibraryConformanceRoot>,
@@ -719,6 +763,64 @@ root = "."
             std::fs::create_dir_all(parent).unwrap();
         }
         std::fs::write(path, body).unwrap();
+    }
+
+    fn git(root: &Path, args: &[&str]) -> String {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "stdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    }
+
+    fn init_git_repo(root: &Path) -> String {
+        let init = std::process::Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .arg("init")
+            .output()
+            .unwrap();
+        assert!(
+            init.status.success(),
+            "stdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&init.stdout),
+            String::from_utf8_lossy(&init.stderr)
+        );
+        git(root, &["config", "user.email", "fkst-test@example.invalid"]);
+        git(root, &["config", "user.name", "fkst test"]);
+        git(root, &["add", "."]);
+        git(root, &["commit", "-m", "Add platform packages"]);
+        git(root, &["rev-parse", "HEAD"])
+    }
+
+    fn write_lock_for_local_platform(host: &Path, external: &Path, resolved_rev: &str) {
+        let tree_hash =
+            crate::manifest_external::tree_sha256(external).expect("hash local platform tree");
+        write(
+            &host.join("fkst.lock"),
+            &format!(
+                r#"
+[[external_source]]
+id = "fkst-platform"
+git = "/tmp/fkst-platform"
+
+[external_source.intent]
+rev = "0123456789abcdef0123456789abcdef01234567"
+
+[external_source.resolved]
+rev = "{resolved_rev}"
+tree_sha256 = "sha256-{tree_hash}"
+"#
+            ),
+        );
     }
 
     #[test]
@@ -997,6 +1099,8 @@ packages = ["platform-a", "platform-b"]
         write_workspace_with_units(&external, &["packages/platform-a", "packages/platform-b"]);
         write_package_unit_manifest(&platform_a, "platform-a");
         write_package_unit_manifest(&platform_b, "platform-b");
+        let rev = init_git_repo(&external);
+        write_lock_for_local_platform(&host, &external, &rev);
 
         let roots = PackageRoots::resolve(&host, vec![platform_a.clone(), platform_b]).unwrap();
 
@@ -1029,6 +1133,8 @@ packages = ["platform-a"]
         );
         write_workspace_with_units(&external, &["packages/platform-a"]);
         write_package_unit_manifest(&package_root, "logical-a");
+        let rev = init_git_repo(&external);
+        write_lock_for_local_platform(&host, &external, &rev);
 
         let roots = PackageRoots::resolve(&host, vec![package_root.clone()]).unwrap();
 
