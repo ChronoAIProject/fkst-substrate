@@ -308,11 +308,21 @@ fn validate_source_decl(source: &ExternalSourceDecl) -> Result<()> {
         ),
         (None, None) => bail!("external source `{}` must set rev or tag", source.id),
     }?;
-    if source.libraries.is_empty() {
+    if source.packages.is_empty() && source.libraries.is_empty() {
         bail!(
-            "external source `{}` libraries must not be empty",
+            "external source `{}` must declare at least one package or library",
             source.id
         );
+    }
+    let mut seen = BTreeSet::new();
+    for package in &source.packages {
+        validate_name("external source package", package)?;
+        if !seen.insert(package.clone()) {
+            bail!(
+                "external source `{}` declares duplicate package `{package}`",
+                source.id
+            );
+        }
     }
     let mut seen = BTreeSet::new();
     for library in &source.libraries {

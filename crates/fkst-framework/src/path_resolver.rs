@@ -137,6 +137,7 @@ impl PackageRoots {
                 anyhow::anyhow!("manifest catalog is required: missing fkst.workspace.toml")
             })?;
         let (external_catalogs, external_package_catalog_roots) = if package_roots_are_explicit {
+            validate_external_package_declarations(&host_root, &catalog, &package_roots)?;
             external_package_catalogs(&host_root, &catalog, &package_roots)?
         } else {
             (BTreeMap::new(), BTreeMap::new())
@@ -424,6 +425,78 @@ fn external_package_catalogs(
         catalogs.entry(workspace_root).or_insert(catalog);
     }
     Ok((catalogs, package_catalog_roots))
+}
+
+fn validate_external_package_declarations(
+    host_root: &Path,
+    host_catalog: &UnitCatalog,
+    package_roots: &[PathBuf],
+) -> Result<()> {
+    if host_catalog.workspace().external_sources().is_empty() {
+        return Ok(());
+    }
+    let declared_packages = external_package_declarations(host_catalog)?;
+    let mut missing = Vec::new();
+    for package_root in package_roots {
+        if package_root == host_root || host_catalog.unit_name_for_root(package_root)?.is_some() {
+            continue;
+        }
+        let catalog = UnitCatalog::discover(package_root)?.ok_or_else(|| {
+            anyhow::anyhow!(
+                "manifest catalog is required for package root {}",
+                package_root.display()
+            )
+        })?;
+        if catalog.unit_for_root(package_root)?.is_none() {
+            continue;
+        };
+        let package = package_root
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| {
+                anyhow::anyhow!("package root has no basename: {}", package_root.display())
+            })?
+            .to_string();
+        validate_name_segment("package root basename", &package)?;
+        if !declared_packages.contains_key(&package) {
+            missing.push(package);
+        }
+    }
+    if !missing.is_empty() {
+        missing.sort();
+        missing.dedup();
+        bail!(
+            "target fkst.workspace.toml does not declare platform packages in [[external_sources]].packages: {}; add them to the external source block that owns these package roots",
+            missing.join(", ")
+        );
+    }
+    Ok(())
+}
+
+fn external_package_declarations(host_catalog: &UnitCatalog) -> Result<BTreeMap<String, String>> {
+    let mut declared_packages = BTreeMap::new();
+    for source in host_catalog.workspace().external_sources() {
+        validate_name_segment("external source id", &source.id)?;
+        let mut source_seen = BTreeSet::new();
+        for package in &source.packages {
+            validate_name_segment("external source package", package)?;
+            if !source_seen.insert(package.clone()) {
+                bail!(
+                    "external source `{}` declares duplicate platform package `{package}`",
+                    source.id
+                );
+            }
+            if let Some(previous_source) =
+                declared_packages.insert(package.clone(), source.id.clone())
+            {
+                bail!(
+                    "ambiguous target fkst.workspace.toml platform package `{package}` declared by external sources `{previous_source}` and `{}`",
+                    source.id
+                );
+            }
+        }
+    }
+    Ok(declared_packages)
 }
 
 fn collect_conformance_library_roots<'a>(
@@ -858,5 +931,175 @@ root = "."
         let msg = format!("{err:#}");
 
         assert!(msg.contains("must not contain `..`"), "{msg}");
+    }
+
+    #[test]
+    fn explicit_external_package_root_must_be_declared_by_host_external_source() {
+        let temp = tempfile::tempdir().unwrap();
+        let host = temp.path().join("host");
+        let external = temp.path().join("platform");
+        let platform_a = external.join("packages/platform-a");
+        let platform_b = external.join("packages/platform-b");
+        std::fs::create_dir_all(&host).unwrap();
+        std::fs::create_dir_all(&platform_a).unwrap();
+        std::fs::create_dir_all(&platform_b).unwrap();
+        write(
+            &host.join("fkst.workspace.toml"),
+            r#"
+[workspace]
+units = []
+
+[[external_sources]]
+id = "fkst-platform"
+git = "/tmp/fkst-platform"
+rev = "0123456789abcdef0123456789abcdef01234567"
+packages = ["platform-a"]
+"#,
+        );
+        write_workspace_with_units(&external, &["packages/platform-a", "packages/platform-b"]);
+        write_package_unit_manifest(&platform_a, "platform-a");
+        write_package_unit_manifest(&platform_b, "platform-b");
+
+        let err = PackageRoots::resolve(&host, vec![platform_a, platform_b]).unwrap_err();
+        let msg = format!("{err:#}");
+
+        assert!(
+            msg.contains("target fkst.workspace.toml does not declare platform packages"),
+            "{msg}"
+        );
+        assert!(msg.contains("platform-b"), "{msg}");
+        assert!(!msg.contains("platform-a,"), "{msg}");
+    }
+
+    #[test]
+    fn declared_external_package_roots_use_their_own_catalog() {
+        let temp = tempfile::tempdir().unwrap();
+        let host = temp.path().join("host");
+        let external = temp.path().join("platform");
+        let platform_a = external.join("packages/platform-a");
+        let platform_b = external.join("packages/platform-b");
+        std::fs::create_dir_all(&host).unwrap();
+        std::fs::create_dir_all(&platform_a).unwrap();
+        std::fs::create_dir_all(&platform_b).unwrap();
+        write(
+            &host.join("fkst.workspace.toml"),
+            r#"
+[workspace]
+units = []
+
+[[external_sources]]
+id = "fkst-platform"
+git = "/tmp/fkst-platform"
+rev = "0123456789abcdef0123456789abcdef01234567"
+packages = ["platform-a", "platform-b"]
+"#,
+        );
+        write_workspace_with_units(&external, &["packages/platform-a", "packages/platform-b"]);
+        write_package_unit_manifest(&platform_a, "platform-a");
+        write_package_unit_manifest(&platform_b, "platform-b");
+
+        let roots = PackageRoots::resolve(&host, vec![platform_a.clone(), platform_b]).unwrap();
+
+        assert!(roots
+            .catalog_for_owner_root(&platform_a)
+            .unwrap()
+            .contains_unit("platform-a"));
+    }
+
+    #[test]
+    fn external_package_declaration_uses_root_basename_not_manifest_name() {
+        let temp = tempfile::tempdir().unwrap();
+        let host = temp.path().join("host");
+        let external = temp.path().join("platform");
+        let package_root = external.join("packages/platform-a");
+        std::fs::create_dir_all(&host).unwrap();
+        std::fs::create_dir_all(&package_root).unwrap();
+        write(
+            &host.join("fkst.workspace.toml"),
+            r#"
+[workspace]
+units = []
+
+[[external_sources]]
+id = "fkst-platform"
+git = "/tmp/fkst-platform"
+rev = "0123456789abcdef0123456789abcdef01234567"
+packages = ["platform-a"]
+"#,
+        );
+        write_workspace_with_units(&external, &["packages/platform-a"]);
+        write_package_unit_manifest(&package_root, "logical-a");
+
+        let roots = PackageRoots::resolve(&host, vec![package_root.clone()]).unwrap();
+
+        assert!(roots
+            .catalog_for_owner_root(&package_root)
+            .unwrap()
+            .contains_unit("logical-a"));
+    }
+
+    #[test]
+    fn external_platform_package_declaration_is_aggregated() {
+        let temp = tempfile::tempdir().unwrap();
+        let host = temp.path().join("host");
+        let external = temp.path().join("platform");
+        let platform_a = external.join("packages/platform-a");
+        let platform_b = external.join("packages/platform-b");
+        std::fs::create_dir_all(&host).unwrap();
+        std::fs::create_dir_all(&platform_a).unwrap();
+        std::fs::create_dir_all(&platform_b).unwrap();
+        write(
+            &host.join("fkst.workspace.toml"),
+            r#"
+[workspace]
+units = []
+
+[[external_sources]]
+id = "fkst-platform"
+git = "/tmp/fkst-platform"
+rev = "0123456789abcdef0123456789abcdef01234567"
+packages = ["declared"]
+"#,
+        );
+        write_workspace_with_units(&external, &["packages/platform-a", "packages/platform-b"]);
+        write_package_unit_manifest(&platform_a, "platform-a");
+        write_package_unit_manifest(&platform_b, "platform-b");
+
+        let err = PackageRoots::resolve(&host, vec![platform_b, platform_a]).unwrap_err();
+        let msg = format!("{err:#}");
+
+        assert!(msg.contains("platform-a, platform-b"), "{msg}");
+    }
+
+    fn write_workspace_with_units(root: &Path, units: &[&str]) {
+        let units = units
+            .iter()
+            .map(|unit| format!(r#""{unit}""#))
+            .collect::<Vec<_>>()
+            .join(", ");
+        write(
+            &root.join("fkst.workspace.toml"),
+            &format!(
+                r#"
+[workspace]
+units = [{units}]
+"#
+            ),
+        );
+    }
+
+    fn write_package_unit_manifest(root: &Path, name: &str) {
+        write(
+            &root.join("fkst.toml"),
+            &format!(
+                r#"
+kind = "package"
+name = "{name}"
+
+[code]
+root = "."
+"#
+            ),
+        );
     }
 }

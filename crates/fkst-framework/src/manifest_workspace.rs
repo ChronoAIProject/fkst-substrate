@@ -41,6 +41,8 @@ pub(crate) struct ExternalSourceDecl {
     pub(crate) rev: Option<String>,
     pub(crate) tag: Option<String>,
     #[serde(default)]
+    pub(crate) packages: Vec<String>,
+    #[serde(default)]
     pub(crate) libraries: Vec<String>,
 }
 
