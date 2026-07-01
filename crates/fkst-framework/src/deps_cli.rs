@@ -17,6 +17,12 @@ pub(crate) struct DepsOptions {
     pub(crate) locked: bool,
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct HostLockOptions {
+    pub(crate) project_root: PathBuf,
+    pub(crate) json: bool,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum DepsMode {
     Check,
@@ -33,6 +39,13 @@ struct DepsReport {
     event_edges: Vec<EdgeReport>,
     failures: Vec<Diagnostic>,
     warnings: Vec<Diagnostic>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct HostLockReport {
+    ok: bool,
+    workspace_root: String,
+    lockfile: String,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -116,6 +129,22 @@ pub(crate) fn run(options: DepsOptions) -> Result<i32> {
         print_human(&report);
     }
     Ok(if report.ok { 0 } else { 1 })
+}
+
+pub(crate) fn run_host_lock(options: HostLockOptions) -> Result<i32> {
+    let project_root = canonical_dir(&options.project_root, "--project-root")?;
+    let _lockfile = write_lockfile(&project_root)?;
+    let report = HostLockReport {
+        ok: true,
+        workspace_root: project_root.display().to_string(),
+        lockfile: project_root.join("fkst.lock").display().to_string(),
+    };
+    if options.json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        println!("fkst host lock: wrote {}", report.lockfile);
+    }
+    Ok(0)
 }
 
 fn write_lockfile(project_root: &Path) -> Result<Lockfile> {
