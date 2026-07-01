@@ -4,5 +4,26 @@
 # from their own source manifest), so this repo declares no in-repo Lua units of its own.
 units = []
 
+[[external_sources]]
+id = "fkst-packages-platform"
+git = "https://github.com/ChronoAIProject/fkst-packages.git"
+rev = "e77d219c3bc4afd691f9482d50f472169f611165"
+packages = [
+  "github-devloop",
+  "github-devloop-pr",
+  "github-devloop-integration",
+  "github-devloop-intake",
+  "github-devloop-intake-default",
+  "github-devloop-decompose",
+  "github-devloop-ops",
+  "github-proxy",
+  "consensus",
+  "github-external-pr-intake",
+  "github-ratchet-migration-slicer",
+  "fkst-substrate-ref-maintainer",
+  "integration-coverage-producer",
+  "idle-detector",
+]
+
 [registries]
 workspace = "workspace"
