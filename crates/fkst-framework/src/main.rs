@@ -6,6 +6,7 @@
 //! CLI: `fkst-framework supervise --project-root <path> --framework-bin <path>`
 //! CLI: `fkst-framework conformance --project-root <path> [--package-root <path> ...] [--config <path>]`
 //! CLI: `fkst-framework test --project-root <path> [--package-root <path> ...] [--report-json <path>]`
+//! CLI: `fkst-framework host lock --project-root <path>`
 //! CLI: `fkst-framework deps --project-root <path> [--package-root <path> ...] [--json]`
 //! CLI: `fkst-framework manifest composed-deps --manifest <path>`
 //! CLI: `fkst-framework init-package-repo [--ref <substrate-ref>] [--force]`
@@ -104,6 +105,7 @@ enum CliCommand {
         program: PathBuf,
         args: Vec<String>,
     },
+    HostLock(deps_cli::HostLockOptions),
     Test(TestCli),
     Deps(deps_cli::DepsOptions),
     ManifestComposedDeps(manifest_composed_deps::Options),
@@ -118,7 +120,7 @@ fn parse_args() -> Result<CliCommand> {
     let mut args_iter = args.into_iter();
     let sub = args_iter.next().ok_or_else(|| {
         anyhow::anyhow!(
-            "usage: fkst-framework run <lua> --project-root <path> --package-root <path> [--package-root <path> ...] [--owner-namespace <id>] --event <json> | fkst-framework supervise --project-root <path> --framework-bin <path> [--package-root <path> ...] | fkst-framework conformance --project-root <path> [--package-root <path> ...] [--config <path>] | fkst-framework config --project-root <path> [--package-root <path> ...] | fkst-framework boundary-resources | fkst-framework rate-acquire <pool> | fkst-framework rate-exec <pool> -- <program> [args...] | fkst-framework test --project-root <path> [--package-root <path> ...] [--report-json <path>] | fkst-framework deps --project-root <path> [--package-root <path> ...] [--json] | fkst-framework manifest composed-deps --manifest <path> | fkst-framework init-package-repo [--ref <substrate-ref>] [--force] | fkst-framework observe --durable-root <path> [--json] [--limit <n>] | fkst-framework --self-test"
+            "usage: fkst-framework run <lua> --project-root <path> --package-root <path> [--package-root <path> ...] [--owner-namespace <id>] --event <json> | fkst-framework supervise --project-root <path> --framework-bin <path> [--package-root <path> ...] | fkst-framework conformance --project-root <path> [--package-root <path> ...] [--config <path>] | fkst-framework config --project-root <path> [--package-root <path> ...] | fkst-framework boundary-resources | fkst-framework rate-acquire <pool> | fkst-framework rate-exec <pool> -- <program> [args...] | fkst-framework host lock --project-root <path> | fkst-framework test --project-root <path> [--package-root <path> ...] [--report-json <path>] | fkst-framework deps --project-root <path> [--package-root <path> ...] [--json] | fkst-framework manifest composed-deps --manifest <path> | fkst-framework init-package-repo [--ref <substrate-ref>] [--force] | fkst-framework observe --durable-root <path> [--json] [--limit <n>] | fkst-framework --self-test"
         )
     })?;
     if sub == "--self-test" {
@@ -189,6 +191,10 @@ fn parse_args() -> Result<CliCommand> {
     if sub == "test" {
         let rest = args_iter.collect::<Vec<_>>();
         return Ok(CliCommand::Test(parse_test_args(&rest)?));
+    }
+    if sub == "host" {
+        let rest = args_iter.collect::<Vec<_>>();
+        return Ok(CliCommand::HostLock(parse_host_args(&rest)?));
     }
     if sub == "deps" {
         let rest = args_iter.collect::<Vec<_>>();
@@ -442,6 +448,46 @@ fn parse_deps_args(args: &[String]) -> Result<deps_cli::DepsOptions> {
         json,
         mode,
         locked,
+    })
+}
+
+fn parse_host_args(args: &[String]) -> Result<deps_cli::HostLockOptions> {
+    let Some(command) = args.first() else {
+        anyhow::bail!("missing host subcommand");
+    };
+    if command == "--help" || command == "-h" {
+        println!("usage: fkst-framework host lock --project-root <root> [--json]");
+        std::process::exit(0);
+    }
+    if command != "lock" {
+        anyhow::bail!("unknown host subcommand: {}", command);
+    }
+
+    let mut project_root: Option<PathBuf> = None;
+    let mut json = false;
+    let mut i = 1;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--help" | "-h" => {
+                println!("usage: fkst-framework host lock --project-root <root> [--json]");
+                std::process::exit(0);
+            }
+            "--project-root" => {
+                if project_root.is_some() {
+                    anyhow::bail!("duplicate --project-root");
+                }
+                i += 1;
+                project_root = Some(next_value(args, i, "--project-root")?.into());
+            }
+            "--json" => json = true,
+            other => anyhow::bail!("unknown host lock argument: {}", other),
+        }
+        i += 1;
+    }
+
+    Ok(deps_cli::HostLockOptions {
+        project_root: project_root.ok_or_else(|| anyhow::anyhow!("missing --project-root"))?,
+        json,
     })
 }
 
@@ -816,6 +862,7 @@ fn run() -> Result<i32> {
         CliCommand::Test(options) => {
             test_runner::run_tests(options.roots, options.report_json, options.coverage)
         }
+        CliCommand::HostLock(options) => deps_cli::run_host_lock(options),
         CliCommand::Deps(options) => deps_cli::run(options),
         CliCommand::ManifestComposedDeps(options) => manifest_composed_deps::run(options),
         CliCommand::InitPackageRepo(options) => init_package_repo::run(options),

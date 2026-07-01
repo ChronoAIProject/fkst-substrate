@@ -8,7 +8,9 @@ fn framework_bin() -> &'static str {
 }
 
 fn command() -> Command {
-    Command::new(framework_bin())
+    let mut command = Command::new(framework_bin());
+    command.env_remove("FKST_SUPERVISOR_PID");
+    command
 }
 
 fn assert_exit(output: &Output, code: i32) {
@@ -152,6 +154,12 @@ fn deps(root: &Path) -> Command {
     cmd
 }
 
+fn host_lock(root: &Path) -> Command {
+    let mut cmd = command();
+    cmd.arg("host").arg("lock").arg("--project-root").arg(root);
+    cmd
+}
+
 fn git(root: &Path, args: &[&str]) -> String {
     let output = Command::new("git")
         .arg("-C")
@@ -284,6 +292,38 @@ fn run_department(root: &Path, cache: &Path) -> Command {
 }
 
 #[test]
+fn host_lock_writes_lockfile_for_declared_external_sources() {
+    let temp = tempfile::tempdir().unwrap();
+    let cache = temp.path().join("cache");
+    let source = temp.path().join("source");
+    let consumer = temp.path().join("consumer");
+    let rev = init_external_library_repo(&source, None);
+    consumer_workspace_with_external_source(&consumer, &source, &rev, &["contract"], &["contract"]);
+
+    let lock_output = host_lock(&consumer)
+        .env("FKST_CACHE_ROOT", &cache)
+        .output()
+        .unwrap();
+
+    assert_exit(&lock_output, 0);
+    let out = stdout(&lock_output);
+    assert!(out.contains("fkst host lock: wrote"), "{out}");
+    assert!(out.contains("fkst.lock"), "{out}");
+    let lock = fs::read_to_string(consumer.join("fkst.lock")).unwrap();
+    assert!(lock.contains("[[external_source]]"), "{lock}");
+    assert!(lock.contains(r#"id = "fkst-platform""#), "{lock}");
+    assert!(lock.contains(&format!(r#"rev = "{rev}""#)), "{lock}");
+
+    let locked_output = deps(&consumer)
+        .arg("--locked")
+        .env("FKST_CACHE_ROOT", &cache)
+        .output()
+        .unwrap();
+
+    assert_exit(&locked_output, 0);
+}
+
+#[test]
 fn cross_repo_deps_lock_writes_hashes_and_locked_catalog_resolves_external_library() {
     let temp = tempfile::tempdir().unwrap();
     let cache = temp.path().join("cache");
@@ -346,6 +386,10 @@ fn cross_repo_unlocked_external_source_fails_closed_until_lock_is_written() {
     let err = stderr(&output);
     assert!(
         err.contains("external source `fkst-platform` is missing from fkst.lock"),
+        "{err}"
+    );
+    assert!(
+        err.contains("fkst-framework host lock --project-root <root>"),
         "{err}"
     );
 }
@@ -569,6 +613,10 @@ fn cross_repo_stale_lock_missing_allowlisted_library_fails_closed() {
         err.contains(
             "library `ghost` is allowed by the workspace manifest but missing from fkst.lock"
         ),
+        "{err}"
+    );
+    assert!(
+        err.contains("fkst-framework host lock --project-root <root>"),
         "{err}"
     );
 }
