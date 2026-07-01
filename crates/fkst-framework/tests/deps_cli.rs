@@ -400,6 +400,8 @@ fn host_lock_with_package_root_pins_local_source_head() {
         .output()
         .unwrap();
     assert_exit(&clone, 0);
+    git(&local, &["config", "user.email", "fkst-test@example.invalid"]);
+    git(&local, &["config", "user.name", "fkst test"]);
     write(
         &local.join("libraries/contract/public/api.lua"),
         r#"return { value = "local-contract" }"#,
@@ -444,6 +446,8 @@ fn locked_package_root_head_mismatch_fails_closed() {
         .output()
         .unwrap();
     assert_exit(&clone, 0);
+    git(&local, &["config", "user.email", "fkst-test@example.invalid"]);
+    git(&local, &["config", "user.name", "fkst test"]);
     consumer_workspace_with_external_packages(
         &consumer,
         &remote,
