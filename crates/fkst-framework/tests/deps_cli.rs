@@ -400,7 +400,10 @@ fn host_lock_with_package_root_pins_local_source_head() {
         .output()
         .unwrap();
     assert_exit(&clone, 0);
-    git(&local, &["config", "user.email", "fkst-test@example.invalid"]);
+    git(
+        &local,
+        &["config", "user.email", "fkst-test@example.invalid"],
+    );
     git(&local, &["config", "user.name", "fkst test"]);
     write(
         &local.join("libraries/contract/public/api.lua"),
@@ -432,7 +435,7 @@ fn host_lock_with_package_root_pins_local_source_head() {
 }
 
 #[test]
-fn locked_package_root_head_mismatch_fails_closed() {
+fn locked_package_root_head_mismatch_uses_local_override() {
     let temp = tempfile::tempdir().unwrap();
     let cache = temp.path().join("cache");
     let remote = temp.path().join("remote");
@@ -446,14 +449,40 @@ fn locked_package_root_head_mismatch_fails_closed() {
         .output()
         .unwrap();
     assert_exit(&clone, 0);
-    git(&local, &["config", "user.email", "fkst-test@example.invalid"]);
+    git(
+        &local,
+        &["config", "user.email", "fkst-test@example.invalid"],
+    );
     git(&local, &["config", "user.name", "fkst test"]);
-    consumer_workspace_with_external_packages(
-        &consumer,
-        &remote,
-        &remote_rev,
-        &["platform-pkg"],
-        &["contract"],
+    write(
+        &consumer.join("fkst.workspace.toml"),
+        &format!(
+            r#"
+[workspace]
+units = ["packages/app"]
+
+[[external_sources]]
+id = "fkst-platform"
+git = "{}"
+rev = "{remote_rev}"
+packages = ["platform-pkg"]
+libraries = ["contract"]
+"#,
+            remote.display()
+        ),
+    );
+    package(&consumer, "app", &["contract"], &[]);
+    write(
+        &consumer.join("packages/app/departments/probe/main.lua"),
+        r#"
+local contract = require("contract.api")
+return {
+  spec = { consumes = { "tick" }, produces = {} },
+  pipeline = function(event)
+    assert(contract.value == "advanced-local-contract", contract.value)
+  end,
+}
+"#,
     );
 
     let lock_output = host_lock(&consumer)
@@ -483,13 +512,40 @@ fn locked_package_root_head_mismatch_fails_closed() {
         .output()
         .unwrap();
 
-    assert_exit(&output, 2);
+    assert_exit(&output, 0);
+    let out = stdout(&output);
+    assert!(out.contains("fkst deps: PASS"), "{out}");
     let err = stderr(&output);
     assert!(
-        err.contains("fkst.lock external_source(id=fkst-platform) resolved.rev does not match explicit --package-root source HEAD"),
+        !err.contains("resolved.rev does not match explicit --package-root source HEAD"),
         "{err}"
     );
-    assert!(err.contains(&advanced_rev), "{err}");
+    assert!(!err.contains(&advanced_rev), "{err}");
+
+    let run_output = command()
+        .arg("run")
+        .arg(consumer.join("packages/app/departments/probe/main.lua"))
+        .arg("--project-root")
+        .arg(&consumer)
+        .arg("--package-root")
+        .arg(consumer.join("packages/app"))
+        .arg("--package-root")
+        .arg(local.join("packages/platform-pkg"))
+        .arg("--owner-namespace")
+        .arg("app")
+        .arg("--event")
+        .arg(r#"{"queue":"tick","payload":{}}"#)
+        .env("FKST_CACHE_ROOT", &cache)
+        .env("FKST_RUNTIME_ROOT", consumer.join(".fkst/runtime"))
+        .output()
+        .unwrap();
+
+    assert_exit(&run_output, 0);
+    assert!(
+        !stderr(&run_output).contains("startup error"),
+        "stderr: {}",
+        stderr(&run_output)
+    );
 }
 
 #[test]

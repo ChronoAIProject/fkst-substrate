@@ -317,7 +317,7 @@ fn locked_source_checkout(
     };
     validate_lock_matches_manifest(source, lock)?;
     if let Some(local_root) = local_roots.get(&source.id) {
-        return locked_local_source_checkout(source, lock, local_root);
+        return locked_local_source_checkout(source, local_root);
     }
     let cache = cache_root();
     let store_root = cache.store_checkout(&lock.resolved.tree_sha256);
@@ -366,32 +366,13 @@ fn locked_source_checkout(
 
 fn locked_local_source_checkout(
     source: &ExternalSourceDecl,
-    lock: &ExternalSourceLock,
     local_root: &Path,
 ) -> Result<ExternalSourceCheckout> {
     let local_root = canonical_dir(
         local_root,
         &format!("external source `{}` local root", source.id),
     )?;
-    let actual_rev = resolve_local_source_rev(source, &local_root)?;
-    if actual_rev != lock.resolved.rev {
-        bail!(
-            "fkst.lock external_source(id={}) resolved.rev does not match explicit --package-root source HEAD: lock has {}, local HEAD is {}",
-            source.id,
-            lock.resolved.rev,
-            actual_rev
-        );
-    }
-    let actual_tree = prefixed_tree_sha256(&local_root)?;
-    if actual_tree != lock.resolved.tree_sha256 {
-        bail!(
-            "external source `{}` local tree hash mismatch: lock has {}, local source has {}",
-            source.id,
-            lock.resolved.tree_sha256,
-            actual_tree
-        );
-    }
-    let libraries = locked_libraries(source, lock, &local_root)?;
+    let libraries = current_libraries(source, &local_root)?;
     let available_libraries = available_library_names(&local_root)?;
     Ok(ExternalSourceCheckout {
         source_id: source.id.clone(),
@@ -431,6 +412,24 @@ fn locked_libraries(
                 name: library.name.clone(),
                 unit: library.unit.clone(),
                 publishable: publishable_library_at(&unit_root)?,
+            })
+        })
+        .collect::<Result<Vec<_>>>()
+}
+
+fn current_libraries(
+    source: &ExternalSourceDecl,
+    source_root: &Path,
+) -> Result<Vec<ExternalLibraryCheckout>> {
+    catalog_allowed_libraries(source, source_root)?
+        .into_iter()
+        .map(|library| {
+            let unit_root = source_root.join(&library.unit);
+            let publishable = publishable_library_at(&unit_root)?;
+            Ok(ExternalLibraryCheckout {
+                name: library.name,
+                unit: library.unit,
+                publishable,
             })
         })
         .collect::<Result<Vec<_>>>()
