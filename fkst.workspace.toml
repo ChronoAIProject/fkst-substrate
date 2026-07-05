@@ -7,13 +7,13 @@ units = []
 [[external_sources]]
 id = "fkst-packages-platform"
 git = "https://github.com/ChronoAIProject/fkst-packages.git"
-rev = "e77d219c3bc4afd691f9482d50f472169f611165"
+rev = "ec664e180bb2f6c8df1c5af430a42b64996de8fc"
 packages = [
   "github-devloop",
   "github-devloop-pr",
   "github-devloop-integration",
   "github-devloop-intake",
-  "github-devloop-intake-default",
+  "github-devloop-workflow",
   "github-devloop-decompose",
   "github-devloop-ops",
   "github-proxy",
