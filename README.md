@@ -1,40 +1,96 @@
 # fkst-substrate
 
-fkst-substrate 是稳定发布的受监督事件 / SDK / 进程衬底：Tier I supervisor + Tier III framework + common。它不包含业务 Lua 包；业务行为由外部 package root 或 host root 注入。
+`fkst-substrate` is a stable supervised event, SDK, and process substrate. It provides the process-root supervisor, framework runtime, shared types, Lua SDK, event dispatch, runtime layout, worktree/lock/codex process contracts, and conformance gates. Business Lua packages, department topology, host workflow policy, release policy, and product-specific behavior live outside this repository and are injected through package roots or a host root.
 
-开发分支：dev。
+The default integration branch is `dev`.
 
-验证命令：
+## Governing Practice
+
+This README follows docs-as-code and single-source-of-truth practice: it is a source-verified entrypoint, not a second specification. Stable identity and contract details belong in `SPEC.md`, engine architecture belongs in `docs/architecture.md`, and executable behavior belongs in `crates/`, `examples/`, and `scripts/verify.sh`.
+
+## Verification
+
+The canonical local and CI gate is:
 
 ```sh
-cargo build --workspace
-cargo test --workspace -- --test-threads=1
-target/debug/fkst-framework test \
-  --project-root "$PWD/examples/minimal-package" \
-  --package-root "$PWD/examples/minimal-package"
+scripts/verify.sh
 ```
 
-这些 gate 现已收敛进 `scripts/verify.sh`，本地与 CI（`.github/workflows/ci.yml`，单 job、stable Rust、push 到 `dev` 与 PR 到 `dev` 触发）都通过它执行，避免本地与 CI 验证漂移。
+`scripts/run.sh test` is the repository-local wrapper for the same gate:
 
-## 配置机制
+```sh
+scripts/run.sh test
+```
 
-引擎操作配置由 `crates/fkst-framework/src/config_registry.rs` 中的静态 typed registry 声明。读取优先级固定为 process env → host `fkst.env` → operational 默认；HostFact 缺失 fail-closed。registry 只读，没有 set/apply/watch、YAML/DSL/manifest/plugin 或 per-key `tunables/*.txt` 兼容层。
+As of this tree, `scripts/verify.sh` runs these checks from the repository root:
 
-11 个 knob:
+- Tier I supervisor audit: all Rust source under `crates/fkst-supervisor/src` must be at most 150 lines.
+- Shell syntax audit for `scripts/*.sh`.
+- `cargo build --workspace`.
+- `cargo test --workspace -- --test-threads=1`.
+- `target/debug/fkst-framework --self-test` with a scratch `FKST_RUNTIME_ROOT`.
+- `target/debug/fkst-framework conformance --project-root <scratch-host> --package-root <scratch-host>`.
+- `target/debug/fkst-framework test --project-root <scratch-host> --package-root <scratch-host>`.
 
-- Operational: `FKST_QUEUE_CAPACITY` 默认 `16`
-- Operational: `FKST_DEPARTMENT_DEFAULT_STALL_WINDOW` 默认 `30s`，作为 Department delivery lease window
-- Operational: `FKST_CODEX_PERMIT_SLOTS` 默认 `20`
-- Operational: `FKST_MAX_IN_FLIGHT_PER_DEPT` 默认 `16`
-- Operational: `FKST_DURABLE_ADMISSION_BURST_PER_DEPT` 默认 `1`
-- Operational: `FKST_RATE_POOL_ROOT` 默认 `~/.fkst/rate-pools`
-- Operational: `FKST_RETRY_DEFAULT_MAX_ATTEMPTS` 默认 `5`
-- Operational: `FKST_RETRY_DEFAULT_BASE` 默认 `60s`
-- Operational: `FKST_RETRY_DEFAULT_CAP` 默认 `30m`
-- HostFact: `FKST_CANDIDATE_PREFIX` 必填
-- HostFact: `FKST_CANDIDATE_FROM_SEP` 必填
+CI runs `./scripts/verify.sh` in `.github/workflows/ci.yml`. The coverage job is explicitly non-gating visualization.
 
-只读自省:
+## Workspace Layout
+
+The Rust workspace currently contains four crates:
+
+| crate | role |
+|---|---|
+| `crates/fkst-supervisor` | Tier I process root. It locates and spawns `fkst-framework supervise`, inherits stdout/stderr, handles process-level signals, waits, and reaps. It does not depend on `fkst-common` or `fkst-framework`. |
+| `crates/fkst-common` | Shared engine types such as config, events, validation, and `RuntimeLayout`. |
+| `crates/fkst-framework` | Tier III runtime, CLI, graph scan, source runner, dispatch, Lua SDK, boundary adapters, self-test, package tests, and conformance. |
+| `crates/fkst-update` | Standalone verify-and-swap deploy client for externally produced GitHub Release artifacts. It is not in the supervisor/framework hot path. |
+
+There is no business Lua package crate in this repository. `examples/minimal-package/` is an engine fixture.
+
+## Framework CLI
+
+`fkst-framework` currently exposes these user-facing commands:
+
+```text
+fkst-framework run <lua> --project-root <path> --package-root <path> [--package-root <path> ...] [--owner-namespace <id>] --event <json>
+fkst-framework supervise --project-root <path> --framework-bin <path> [--package-root <path> ...]
+fkst-framework conformance --project-root <path> [--package-root <path> ...] [--config <path>]
+fkst-framework config --project-root <path> [--package-root <path> ...]
+fkst-framework boundary-resources
+fkst-framework rate-acquire <pool>
+fkst-framework rate-exec <pool> -- <program> [args...]
+fkst-framework host lock --project-root <path> [--package-root <path> ...]
+fkst-framework test --project-root <path> [--package-root <path> ...] [--report-json <path>] [--coverage <dir>]
+fkst-framework deps [lock|fetch] --project-root <path> [--package-root <path> ...] [--json] [--locked]
+fkst-framework manifest composed-deps --manifest <path>
+fkst-framework init-package-repo [--ref <substrate-ref>] [--force]
+fkst-framework observe --durable-root <path> [--json] [--limit <n>]
+fkst-framework --self-test [--coverage <dir>]
+```
+
+The internal `__codex-worker` command is not package-facing API.
+
+## Configuration Registry
+
+Engine operation configuration is declared by the static typed registry in `crates/fkst-framework/src/config_registry.rs`. Resolution order is process environment, host `fkst.env`, then an operational default. `HostFact` entries have no default and fail closed when absent. The registry is read-only: it has no set, apply, watch, YAML, DSL, manifest, plugin, or `tunables/*.txt` compatibility layer.
+
+Current registry entries:
+
+| name | env key | kind | type | default / required |
+|---|---|---|---|---|
+| `queue_capacity` | `FKST_QUEUE_CAPACITY` | `Operational` | `usize` | default `16` |
+| `department_default_stall_window` | `FKST_DEPARTMENT_DEFAULT_STALL_WINDOW` | `Operational` | `duration-string` | default `30s`; Department delivery lease window |
+| `codex_permit_slots` | `FKST_CODEX_PERMIT_SLOTS` | `Operational` | `usize` | default `20` |
+| `max_in_flight_per_dept` | `FKST_MAX_IN_FLIGHT_PER_DEPT` | `Operational` | `usize` | default `16` |
+| `durable_admission_burst_per_dept` | `FKST_DURABLE_ADMISSION_BURST_PER_DEPT` | `Operational` | `usize` | default `1` |
+| `rate_pool_root` | `FKST_RATE_POOL_ROOT` | `Operational` | `string` | default `~/.fkst/rate-pools` |
+| `retry_default_max_attempts` | `FKST_RETRY_DEFAULT_MAX_ATTEMPTS` | `Operational` | `usize` | default `5` |
+| `retry_default_base` | `FKST_RETRY_DEFAULT_BASE` | `Operational` | `duration-string` | default `60s` |
+| `retry_default_cap` | `FKST_RETRY_DEFAULT_CAP` | `Operational` | `duration-string` | default `30m` |
+| `candidate_prefix` | `FKST_CANDIDATE_PREFIX` | `HostFact` | `string` | required |
+| `candidate_from_sep` | `FKST_CANDIDATE_FROM_SEP` | `HostFact` | `string` | required |
+
+Read-only introspection:
 
 ```sh
 target/debug/fkst-framework config \
@@ -42,67 +98,114 @@ target/debug/fkst-framework config \
   --package-root "$PWD/examples/minimal-package"
 ```
 
-## Package repo scaffold
+## Boundary Resources
 
-`fkst-framework init-package-repo [--ref <substrate-ref>] [--force]` materializes the package-repo bootstrap scaffold in the current git repository. It writes the engine-owned templates for `scripts/run.sh`, `scripts/check_repo.py`, `.github/workflows/ci.yml`, `env.example`, `.fkst-substrate-ref`, `.gitignore` entries and a minimal `README.md` pointer.
+Boundary resources follow capability-security practice: no ambient authority. Every external resource class the framework can touch must be listed in `crates/fkst-framework/src/boundary_resource.rs` and mediated through an adapter, grant, meter, budget/backpressure posture, and typed error contract.
 
-The command is idempotent: identical files are reported as `UNCHANGED`; missing files are created; local edits to owned template files are refused by default and require `--force` to overwrite. `.gitignore` is append-only for the scaffold entries. The command does not touch `packages/`, git history or remotes.
+Current boundary resource ids are:
 
-With no `--ref`, the scaffold pins the running engine binary's build-time source revision. Operators can pass `--ref <substrate-ref>` when they need an explicit release tag or commit.
+- `codex.process`
+- `shell.process`
+- `argv.process`
+- `git.process`
+- `runtime.filesystem`
+- `wall-clock`
 
-## 边界资源
-
-边界资源遵循 capability security 的 no ambient authority 模型：engine 能触达的外部资源必须先进入静态 registry，并通过 adapter grant、meter、budget/backpressure 与 typed error contract 访问。当前 registry 由 `crates/fkst-framework/src/boundary_resource.rs` 定义，覆盖 `codex.process`、`shell.process`、`git.process`、`runtime.filesystem` 与 `wall-clock`。
-
-只读自省:
+Read-only introspection:
 
 ```sh
 target/debug/fkst-framework boundary-resources
 ```
 
-`exec_sync`、`spawn_codex_sync` 与 `spawn_codex` 在可分类的边界失败结果中返回 `error_class`，取值为 `quota-exhausted`、`auth-degraded`、`provider-unavailable` 或 `provider-throttle`。该字段是 adapter 层事实；调用方不得通过 stderr 字符串猜测配额、身份或 provider 状态。
+Classified adapter failures use `error_class` values from the same registry: `quota-exhausted`, `auth-degraded`, `provider-unavailable`, and `provider-throttle`.
 
-## 独立运行
+## Runtime Model
 
-本仓库内置一个 package-root fixture：`examples/minimal-package`。它声明一个 cron source `tick`、一个 producer department 和一个 consumer department。cron source 产生 `tick` queue 事件；producer 消费 `tick` 后 `raise("example_event", payload)`；consumer 消费 `example_event`，只读并打印完整标准事件。
+The event flow is:
 
-`FKST_RUNTIME_ROOT` 仍是引擎 scratch 配置，用于 worktree、codex permit、lock 与 log 等运行时落点；这个 fixture 的 Lua 不读取它，也不把 `<RT>` 当 package 状态目录。fixture 只展示 package-root 独立加载、graph validation、两个 Department 的直接触发 pipeline 行为，以及 producer 真实 `RAISED:` 输出可被 consumer 作为标准事件消费的契约。
-
-package identity 是 canonical package-root basename。多 package-root 组合时，queue 是包内命名空间：裸名按 owner 解析为 `<pkg>.<queue>` 或 `host.<queue>`，host glue 要消费 package queue 时写 `pkg.queue`。折叠单包（`package-root == host-root`）保持旧字节：`tick`、`example_event`、`RAISED` 与 `Event.queue` 都仍是裸名，同包限定名只作为别名解析回裸名。
-
-下列命令证明的范围如下：
-
-- `conformance`：minimal-package 的单 source / 双 department / 双 queue 图通过 validation。
-- `test`：扫描 `departments/*/*_test.lua` 和 `tests/*_test.lua`，执行返回表里的 `test_*` 函数。
-- `run producer`：单个 producer pipeline 消费注入的 `tick` 事件，并在 stdout 输出 `RAISED:`。
-- `run consumer`：单个 consumer pipeline 消费注入的标准事件，并向 stderr 打印 `Event{queue,payload,ts}`。
-- `producer -> consumer` 契约测试：直接把 producer 的真实 payload 放进 consumer 标准事件，不经过 supervise dispatcher 路由。
-
-Department 收到的标准事件结构是 `Event{queue,payload,ts}`，其中 `ts` 是 Unix 毫秒。producer 的 `RAISED:` 解码后是 queue + payload，还没有 `ts`：
-
-```json
-[{"queue":"example_event","payload":{"from":"producer","note":"opaque example payload","source_queue":"tick","source_raiser":"tick"}}]
+```text
+source -> fanout -> route -> spawn fkst-framework run -> pipeline(event) -> RAISED -> dispatch
 ```
 
-`run --event` 是单 pipeline 注入，不经过 supervise 路由。示例里的事件不会获得 runtime 生成的 `ts`；consumer 示例里的 numeric `ts` 是注入的标准事件值。真实 dispatch 由 runtime 生成 `ts`。
+Sources are declared by `raisers/*.lua`. Departments are `departments/<dept>/main.lua` files that return `M.spec` and implement `pipeline(event)`. A delivered event has the standard shape `Event { queue, payload, ts }`, where `ts` is Unix milliseconds generated by the runtime on real dispatch.
 
-真实 dispatch 派发给 consumer 的标准事件会包含 runtime 生成的 Unix 毫秒 `ts`，实际值会变：
+Package roots are supplied by repeated `--package-root`, `FKST_PACKAGE_ROOTS`, or the legacy single `FKST_PACKAGE_ROOT`. `FKST_PACKAGE_ROOTS` uses the platform path-list separator. When both `FKST_PACKAGE_ROOTS` and `FKST_PACKAGE_ROOT` are set without explicit `--package-root`, the framework fails closed.
 
-```json
-{"queue":"example_event","payload":{"from":"producer","note":"opaque example payload","source_queue":"tick","source_raiser":"tick"},"ts":1717420800000}
+Queue names are package-local. In composed multi-root graphs, bare queue names resolve inside the owner namespace and cross-package consumption must use `pkg.queue`. A folded single package/host root preserves legacy flat byte output for queue names.
+
+`FKST_RUNTIME_ROOT` is engine scratch for `worktrees`, `codex-permits`, `locks`, `logs`, `marks`, and `cache`. Durable business facts must come from git refs/commits/branches, explicit host filesystem facts, or external sources. Runtime scratch is not accepted release state, package state, rollback state, or a durable business database.
+
+Reliable delivery state uses `FKST_DURABLE_ROOT` and the framework delivery store. It is a delivery lease, retry, and DLQ ledger, not an entity fact store.
+
+## Lua SDK Surface
+
+The fixed production Lua SDK surface is anchored in `SPEC.md`; Rust-registered runtime primitives are wired through `crates/fkst-framework/src/mlua_init.rs`. Current surface names include:
+
+```text
+pipeline
+source
+raise
+spawn_codex_sync
+spawn_codex
+await_all
+exec_sync
+exec_argv
+with_lock
+once
+cache_set
+cache_get
+cache_expire
+graph_json
+t
+restricted_lua_load
+truncate_utf8
+git_log_count
+git_log_grep
+count_worktrees
+list_orphan_worktrees
+setup_worktree
+file.read
+file.write
+file.exists
+file.list
+json.decode
+log.info
+log.warn
+log.error
+now
+fkst.codex_runs
+fkst.observe
 ```
+
+`json` is decode-only. `fkst.test` is registered only by `fkst-framework test`; production `run`, `supervise`, `--self-test`, and conformance do not expose the test table.
+
+See `SPEC.md` for the normative SDK contract and `docs/architecture.md` for operational details.
+
+## Minimal Package Fixture
+
+`examples/minimal-package/` is the repository fixture for package-root loading and graph validation. It contains:
+
+- a cron raiser `tick`;
+- a `producer` Department that consumes `tick` and raises `example_event`;
+- a `consumer` Department that consumes `example_event` and logs the full standard event;
+- Lua tests under `tests/*_test.lua`.
+
+Manual fixture check:
 
 ```sh
 cargo build --workspace
 repo="$PWD"
 tmp_host="$(mktemp -d)"
 cp -R examples/minimal-package/. "$tmp_host/"
+
 target/debug/fkst-framework conformance \
   --project-root "$tmp_host" \
   --package-root "$tmp_host"
+
 target/debug/fkst-framework test \
   --project-root "$tmp_host" \
   --package-root "$tmp_host"
+
 (
   cd "$tmp_host" &&
   "$repo/target/debug/fkst-framework" run \
@@ -112,115 +215,62 @@ target/debug/fkst-framework test \
     --owner-namespace "$(basename "$tmp_host")" \
     --event '{"queue":"tick","payload":{"raiser":"tick"}}'
 )
-(
-  cd "$tmp_host" &&
-  "$repo/target/debug/fkst-framework" run \
-    "$tmp_host/departments/consumer/main.lua" \
-    --project-root "$tmp_host" \
-    --package-root "$tmp_host" \
-    --owner-namespace "$(basename "$tmp_host")" \
-    --event '{"queue":"example_event","payload":{"from":"producer","note":"opaque example payload","source_queue":"tick","source_raiser":"tick"},"ts":0}'
-)
 ```
 
-上面两个 `run` 命令是单 pipeline 注入，不经过路由。可以手动运行 supervise 观察真实 producer -> consumer 路由，运行后用 `Ctrl-C` 停止；它不是 example 测试依赖：
+`run --event` injects one pipeline directly; it does not go through `supervise` routing.
 
-```sh
-FKST_RUNTIME_ROOT="$tmp_host/.fkst/runtime" \
-  "$repo/target/debug/fkst-framework" supervise \
-    --project-root "$tmp_host" \
-    --package-root "$tmp_host" \
-    --framework-bin "$repo/target/debug/fkst-framework"
-```
+## Package Repository Scaffold
 
-consumer 的完整事件日志会落在 `<RT>/logs/framework-child/` 下。真实 routing / dispatch 由 framework 自身的 supervise / consumer 测试覆盖；minimal-package 测试不重复启动 supervise。
+`fkst-framework init-package-repo [--ref <substrate-ref>] [--force]` materializes an engine-owned package-repository scaffold in the current git repository. It writes templates such as `scripts/run.sh`, `scripts/check_repo.py`, `.github/workflows/ci.yml`, `env.example`, `.fkst-substrate-ref`, `.gitignore` entries, and a minimal `README.md` pointer.
 
-Lua 单元测试由 `fkst-framework test` 执行。runner 只发现 package root 和 host root 下的 `departments/*/*_test.lua` 与 `tests/*_test.lua`，不全树递归，也不扫描 `raisers/` 或 `fkst/`。测试文件应 `return { test_name = function() ... end }`；runner 按文件路径和 `test_*` key 排序，失败后继续执行后续测试，最后输出通过 / 失败汇总。
+The command is idempotent. Identical files are reported as `UNCHANGED`; missing files are created; local edits to owned template files are refused unless `--force` is passed. `.gitignore` updates are append-only for scaffold entries. The command does not touch `packages/`, git history, or remotes.
 
-`fkst.test` 只在 `test` 子命令的 Lua state 中注册，不属于 production Lua SDK surface；`run` 与 `supervise` 模式不可依赖它。当前断言只有 `eq(actual, expected[, msg])`、`is_true(value[, msg])`、`raises(fn[, msg])` 和 `is_nil(value[, msg])`。test-mode 还提供 `run_department(path, event[, opts])`，用 fresh Lua state、production SDK 和独立 raise buffer 执行一个 department entrypoint，返回 `{ exit_code = int, raises = { { queue = string, payload = table }, ... } }`；queue 解析与 production 一致，唯一例外是 `run_department` 会记录但不投递 subject department 在 `M.spec.produces` 中声明的 qualified queue raise。每个测试文件按所属 graph root 隔离执行，相对路径按该测试文件所属 owner package root 解析，`opts.cwd`、`opts.env`、`opts.path_prepend` 只作用于该次执行并随后恢复。
+With no `--ref`, the scaffold pins the running engine binary's build-time source revision. Operators can pass `--ref <substrate-ref>` for an explicit release tag or commit.
 
-`fkst.test.mock_command(pattern, result)` 劫持 test mode 中的 `exec_sync`、codex SDK 与 git SDK 外部命令调用；渲染命令行按前缀或子串匹配，mock 按注册顺序一次性消费。`result` 是 `{ stdout = "", stderr = "", exit_code = 0 }` 形状，`stderr` 与 `exit_code` 可省略。未 mock 且无 active cassette 的外部命令 fail closed 且不启动真实进程。`fkst.test.mock_observe(snapshot)` makes `fkst.observe()` use that deterministic raw snapshot for the current test and its `run_department` / test-runtime child Lua states; `fkst.observe(opts)` still applies `since`, `limit`, and `include` to the mock. Unmocked test-mode `fkst.observe()` fails closed. `fkst.test.with_command_cassette({ path, mode, redact? }, fn)` provides bounded VCR-style record/replay for external-command contract tests. `mode` is `"record"` or `"replay"`; cassette JSON uses schema `"fkst.test.command-cassette.v1"` and ordered entries containing `rendered`、`program`、`args`、`stdin`、optional `cwd`、sorted `env`、`stdout`、`stderr` and `exit_code`. Replay consumes entries deterministically without spawning real commands and fails closed on mismatch, exhausted entries, unused entries, unsupported schema, or malformed cassette. `redact` replaces exact non-empty values before cassette write/compare, defaulting to `"<REDACTED>"`. `fkst.test.command_calls()` 返回已记录调用，包含渲染命令、program、args、stdin、cwd、env、stdout、stderr 与 exit_code。`setup_worktree` 在 test mode 也通过 git mock runner，但 mock 不合成 worktree 副作用。
+## Install And Update
 
-The production Lua SDK includes `once(key, fn) -> boolean`. It is a `saga_recovery` capability-gated, best-effort, per-key debounce scratch marker, not durable state. Only owner packages whose manifest declares `persistence_class = "saga"` derive `saga_recovery`; other owners fail closed when calling `once`. `key` must be a non-empty relative filesystem path; `/` means directory nesting; each segment must be non-empty, match `[A-Za-z0-9._-]+`, and must not be `.` or `..`; leading `/`, trailing `/`, `//`, backslash, NUL, and absolute paths are rejected. The framework uses the validated key directly, takes an exclusive flock at `<RT>/locks/once/<key>/=lock`, and then checks `<RT>/marks/<key>/=mark`. `locks/once/` is `once`'s internal lock namespace and is not part of the user `with_lock` namespace. When the marker already exists, `once` returns `false` without calling `fn`; when the marker is absent, it calls `fn`, writes the marker after success, and returns `true`; when `fn` fails, the error propagates unchanged and no marker is written, so later calls retry.
-
-`once` 的可观察性来自 engine log 和 runtime scratch：skip / run 决策会写入可 grep 的 `once decision=... key=...` 结构化日志；marker 内容只提供 `key` 与 `marked_at` 的人工可读提示，不参与判重；LIVE lock holder 可用 `lsof <RT>/locks/once/<key>/=lock` 查看。
-
-production Lua SDK 还包含 `cache_set(key, value[, ttl_seconds])`、`cache_get(key) -> string | nil` 与 `cache_expire(key)`。它们是 best-effort scratch KV primitive，不是 durable state。`key` 使用同一 runtime key 合约，framework 读写 `<RT>/cache/<key>/=value`，所以 `<RT>/cache` 是人工可浏览的目录树；reserved leaf `=value` 不会与有效 key 冲突，因为 `=` 不在合法 key segment 字符集内。`cache_set` 原子覆盖写入带 expiry metadata 的 string value，`ttl_seconds` 缺省或 nil 表示不过期，正数表示按 wall-clock deadline 过期；`cache_get` 命中时返回 string，缺失、过期、malformed 或 unreadable 时返回 nil，过期文件会 best-effort lazy evict；`cache_expire` 显式删除 key，缺失视为成功。`<RT>` 被清空或换 host 后，`cache_get` 返回 nil，调用者必须从 durable source 重新推导；需要 read-compare-write 原子性时由调用者外层使用 `with_lock`。
-
-production Lua SDK 包含 `graph_json() -> string`。它是显式授权的只读 composed graph introspection：只有当前 Department 的 `M.spec.graph_json = true` 时可调用。调用时按当前 fixed package roots input set 与 host root 重新扫描并验证 graph，返回稳定排序的 `fkst.graph.v1` JSON string，供 package/host 渲染 topology view。输出包含 raiser / queue / department nodes、消息流 edges、department `consumes` / `produces` / `ephemeral` / `stall_window` / materialized `retry` metadata；node `id` 与 edge endpoint 使用 `kind:canonical_name` 形态；不包含 runtime state、queue capacity、`lua` path 或 `owner_root`。
-
-production Lua SDK 包含 `fkst.observe([opts]) -> table`。它是 `fkst-framework observe --json` 的 in-process adapter，返回 generic durable delivery facts：source metadata、limits、truncation flags、queue depth state、live deliveries 和 DLQ entries；payload 只输出 schema、dedup key、byte count 和 digest，不输出完整 body。`opts` 只能包含 generic narrowing fields：`limit`、`include = {"queues","errors","events","entities"}` 和 `since = <delivery_id>`；`since` 在 `limit` 截断前应用。idle / board / audit 等业务解释属于 package-side helper，不进入 engine。
-
-The production Lua SDK includes `restricted_lua_load({ source, bindings?, mode?, name? })`. It is a host-owned restricted loader for small declarative Lua sources: it evaluates `source` in a fresh Lua state with an empty `_ENV`, defaults to text-only loading, and accepts bytecode only with `mode = "bytecode"`. Callers grant plain data or function capabilities explicitly through `bindings`; ambient `require`, `load`, `_G`, `debug`, `package`, raw/metatable primitives, `io`, `os`, coroutine APIs, `string.dump`, and `("").dump` are unreachable. Returned values must be plain nil / boolean / number / string / table data, and errors use `restricted_lua ...` classifications.
-
-## 安装与更新
-
-`scripts/install.sh` 是 operator 便利脚本，和 `scripts/verify.sh` 同级，不是 engine surface：它只生成本机 operator 配置,不改 SPEC、conformance、supervisor 或任何二进制默认值。更新走独立的 `fkst-update` 二进制(见下)。
-
-`scripts/install.sh`：
+`scripts/install.sh` is an operator convenience script, not engine surface. It builds the workspace in release mode, installs `fkst-supervisor`, `fkst-framework`, and `fkst-update` into `$FKST_HOME/bin` (default `~/fkst/bin`), creates the package root and runtime root, and generates `$FKST_HOME/bin/fkst-run`.
 
 ```sh
 scripts/install.sh
-```
-
-它 `cargo build --release --workspace`，把 `fkst-supervisor` 与 `fkst-framework` 装进 `$FKST_HOME/bin`（默认 `~/fkst/bin`），创建 package root（默认 `~/fkst-packages`），并生成启动器 `$FKST_HOME/bin/fkst-run`，由它设置 `FKST_PACKAGE_ROOT` / `FKST_RUNTIME_ROOT` 并 `exec fkst-supervisor`。引擎二进制本身**没有默认 package root**（缺 `FKST_PACKAGE_ROOT` / `--package-root` 时 fail-closed）；`~/fkst-packages` 这个默认值只活在生成的启动器里，是 operator config。路径可用 env 覆盖：
-
-```sh
 FKST_HOME=/opt/fkst FKST_PACKAGE_ROOT=/srv/fkst-packages scripts/install.sh
 ```
 
-装好后启动（启动器 `cd` 到 package root，PKG == HOST 单 root）：
+The generated `fkst-run` launcher sets `FKST_PACKAGE_ROOT`, `FKST_RUNTIME_ROOT`, and `FKST_FRAMEWORK_BIN`, then executes `fkst-supervisor` from the package root. The engine binaries themselves carry no default package root.
+
+`fkst-update` is a standalone deploy client:
 
 ```sh
-~/fkst/bin/fkst-run
-```
-
-更新走 `fkst-update`（独立二进制，`crates/fkst-update`，由 `install.sh` 一并装入 `$FKST_HOME/bin`）：从 GitHub Release 下载外部 release pipeline 产出的 `fkst-<target>.tar.gz` 与 `SHA256SUMS`、校验 SHA-256 后**逐二进制原子替换**（每个 rename 在 bin dir 文件系统上原子）`$FKST_HOME/bin` 里的 `fkst-supervisor`、`fkst-framework`，不重建、不联系源码。它只做 verify+swap，**不**实现 known-good / accepted-state / rollback / 进程重启（这些仍是外部策略，见「发布边界」）。
-
-```sh
-fkst-update                 # 装到 latest release
-fkst-update --tag v0.1.0    # 装到指定 tag
+fkst-update
+fkst-update --tag v0.1.0
 fkst-update --bin-dir /opt/fkst/bin
 ```
 
-`fkst-update` 消费的 artifact 由 `.github/workflows/release.yml` 在打 `v*` tag 时产出（构建两 target 的 `fkst-<target>.tar.gz` + 聚合 `SHA256SUMS` 发 GitHub Release）。**没有发布过 release 时 `fkst-update` 无 artifact 可拉**（报 `no-matching-release`）；先 `git tag v0.1.0 && git push origin v0.1.0` 触发发布。
+It downloads the externally produced `fkst-<target>.tar.gz` and `SHA256SUMS` from GitHub Releases, verifies the SHA-256 checksum, and atomically swaps `fkst-supervisor` and `fkst-framework` in the selected bin directory. It does not build from source, maintain known-good state, implement rollback, run health gates, run canaries, signal a supervisor, or restart processes.
 
-持有源码 checkout、想直接从 dev 跟踪而不走 release 的话，更新就是一行 `git pull --ff-only && scripts/verify.sh && scripts/install.sh`（先过 gate 再重装），不需要单独的更新脚本。
+The release producer is `.github/workflows/release.yml`, triggered by `v*` tags.
 
-自动更新是把 `fkst-update` 交给 operator 的调度器，引擎不拥有调度。macOS 下用一个 LaunchAgent（落 `~/Library/LaunchAgents/com.fkst.update.plist`，属于本机 ops，不进本仓库），把下面示例里的 `/Users/you/...` 换成你的实际路径：
+For a source checkout tracking `dev`, update by running:
 
-```xml
-<plist version="1.0"><dict>
-  <key>Label</key><string>com.fkst.update</string>
-  <key>ProgramArguments</key>
-  <array><string>/Users/you/fkst/bin/fkst-update</string></array>
-  <key>EnvironmentVariables</key>
-  <dict><key>PATH</key><string>/usr/bin:/bin</string></dict>
-  <key>StartCalendarInterval</key>
-  <dict><key>Hour</key><integer>4</integer><key>Minute</key><integer>0</integer></dict>
-  <key>StandardOutPath</key><string>/tmp/fkst-update.log</string>
-  <key>StandardErrorPath</key><string>/tmp/fkst-update.log</string>
-</dict></plist>
+```sh
+git pull --ff-only
+scripts/verify.sh
+scripts/install.sh
 ```
 
-`StartCalendarInterval` 必须同时给 `Hour` 和 `Minute`，否则 launchd 会在该小时内每分钟触发；`fkst-update` 只用到 `/usr/bin` 下的 `curl`、`tar`、`shasum`。`launchctl load ~/Library/LaunchAgents/com.fkst.update.plist` 后每天 04:00 跑一次。注意 `fkst-update` 只换二进制不重启——新版本要等 supervisor 重启才生效（由你的 launchd 服务或手动重启负责）。
+## Release Boundary
 
-operator 的 package/host root（默认 `~/fkst-packages`）需自备：它应是一个 git repo（git-based SDK 用 `git -C <HOST>`），并在 `fkst.env` 里提供必填 HostFact（如 `FKST_CANDIDATE_PREFIX`、`FKST_CANDIDATE_FROM_SEP`），否则相关 department 行为 fail-closed。安装器只建目录，不替你注入业务配置。
+Accepted release state is an external release-pipeline fact, not engine runtime state. The recommended external chain is build, test, `--self-test`, conformance, signed artifact, deploy, canary, and rollback policy. `fkst-substrate` does not own runtime accepted-state or rollback.
 
-## 发布边界
+## Documentation
 
-fkst-substrate 的 accepted release state 来自外部 release pipeline，而不是 engine runtime 内部状态。推荐外部链路是 build → test → `--self-test` → conformance → 签名 artifact → deploy → canary / 回退策略。engine 无 runtime accepted-state/回退；发布安全是外部策略。
+- `CLAUDE.md` and `AGENTS.md`: repository governance and engine philosophy.
+- `SPEC.md`: Tier II identity anchor and normative contract surface.
+- `docs/architecture.md`: detailed engine architecture.
+- `crates/fkst-framework/src/config_registry.rs`: source-owned engine operation registry.
+- `crates/fkst-framework/src/boundary_resource.rs`: source-owned boundary-resource registry.
+- `scripts/verify.sh`: canonical verification gate used by local development and CI.
 
-host/package 可以在此 runtime 上编排 SDLC 工作流，但这属于外部行为层，不是 engine 内建职责。
-
-engine 队列是瞬时的；durable 真相属于 git commit、明确的 host filesystem fact 或外部源，不在 engine 内部维护。
-
-## 文档
-
-- `CLAUDE.md`（= `AGENTS.md` 软链）：引擎治理与哲学不动点。
-- `SPEC.md`：Tier II 身份锚点。
-- `docs/architecture.md`：详细引擎架构（分层 / 依赖 / I/O / SDK / 事件机制 / runtime 目录 / 并发）。
-
-本仓库作为稳定发布衬底消费前，应以 `cargo build --workspace`、`cargo test --workspace -- --test-threads=1`、`--self-test` 与 `conformance` 结果为准。
+Before consuming this repository as a stable substrate, rely on the current `scripts/verify.sh` result and the local conformance result, not on README prose alone.
 
 ⟦AI:FKST⟧
