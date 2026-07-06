@@ -217,6 +217,10 @@ impl DeliveryRouter {
         subscriptions(cfg).remove(queue).unwrap_or_default()
     }
 
+    pub(crate) fn current_subscriber_queues(&self) -> BTreeSet<String> {
+        self.subscriptions.keys().cloned().collect()
+    }
+
     pub(crate) fn notify_reliable_public(&self, dept: &str) {
         self.notify_reliable(dept);
     }
@@ -783,6 +787,17 @@ mod tests {
             .unwrap_err();
 
         assert!(err.to_string().contains("requires source_ref"), "{err}");
+    }
+
+    #[test]
+    fn current_subscriber_queues_are_derived_from_router_subscriptions() {
+        let cfg = namespaced_config();
+        let router = DeliveryRouter::new(&cfg, Fanout::new(), None, None);
+
+        assert_eq!(
+            router.current_subscriber_queues(),
+            BTreeSet::from(["other.jobs".to_string(), "pkg.jobs".to_string()])
+        );
     }
 
     #[tokio::test]

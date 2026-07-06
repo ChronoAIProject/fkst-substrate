@@ -138,6 +138,7 @@ pub async fn supervise(roots: PackageRoots, framework_bin: PathBuf) -> Result<()
         handles.push(observe_server::spawn_observe_server(
             delivery.observe_endpoint.clone(),
             store.clone(),
+            router.current_subscriber_queues(),
         )?);
     }
 

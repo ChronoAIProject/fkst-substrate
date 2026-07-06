@@ -2,6 +2,7 @@ use super::delivery_observe::{observe_snapshot, DeliveryObserveOptions};
 use super::delivery_store::DeliveryStore;
 use anyhow::{Context, Result};
 use fkst_common::DurableLayout;
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -28,6 +29,7 @@ pub(crate) fn endpoint_for_layout(layout: &DurableLayout) -> ObserveEndpoint {
 pub(crate) fn spawn_observe_server(
     endpoint: ObserveEndpoint,
     store: Arc<DeliveryStore>,
+    current_subscriber_queues: BTreeSet<String>,
 ) -> Result<tokio::task::JoinHandle<()>> {
     if let Some(parent) = endpoint.socket.parent() {
         std::fs::create_dir_all(parent)
@@ -43,8 +45,12 @@ pub(crate) fn spawn_observe_server(
                 Ok((stream, _)) => {
                     let store = store.clone();
                     let endpoint = endpoint.clone();
+                    let current_subscriber_queues = current_subscriber_queues.clone();
                     tokio::spawn(async move {
-                        if let Err(err) = serve_connection(stream, store, endpoint).await {
+                        if let Err(err) =
+                            serve_connection(stream, store, endpoint, current_subscriber_queues)
+                                .await
+                        {
                             warn!(error = %err, "observe request failed");
                         }
                     });
@@ -63,6 +69,7 @@ async fn serve_connection(
     mut stream: UnixStream,
     store: Arc<DeliveryStore>,
     endpoint: ObserveEndpoint,
+    current_subscriber_queues: BTreeSet<String>,
 ) -> Result<()> {
     let mut line = String::new();
     {
@@ -81,6 +88,7 @@ async fn serve_connection(
                 now_ms: request.now_ms,
                 limit: request.limit.clamp(1, MAX_LIMIT),
                 since: request.since,
+                current_subscriber_queues: Some(current_subscriber_queues),
             },
         ) {
             Ok(snapshot) => ObserveSocketResponse::Ok { snapshot },
@@ -148,7 +156,11 @@ mod tests {
         let database = layout.delivery_db_path();
         let store = Arc::new(DeliveryStore::open(&database).unwrap());
         store.enqueue(&record("one")).unwrap();
-        let handle = match spawn_observe_server(endpoint_for_layout(&layout), store.clone()) {
+        let handle = match spawn_observe_server(
+            endpoint_for_layout(&layout),
+            store.clone(),
+            BTreeSet::from(["jobs".to_string()]),
+        ) {
             Ok(handle) => handle,
             Err(err)
                 if format!("{err:#}").contains("Operation not permitted")
@@ -181,6 +193,7 @@ mod tests {
         assert_eq!(snapshot.deliveries.len(), 1);
         assert_eq!(snapshot.deliveries[0].delivery_id, "one");
         assert_eq!(snapshot.queues[0].queue, "jobs");
+        assert_eq!(snapshot.queues[0].has_current_subscriber, Some(true));
 
         handle.abort();
     }

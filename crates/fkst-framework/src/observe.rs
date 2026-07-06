@@ -105,6 +105,7 @@ pub(crate) fn snapshot_for_durable_root(
                     now_ms: now_ms(),
                     limit,
                     since: options.since.clone(),
+                    current_subscriber_queues: None,
                 },
             )
         }
