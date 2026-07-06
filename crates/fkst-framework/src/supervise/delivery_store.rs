@@ -66,6 +66,15 @@ pub(crate) struct RedriveResult {
     pub permanent: Vec<DeadRecord>,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct ReboundDelivery {
+    pub delivery_id: String,
+    pub queue: String,
+    pub old_dept: String,
+    pub new_dept: String,
+    pub leased: bool,
+}
+
 pub(crate) struct DeliveryStore {
     db: Database,
 }
@@ -163,6 +172,93 @@ impl DeliveryStore {
         }
         commit_write(write)?;
         Ok(())
+    }
+
+    pub(crate) fn rebind_deliveries_to_current_subscribers(
+        &self,
+        current_dept_by_queue: &BTreeMap<String, String>,
+    ) -> Result<Vec<ReboundDelivery>> {
+        if current_dept_by_queue.is_empty() {
+            return Ok(Vec::new());
+        }
+        let _op = StoreOpWatch::new("rebind", "<startup>");
+        let write = self.begin_write()?;
+        let candidates = {
+            let delivery = write.open_table(DELIVERY_BY_ID)?;
+            let mut candidates = Vec::new();
+            for entry in delivery.iter()? {
+                let (delivery_id, bytes) = entry?;
+                let delivery_id = delivery_id.value().to_string();
+                let record = match serde_json::from_slice::<DeliveryRecord>(bytes.value()) {
+                    Ok(record) => record,
+                    Err(err) => {
+                        tracing::warn!(
+                            delivery_id = %delivery_id,
+                            error = %err,
+                            "skipping undecodable delivery record during subscriber rebind"
+                        );
+                        continue;
+                    }
+                };
+                let Some(current_dept) = current_dept_by_queue.get(&record.queue) else {
+                    continue;
+                };
+                if record.dept == *current_dept {
+                    continue;
+                }
+                candidates.push((delivery_id, record, current_dept.clone()));
+            }
+            candidates
+        };
+        if candidates.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut rebound = Vec::new();
+        {
+            let mut delivery = write.open_table(DELIVERY_BY_ID)?;
+            let mut ready = write.open_table(READY_BY_DEPT_DUE)?;
+            let mut lease_index = write.open_table(LEASED_BY_DEPT_UNTIL)?;
+            for (delivery_id, mut record, new_dept) in candidates {
+                let old_dept = record.dept.clone();
+                let leased = record.lease_until_ms.is_some();
+                if let Some(lease_until) = record.lease_until_ms {
+                    lease_index.remove(
+                        make_index_key(&old_dept, lease_until, delivery_id.as_str()).as_str(),
+                    )?;
+                    record.lease_generation = record.lease_generation.saturating_add(1);
+                } else {
+                    ready.remove(
+                        make_index_key(&old_dept, record.not_before_ms, delivery_id.as_str())
+                            .as_str(),
+                    )?;
+                }
+                record.dept = new_dept.clone();
+                let bytes = serde_json::to_vec(&record)?;
+                delivery.insert(delivery_id.as_str(), bytes.as_slice())?;
+                if let Some(lease_until) = record.lease_until_ms {
+                    lease_index.insert(
+                        make_index_key(&record.dept, lease_until, delivery_id.as_str()).as_str(),
+                        &(),
+                    )?;
+                } else {
+                    ready.insert(
+                        make_index_key(&record.dept, record.not_before_ms, delivery_id.as_str())
+                            .as_str(),
+                        &(),
+                    )?;
+                }
+                rebound.push(ReboundDelivery {
+                    delivery_id,
+                    queue: record.queue,
+                    old_dept,
+                    new_dept,
+                    leased,
+                });
+            }
+        }
+        commit_write(write)?;
+        Ok(rebound)
     }
 
     pub(crate) fn renew_leases(
@@ -1528,6 +1624,108 @@ mod tests {
 
         assert_eq!(first.len(), 1);
         assert!(second.is_empty());
+    }
+
+    #[test]
+    fn rebind_ready_delivery_to_current_subscriber() {
+        let temp = TempDir::new().unwrap();
+        let store = store(&temp);
+        let mut stale = record("ready", 100);
+        stale.queue = "jobs".to_string();
+        stale.dept = "old_worker".to_string();
+        store.enqueue(&stale).unwrap();
+
+        assert!(store
+            .lease_for_dept("new_worker", 100, 10, Duration::from_millis(50))
+            .unwrap()
+            .is_empty());
+
+        let rebound = store
+            .rebind_deliveries_to_current_subscribers(&BTreeMap::from([(
+                "jobs".to_string(),
+                "new_worker".to_string(),
+            )]))
+            .unwrap();
+
+        assert_eq!(
+            rebound,
+            vec![ReboundDelivery {
+                delivery_id: "ready".to_string(),
+                queue: "jobs".to_string(),
+                old_dept: "old_worker".to_string(),
+                new_dept: "new_worker".to_string(),
+                leased: false,
+            }]
+        );
+        assert_eq!(store.ready_index_len().unwrap(), 1);
+        assert_eq!(store.leased_index_len().unwrap(), 0);
+        let current = store.get("ready").unwrap().unwrap();
+        assert_eq!(current.dept, "new_worker");
+        assert_eq!(current.lease_generation, 0);
+        let leased = store
+            .lease_for_dept("new_worker", 100, 10, Duration::from_millis(50))
+            .unwrap();
+        assert_eq!(leased.len(), 1);
+        assert_eq!(leased[0].delivery_id, "ready");
+        assert_eq!(leased[0].dept, "new_worker");
+        assert!(store
+            .lease_for_dept("old_worker", 151, 10, Duration::from_millis(50))
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn rebind_in_flight_delivery_to_current_subscriber_after_lease_expiry() {
+        let temp = TempDir::new().unwrap();
+        let store = store(&temp);
+        let mut stale = record("in-flight", 100);
+        stale.queue = "jobs".to_string();
+        stale.dept = "old_worker".to_string();
+        store.enqueue(&stale).unwrap();
+        let old_lease = store
+            .lease_for_dept("old_worker", 100, 1, Duration::from_millis(50))
+            .unwrap()
+            .remove(0);
+        assert_eq!(old_lease.lease_generation, 1);
+        assert_eq!(old_lease.lease_until_ms, Some(150));
+
+        let rebound = store
+            .rebind_deliveries_to_current_subscribers(&BTreeMap::from([(
+                "jobs".to_string(),
+                "new_worker".to_string(),
+            )]))
+            .unwrap();
+
+        assert_eq!(
+            rebound,
+            vec![ReboundDelivery {
+                delivery_id: "in-flight".to_string(),
+                queue: "jobs".to_string(),
+                old_dept: "old_worker".to_string(),
+                new_dept: "new_worker".to_string(),
+                leased: true,
+            }]
+        );
+        assert!(!store.ack("in-flight", old_lease.lease_generation).unwrap());
+        let current = store.get("in-flight").unwrap().unwrap();
+        assert_eq!(current.dept, "new_worker");
+        assert_eq!(current.lease_generation, 2);
+        assert_eq!(current.lease_until_ms, Some(150));
+        assert_eq!(store.ready_index_len().unwrap(), 0);
+        assert_eq!(store.leased_index_len().unwrap(), 1);
+        assert!(store
+            .lease_for_dept("new_worker", 149, 10, Duration::from_millis(50))
+            .unwrap()
+            .is_empty());
+
+        let leased = store
+            .lease_for_dept("new_worker", 150, 10, Duration::from_millis(50))
+            .unwrap();
+
+        assert_eq!(leased.len(), 1);
+        assert_eq!(leased[0].delivery_id, "in-flight");
+        assert_eq!(leased[0].dept, "new_worker");
+        assert_eq!(leased[0].lease_generation, 3);
     }
 
     #[test]
