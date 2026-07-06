@@ -65,6 +65,7 @@ mod sdk_mark;
 mod sdk_observe;
 mod sdk_restricted_lua;
 mod sdk_strings;
+mod sdk_toml;
 mod self_test;
 mod spec_queues;
 mod supervise;

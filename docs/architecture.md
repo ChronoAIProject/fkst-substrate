@@ -298,6 +298,7 @@ engine 维护 durable 在途 delivery state，但它不是实体业务真相、a
 | `list_orphan_worktrees(prefix)` | `sdk_git.rs`，列 `<RT>/worktrees/<prefix>*` linked worktree |
 | `setup_worktree(prefix)` | `sdk_git.rs`，创建 `<RT>/worktrees/<prefix>-<ULID>` 和 candidate branch |
 | `file.read/write/exists` | `sdk_fs.rs` |
+| `toml.decode(text)` | `sdk_toml.rs`, parses a TOML string and converts it to a Lua table through `LuaSerdeExt` |
 | `log.info/warn/error` | `sdk_log.rs`，结构化行写 stderr，由 supervise 捕获进 framework-child log |
 | `now()` | `sdk_basic.rs`，Unix seconds |
 

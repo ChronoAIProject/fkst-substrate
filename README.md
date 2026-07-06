@@ -169,6 +169,7 @@ file.write
 file.exists
 file.list
 json.decode
+toml.decode
 log.info
 log.warn
 log.error
