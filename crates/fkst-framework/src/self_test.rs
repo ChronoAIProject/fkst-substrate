@@ -204,6 +204,18 @@ fn check_sdk_registration(host_root: &std::path::Path) -> Result<()> {
                 error("json table has unexpected key: " .. tostring(json_key))
             end
         end
+        expect_type("toml", toml, "table")
+        expect_type("toml.decode", toml.decode, "function")
+        expect_nil("toml.encode", toml.encode)
+        local toml_result = toml.decode("[a]\nb = 1\n")
+        if toml_result.a.b ~= 1 then
+            error("toml.decode smoke test failed")
+        end
+        for toml_key in pairs(toml) do
+            if toml_key ~= "decode" then
+                error("toml table has unexpected key: " .. tostring(toml_key))
+            end
+        end
         expect_nil("notify_human", notify_human)
         "#,
     )

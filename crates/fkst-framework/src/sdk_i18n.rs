@@ -11,6 +11,7 @@ const REFERENCE_LOCALE: &str = "en";
 const LOCALES_DIR: &str = "locales";
 const FORBIDDEN_SOURCE_PATTERNS: &[&str] = &[
     "json.decode",
+    "toml.decode",
     "base64",
     "string.char",
     "utf8.char",
