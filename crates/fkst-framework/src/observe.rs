@@ -199,8 +199,14 @@ fn print_human(snapshot: &DeliveryObserveSnapshot) {
                 .map(|value| value.to_string())
                 .unwrap_or_else(|| "-".to_string());
             println!(
-                "  queue={} depth={} pending={} in_flight={} retrying={} oldest_pending_age_ms={}",
-                queue.queue, queue.depth, queue.pending, queue.in_flight, queue.retrying, oldest
+                "  queue={} depth={} pending={} in_flight={} retrying={} oldest_pending_age_ms={} subscriber_status={}",
+                queue.queue,
+                queue.depth,
+                queue.pending,
+                queue.in_flight,
+                queue.retrying,
+                oldest,
+                queue.subscriber_status
             );
         }
     }

@@ -505,7 +505,9 @@ fn observe_json_uses_live_socket_when_database_is_open() {
                     "pending": 1,
                     "in_flight": 0,
                     "retrying": 0,
-                    "oldest_pending_age_ms": 0
+                    "oldest_pending_age_ms": 0,
+                    "subscriber_status": "current",
+                    "has_current_subscriber": true
                 }],
                 "deliveries": [{
                     "delivery_id": "live-one",
@@ -547,11 +549,12 @@ fn observe_json_uses_live_socket_when_database_is_open() {
     assert_exit(&output, 0);
     let out = String::from_utf8_lossy(&output.stdout);
     assert!(out.contains("\"delivery_id\": \"live-one\""), "{out}");
+    assert!(out.contains("\"subscriber_status\": \"current\""), "{out}");
     assert!(out.contains("owner redb handle"), "{out}");
 }
 
 #[test]
-fn observe_json_reports_current_subscriber_presence_for_pending_queues() {
+fn observe_json_reports_live_subscriber_status_for_pending_queues() {
     let host = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
     let durable = tempfile::Builder::new()
         .prefix("fkst-durable")
@@ -644,6 +647,69 @@ return M
 
     assert_eq!(active["pending"], 1);
     assert_eq!(orphan["pending"], 1);
+    assert_eq!(active["subscriber_status"], "current");
+    assert_eq!(orphan["subscriber_status"], "absent");
     assert_eq!(active["has_current_subscriber"], true);
     assert_eq!(orphan["has_current_subscriber"], false);
+}
+
+#[test]
+fn observe_json_reports_unknown_subscriber_status_without_live_graph_authority() {
+    let durable = tempfile::Builder::new()
+        .prefix("fkst-durable")
+        .tempdir()
+        .unwrap();
+    write_pending_delivery_fixture(
+        durable.path(),
+        &[
+            ("active-one", "active", "worker"),
+            ("orphan-one", "orphan", "removed_worker"),
+        ],
+    );
+
+    let output = framework_command()
+        .arg("observe")
+        .arg("--durable-root")
+        .arg(durable.path())
+        .arg("--json")
+        .output()
+        .unwrap();
+
+    assert_exit(&output, 0);
+    let snapshot: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let queues = snapshot["queues"].as_array().unwrap();
+    let active = queues
+        .iter()
+        .find(|queue| queue["queue"] == "active")
+        .unwrap();
+    let orphan = queues
+        .iter()
+        .find(|queue| queue["queue"] == "orphan")
+        .unwrap();
+
+    assert_eq!(active["subscriber_status"], "unknown");
+    assert_eq!(orphan["subscriber_status"], "unknown");
+    assert!(active.get("has_current_subscriber").is_none());
+    assert!(orphan.get("has_current_subscriber").is_none());
+}
+
+#[test]
+fn observe_human_output_includes_subscriber_status() {
+    let durable = tempfile::Builder::new()
+        .prefix("fkst-durable")
+        .tempdir()
+        .unwrap();
+    write_pending_delivery_fixture(durable.path(), &[("pending-one", "input", "worker")]);
+
+    let output = framework_command()
+        .arg("observe")
+        .arg("--durable-root")
+        .arg(durable.path())
+        .output()
+        .unwrap();
+
+    assert_exit(&output, 0);
+    let out = String::from_utf8_lossy(&output.stdout);
+    assert!(out.contains("queue=input"), "{out}");
+    assert!(out.contains("subscriber_status=unknown"), "{out}");
 }
