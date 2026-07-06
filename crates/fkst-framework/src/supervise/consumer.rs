@@ -1973,6 +1973,87 @@ units = [{units}]
     }
 
     #[tokio::test]
+    async fn durable_dispatch_receives_rebound_delivery_after_consumer_swap() {
+        let temp = TempDir::new().unwrap();
+        let store = Arc::new(DeliveryStore::open(temp.path().join("delivery.redb")).unwrap());
+        let mut stale = record_for_dept("swapped", "old_worker");
+        stale.queue = "jobs".to_string();
+        store.enqueue(&stale).unwrap();
+        let started = temp.path().join("started");
+        let release = temp.path().join("release");
+        let binary = temp.path().join("fkst-framework");
+        let lua = temp.path().join("departments/new_worker/main.lua");
+        let log_dir = temp.path().join("logs");
+        fs::create_dir_all(lua.parent().unwrap()).unwrap();
+        fs::write(&lua, "return {}\n").unwrap();
+        write_executable(
+            &binary,
+            &format!(
+                "printf 'started\\n' >> '{}'\nwhile [ ! -f '{}' ]; do sleep 0.05; done\nexit 0",
+                started.display(),
+                release.display()
+            ),
+        );
+        write_single_package_workspace(temp.path());
+        let roots = PackageRoots::resolve(temp.path(), vec![temp.path().to_path_buf()]).unwrap();
+        let decl = durable_decl(temp.path(), "new_worker", "30s");
+        let router = durable_router(store.clone(), &[("new_worker", decl.clone())]);
+        assert!(store
+            .lease_for_dept("new_worker", now_unix_millis(), 1, Duration::from_secs(30))
+            .unwrap()
+            .is_empty());
+        store
+            .rebind_deliveries_to_current_subscribers(
+                &router.single_reliable_subscribers_by_queue(),
+            )
+            .unwrap();
+        let (complete_tx, mut complete_rx) = mpsc::channel::<CompletedDelivery>(8);
+        let mut running = BTreeMap::new();
+
+        dispatch_due(
+            "new_worker",
+            &decl,
+            temp.path(),
+            &roots,
+            &binary,
+            &router,
+            Some(store.clone()),
+            None,
+            &log_dir,
+            Duration::from_secs(30),
+            1,
+            16,
+            1,
+            ProcessGroupRegistry::default(),
+            SupervisorJournal::disabled(),
+            &complete_tx,
+            &mut running,
+        );
+        wait_for_started_count(&started, 1).await;
+        assert_eq!(running.len(), 1);
+        let running_delivery = running.values().next().unwrap();
+        assert_eq!(running_delivery.record.delivery_id, "swapped");
+        assert_eq!(running_delivery.record.dept, "new_worker");
+
+        fs::write(&release, "").unwrap();
+        let done = timeout(Duration::from_secs(2), complete_rx.recv())
+            .await
+            .expect("rebound durable child should complete")
+            .expect("completion channel should remain open");
+        running.remove(&done.record.delivery_id);
+        finish_durable_record(
+            "new_worker",
+            Some(store.as_ref()),
+            &router,
+            None,
+            done,
+            &SupervisorJournal::disabled(),
+        );
+
+        assert!(store.get("swapped").unwrap().is_none());
+    }
+
+    #[tokio::test]
     async fn durable_dispatch_admits_burst_children_in_one_pass() {
         // Guards the dispatch path itself (not just durable_dispatch_capacity arithmetic):
         // with admission_burst = 2 a single dispatch_due pass must lease+spawn exactly two

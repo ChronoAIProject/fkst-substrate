@@ -126,6 +126,9 @@ pub async fn supervise(roots: PackageRoots, framework_bin: PathBuf) -> Result<()
         delivery_store.clone(),
         Some(journal.clone()),
     );
+    if let Some(store) = delivery_store.as_ref() {
+        rebind_deliveries_to_current_subscribers(store, &router, &journal)?;
+    }
     delivery_watch::set_failure_fact_publisher(router.failure_fact_publisher());
     let codex_permit_slots = cfg.limits.global_codex_processes;
     let max_in_flight_per_dept =
@@ -267,6 +270,36 @@ fn delivery_store_for_config(cfg: &Config) -> Result<DeliveryStoreHandle> {
         store: Some(Arc::new(DeliveryStore::open(&database)?)),
         observe_endpoint: observe_server::endpoint_for_layout(&durable),
     })
+}
+
+fn rebind_deliveries_to_current_subscribers(
+    store: &DeliveryStore,
+    router: &DeliveryRouter,
+    journal: &SupervisorJournal,
+) -> Result<()> {
+    let rebound = store
+        .rebind_deliveries_to_current_subscribers(&router.single_reliable_subscribers_by_queue())?;
+    for record in rebound {
+        journal.event(
+            "delivery_rebound",
+            [
+                ("queue", record.queue.clone()),
+                ("delivery_id", record.delivery_id.clone()),
+                ("old_dept", record.old_dept.clone()),
+                ("new_dept", record.new_dept.clone()),
+                ("leased", record.leased.to_string()),
+            ],
+        );
+        info!(
+            queue = %record.queue,
+            delivery_id = %record.delivery_id,
+            old_dept = %record.old_dept,
+            new_dept = %record.new_dept,
+            leased = record.leased,
+            "delivery rebound to current subscriber"
+        );
+    }
+    Ok(())
 }
 
 fn publish_startup_validation_failure(cfg: &Config, error: &str) {
