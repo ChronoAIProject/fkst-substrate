@@ -4,7 +4,7 @@ use crate::manifest_hash::sha256_hex;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -12,6 +12,7 @@ pub(crate) struct DeliveryObserveOptions {
     pub(crate) now_ms: u64,
     pub(crate) limit: usize,
     pub(crate) since: Option<String>,
+    pub(crate) current_subscriber_queues: Option<BTreeSet<String>>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -54,6 +55,8 @@ pub(crate) struct QueueObserveState {
     pub(crate) in_flight: usize,
     pub(crate) retrying: usize,
     pub(crate) oldest_pending_age_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) has_current_subscriber: Option<bool>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -185,7 +188,13 @@ pub(crate) fn observe_snapshot(
         truncated,
         queues: queues
             .into_iter()
-            .map(|(queue, accumulator)| accumulator.finish(queue, options.now_ms))
+            .map(|(queue, accumulator)| {
+                accumulator.finish(
+                    queue,
+                    options.now_ms,
+                    options.current_subscriber_queues.as_ref(),
+                )
+            })
             .collect(),
         deliveries,
         dead_letters,
@@ -244,7 +253,14 @@ impl QueueAccumulator {
         }
     }
 
-    fn finish(self, queue: String, now_ms: u64) -> QueueObserveState {
+    fn finish(
+        self,
+        queue: String,
+        now_ms: u64,
+        current_subscriber_queues: Option<&BTreeSet<String>>,
+    ) -> QueueObserveState {
+        let has_current_subscriber =
+            current_subscriber_queues.map(|subscribers| subscribers.contains(&queue));
         QueueObserveState {
             queue,
             depth: self
@@ -257,6 +273,7 @@ impl QueueAccumulator {
             oldest_pending_age_ms: self
                 .oldest_pending_ms
                 .map(|observed| now_ms.saturating_sub(observed)),
+            has_current_subscriber,
         }
     }
 }
@@ -423,6 +440,7 @@ mod tests {
                 now_ms: 150,
                 limit: 10,
                 since: None,
+                current_subscriber_queues: None,
             },
         )
         .unwrap();
@@ -484,6 +502,7 @@ mod tests {
                 now_ms: 121,
                 limit: 10,
                 since: None,
+                current_subscriber_queues: None,
             },
         )
         .unwrap();
@@ -514,6 +533,7 @@ mod tests {
                 now_ms: 100,
                 limit: 1,
                 since: None,
+                current_subscriber_queues: None,
             },
         )
         .unwrap();
@@ -538,6 +558,7 @@ mod tests {
                 now_ms: 100,
                 limit: 1,
                 since: Some("delivery-001".to_string()),
+                current_subscriber_queues: None,
             },
         )
         .unwrap();
@@ -545,5 +566,42 @@ mod tests {
         assert_eq!(snapshot.deliveries.len(), 1);
         assert_eq!(snapshot.deliveries[0].delivery_id, "delivery-002");
         assert!(snapshot.truncated.deliveries);
+    }
+
+    #[test]
+    fn observe_snapshot_marks_current_subscriber_presence_when_graph_is_available() {
+        let temp = TempDir::new().unwrap();
+        let store = store(&temp);
+        store.enqueue(&record("subscribed", 100)).unwrap();
+        let mut orphan = record("orphan", 100);
+        orphan.queue = "orphan".to_string();
+        orphan.dept = "removed_worker".to_string();
+        store.enqueue(&orphan).unwrap();
+
+        let snapshot = observe_snapshot(
+            &store,
+            temp.path(),
+            &temp.path().join("delivery.redb"),
+            &DeliveryObserveOptions {
+                now_ms: 100,
+                limit: 10,
+                since: None,
+                current_subscriber_queues: Some(BTreeSet::from(["input".to_string()])),
+            },
+        )
+        .unwrap();
+
+        let input = snapshot
+            .queues
+            .iter()
+            .find(|entry| entry.queue == "input")
+            .unwrap();
+        let orphan = snapshot
+            .queues
+            .iter()
+            .find(|entry| entry.queue == "orphan")
+            .unwrap();
+        assert_eq!(input.has_current_subscriber, Some(true));
+        assert_eq!(orphan.has_current_subscriber, Some(false));
     }
 }

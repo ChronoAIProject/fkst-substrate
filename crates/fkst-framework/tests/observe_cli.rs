@@ -6,7 +6,8 @@ use std::io::ErrorKind;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Child, Command, Output};
+use std::time::{Duration, Instant};
 
 mod support;
 
@@ -119,6 +120,64 @@ fn write_observe_fixture(durable_root: &Path) {
     }
     write.commit().unwrap();
     drop(db);
+}
+
+fn write_pending_delivery_fixture(durable_root: &Path, rows: &[(&str, &str, &str)]) {
+    let db = Database::create(durable_root.join("delivery.redb")).unwrap();
+    let write = db.begin_write().unwrap();
+    {
+        let mut deliveries = write.open_table(DELIVERY_BY_ID).unwrap();
+        write.open_table(DEAD_BY_ID).unwrap();
+        for (delivery_id, queue, dept) in rows {
+            let delivery = json!({
+                "delivery_id": delivery_id,
+                "queue": queue,
+                "dept": dept,
+                "payload": {
+                    "schema": "test.pending",
+                    "dedup_key": delivery_id
+                },
+                "source": {"kind": "External", "reference": format!("fixture/{delivery_id}")},
+                "cron_payload": null,
+                "observed_at_ms": 1000,
+                "attempt": 0,
+                "redrive_count": 0,
+                "lease_generation": 0,
+                "lease_until_ms": null,
+                "not_before_ms": 4000000000000_u64,
+                "last_error_excerpt": null
+            });
+            deliveries
+                .insert(
+                    *delivery_id,
+                    serde_json::to_vec(&delivery).unwrap().as_slice(),
+                )
+                .unwrap();
+        }
+    }
+    write.commit().unwrap();
+    drop(db);
+}
+
+fn wait_for_path(path: &Path, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if path.exists() {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
+fn terminate_child(child: &mut Child) {
+    let _ = nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(child.id() as i32),
+        nix::sys::signal::Signal::SIGTERM,
+    );
+    let _ = child.wait();
 }
 
 #[test]
@@ -489,4 +548,102 @@ fn observe_json_uses_live_socket_when_database_is_open() {
     let out = String::from_utf8_lossy(&output.stdout);
     assert!(out.contains("\"delivery_id\": \"live-one\""), "{out}");
     assert!(out.contains("owner redb handle"), "{out}");
+}
+
+#[test]
+fn observe_json_reports_current_subscriber_presence_for_pending_queues() {
+    let host = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
+    let durable = tempfile::Builder::new()
+        .prefix("fkst-durable")
+        .tempdir()
+        .unwrap();
+    fs::create_dir_all(host.path().join("departments/worker")).unwrap();
+    fs::create_dir_all(host.path().join("raisers")).unwrap();
+    fs::write(
+        host.path().join("fkst.env"),
+        "FKST_QUEUE_CAPACITY=100\nFKST_DEPARTMENT_DEFAULT_STALL_WINDOW=30s\nFKST_CODEX_PERMIT_SLOTS=20\n",
+    )
+    .unwrap();
+    fs::write(
+        host.path().join("departments/worker/main.lua"),
+        r#"
+local M = {}
+M.spec = { consumes = { "active" }, stall_window = "30s" }
+function M.pipeline(event)
+end
+return M
+"#,
+    )
+    .unwrap();
+    fs::write(
+        host.path().join("raisers/active.lua"),
+        format!(
+            r#"return {{ type = "file_watch", glob = {:?}, produces = "active" }}"#,
+            host.path()
+                .join("no-matches")
+                .join("*.txt")
+                .to_string_lossy()
+        ),
+    )
+    .unwrap();
+    write_single_package_workspace(host.path());
+    write_pending_delivery_fixture(
+        durable.path(),
+        &[
+            ("active-one", "active", "worker"),
+            ("orphan-one", "orphan", "removed_worker"),
+        ],
+    );
+
+    let socket_path = observe_socket_path(durable.path());
+    let _ = std::fs::remove_file(&socket_path);
+    let mut supervise = framework_command()
+        .current_dir(host.path())
+        .arg("supervise")
+        .arg("--project-root")
+        .arg(host.path())
+        .arg("--package-root")
+        .arg(host.path())
+        .arg("--framework-bin")
+        .arg(framework_bin())
+        .env("FKST_RUNTIME_ROOT", host.path().join(".fkst/runtime"))
+        .env("FKST_DURABLE_ROOT", durable.path())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    if !wait_for_path(&socket_path, Duration::from_secs(10)) {
+        terminate_child(&mut supervise);
+        panic!(
+            "timed out waiting for observe socket {}",
+            socket_path.display()
+        );
+    }
+
+    let output = framework_command()
+        .arg("observe")
+        .arg("--durable-root")
+        .arg(durable.path())
+        .arg("--json")
+        .output()
+        .unwrap();
+    terminate_child(&mut supervise);
+
+    assert_exit(&output, 0);
+    let snapshot: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let queues = snapshot["queues"].as_array().unwrap();
+    let active = queues
+        .iter()
+        .find(|queue| queue["queue"] == "active")
+        .unwrap();
+    let orphan = queues
+        .iter()
+        .find(|queue| queue["queue"] == "orphan")
+        .unwrap();
+
+    assert_eq!(active["pending"], 1);
+    assert_eq!(orphan["pending"], 1);
+    assert_eq!(active["has_current_subscriber"], true);
+    assert_eq!(orphan["has_current_subscriber"], false);
 }
