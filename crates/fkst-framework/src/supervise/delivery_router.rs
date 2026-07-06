@@ -221,6 +221,23 @@ impl DeliveryRouter {
         self.subscriptions.keys().cloned().collect()
     }
 
+    pub(crate) fn single_reliable_subscribers_by_queue(&self) -> BTreeMap<String, String> {
+        self.subscriptions
+            .iter()
+            .filter_map(|(queue, subscriptions)| {
+                let reliable = subscriptions
+                    .iter()
+                    .filter(|subscription| subscription.reliable)
+                    .collect::<Vec<_>>();
+                if reliable.len() == 1 {
+                    Some((queue.clone(), reliable[0].dept.clone()))
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
     pub(crate) fn notify_reliable_public(&self, dept: &str) {
         self.notify_reliable(dept);
     }
@@ -797,6 +814,20 @@ mod tests {
         assert_eq!(
             router.current_subscriber_queues(),
             BTreeSet::from(["other.jobs".to_string(), "pkg.jobs".to_string()])
+        );
+    }
+
+    #[test]
+    fn single_reliable_subscribers_are_derived_from_router_subscriptions() {
+        let cfg = namespaced_config();
+        let router = DeliveryRouter::new(&cfg, Fanout::new(), None, None);
+
+        assert_eq!(
+            router.single_reliable_subscribers_by_queue(),
+            BTreeMap::from([
+                ("other.jobs".to_string(), "other.worker".to_string()),
+                ("pkg.jobs".to_string(), "pkg.worker".to_string())
+            ])
         );
     }
 
