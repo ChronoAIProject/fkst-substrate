@@ -55,8 +55,27 @@ pub(crate) struct QueueObserveState {
     pub(crate) in_flight: usize,
     pub(crate) retrying: usize,
     pub(crate) oldest_pending_age_ms: Option<u64>,
+    pub(crate) subscriber_status: QueueSubscriberStatus,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) has_current_subscriber: Option<bool>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum QueueSubscriberStatus {
+    Current,
+    Absent,
+    Unknown,
+}
+
+impl std::fmt::Display for QueueSubscriberStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Current => "current",
+            Self::Absent => "absent",
+            Self::Unknown => "unknown",
+        })
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -259,8 +278,16 @@ impl QueueAccumulator {
         now_ms: u64,
         current_subscriber_queues: Option<&BTreeSet<String>>,
     ) -> QueueObserveState {
-        let has_current_subscriber =
-            current_subscriber_queues.map(|subscribers| subscribers.contains(&queue));
+        let subscriber_status = match current_subscriber_queues {
+            Some(subscribers) if subscribers.contains(&queue) => QueueSubscriberStatus::Current,
+            Some(_) => QueueSubscriberStatus::Absent,
+            None => QueueSubscriberStatus::Unknown,
+        };
+        let has_current_subscriber = match subscriber_status {
+            QueueSubscriberStatus::Current => Some(true),
+            QueueSubscriberStatus::Absent => Some(false),
+            QueueSubscriberStatus::Unknown => None,
+        };
         QueueObserveState {
             queue,
             depth: self
@@ -273,6 +300,7 @@ impl QueueAccumulator {
             oldest_pending_age_ms: self
                 .oldest_pending_ms
                 .map(|observed| now_ms.saturating_sub(observed)),
+            subscriber_status,
             has_current_subscriber,
         }
     }
@@ -455,9 +483,12 @@ mod tests {
         assert_eq!(queue.in_flight, 1);
         assert_eq!(queue.retrying, 0);
         assert_eq!(queue.oldest_pending_age_ms, Some(0));
+        assert_eq!(queue.subscriber_status, QueueSubscriberStatus::Unknown);
+        assert_eq!(queue.has_current_subscriber, None);
         let json = serde_json::to_string(&snapshot).unwrap();
         assert!(json.contains("\"schema\":\"github.issue\""));
         assert!(json.contains("\"dedup_key\":\"issue-81\""));
+        assert!(json.contains("\"subscriber_status\":\"unknown\""));
         assert!(!json.contains("secret body must not be emitted"));
     }
 
@@ -569,7 +600,7 @@ mod tests {
     }
 
     #[test]
-    fn observe_snapshot_marks_current_subscriber_presence_when_graph_is_available() {
+    fn observe_snapshot_marks_subscriber_status_when_graph_is_available() {
         let temp = TempDir::new().unwrap();
         let store = store(&temp);
         store.enqueue(&record("subscribed", 100)).unwrap();
@@ -601,6 +632,8 @@ mod tests {
             .iter()
             .find(|entry| entry.queue == "orphan")
             .unwrap();
+        assert_eq!(input.subscriber_status, QueueSubscriberStatus::Current);
+        assert_eq!(orphan.subscriber_status, QueueSubscriberStatus::Absent);
         assert_eq!(input.has_current_subscriber, Some(true));
         assert_eq!(orphan.has_current_subscriber, Some(false));
     }

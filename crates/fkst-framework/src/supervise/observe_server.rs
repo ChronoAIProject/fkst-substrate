@@ -127,6 +127,7 @@ fn remove_stale_socket(socket: &Path) -> Result<()> {
 mod tests {
     use super::*;
     use crate::observe;
+    use crate::supervise::delivery_observe::QueueSubscriberStatus;
     use crate::supervise::delivery_types::DeliveryRecord;
     use tempfile::TempDir;
 
@@ -193,6 +194,10 @@ mod tests {
         assert_eq!(snapshot.deliveries.len(), 1);
         assert_eq!(snapshot.deliveries[0].delivery_id, "one");
         assert_eq!(snapshot.queues[0].queue, "jobs");
+        assert_eq!(
+            snapshot.queues[0].subscriber_status,
+            QueueSubscriberStatus::Current
+        );
         assert_eq!(snapshot.queues[0].has_current_subscriber, Some(true));
 
         handle.abort();
