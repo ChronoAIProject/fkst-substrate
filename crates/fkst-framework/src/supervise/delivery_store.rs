@@ -323,18 +323,20 @@ impl DeliveryStore {
                     continue;
                 };
 
+                if has_current_subscriber {
+                    record.subscriber_absent_since_ms = None;
+                    let bytes = serde_json::to_vec(&record)?;
+                    delivery.insert(delivery_id.as_str(), bytes.as_slice())?;
+                    sweep.cleared_absent.push(SubscriberAbsentMark {
+                        delivery_id,
+                        queue: record.queue,
+                        dept: record.dept,
+                        absent_since_ms,
+                    });
+                    continue;
+                }
+
                 if !subscriber_absence_budget_elapsed(absent_since_ms, budget_ms, now_ms) {
-                    if has_current_subscriber {
-                        record.subscriber_absent_since_ms = None;
-                        let bytes = serde_json::to_vec(&record)?;
-                        delivery.insert(delivery_id.as_str(), bytes.as_slice())?;
-                        sweep.cleared_absent.push(SubscriberAbsentMark {
-                            delivery_id,
-                            queue: record.queue,
-                            dept: record.dept,
-                            absent_since_ms,
-                        });
-                    }
                     continue;
                 }
 
@@ -2073,7 +2075,7 @@ mod tests {
     }
 
     #[test]
-    fn subscriber_absence_does_not_clear_after_budget_expired() {
+    fn subscriber_absence_clears_when_subscriber_returns_at_budget_expiry() {
         let temp = TempDir::new().unwrap();
         let store = store(&temp);
         let mut delivery = record("late-return", 100);
@@ -2093,17 +2095,21 @@ mod tests {
             )
             .unwrap();
 
-        assert!(expired.cleared_absent.is_empty());
-        assert_eq!(expired.dead_lettered.len(), 1);
-        assert!(store.get("late-return").unwrap().is_none());
         assert_eq!(
-            store
-                .get_dead("late-return")
-                .unwrap()
-                .unwrap()
-                .error_excerpt
-                .as_deref(),
-            Some(SUBSCRIBER_ABSENT_DEAD_REASON)
+            expired.cleared_absent,
+            vec![SubscriberAbsentMark {
+                delivery_id: "late-return".to_string(),
+                queue: "jobs".to_string(),
+                dept: "worker".to_string(),
+                absent_since_ms: 1_000,
+            }]
+        );
+        assert!(expired.dead_lettered.is_empty());
+        let current = store.get("late-return").unwrap().unwrap();
+        assert_eq!(current.subscriber_absent_since_ms, None);
+        assert_eq!(
+            store.get_dead("late-return").unwrap(),
+            None
         );
     }
 
