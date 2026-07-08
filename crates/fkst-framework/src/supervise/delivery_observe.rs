@@ -92,6 +92,7 @@ pub(crate) struct DeliveryObserveEntry {
     pub(crate) lease_generation: u64,
     pub(crate) lease_until_ms: Option<u64>,
     pub(crate) fence_token: String,
+    pub(crate) subscriber_absent_since_ms: Option<u64>,
     pub(crate) payload: PayloadObserveSummary,
     pub(crate) last_error_excerpt: Option<String>,
 }
@@ -322,6 +323,7 @@ fn delivery_observe_entry(record: DeliveryRecord, now_ms: u64) -> Result<Deliver
         redrive_count: record.redrive_count,
         lease_generation: record.lease_generation,
         lease_until_ms: record.lease_until_ms,
+        subscriber_absent_since_ms: record.subscriber_absent_since_ms,
         payload,
         last_error_excerpt: record.last_error_excerpt,
     })
@@ -423,6 +425,7 @@ mod tests {
             attempt: 0,
             redrive_count: 0,
             collapse_by_dedup_id: false,
+            subscriber_absent_since_ms: None,
             lease_generation: 0,
             lease_until_ms: None,
             not_before_ms,

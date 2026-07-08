@@ -14,6 +14,7 @@ const CONFIG_ENVS: &[&str] = &[
     "FKST_CODEX_PERMIT_SLOTS",
     "FKST_MAX_IN_FLIGHT_PER_DEPT",
     "FKST_DURABLE_ADMISSION_BURST_PER_DEPT",
+    "FKST_SUBSCRIBER_ABSENT_DELIVERY_BUDGET",
     "FKST_RATE_POOL_ROOT",
     "FKST_RATE_POOL_GH",
     "FKST_RETRY_DEFAULT_MAX_ATTEMPTS",
@@ -73,7 +74,7 @@ fn config_reads_host_fkst_env_from_project_root_when_cwd_differs() {
 
     assert_exit(&output, 0);
     let out = stdout(&output);
-    assert_eq!(out.lines().count(), 11, "{out}");
+    assert_eq!(out.lines().count(), 12, "{out}");
     assert!(out.contains("name=queue_capacity"), "{out}");
     assert!(out.contains("resolved=31 source=fkst.env"), "{out}");
     assert!(out.contains("name=max_in_flight_per_dept"), "{out}");
@@ -83,6 +84,11 @@ fn config_reads_host_fkst_env_from_project_root_when_cwd_differs() {
         "{out}"
     );
     assert!(out.contains("resolved=1 source=default"), "{out}");
+    assert!(
+        out.contains("name=subscriber_absent_delivery_budget"),
+        "{out}"
+    );
+    assert!(out.contains("resolved=168h source=default"), "{out}");
     assert!(out.contains("name=retry_default_max_attempts"), "{out}");
     assert!(out.contains("name=rate_pool_root"), "{out}");
     assert!(out.contains("resolved=5 source=default"), "{out}");

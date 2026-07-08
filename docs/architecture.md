@@ -181,7 +181,7 @@ queue 是包内命名空间。多 graph-root 组合时，裸 queue 名按 owner 
 
 引擎操作 knob 统一由 `config_registry.rs` 的静态 typed registry 声明，并通过显式 host root 构造的 `ConfigContext` 解析。读取优先级是 process env → host `fkst.env` → operational 默认。registry 不读 cwd、`tunables/*.txt`，也没有 set/write/dynamic registration、YAML、DSL、manifest、plugin 或 dashboard 入口。
 
-当前 registry 只有 11 项：
+当前 registry 只有 12 项：
 
 | name | env key | kind | type | default / required |
 |---|---|---|---|---|
@@ -190,6 +190,7 @@ queue 是包内命名空间。多 graph-root 组合时，裸 queue 名按 owner 
 | `codex_permit_slots` | `FKST_CODEX_PERMIT_SLOTS` | Operational | `usize` | default `20` |
 | `max_in_flight_per_dept` | `FKST_MAX_IN_FLIGHT_PER_DEPT` | Operational | `usize` | default `16` |
 | `durable_admission_burst_per_dept` | `FKST_DURABLE_ADMISSION_BURST_PER_DEPT` | Operational | `usize` | default `1` |
+| `subscriber_absent_delivery_budget` | `FKST_SUBSCRIBER_ABSENT_DELIVERY_BUDGET` | Operational | duration string | default `168h`, continuous subscriber absence before DLQ |
 | `rate_pool_root` | `FKST_RATE_POOL_ROOT` | Operational | string | default `~/.fkst/rate-pools` |
 | `retry_default_max_attempts` | `FKST_RETRY_DEFAULT_MAX_ATTEMPTS` | Operational | `usize` | default `5` |
 | `retry_default_base` | `FKST_RETRY_DEFAULT_BASE` | Operational | duration string | default `60s` |
@@ -269,6 +270,8 @@ durable 真相来自可观测事实：git commit、明确的 host filesystem fac
 可靠 delivery 默认启用。Department 可用 `M.spec.ephemeral = {"queue"}` 将本 Department 对指定 consumed queue 的订阅降级为非可靠；`M.spec.retry = false` 只表示失败不重试，不再表示非可靠投递。可靠订阅启动时必须有 `FKST_DURABLE_ROOT`，缺失 fail-closed。`DeliveryRouter` 对可靠订阅写入 redb delivery store 后再唤醒 consumer；ephemeral 订阅仍直接走 `Fanout::send`。可靠 delivery 的 source event 必须带 `SourceRef{kind, reference}`，cron 由 raiser 名派生，file_watch 由绝对路径派生；Department `RAISED` 进入可靠 queue 时继承上游 source_ref，缺失则 publish fail-closed，上游 delivery 不 ack 并进入 retry。
 
 consumer 的可靠路径由定时 tick 和 Fanout 唤醒触发，调用 delivery store `lease` 取 due 或过期 lease 的记录，构造标准 `Event{queue,payload,ts}` 后 spawn framework。exit 0 且所有 RAISED publish 成功才 `ack`；spawn error、stall、非零退出或 RAISED publish 失败都调用 `retry`。retry 达到 `max_attempts` 时 delivery 移入 redb dead 表，并 best-effort 经 Router publish `dead_letter` 通知；当前 delivery 自身来自 `dead_letter` 时抑制再次发送 `dead_letter`，避免自环。`Fanout` 在可靠路径只承担进程内唤醒，不再承载可靠事实。
+
+When a pending durable delivery's queue has no current subscriber, supervise records the first continuously observed absence in `subscriber_absent_since_ms`. The supervisor-level sweep clears that timestamp if the subscriber returns before `FKST_SUBSCRIBER_ABSENT_DELIVERY_BUDGET`; otherwise it moves the delivery to the replayable DLQ with `error_excerpt = "subscriber-absent"`. This is driven by graph authority plus redb delivery state, not by a missing consumer.
 
 engine 维护 durable 在途 delivery state，但它不是实体业务真相、accepted state 或 rollback state。`处理中` 可以是 redb delivery lease、`with_lock` 租约（进程死后 fcntl lock 自动释放）或 worktree 等可观测事实；完成态仍是 commit、明确的 host filesystem fact 或外部源事实。
 

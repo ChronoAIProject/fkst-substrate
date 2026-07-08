@@ -151,6 +151,7 @@ impl DeliveryRouter {
                     attempt: 0,
                     redrive_count: 0,
                     collapse_by_dedup_id: delivery_identity.collapse_by_dedup_id,
+                    subscriber_absent_since_ms: None,
                     lease_generation: 0,
                     lease_until_ms: None,
                     not_before_ms: (self.clock)(),
@@ -219,6 +220,18 @@ impl DeliveryRouter {
 
     pub(crate) fn current_subscriber_queues(&self) -> BTreeSet<String> {
         self.subscriptions.keys().cloned().collect()
+    }
+
+    pub(crate) fn reliable_subscriber_queues(&self) -> BTreeSet<String> {
+        self.subscriptions
+            .iter()
+            .filter(|(_, subscriptions)| {
+                subscriptions
+                    .iter()
+                    .any(|subscription| subscription.reliable)
+            })
+            .map(|(queue, _)| queue.clone())
+            .collect()
     }
 
     pub(crate) fn single_reliable_subscribers_by_queue(&self) -> BTreeMap<String, String> {
@@ -815,6 +828,18 @@ mod tests {
             router.current_subscriber_queues(),
             BTreeSet::from(["other.jobs".to_string(), "pkg.jobs".to_string()])
         );
+    }
+
+    #[test]
+    fn reliable_subscriber_queues_exclude_ephemeral_only_subscriptions() {
+        let cfg = config(true);
+        let router = DeliveryRouter::new(&cfg, Fanout::new(), None, None);
+
+        assert_eq!(
+            router.current_subscriber_queues(),
+            BTreeSet::from(["jobs".to_string()])
+        );
+        assert_eq!(router.reliable_subscriber_queues(), BTreeSet::new());
     }
 
     #[test]

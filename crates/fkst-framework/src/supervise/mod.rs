@@ -4,6 +4,7 @@ use fkst_common::validation::validate;
 use fkst_common::DurableLayout;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 use tracing::{error, info, warn};
 
 use crate::path_resolver::PackageRoots;
@@ -31,12 +32,15 @@ use crate::config_registry::{ConfigContext, ConfigKey};
 use crate::process_tree::ProcessGroupRegistry;
 use consumer::spawn_consumer;
 use delivery_router::DeliveryRouter;
-use delivery_store::DeliveryStore;
+use delivery_store::{DeliveryStore, SubscriberAbsentSweep};
 use event_fanout::Fanout;
 use failure_fact::schema_validation_failure_fact;
 use journal::SupervisorJournal;
 use observe_server::ObserveEndpoint;
-use source_runner::{spawn_cron, spawn_file_watch};
+use source_runner::{parse_duration, spawn_cron, spawn_file_watch};
+
+const SUBSCRIBER_ABSENCE_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
+const SUBSCRIBER_ABSENCE_SWEEP_BATCH: usize = 1_024;
 
 pub(crate) fn load_host_graph_for_conformance(roots: &PackageRoots) -> Result<Config> {
     graph_scan::load_roots(roots)
@@ -135,13 +139,30 @@ pub async fn supervise(roots: PackageRoots, framework_bin: PathBuf) -> Result<()
         config_context.resolved_positive_usize(ConfigKey::MaxInFlightPerDept)?;
     let durable_admission_burst_per_dept =
         config_context.resolved_positive_usize(ConfigKey::DurableAdmissionBurstPerDept)?;
+    let subscriber_absent_budget = parse_duration(
+        &config_context
+            .resolved_positive_duration_string(ConfigKey::SubscriberAbsentDeliveryBudget)?,
+    )?;
     let process_groups = ProcessGroupRegistry::default();
     let mut handles = vec![];
     if let Some(store) = delivery.store.as_ref() {
+        sweep_subscriber_absence(
+            store,
+            &router,
+            subscriber_absent_budget,
+            &journal,
+            "startup",
+        );
+        handles.push(spawn_subscriber_absence_sweeper(
+            store.clone(),
+            router.clone(),
+            subscriber_absent_budget,
+            journal.clone(),
+        ));
         handles.push(observe_server::spawn_observe_server(
             delivery.observe_endpoint.clone(),
             store.clone(),
-            router.current_subscriber_queues(),
+            router.reliable_subscriber_queues(),
         )?);
     }
 
@@ -256,6 +277,13 @@ struct DeliveryStoreHandle {
 
 fn delivery_store_for_config(cfg: &Config) -> Result<DeliveryStoreHandle> {
     if !DeliveryRouter::has_reliable_subscriptions(cfg) {
+        if let Some(durable) = optional_existing_durable_layout()? {
+            let database = durable.delivery_db_path();
+            return Ok(DeliveryStoreHandle {
+                store: Some(Arc::new(DeliveryStore::open(&database)?)),
+                observe_endpoint: observe_server::endpoint_for_layout(&durable),
+            });
+        }
         return Ok(DeliveryStoreHandle {
             store: None,
             observe_endpoint: ObserveEndpoint::default(),
@@ -270,6 +298,19 @@ fn delivery_store_for_config(cfg: &Config) -> Result<DeliveryStoreHandle> {
         store: Some(Arc::new(DeliveryStore::open(&database)?)),
         observe_endpoint: observe_server::endpoint_for_layout(&durable),
     })
+}
+
+fn optional_existing_durable_layout() -> Result<Option<DurableLayout>> {
+    let Some(root) =
+        std::env::var_os(fkst_common::DURABLE_ROOT_ENV).filter(|value| !value.is_empty())
+    else {
+        return Ok(None);
+    };
+    let database = PathBuf::from(&root).join("delivery.redb");
+    if !database.exists() {
+        return Ok(None);
+    }
+    Ok(Some(DurableLayout::new(root)?))
 }
 
 fn rebind_deliveries_to_current_subscribers(
@@ -300,6 +341,119 @@ fn rebind_deliveries_to_current_subscribers(
         );
     }
     Ok(())
+}
+
+fn spawn_subscriber_absence_sweeper(
+    store: Arc<DeliveryStore>,
+    router: DeliveryRouter,
+    budget: Duration,
+    journal: SupervisorJournal,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(SUBSCRIBER_ABSENCE_SWEEP_INTERVAL);
+        tick.tick().await;
+        loop {
+            tick.tick().await;
+            sweep_subscriber_absence(&store, &router, budget, &journal, "periodic");
+        }
+    })
+}
+
+fn sweep_subscriber_absence(
+    store: &DeliveryStore,
+    router: &DeliveryRouter,
+    budget: Duration,
+    journal: &SupervisorJournal,
+    trigger: &str,
+) {
+    match store.sweep_subscriber_absence(
+        &router.reliable_subscriber_queues(),
+        delivery_router::now_unix_millis(),
+        budget,
+        SUBSCRIBER_ABSENCE_SWEEP_BATCH,
+    ) {
+        Ok(sweep) => report_subscriber_absence_sweep(sweep, journal, trigger),
+        Err(err) => {
+            journal.event(
+                "subscriber_absence_sweep_failed",
+                [
+                    ("trigger", trigger.to_string()),
+                    ("reason", err.to_string()),
+                ],
+            );
+            error!(
+                trigger = %trigger,
+                error = %err,
+                "subscriber absence sweep failed"
+            );
+        }
+    }
+}
+
+fn report_subscriber_absence_sweep(
+    sweep: SubscriberAbsentSweep,
+    journal: &SupervisorJournal,
+    trigger: &str,
+) {
+    for record in sweep.marked_absent {
+        journal.event(
+            "subscriber_absent_marked",
+            [
+                ("queue", record.queue.clone()),
+                ("dept", record.dept.clone()),
+                ("delivery_id", record.delivery_id.clone()),
+                ("absent_since_ms", record.absent_since_ms.to_string()),
+                ("trigger", trigger.to_string()),
+            ],
+        );
+        info!(
+            queue = %record.queue,
+            dept = %record.dept,
+            delivery_id = %record.delivery_id,
+            absent_since_ms = record.absent_since_ms,
+            trigger = %trigger,
+            "delivery subscriber absence marked"
+        );
+    }
+    for record in sweep.cleared_absent {
+        journal.event(
+            "subscriber_absent_cleared",
+            [
+                ("queue", record.queue.clone()),
+                ("dept", record.dept.clone()),
+                ("delivery_id", record.delivery_id.clone()),
+                ("absent_since_ms", record.absent_since_ms.to_string()),
+                ("trigger", trigger.to_string()),
+            ],
+        );
+        info!(
+            queue = %record.queue,
+            dept = %record.dept,
+            delivery_id = %record.delivery_id,
+            absent_since_ms = record.absent_since_ms,
+            trigger = %trigger,
+            "delivery subscriber absence cleared"
+        );
+    }
+    for dead in sweep.dead_lettered {
+        journal.event(
+            "dead_lettered",
+            [
+                ("dept", dead.dept.clone()),
+                ("delivery_id", dead.delivery_id.clone()),
+                ("reason", "subscriber-absent".to_string()),
+                ("trigger", trigger.to_string()),
+            ],
+        );
+        warn!(
+            queue = %dead.queue,
+            dept = %dead.dept,
+            delivery_id = %dead.delivery_id,
+            dead_at_ms = dead.dead_at_ms,
+            trigger = %trigger,
+            "subscriber-absent delivery dead-lettered"
+        );
+    }
 }
 
 fn publish_startup_validation_failure(cfg: &Config, error: &str) {
@@ -383,6 +537,12 @@ mod tests {
     }
 
     impl EnvGuard {
+        fn set(value: &std::path::Path) -> Self {
+            let old = std::env::var_os(DURABLE_ROOT_ENV);
+            std::env::set_var(DURABLE_ROOT_ENV, value);
+            Self { old }
+        }
+
         fn unset() -> Self {
             let old = std::env::var_os(DURABLE_ROOT_ENV);
             std::env::remove_var(DURABLE_ROOT_ENV);
@@ -422,6 +582,35 @@ mod tests {
             .unwrap()
             .store
             .is_none());
+    }
+
+    #[test]
+    fn pure_ephemeral_config_opens_existing_durable_store_for_orphan_sweep() {
+        let _lock = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+        let temp = tempfile::TempDir::new().unwrap();
+        let durable_root = temp.path().join("durable");
+        std::fs::create_dir_all(&durable_root).unwrap();
+        DeliveryStore::open(durable_root.join("delivery.redb")).unwrap();
+        let _guard = EnvGuard::set(&durable_root);
+
+        assert!(delivery_store_for_config(&config(true))
+            .unwrap()
+            .store
+            .is_some());
+    }
+
+    #[test]
+    fn pure_ephemeral_config_does_not_create_durable_store_from_env() {
+        let _lock = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+        let temp = tempfile::TempDir::new().unwrap();
+        let durable_root = temp.path().join("durable");
+        let _guard = EnvGuard::set(&durable_root);
+
+        assert!(delivery_store_for_config(&config(true))
+            .unwrap()
+            .store
+            .is_none());
+        assert!(!durable_root.join("delivery.redb").exists());
     }
 
     #[tokio::test]
