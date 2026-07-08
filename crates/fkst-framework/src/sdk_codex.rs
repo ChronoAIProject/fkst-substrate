@@ -48,6 +48,13 @@ const CODEX_ADOPTION_STATUS_RUNNING: &str = "running";
 const CODEX_ADOPTION_STATUS_COMPLETED: &str = "completed";
 const CODEX_ADOPTION_POLL: Duration = Duration::from_millis(100);
 const CODEX_ADOPTION_TIMEOUT_GRACE: Duration = Duration::from_secs(2);
+const GH_CONFIG_DIR_ENV: &str = "GH_CONFIG_DIR";
+const GITHUB_AUTH_ENV_KEYS: &[&str] = &[
+    "GH_TOKEN",
+    "GITHUB_TOKEN",
+    "GH_ENTERPRISE_TOKEN",
+    "GITHUB_ENTERPRISE_TOKEN",
+];
 static NEXT_PIPELINE_OWNER_ID: AtomicU64 = AtomicU64::new(1);
 static NEXT_CODEX_RUN_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -2455,8 +2462,74 @@ fn command_for_request(request: &CodexRequest, program: &Path) -> (Command, Stri
     cmd.stdin(Stdio::piped());
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
+    scrub_github_auth_for_codex(&mut cmd, request);
     let cmd_line = format_command("codex", &cmd_args);
     (cmd, cmd_line)
+}
+
+fn scrub_github_auth_for_codex(cmd: &mut Command, request: &CodexRequest) {
+    for key in GITHUB_AUTH_ENV_KEYS {
+        cmd.env_remove(key);
+    }
+    for (key, _) in std::env::vars_os() {
+        if is_github_credential_env_key(&key) {
+            cmd.env_remove(key);
+        }
+    }
+
+    let gh_config_dir = codex_gh_config_dir(request);
+    if let Err(err) = std::fs::create_dir_all(&gh_config_dir) {
+        eprintln!(
+            "WARN: codex gh config dir create failed path={} error={err}",
+            gh_config_dir.display()
+        );
+    }
+    // Complete gh banning also needs OS-enforced egress denial, tracked in substrate#256.
+    // This strips credentials only; codex may still invoke gh, but it does not inherit bot auth.
+    cmd.env(GH_CONFIG_DIR_ENV, gh_config_dir);
+}
+
+fn is_github_credential_env_key(key: &OsStr) -> bool {
+    let Some(key) = key.to_str() else {
+        return false;
+    };
+    if key == GH_CONFIG_DIR_ENV {
+        return false;
+    }
+    if GITHUB_AUTH_ENV_KEYS.contains(&key) {
+        return true;
+    }
+    let Some(suffix) = key
+        .strip_prefix("GH_")
+        .or_else(|| key.strip_prefix("GITHUB_"))
+    else {
+        return false;
+    };
+    let suffix = suffix.to_ascii_uppercase();
+    suffix.split('_').any(|part| {
+        matches!(
+            part,
+            "AUTH"
+                | "OAUTH"
+                | "TOKEN"
+                | "SECRET"
+                | "PASSWORD"
+                | "CREDENTIAL"
+                | "CREDENTIALS"
+                | "PAT"
+                | "KEY"
+        )
+    })
+}
+
+fn codex_gh_config_dir(request: &CodexRequest) -> PathBuf {
+    request
+        .log_path
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(runtime_log_dir)
+        .join("gh-config")
+        .join(&request.run_id)
 }
 
 fn command_line_for_request(request: &CodexRequest) -> String {
@@ -2899,6 +2972,32 @@ fn permit_pool_dir(host_root: &Path) -> mlua::Result<PathBuf> {
 mod tests {
     use super::*;
 
+    fn command_test_request() -> CodexRequest {
+        let run_id = codex_run_id();
+        let log_path = std::env::temp_dir()
+            .join("fkst-sdk-codex-command-test")
+            .join(&run_id)
+            .join("run.log");
+        CodexRequest {
+            run_id,
+            prompt: String::new(),
+            context: None,
+            worktree: None,
+            timeout_seconds: DEFAULT_CODEX_TIMEOUT_SECONDS,
+            output_tail_path: codex_output_tail_path(&log_path),
+            log_path,
+            role: None,
+            label: None,
+            proposal_id: None,
+            dedup_key: None,
+            dept: None,
+            started_at_ms: 0,
+            adoption_status_path: None,
+            effect_key: None,
+            effect_log_path: None,
+        }
+    }
+
     #[test]
     fn unix_seconds_to_iso8601_formats_epoch_and_leap_day() {
         assert_eq!(unix_seconds_to_iso8601(0), "1970-01-01T00:00:00Z");
@@ -2906,5 +3005,34 @@ mod tests {
             unix_seconds_to_iso8601(1_709_251_199),
             "2024-02-29T23:59:59Z"
         );
+    }
+
+    #[test]
+    fn codex_command_strips_github_token_env() {
+        let request = command_test_request();
+        let (cmd, _) = command_for_request(&request, Path::new("codex"));
+        let envs = cmd.get_envs().collect::<Vec<_>>();
+
+        assert!(envs
+            .iter()
+            .any(|(key, value)| *key == OsStr::new("GH_TOKEN") && value.is_none()));
+        assert!(envs
+            .iter()
+            .any(|(key, value)| *key == OsStr::new("GITHUB_TOKEN") && value.is_none()));
+        assert!(!envs.iter().any(|(key, value)| {
+            matches!(
+                (*key, value),
+                (key, Some(_)) if key == OsStr::new("GH_TOKEN")
+                    || key == OsStr::new("GITHUB_TOKEN")
+            )
+        }));
+        assert!(envs.iter().any(|(key, value)| {
+            *key == OsStr::new(GH_CONFIG_DIR_ENV)
+                && value.is_some_and(|path| {
+                    Path::new(path)
+                        .file_name()
+                        .is_some_and(|name| name == OsStr::new(&request.run_id))
+                })
+        }));
     }
 }
