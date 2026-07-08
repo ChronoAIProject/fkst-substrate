@@ -33,6 +33,8 @@ pub(crate) struct DeliveryRecord {
     pub redrive_count: u64,
     #[serde(default)]
     pub collapse_by_dedup_id: bool,
+    #[serde(default)]
+    pub subscriber_absent_since_ms: Option<u64>,
     pub lease_generation: u64,
     pub lease_until_ms: Option<u64>,
     pub not_before_ms: u64,

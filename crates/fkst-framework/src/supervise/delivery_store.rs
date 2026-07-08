@@ -75,6 +75,21 @@ pub(crate) struct ReboundDelivery {
     pub leased: bool,
 }
 
+#[derive(Debug, PartialEq)]
+pub(crate) struct SubscriberAbsentSweep {
+    pub marked_absent: Vec<SubscriberAbsentMark>,
+    pub cleared_absent: Vec<SubscriberAbsentMark>,
+    pub dead_lettered: Vec<DeadRecord>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct SubscriberAbsentMark {
+    pub delivery_id: String,
+    pub queue: String,
+    pub dept: String,
+    pub absent_since_ms: u64,
+}
+
 pub(crate) struct DeliveryStore {
     db: Database,
 }
@@ -259,6 +274,120 @@ impl DeliveryStore {
         }
         commit_write(write)?;
         Ok(rebound)
+    }
+
+    pub(crate) fn sweep_subscriber_absence(
+        &self,
+        current_subscriber_queues: &BTreeSet<String>,
+        now_ms: u64,
+        budget: Duration,
+        batch_limit: usize,
+    ) -> Result<SubscriberAbsentSweep> {
+        if batch_limit == 0 {
+            return Ok(SubscriberAbsentSweep::empty());
+        }
+        let _op = StoreOpWatch::new("subscriber_absence", "<any>");
+        let budget_ms = duration_millis(budget);
+        let candidates =
+            self.collect_subscriber_absence_candidates(current_subscriber_queues, batch_limit)?;
+        if candidates.is_empty() {
+            return Ok(SubscriberAbsentSweep::empty());
+        }
+
+        let write = self.begin_write()?;
+        let mut sweep = SubscriberAbsentSweep::empty();
+        {
+            let mut delivery = write.open_table(DELIVERY_BY_ID)?;
+            let mut ready = write.open_table(READY_BY_DEPT_DUE)?;
+            let mut lease_index = write.open_table(LEASED_BY_DEPT_UNTIL)?;
+            let mut dead_table = write.open_table(DEAD_BY_ID)?;
+            let mut dead_index = write.open_table(DEAD_BY_DEPT_DUE)?;
+            for delivery_id in candidates {
+                let Some(mut record) = read_delivery_table(&delivery, &delivery_id)? else {
+                    continue;
+                };
+                let has_current_subscriber = current_subscriber_queues.contains(&record.queue);
+                let Some(absent_since_ms) = record.subscriber_absent_since_ms else {
+                    if has_current_subscriber {
+                        continue;
+                    }
+                    record.subscriber_absent_since_ms = Some(now_ms);
+                    let bytes = serde_json::to_vec(&record)?;
+                    delivery.insert(delivery_id.as_str(), bytes.as_slice())?;
+                    sweep.marked_absent.push(SubscriberAbsentMark {
+                        delivery_id,
+                        queue: record.queue,
+                        dept: record.dept,
+                        absent_since_ms: now_ms,
+                    });
+                    continue;
+                };
+
+                if !subscriber_absence_budget_elapsed(absent_since_ms, budget_ms, now_ms) {
+                    if has_current_subscriber {
+                        record.subscriber_absent_since_ms = None;
+                        let bytes = serde_json::to_vec(&record)?;
+                        delivery.insert(delivery_id.as_str(), bytes.as_slice())?;
+                        sweep.cleared_absent.push(SubscriberAbsentMark {
+                            delivery_id,
+                            queue: record.queue,
+                            dept: record.dept,
+                            absent_since_ms,
+                        });
+                    }
+                    continue;
+                }
+
+                if let Some(lease_until) = record.lease_until_ms {
+                    lease_index.remove(
+                        make_index_key(&record.dept, lease_until, delivery_id.as_str()).as_str(),
+                    )?;
+                } else {
+                    ready.remove(
+                        make_index_key(&record.dept, record.not_before_ms, delivery_id.as_str())
+                            .as_str(),
+                    )?;
+                }
+                record.lease_until_ms = None;
+                record.not_before_ms = now_ms;
+                record.last_error_excerpt = Some(SUBSCRIBER_ABSENT_DEAD_REASON.to_string());
+                let dead = DeadRecord {
+                    delivery_id: record.delivery_id.clone(),
+                    queue: record.queue.clone(),
+                    dept: record.dept.clone(),
+                    source: record.source.clone(),
+                    observed_at_ms: record.observed_at_ms,
+                    not_before_ms: record.not_before_ms,
+                    dead_at_ms: now_ms,
+                    attempts: record.attempt,
+                    redrive_count: record.redrive_count,
+                    replayable: true,
+                    permanent: false,
+                    error_excerpt: record.last_error_excerpt.clone(),
+                    record: Some(record.clone()),
+                };
+                let bytes = serde_json::to_vec(&dead)?;
+                dead_table.insert(delivery_id.as_str(), bytes.as_slice())?;
+                dead_index.insert(
+                    make_dead_due_index_key(&dead.dept, dead.dead_at_ms, delivery_id.as_str())
+                        .as_str(),
+                    &(),
+                )?;
+                delivery.remove(delivery_id.as_str())?;
+                sweep.dead_lettered.push(dead);
+            }
+            drop(delivery);
+            drop(ready);
+            drop(lease_index);
+            drop(dead_table);
+            drop(dead_index);
+            compact_terminal_dead_records(&write, now_ms)?;
+        }
+        if sweep.is_empty() {
+            return Ok(sweep);
+        }
+        commit_write(write)?;
+        Ok(sweep)
     }
 
     pub(crate) fn renew_leases(
@@ -654,6 +783,26 @@ impl DeliveryStore {
         now_ms: u64,
         batch_limit: usize,
     ) -> Result<RedriveResult> {
+        self.redrive_due_inner(policy, None, now_ms, batch_limit)
+    }
+
+    pub(crate) fn redrive_due_with_current_subscribers(
+        &self,
+        policy: &RedrivePolicy,
+        current_dept_by_queue: &BTreeMap<String, String>,
+        now_ms: u64,
+        batch_limit: usize,
+    ) -> Result<RedriveResult> {
+        self.redrive_due_inner(policy, Some(current_dept_by_queue), now_ms, batch_limit)
+    }
+
+    fn redrive_due_inner(
+        &self,
+        policy: &RedrivePolicy,
+        current_dept_by_queue: Option<&BTreeMap<String, String>>,
+        now_ms: u64,
+        batch_limit: usize,
+    ) -> Result<RedriveResult> {
         let _op = StoreOpWatch::new("redrive", "<any>");
         let mut result = RedriveResult {
             redriven: Vec::new(),
@@ -663,7 +812,8 @@ impl DeliveryStore {
             return Ok(result);
         }
         let cooldown_ms = duration_millis(policy.cooldown);
-        let due_keys = self.collect_due_dead_keys(policy, now_ms, batch_limit)?;
+        let due_keys =
+            self.collect_due_dead_keys(policy, current_dept_by_queue, now_ms, batch_limit)?;
         if due_keys.is_empty() {
             return Ok(result);
         }
@@ -735,6 +885,15 @@ impl DeliveryStore {
                     mutated = true;
                     continue;
                 }
+                if is_subscriber_absent_dead_record(&dead) {
+                    let Some(current_dept_by_queue) = current_dept_by_queue else {
+                        continue;
+                    };
+                    let Some(current_dept) = current_dept_by_queue.get(&record.queue) else {
+                        continue;
+                    };
+                    record.dept.clone_from(current_dept);
+                }
                 if delivery.get(delivery_id.as_str())?.is_some() {
                     dead_index.remove(key.key.as_str())?;
                     dead.permanent = true;
@@ -761,6 +920,7 @@ impl DeliveryStore {
                 record.lease_generation = record.lease_generation.saturating_add(1);
                 record.not_before_ms = now_ms;
                 record.last_error_excerpt = None;
+                record.subscriber_absent_since_ms = None;
                 let bytes = serde_json::to_vec(&record)?;
                 delivery.insert(delivery_id.as_str(), bytes.as_slice())?;
                 ready.insert(
@@ -788,6 +948,7 @@ impl DeliveryStore {
     fn collect_due_dead_keys(
         &self,
         policy: &RedrivePolicy,
+        current_dept_by_queue: Option<&BTreeMap<String, String>>,
         now_ms: u64,
         batch_limit: usize,
     ) -> Result<Vec<super::delivery_index::DueIndexKey>> {
@@ -808,9 +969,20 @@ impl DeliveryStore {
                 }
                 continue;
             };
-            if dead.dead_at_ms != parsed.due_ms
-                || dead_redrive_cooldown_elapsed(dead.dead_at_ms, cooldown_ms, now_ms)
-            {
+            if dead.dead_at_ms != parsed.due_ms {
+                due.push(parsed);
+                if due.len() >= batch_limit {
+                    break;
+                }
+            } else if dead_redrive_cooldown_elapsed(dead.dead_at_ms, cooldown_ms, now_ms) {
+                if is_subscriber_absent_dead_record(&dead) {
+                    let Some(current_dept_by_queue) = current_dept_by_queue else {
+                        continue;
+                    };
+                    if !current_dept_by_queue.contains_key(&dead.queue) {
+                        continue;
+                    }
+                }
                 due.push(parsed);
                 if due.len() >= batch_limit {
                     break;
@@ -820,6 +992,41 @@ impl DeliveryStore {
             }
         }
         Ok(due)
+    }
+
+    fn collect_subscriber_absence_candidates(
+        &self,
+        current_subscriber_queues: &BTreeSet<String>,
+        batch_limit: usize,
+    ) -> Result<Vec<String>> {
+        let read = self.db.begin_read()?;
+        let delivery = read.open_table(DELIVERY_BY_ID)?;
+        let mut delivery_ids = Vec::new();
+        for entry in delivery.iter()? {
+            let (delivery_id, bytes) = entry?;
+            let delivery_id = delivery_id.value().to_string();
+            let record = match serde_json::from_slice::<DeliveryRecord>(bytes.value()) {
+                Ok(record) => record,
+                Err(err) => {
+                    tracing::warn!(
+                        delivery_id = %delivery_id,
+                        error = %err,
+                        "skipping undecodable delivery record during subscriber absence sweep"
+                    );
+                    continue;
+                }
+            };
+            if current_subscriber_queues.contains(&record.queue)
+                && record.subscriber_absent_since_ms.is_none()
+            {
+                continue;
+            }
+            delivery_ids.push(delivery_id);
+            if delivery_ids.len() >= batch_limit {
+                break;
+            }
+        }
+        Ok(delivery_ids)
     }
 
     #[cfg(test)]
@@ -940,6 +1147,24 @@ impl DeliveryStore {
 
     fn begin_write(&self) -> Result<redb::WriteTransaction> {
         begin_write(&self.db)
+    }
+}
+
+pub(crate) const SUBSCRIBER_ABSENT_DEAD_REASON: &str = "subscriber-absent";
+
+impl SubscriberAbsentSweep {
+    fn empty() -> Self {
+        Self {
+            marked_absent: Vec::new(),
+            cleared_absent: Vec::new(),
+            dead_lettered: Vec::new(),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.marked_absent.is_empty()
+            && self.cleared_absent.is_empty()
+            && self.dead_lettered.is_empty()
     }
 }
 
@@ -1334,6 +1559,18 @@ fn dead_redrive_cooldown_elapsed(dead_at_ms: u64, cooldown_ms: u64, now_ms: u64)
     dead_at_ms.saturating_add(cooldown_ms) <= now_ms
 }
 
+fn subscriber_absence_budget_elapsed(absent_since_ms: u64, budget_ms: u64, now_ms: u64) -> bool {
+    absent_since_ms.saturating_add(budget_ms) <= now_ms
+}
+
+fn is_subscriber_absent_dead_record(dead: &DeadRecord) -> bool {
+    dead.error_excerpt.as_deref() == Some(SUBSCRIBER_ABSENT_DEAD_REASON)
+        && dead
+            .record
+            .as_ref()
+            .is_some_and(|record| record.subscriber_absent_since_ms.is_some())
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::delivery_types::{SourceKind, SourceRef};
@@ -1356,6 +1593,7 @@ mod tests {
             attempt: 0,
             redrive_count: 0,
             collapse_by_dedup_id: false,
+            subscriber_absent_since_ms: None,
             lease_generation: 0,
             lease_until_ms: None,
             not_before_ms,
@@ -1726,6 +1964,230 @@ mod tests {
         assert_eq!(leased[0].delivery_id, "in-flight");
         assert_eq!(leased[0].dept, "new_worker");
         assert_eq!(leased[0].lease_generation, 3);
+    }
+
+    #[test]
+    fn subscriber_absence_marks_then_dead_letters_after_budget() {
+        let temp = TempDir::new().unwrap();
+        let store = store(&temp);
+        let mut orphan = record("orphan", 100);
+        orphan.queue = "missing".to_string();
+        orphan.dept = "old_worker".to_string();
+        store.enqueue(&orphan).unwrap();
+
+        let first = store
+            .sweep_subscriber_absence(&BTreeSet::new(), 1_000, Duration::from_millis(500), 10)
+            .unwrap();
+
+        assert_eq!(
+            first.marked_absent,
+            vec![SubscriberAbsentMark {
+                delivery_id: "orphan".to_string(),
+                queue: "missing".to_string(),
+                dept: "old_worker".to_string(),
+                absent_since_ms: 1_000,
+            }]
+        );
+        assert!(first.dead_lettered.is_empty());
+        assert_eq!(
+            store
+                .get("orphan")
+                .unwrap()
+                .unwrap()
+                .subscriber_absent_since_ms,
+            Some(1_000)
+        );
+
+        let early = store
+            .sweep_subscriber_absence(&BTreeSet::new(), 1_499, Duration::from_millis(500), 10)
+            .unwrap();
+
+        assert!(early.is_empty());
+        assert!(store.get("orphan").unwrap().is_some());
+
+        let expired = store
+            .sweep_subscriber_absence(&BTreeSet::new(), 1_500, Duration::from_millis(500), 10)
+            .unwrap();
+
+        assert_eq!(expired.dead_lettered.len(), 1);
+        let dead = store.get_dead("orphan").unwrap().unwrap();
+        assert_eq!(dead.delivery_id, "orphan");
+        assert_eq!(dead.queue, "missing");
+        assert_eq!(dead.dept, "old_worker");
+        assert_eq!(dead.dead_at_ms, 1_500);
+        assert_eq!(dead.attempts, 0);
+        assert!(dead.replayable);
+        assert!(!dead.permanent);
+        assert_eq!(
+            dead.error_excerpt.as_deref(),
+            Some(SUBSCRIBER_ABSENT_DEAD_REASON)
+        );
+        assert_eq!(
+            dead.record.as_ref().unwrap().subscriber_absent_since_ms,
+            Some(1_000)
+        );
+        assert!(store.get("orphan").unwrap().is_none());
+        assert_eq!(store.ready_index_len().unwrap(), 0);
+        assert_eq!(store.dead_due_index_len().unwrap(), 1);
+    }
+
+    #[test]
+    fn subscriber_absence_clears_when_subscriber_returns_within_budget() {
+        let temp = TempDir::new().unwrap();
+        let store = store(&temp);
+        let mut delivery = record("returning", 100);
+        delivery.queue = "jobs".to_string();
+        delivery.dept = "worker".to_string();
+        store.enqueue(&delivery).unwrap();
+
+        store
+            .sweep_subscriber_absence(&BTreeSet::new(), 1_000, Duration::from_millis(500), 10)
+            .unwrap();
+        let returned = store
+            .sweep_subscriber_absence(
+                &BTreeSet::from(["jobs".to_string()]),
+                1_400,
+                Duration::from_millis(500),
+                10,
+            )
+            .unwrap();
+
+        assert_eq!(
+            returned.cleared_absent,
+            vec![SubscriberAbsentMark {
+                delivery_id: "returning".to_string(),
+                queue: "jobs".to_string(),
+                dept: "worker".to_string(),
+                absent_since_ms: 1_000,
+            }]
+        );
+        assert!(returned.dead_lettered.is_empty());
+        let current = store.get("returning").unwrap().unwrap();
+        assert_eq!(current.subscriber_absent_since_ms, None);
+        assert_eq!(store.get_dead("returning").unwrap(), None);
+        let leased = store
+            .lease_for_dept("worker", 1_400, 1, Duration::from_millis(50))
+            .unwrap();
+        assert_eq!(leased.len(), 1);
+        assert_eq!(leased[0].delivery_id, "returning");
+    }
+
+    #[test]
+    fn subscriber_absence_does_not_clear_after_budget_expired() {
+        let temp = TempDir::new().unwrap();
+        let store = store(&temp);
+        let mut delivery = record("late-return", 100);
+        delivery.queue = "jobs".to_string();
+        delivery.dept = "worker".to_string();
+        store.enqueue(&delivery).unwrap();
+
+        store
+            .sweep_subscriber_absence(&BTreeSet::new(), 1_000, Duration::from_millis(500), 10)
+            .unwrap();
+        let expired = store
+            .sweep_subscriber_absence(
+                &BTreeSet::from(["jobs".to_string()]),
+                1_500,
+                Duration::from_millis(500),
+                10,
+            )
+            .unwrap();
+
+        assert!(expired.cleared_absent.is_empty());
+        assert_eq!(expired.dead_lettered.len(), 1);
+        assert!(store.get("late-return").unwrap().is_none());
+        assert_eq!(
+            store
+                .get_dead("late-return")
+                .unwrap()
+                .unwrap()
+                .error_excerpt
+                .as_deref(),
+            Some(SUBSCRIBER_ABSENT_DEAD_REASON)
+        );
+    }
+
+    #[test]
+    fn subscriber_absence_uses_first_observed_absence_across_restarts() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("delivery.redb");
+        {
+            let store = DeliveryStore::open(&path).unwrap();
+            store.enqueue(&record("persisted", 100)).unwrap();
+            store
+                .sweep_subscriber_absence(&BTreeSet::new(), 1_000, Duration::from_millis(500), 10)
+                .unwrap();
+        }
+
+        let store = DeliveryStore::open(&path).unwrap();
+        let expired = store
+            .sweep_subscriber_absence(&BTreeSet::new(), 1_500, Duration::from_millis(500), 10)
+            .unwrap();
+
+        assert_eq!(expired.dead_lettered.len(), 1);
+        assert_eq!(
+            store
+                .get_dead("persisted")
+                .unwrap()
+                .unwrap()
+                .record
+                .as_ref()
+                .unwrap()
+                .subscriber_absent_since_ms,
+            Some(1_000)
+        );
+    }
+
+    #[test]
+    fn subscriber_absent_dead_letter_redrives_only_when_subscriber_returns() {
+        let temp = TempDir::new().unwrap();
+        let store = store(&temp);
+        let mut delivery = record("redrive-absent", 100);
+        delivery.queue = "jobs".to_string();
+        delivery.dept = "old_worker".to_string();
+        store.enqueue(&delivery).unwrap();
+        store
+            .sweep_subscriber_absence(&BTreeSet::new(), 1_000, Duration::from_millis(500), 10)
+            .unwrap();
+        store
+            .sweep_subscriber_absence(&BTreeSet::new(), 1_500, Duration::from_millis(500), 10)
+            .unwrap();
+        let policy = RedrivePolicy {
+            max_redrives: 3,
+            cooldown: Duration::from_millis(50),
+        };
+
+        let absent = store
+            .redrive_due_with_current_subscribers(&policy, &BTreeMap::new(), 1_550, 10)
+            .unwrap();
+
+        assert!(absent.redriven.is_empty());
+        assert!(store.get("redrive-absent").unwrap().is_none());
+        assert!(store.get_dead("redrive-absent").unwrap().is_some());
+        assert_eq!(store.dead_due_index_len().unwrap(), 1);
+
+        let generic = store.redrive_due(&policy, 1_550, 10).unwrap();
+
+        assert!(generic.redriven.is_empty());
+        assert!(store.get("redrive-absent").unwrap().is_none());
+        assert!(store.get_dead("redrive-absent").unwrap().is_some());
+        assert_eq!(store.dead_due_index_len().unwrap(), 1);
+
+        let returned = store
+            .redrive_due_with_current_subscribers(
+                &policy,
+                &BTreeMap::from([("jobs".to_string(), "new_worker".to_string())]),
+                1_550,
+                10,
+            )
+            .unwrap();
+
+        assert_eq!(returned.redriven.len(), 1);
+        let current = store.get("redrive-absent").unwrap().unwrap();
+        assert_eq!(current.dept, "new_worker");
+        assert_eq!(current.subscriber_absent_since_ms, None);
+        assert_eq!(current.last_error_excerpt, None);
+        assert!(store.get_dead("redrive-absent").unwrap().is_none());
     }
 
     #[test]

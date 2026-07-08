@@ -800,7 +800,12 @@ fn maintain_dead_letters(dept_name: &str, store: Option<&DeliveryStore>, router:
         max_redrives: REDRIVE_MAX,
         cooldown: REDRIVE_COOLDOWN,
     };
-    match store.redrive_due(&policy, now_unix_millis(), DISPATCH_BATCH) {
+    match store.redrive_due_with_current_subscribers(
+        &policy,
+        &router.single_reliable_subscribers_by_queue(),
+        now_unix_millis(),
+        DISPATCH_BATCH,
+    ) {
         Ok(result) => {
             for record in result.redriven {
                 info!(
@@ -1202,6 +1207,7 @@ mod tests {
             attempt: 0,
             redrive_count: 0,
             collapse_by_dedup_id: false,
+            subscriber_absent_since_ms: None,
             lease_generation: 0,
             lease_until_ms: None,
             not_before_ms: 0,

@@ -83,6 +83,7 @@ Current registry entries:
 | `codex_permit_slots` | `FKST_CODEX_PERMIT_SLOTS` | `Operational` | `usize` | default `20` |
 | `max_in_flight_per_dept` | `FKST_MAX_IN_FLIGHT_PER_DEPT` | `Operational` | `usize` | default `16` |
 | `durable_admission_burst_per_dept` | `FKST_DURABLE_ADMISSION_BURST_PER_DEPT` | `Operational` | `usize` | default `1` |
+| `subscriber_absent_delivery_budget` | `FKST_SUBSCRIBER_ABSENT_DELIVERY_BUDGET` | `Operational` | `duration-string` | default `168h`; continuous absence before DLQ |
 | `rate_pool_root` | `FKST_RATE_POOL_ROOT` | `Operational` | `string` | default `~/.fkst/rate-pools` |
 | `retry_default_max_attempts` | `FKST_RETRY_DEFAULT_MAX_ATTEMPTS` | `Operational` | `usize` | default `5` |
 | `retry_default_base` | `FKST_RETRY_DEFAULT_BASE` | `Operational` | `duration-string` | default `60s` |
@@ -136,6 +137,8 @@ Queue names are package-local. In composed multi-root graphs, bare queue names r
 `FKST_RUNTIME_ROOT` is engine scratch for `worktrees`, `codex-permits`, `locks`, `logs`, `marks`, and `cache`. Durable business facts must come from git refs/commits/branches, explicit host filesystem facts, or external sources. Runtime scratch is not accepted release state, package state, rollback state, or a durable business database.
 
 Reliable delivery state uses `FKST_DURABLE_ROOT` and the framework delivery store. It is a delivery lease, retry, and DLQ ledger, not an entity fact store.
+
+If a pending durable delivery's queue has no current subscriber, supervise records `subscriber_absent_since_ms` in the delivery row. If the subscriber returns before `FKST_SUBSCRIBER_ABSENT_DELIVERY_BUDGET` elapses, the delivery resumes normally and the absence clock is cleared. If the absence remains continuous past the budget, the supervisor sweep moves the delivery to the replayable DLQ with `error_excerpt` set to `subscriber-absent`.
 
 ## Lua SDK Surface
 
