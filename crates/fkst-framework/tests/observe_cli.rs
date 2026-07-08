@@ -86,6 +86,7 @@ fn write_observe_fixture(durable_root: &Path) {
             "observed_at_ms": 1000,
             "attempt": 0,
             "redrive_count": 0,
+            "subscriber_absent_since_ms": null,
             "lease_generation": 0,
             "lease_until_ms": null,
             "not_before_ms": 1000,
@@ -122,6 +123,81 @@ fn write_observe_fixture(durable_root: &Path) {
     drop(db);
 }
 
+fn write_subscriber_absence_fixture(durable_root: &Path) {
+    let db = Database::create(durable_root.join("delivery.redb")).unwrap();
+    let write = db.begin_write().unwrap();
+    {
+        let mut deliveries = write.open_table(DELIVERY_BY_ID).unwrap();
+        let mut dead = write.open_table(DEAD_BY_ID).unwrap();
+        let pending = json!({
+            "delivery_id": "pending-absent",
+            "queue": "orphan",
+            "dept": "old_worker",
+            "payload": {
+                "schema": "test.absent",
+                "dedup_key": "pending-absent"
+            },
+            "source": {"kind": "External", "reference": "fixture/pending-absent"},
+            "cron_payload": null,
+            "observed_at_ms": 1000,
+            "attempt": 0,
+            "redrive_count": 0,
+            "subscriber_absent_since_ms": 1100,
+            "lease_generation": 0,
+            "lease_until_ms": null,
+            "not_before_ms": 4000000000000_u64,
+            "last_error_excerpt": null
+        });
+        deliveries
+            .insert(
+                "pending-absent",
+                serde_json::to_vec(&pending).unwrap().as_slice(),
+            )
+            .unwrap();
+        let original = json!({
+            "delivery_id": "dead-absent",
+            "queue": "orphan",
+            "dept": "old_worker",
+            "payload": {
+                "schema": "test.absent",
+                "dedup_key": "dead-absent"
+            },
+            "source": {"kind": "External", "reference": "fixture/dead-absent"},
+            "cron_payload": null,
+            "observed_at_ms": 1000,
+            "attempt": 0,
+            "redrive_count": 0,
+            "subscriber_absent_since_ms": 1100,
+            "lease_generation": 0,
+            "lease_until_ms": null,
+            "not_before_ms": 1600,
+            "last_error_excerpt": "subscriber-absent"
+        });
+        let dead_record = json!({
+            "delivery_id": "dead-absent",
+            "queue": "orphan",
+            "dept": "old_worker",
+            "source": {"kind": "External", "reference": "fixture/dead-absent"},
+            "observed_at_ms": 1000,
+            "not_before_ms": 1600,
+            "dead_at_ms": 1600,
+            "attempts": 0,
+            "redrive_count": 0,
+            "replayable": true,
+            "permanent": false,
+            "error_excerpt": "subscriber-absent",
+            "record": original
+        });
+        dead.insert(
+            "dead-absent",
+            serde_json::to_vec(&dead_record).unwrap().as_slice(),
+        )
+        .unwrap();
+    }
+    write.commit().unwrap();
+    drop(db);
+}
+
 fn write_pending_delivery_fixture(durable_root: &Path, rows: &[(&str, &str, &str)]) {
     let db = Database::create(durable_root.join("delivery.redb")).unwrap();
     let write = db.begin_write().unwrap();
@@ -142,6 +218,7 @@ fn write_pending_delivery_fixture(durable_root: &Path, rows: &[(&str, &str, &str
                 "observed_at_ms": 1000,
                 "attempt": 0,
                 "redrive_count": 0,
+                "subscriber_absent_since_ms": null,
                 "lease_generation": 0,
                 "lease_until_ms": null,
                 "not_before_ms": 4000000000000_u64,
@@ -522,6 +599,7 @@ fn observe_json_uses_live_socket_when_database_is_open() {
                     "lease_generation": 0,
                     "lease_until_ms": null,
                     "fence_token": "live-one#0",
+                    "subscriber_absent_since_ms": null,
                     "payload": {
                         "schema": "github.issue",
                         "dedup_key": "issue-81",
@@ -651,6 +729,54 @@ return M
     assert_eq!(orphan["subscriber_status"], "absent");
     assert_eq!(active["has_current_subscriber"], true);
     assert_eq!(orphan["has_current_subscriber"], false);
+    let orphan_delivery = snapshot["deliveries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|delivery| delivery["delivery_id"] == "orphan-one")
+        .unwrap();
+    assert!(
+        orphan_delivery["subscriber_absent_since_ms"].is_u64(),
+        "{orphan_delivery}"
+    );
+}
+
+#[test]
+fn observe_json_distinguishes_pending_absent_from_dead_lettered_absent() {
+    let durable = tempfile::Builder::new()
+        .prefix("fkst-durable")
+        .tempdir()
+        .unwrap();
+    write_subscriber_absence_fixture(durable.path());
+
+    let output = framework_command()
+        .arg("observe")
+        .arg("--durable-root")
+        .arg(durable.path())
+        .arg("--json")
+        .output()
+        .unwrap();
+
+    assert_exit(&output, 0);
+    let snapshot: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let pending = snapshot["deliveries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|delivery| delivery["delivery_id"] == "pending-absent")
+        .unwrap();
+    let dead = snapshot["dead_letters"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|delivery| delivery["delivery_id"] == "dead-absent")
+        .unwrap();
+
+    assert_eq!(pending["status"], "pending");
+    assert_eq!(pending["subscriber_absent_since_ms"], 1100);
+    assert_eq!(dead["error_excerpt"], "subscriber-absent");
+    assert_eq!(dead["replayable"], true);
+    assert_eq!(dead["permanent"], false);
 }
 
 #[test]

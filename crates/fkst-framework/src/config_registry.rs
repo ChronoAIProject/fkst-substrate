@@ -38,6 +38,7 @@ pub(crate) enum ConfigKey {
     CodexPermitSlots,
     MaxInFlightPerDept,
     DurableAdmissionBurstPerDept,
+    SubscriberAbsentDeliveryBudget,
     RatePoolRoot,
     RetryDefaultMaxAttempts,
     RetryDefaultBase,
@@ -90,6 +91,11 @@ impl ConfigContext {
     pub(crate) fn resolved_duration_string(&self, key: ConfigKey) -> Result<String> {
         let resolved = self.resolve(key)?;
         parse_duration_string(entry(key), &resolved.value)
+    }
+
+    pub(crate) fn resolved_positive_duration_string(&self, key: ConfigKey) -> Result<String> {
+        let resolved = self.resolve(key)?;
+        parse_positive_duration_string(entry(key), &resolved.value)
     }
 
     pub(crate) fn resolved_string(&self, key: ConfigKey) -> Result<String> {
@@ -194,6 +200,14 @@ pub(crate) static CONFIG_REGISTRY: &[ConfigEntry] = &[
         kind: ConfigKind::Operational { default: "1" },
         value_type: ConfigValueType::Usize,
         doc: "Maximum new durable Department children admitted per dispatch pass.",
+    },
+    ConfigEntry {
+        key: ConfigKey::SubscriberAbsentDeliveryBudget,
+        name: "subscriber_absent_delivery_budget",
+        env_key: "FKST_SUBSCRIBER_ABSENT_DELIVERY_BUDGET",
+        kind: ConfigKind::Operational { default: "168h" },
+        value_type: ConfigValueType::DurationString,
+        doc: "Continuous subscriber absence budget before a pending durable delivery is dead-lettered.",
     },
     ConfigEntry {
         key: ConfigKey::RatePoolRoot,
@@ -348,9 +362,21 @@ pub(crate) fn parse_duration_string(entry: &ConfigEntry, raw: &str) -> Result<St
     let value = raw.trim().to_string();
     if value.is_empty() || !(value.ends_with('s') || value.ends_with('m') || value.ends_with('h')) {
         bail!(
-            "{} must be a Department delivery lease duration ending with s/m/h, got {raw:?}",
+            "{} must be a duration ending with s/m/h, got {raw:?}",
             entry.env_key
         );
+    }
+    Ok(value)
+}
+
+pub(crate) fn parse_positive_duration_string(entry: &ConfigEntry, raw: &str) -> Result<String> {
+    let value = parse_duration_string(entry, raw)?;
+    let (num_str, _) = value.split_at(value.len() - 1);
+    let amount = num_str
+        .parse::<u64>()
+        .with_context(|| format!("{} must start with a positive integer", entry.env_key))?;
+    if amount == 0 {
+        bail!("{} must be > 0", entry.env_key);
     }
     Ok(value)
 }
@@ -411,6 +437,14 @@ mod tests {
         let resolved =
             resolve(ConfigKey::RetryDefaultCap, &HashMap::new(), &HashMap::new()).unwrap();
         assert_eq!(resolved.value, "30m");
+
+        let resolved = resolve(
+            ConfigKey::SubscriberAbsentDeliveryBudget,
+            &HashMap::new(),
+            &HashMap::new(),
+        )
+        .unwrap();
+        assert_eq!(resolved.value, "168h");
     }
 
     #[test]
@@ -418,5 +452,14 @@ mod tests {
         let err =
             resolve(ConfigKey::CandidatePrefix, &HashMap::new(), &HashMap::new()).unwrap_err();
         assert!(format!("{err:#}").contains("FKST_CANDIDATE_PREFIX missing"));
+    }
+
+    #[test]
+    fn positive_duration_rejects_zero() {
+        let err =
+            parse_positive_duration_string(entry(ConfigKey::SubscriberAbsentDeliveryBudget), "0s")
+                .unwrap_err();
+
+        assert!(format!("{err:#}").contains("FKST_SUBSCRIBER_ABSENT_DELIVERY_BUDGET must be > 0"));
     }
 }
