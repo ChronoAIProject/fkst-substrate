@@ -58,12 +58,39 @@ const GITHUB_AUTH_ENV_KEYS: &[&str] = &[
 static NEXT_PIPELINE_OWNER_ID: AtomicU64 = AtomicU64::new(1);
 static NEXT_CODEX_RUN_ID: AtomicU64 = AtomicU64::new(1);
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CodexSandbox {
+    ReadOnly,
+    WorkspaceWrite,
+    DangerFullAccess,
+}
+
+impl CodexSandbox {
+    fn parse(mode: &str) -> anyhow::Result<Self> {
+        match mode {
+            "read-only" => Ok(Self::ReadOnly),
+            "workspace-write" => Ok(Self::WorkspaceWrite),
+            "danger-full-access" => Ok(Self::DangerFullAccess),
+            _ => anyhow::bail!("codex-sandbox-invalid: unsupported sandbox mode {mode}"),
+        }
+    }
+
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::ReadOnly => "read-only",
+            Self::WorkspaceWrite => "workspace-write",
+            Self::DangerFullAccess => "danger-full-access",
+        }
+    }
+}
+
 // both sync and async SDK calls share one immutable request description.
 struct CodexRequest {
     run_id: String,
     prompt: String,
     context: Option<String>,
     worktree: Option<String>,
+    sandbox: Option<CodexSandbox>,
     timeout_seconds: i64,
     log_path: PathBuf,
     output_tail_path: PathBuf,
@@ -384,7 +411,7 @@ pub(crate) fn register_with_runner(
         let raised_auth_token = Arc::clone(&raised_auth_token);
         lua.create_function(move |lua, opts: Table| {
             crate::process_tree::ensure_supervisor_parent_alive()?;
-            let request = codex_request_from_opts(opts, dept.as_deref().map(str::to_string));
+            let request = codex_request_from_opts(opts, dept.as_deref().map(str::to_string))?;
             flush_raises_before_sync_codex(&raise_buf, raised_auth_token.as_deref());
             run_codex_request(request, &host_root, &config, runner.as_ref().as_ref())?
                 .into_lua_table(lua)
@@ -398,7 +425,7 @@ pub(crate) fn register_with_runner(
         let runner = Arc::clone(&runner);
         lua.create_function(move |_, opts: Table| {
             crate::process_tree::ensure_supervisor_parent_alive()?;
-            let request = codex_request_from_opts(opts, dept.as_deref().map(str::to_string));
+            let request = codex_request_from_opts(opts, dept.as_deref().map(str::to_string))?;
             let task_id = next_task_id.fetch_add(1, Ordering::Relaxed);
             let host_root = Arc::clone(&host_root);
             let config = Arc::clone(&config);
@@ -442,10 +469,11 @@ fn flush_raises_before_sync_codex(raise_buf: &RaiseBuffer, raised_auth_token: Op
 }
 
 // the same input names an overall wall-clock timeout with a bounded default.
-fn codex_request_from_opts(opts: Table, runtime_dept: Option<String>) -> CodexRequest {
+fn codex_request_from_opts(opts: Table, runtime_dept: Option<String>) -> Result<CodexRequest> {
     let prompt: String = opts.get("prompt").unwrap_or_default();
     let context: Option<String> = opts.get("context").ok();
     let worktree: Option<String> = opts.get("worktree").ok();
+    let sandbox = codex_sandbox_from_opts(&opts)?;
     let role: Option<String> = opts.get("role").ok();
     let label: Option<String> = opts.get("label").ok();
     let proposal_id: Option<String> = opts.get("proposal_id").ok();
@@ -458,11 +486,12 @@ fn codex_request_from_opts(opts: Table, runtime_dept: Option<String>) -> CodexRe
     let log_path = codex_log_path(worktree.as_deref());
     let output_tail_path = codex_output_tail_path(&log_path);
     let started_at_ms = unix_duration().as_millis() as u64;
-    CodexRequest {
+    Ok(CodexRequest {
         run_id: codex_run_id(),
         prompt,
         context,
         worktree,
+        sandbox,
         timeout_seconds,
         log_path,
         output_tail_path,
@@ -475,6 +504,25 @@ fn codex_request_from_opts(opts: Table, runtime_dept: Option<String>) -> CodexRe
         adoption_status_path: None,
         effect_key: None,
         effect_log_path: None,
+    })
+}
+
+fn codex_sandbox_from_opts(opts: &Table) -> Result<Option<CodexSandbox>> {
+    let value: mlua::Value = opts.get("sandbox")?;
+    match value {
+        mlua::Value::Nil => Ok(None),
+        mlua::Value::String(value) => {
+            let mode = value.to_str().map_err(|_| {
+                mlua::Error::external("codex-sandbox-invalid: sandbox must be valid UTF-8")
+            })?;
+            let mode = mode.as_ref();
+            CodexSandbox::parse(mode)
+                .map(Some)
+                .map_err(mlua::Error::external)
+        }
+        _ => Err(mlua::Error::external(
+            "codex-sandbox-invalid: sandbox must be read-only, workspace-write, or danger-full-access",
+        )),
     }
 }
 
@@ -809,6 +857,10 @@ fn adoption_request_hash(request: &CodexRequest) -> String {
         &mut hash,
         request.worktree.as_deref().unwrap_or("").as_bytes(),
     );
+    if let Some(sandbox) = request.sandbox {
+        feed(&mut hash, b"\0sandbox\0");
+        feed(&mut hash, sandbox.as_str().as_bytes());
+    }
     feed(&mut hash, b"\0prompt\0");
     feed(&mut hash, request.prompt.as_bytes());
     feed(&mut hash, b"\0context\0");
@@ -1168,6 +1220,10 @@ fn codex_worker_args(
         args.push("--worktree".to_string());
         args.push(worktree.to_string());
     }
+    if let Some(sandbox) = request.sandbox {
+        args.push("--sandbox".to_string());
+        args.push(sandbox.as_str().to_string());
+    }
     if let Some(label) = request.label.as_deref() {
         args.push("--label".to_string());
         args.push(label.to_string());
@@ -1284,6 +1340,7 @@ pub(crate) struct CodexWorkerOptions {
     timeout_seconds: i64,
     context: Option<String>,
     worktree: Option<String>,
+    sandbox: Option<CodexSandbox>,
     role: Option<String>,
     label: Option<String>,
     proposal_id: Option<String>,
@@ -1309,6 +1366,10 @@ pub(crate) fn parse_worker_args(args: Vec<String>) -> anyhow::Result<CodexWorker
     let timeout_seconds = parser.required_string("--timeout")?.parse::<i64>()?;
     let context = parser.optional_string("--context");
     let worktree = parser.optional_string("--worktree");
+    let sandbox = parser
+        .optional_string("--sandbox")
+        .map(|mode| CodexSandbox::parse(&mode))
+        .transpose()?;
     let role = parser.optional_string("--role");
     let label = parser.optional_string("--label");
     let proposal_id = parser.optional_string("--proposal-id");
@@ -1332,6 +1393,7 @@ pub(crate) fn parse_worker_args(args: Vec<String>) -> anyhow::Result<CodexWorker
         timeout_seconds,
         context,
         worktree,
+        sandbox,
         role,
         label,
         proposal_id,
@@ -1348,6 +1410,7 @@ pub(crate) fn run_codex_worker(options: CodexWorkerOptions) -> anyhow::Result<i3
         prompt,
         context: options.context.clone(),
         worktree: options.worktree.clone(),
+        sandbox: options.sandbox,
         timeout_seconds: options.timeout_seconds,
         log_path: options.log_path.clone(),
         output_tail_path: codex_output_tail_path(&options.log_path),
@@ -2537,10 +2600,13 @@ fn command_line_for_request(request: &CodexRequest) -> String {
 }
 
 fn command_args_for_request(request: &CodexRequest) -> Vec<String> {
-    let mut args = vec![
-        "exec".to_string(),
-        "--dangerously-bypass-approvals-and-sandbox".to_string(),
-    ];
+    let mut args = vec!["exec".to_string()];
+    if let Some(sandbox) = request.sandbox {
+        args.push("--sandbox".to_string());
+        args.push(sandbox.as_str().to_string());
+    } else {
+        args.push("--dangerously-bypass-approvals-and-sandbox".to_string());
+    }
     if let Some(ctx) = request.context.as_deref() {
         args.push("--context".to_string());
         args.push(ctx.to_string());
@@ -2983,6 +3049,7 @@ mod tests {
             prompt: String::new(),
             context: None,
             worktree: None,
+            sandbox: None,
             timeout_seconds: DEFAULT_CODEX_TIMEOUT_SECONDS,
             output_tail_path: codex_output_tail_path(&log_path),
             log_path,
@@ -3005,6 +3072,121 @@ mod tests {
             unix_seconds_to_iso8601(1_709_251_199),
             "2024-02-29T23:59:59Z"
         );
+    }
+
+    #[test]
+    fn codex_command_uses_requested_sandbox_without_bypass_flag() {
+        let lua = Lua::new();
+        let opts = lua.create_table().unwrap();
+        opts.set("prompt", "judge").unwrap();
+        opts.set("sandbox", "read-only").unwrap();
+        let request = codex_request_from_opts(opts, None).unwrap();
+
+        let args = command_args_for_request(&request);
+
+        assert_eq!(
+            args,
+            vec![
+                "exec".to_string(),
+                "--sandbox".to_string(),
+                "read-only".to_string(),
+                "-".to_string()
+            ]
+        );
+        assert!(!args
+            .iter()
+            .any(|arg| arg == "--dangerously-bypass-approvals-and-sandbox"));
+    }
+
+    #[test]
+    fn codex_command_without_sandbox_preserves_default_argv() {
+        let lua = Lua::new();
+        let opts = lua.create_table().unwrap();
+        opts.set("prompt", "implement").unwrap();
+        let request = codex_request_from_opts(opts, None).unwrap();
+
+        let args = command_args_for_request(&request);
+
+        assert_eq!(
+            args,
+            vec![
+                "exec".to_string(),
+                "--dangerously-bypass-approvals-and-sandbox".to_string(),
+                "-".to_string()
+            ]
+        );
+        assert!(!args.iter().any(|arg| arg == "--sandbox"));
+    }
+
+    #[test]
+    fn codex_request_rejects_invalid_sandbox_mode() {
+        let lua = Lua::new();
+        let opts = lua.create_table().unwrap();
+        opts.set("prompt", "judge").unwrap();
+        opts.set("sandbox", "bogus").unwrap();
+
+        let err = match codex_request_from_opts(opts, None) {
+            Ok(_) => panic!("invalid sandbox mode should fail closed"),
+            Err(err) => err,
+        };
+
+        assert!(err.to_string().contains("codex-sandbox-invalid"));
+    }
+
+    #[test]
+    fn adoption_request_hash_includes_sandbox_mode() {
+        let mut default = command_test_request();
+        default.prompt = "same prompt".to_string();
+        default.worktree = Some("same-worktree".to_string());
+        let mut read_only = command_test_request();
+        read_only.prompt = default.prompt.clone();
+        read_only.worktree = default.worktree.clone();
+        read_only.sandbox = Some(CodexSandbox::ReadOnly);
+        let mut workspace_write = command_test_request();
+        workspace_write.prompt = default.prompt.clone();
+        workspace_write.worktree = default.worktree.clone();
+        workspace_write.sandbox = Some(CodexSandbox::WorkspaceWrite);
+        let mut danger_full_access = command_test_request();
+        danger_full_access.prompt = default.prompt.clone();
+        danger_full_access.worktree = default.worktree.clone();
+        danger_full_access.sandbox = Some(CodexSandbox::DangerFullAccess);
+
+        let hashes = [
+            adoption_request_hash(&default),
+            adoption_request_hash(&read_only),
+            adoption_request_hash(&workspace_write),
+            adoption_request_hash(&danger_full_access),
+        ];
+
+        assert_eq!(hashes.iter().collect::<HashSet<_>>().len(), hashes.len());
+    }
+
+    #[test]
+    fn worker_args_round_trip_sandbox_mode() {
+        let mut request = command_test_request();
+        let paths = CodexAdoptionPaths {
+            key: "key".to_string(),
+            dir: PathBuf::from("adoption-dir"),
+            prompt: PathBuf::from("prompt"),
+            stdout: PathBuf::from("stdout"),
+            stderr: PathBuf::from("stderr"),
+            effect: PathBuf::from("effect"),
+            effect_log: PathBuf::from("effect-log"),
+            result: PathBuf::from("result"),
+            status: PathBuf::from("status"),
+        };
+
+        for sandbox in [
+            CodexSandbox::ReadOnly,
+            CodexSandbox::WorkspaceWrite,
+            CodexSandbox::DangerFullAccess,
+        ] {
+            request.sandbox = Some(sandbox);
+            let args = codex_worker_args(&request, &paths, Path::new("host-root"));
+            let options = parse_worker_args(args.into_iter().skip(1).collect()).unwrap();
+
+            assert_eq!(options.sandbox, Some(sandbox));
+        }
     }
 
     #[test]
