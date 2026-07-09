@@ -4,6 +4,7 @@
 //! Multiple `--package-root` flags give composed namespace knowledge; `--owner-namespace`
 //! selects the owner root used for Lua `require`.
 //! CLI: `fkst-framework supervise --project-root <path> --framework-bin <path>`
+//! CLI: `fkst-framework supervise render-launchd --label <label> --framework-bin <path> --project-root <path> [--package-root <path> ...] --runtime-root <path> --durable-root <path>`
 //! CLI: `fkst-framework conformance --project-root <path> [--package-root <path> ...] [--config <path>]`
 //! CLI: `fkst-framework test --project-root <path> [--package-root <path> ...] [--report-json <path>]`
 //! CLI: `fkst-framework host lock --project-root <path> [--package-root <path> ...]`
@@ -95,6 +96,7 @@ enum CliCommand {
         roots: PackageRoots,
         framework_bin: PathBuf,
     },
+    RenderLaunchd(supervise::launchd::LaunchdDeploymentUnit),
     Conformance(HostConformanceOptions),
     Config(ConfigCli),
     BoundaryResources,
@@ -121,7 +123,7 @@ fn parse_args() -> Result<CliCommand> {
     let mut args_iter = args.into_iter();
     let sub = args_iter.next().ok_or_else(|| {
         anyhow::anyhow!(
-            "usage: fkst-framework run <lua> --project-root <path> --package-root <path> [--package-root <path> ...] [--owner-namespace <id>] --event <json> | fkst-framework supervise --project-root <path> --framework-bin <path> [--package-root <path> ...] | fkst-framework conformance --project-root <path> [--package-root <path> ...] [--config <path>] | fkst-framework config --project-root <path> [--package-root <path> ...] | fkst-framework boundary-resources | fkst-framework rate-acquire <pool> | fkst-framework rate-exec <pool> -- <program> [args...] | fkst-framework host lock --project-root <path> [--package-root <path> ...] | fkst-framework test --project-root <path> [--package-root <path> ...] [--report-json <path>] | fkst-framework deps --project-root <path> [--package-root <path> ...] [--json] | fkst-framework manifest composed-deps --manifest <path> | fkst-framework init-package-repo [--ref <substrate-ref>] [--force] | fkst-framework observe --durable-root <path> [--json] [--limit <n>] | fkst-framework --self-test"
+            "usage: fkst-framework run <lua> --project-root <path> --package-root <path> [--package-root <path> ...] [--owner-namespace <id>] --event <json> | fkst-framework supervise --project-root <path> --framework-bin <path> [--package-root <path> ...] | fkst-framework supervise render-launchd --label <label> --framework-bin <path> --project-root <path> [--package-root <path> ...] --runtime-root <path> --durable-root <path> | fkst-framework conformance --project-root <path> [--package-root <path> ...] [--config <path>] | fkst-framework config --project-root <path> [--package-root <path> ...] | fkst-framework boundary-resources | fkst-framework rate-acquire <pool> | fkst-framework rate-exec <pool> -- <program> [args...] | fkst-framework host lock --project-root <path> [--package-root <path> ...] | fkst-framework test --project-root <path> [--package-root <path> ...] [--report-json <path>] | fkst-framework deps --project-root <path> [--package-root <path> ...] [--json] | fkst-framework manifest composed-deps --manifest <path> | fkst-framework init-package-repo [--ref <substrate-ref>] [--force] | fkst-framework observe --durable-root <path> [--json] [--limit <n>] | fkst-framework --self-test"
         )
     })?;
     if sub == "--self-test" {
@@ -134,6 +136,13 @@ fn parse_args() -> Result<CliCommand> {
         )?));
     }
     if sub == "supervise" {
+        let rest = args_iter.collect::<Vec<_>>();
+        if rest.first().is_some_and(|arg| arg == "render-launchd") {
+            return Ok(CliCommand::RenderLaunchd(
+                supervise::launchd::parse_render_launchd_args(&rest[1..])?,
+            ));
+        }
+        let mut args_iter = rest.into_iter();
         let mut project_root: Option<PathBuf> = None;
         let mut package_roots: Vec<PathBuf> = Vec::new();
         let mut framework_bin: Option<PathBuf> = None;
@@ -859,6 +868,10 @@ fn run() -> Result<i32> {
                 .build()
                 .context("build supervise runtime")?;
             rt.block_on(supervise::supervise(roots, framework_bin))?;
+            Ok(0)
+        }
+        CliCommand::RenderLaunchd(unit) => {
+            print!("{}", unit.render_launchd_plist()?);
             Ok(0)
         }
         CliCommand::Conformance(options) => host_conformance::run(options),

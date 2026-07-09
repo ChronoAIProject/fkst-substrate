@@ -22,6 +22,7 @@ pub mod event_fanout;
 pub(crate) mod failure_fact;
 pub(crate) mod graph_scan;
 pub(crate) mod journal;
+pub(crate) mod launchd;
 mod observe_server;
 mod queue_starvation;
 mod raised;
