@@ -689,6 +689,8 @@ return M
         .arg(framework_bin())
         .env("FKST_RUNTIME_ROOT", host.path().join(".fkst/runtime"))
         .env("FKST_DURABLE_ROOT", durable.path())
+        .env("XPC_SERVICE_NAME", "com.example.fkst.observe-test")
+        .env("FKST_LAUNCHD_LABEL", "com.example.fkst.observe-test")
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()

@@ -642,4 +642,27 @@ mod tests {
 
         assert!(warnings.is_empty(), "{warnings:?}");
     }
+
+    #[test]
+    fn runtime_failure_fact_queue_satisfies_producer_contract() {
+        let tmp = tempdir().unwrap();
+        let lua = touch(tmp.path(), "d.lua");
+        let mut cfg = cfg_minimal(&lua);
+        cfg.queue.insert(
+            "fkst.failure_fact".into(),
+            QueueDecl {
+                capacity: 10,
+                fanout: false,
+            },
+        );
+        cfg.department
+            .get_mut("d")
+            .unwrap()
+            .consumes
+            .push("fkst.failure_fact".into());
+
+        let warnings = validate(&cfg, tmp.path()).unwrap();
+
+        assert!(warnings.is_empty(), "{warnings:?}");
+    }
 }

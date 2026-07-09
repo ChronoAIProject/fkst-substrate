@@ -26,6 +26,7 @@ pub(crate) mod launchd;
 mod observe_server;
 mod queue_starvation;
 mod raised;
+mod restart_authority;
 pub(crate) mod source_runner;
 mod spawner;
 
@@ -35,9 +36,12 @@ use consumer::spawn_consumer;
 use delivery_router::DeliveryRouter;
 use delivery_store::{DeliveryStore, SubscriberAbsentSweep};
 use event_fanout::Fanout;
-use failure_fact::schema_validation_failure_fact;
+use failure_fact::{
+    restart_authority_failure_fact, schema_validation_failure_fact, FAILURE_FACT_QUEUE,
+};
 use journal::SupervisorJournal;
 use observe_server::ObserveEndpoint;
+use restart_authority::ensure_restart_authority;
 use source_runner::{parse_duration, spawn_cron, spawn_file_watch};
 
 const SUBSCRIBER_ABSENCE_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
@@ -114,6 +118,18 @@ pub async fn supervise(roots: PackageRoots, framework_bin: PathBuf) -> Result<()
         warn!(warning = %warning, "schema validation warning");
     }
     info!("schema validation passed");
+    if DeliveryRouter::has_reliable_subscriptions(&cfg) {
+        ensure_restart_authority().map_err(|e| {
+            let message = e.to_string();
+            error!(error = %message, "restart authority missing, refusing durable supervise");
+            journal.event(
+                "startup_failed",
+                [("reason", format!("missing_restart_authority:{message}"))],
+            );
+            publish_startup_restart_authority_failure(&cfg, &message);
+            anyhow::Error::msg(message)
+        })?;
+    }
     let config_context = ConfigContext::from_host_root(&project_root)?;
     let rate_pools = crate::rate_pool::RatePoolRegistry::from_config(&config_context)?;
     if !rate_pools.is_empty() {
@@ -459,19 +475,44 @@ fn report_subscriber_absence_sweep(
 
 fn publish_startup_validation_failure(cfg: &Config, error: &str) {
     let fact = schema_validation_failure_fact(error);
+    publish_startup_failure_fact(cfg, fact);
+}
+
+fn publish_startup_restart_authority_failure(cfg: &Config, error: &str) {
+    let fact = restart_authority_failure_fact(error);
+    publish_startup_failure_fact(cfg, fact);
+}
+
+fn publish_startup_failure_fact(cfg: &Config, fact: fkst_common::Event) {
     let fanout = Fanout::new();
-    let store = match delivery_store_for_config(cfg) {
-        Ok(handle) => handle.store,
-        Err(err) => {
-            warn!(error = %err, "startup failure fact store unavailable");
-            None
+    let store = if has_reliable_failure_fact_subscriber(cfg) {
+        match delivery_store_for_config(cfg) {
+            Ok(handle) => handle.store,
+            Err(err) => {
+                warn!(error = %err, "startup failure fact store unavailable");
+                None
+            }
         }
+    } else {
+        None
     };
     let router = DeliveryRouter::new(cfg, fanout, store, None);
     if let Err(err) = router.publish_failure_fact(fact.clone()) {
         warn!(error = %err, "startup failure fact publish failed");
     }
     error!(queue = %fact.queue, payload = %fact.payload, "engine failure fact");
+}
+
+fn has_reliable_failure_fact_subscriber(cfg: &Config) -> bool {
+    cfg.department.values().any(|dept| {
+        dept.consumes
+            .iter()
+            .any(|queue| queue == FAILURE_FACT_QUEUE)
+            && !dept
+                .ephemeral
+                .iter()
+                .any(|queue| queue == FAILURE_FACT_QUEUE)
+    })
 }
 
 fn path_list(paths: &[PathBuf]) -> String {

@@ -17,6 +17,7 @@ pub(crate) enum ErrorClass {
     SpawnArgs,
     StoreOpWatchdog,
     SchemaValidation,
+    RestartAuthority,
 }
 
 impl ErrorClass {
@@ -29,6 +30,7 @@ impl ErrorClass {
             Self::SpawnArgs => "spawn_args",
             Self::StoreOpWatchdog => "store_op_watchdog",
             Self::SchemaValidation => "schema_validation",
+            Self::RestartAuthority => "restart_authority",
         }
     }
 }
@@ -120,6 +122,16 @@ pub(crate) fn store_watchdog_failure_fact(op: &str, dept: &str, elapsed_ms: u64)
 
 pub(crate) fn schema_validation_failure_fact(error: &str) -> Event {
     let error_class = ErrorClass::SchemaValidation;
+    failure_fact_event(json!({
+        "schema": FAILURE_FACT_SCHEMA,
+        "error_class": error_class.as_str(),
+        "fingerprint": fingerprint(error_class, error),
+        "error": error_excerpt(error),
+    }))
+}
+
+pub(crate) fn restart_authority_failure_fact(error: &str) -> Event {
+    let error_class = ErrorClass::RestartAuthority;
     failure_fact_event(json!({
         "schema": FAILURE_FACT_SCHEMA,
         "error_class": error_class.as_str(),

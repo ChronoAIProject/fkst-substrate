@@ -71,6 +71,11 @@ fn render_launchd_plist_carries_restart_contract_and_declared_command() {
         "plist: {plist}"
     );
     assert_eq!(
+        values.scalar("FKST_LAUNCHD_LABEL"),
+        Some("com.example.fkst-substrate.test"),
+        "plist: {plist}"
+    );
+    assert_eq!(
         values.array("ProgramArguments"),
         Some(vec![
             rendered_framework_bin.to_str().unwrap().to_string(),

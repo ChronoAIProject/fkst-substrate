@@ -26,7 +26,7 @@ fn supervise_smoke_lock() -> MutexGuard<'static, ()> {
     SUPERVISE_SMOKE_LOCK
         .get_or_init(|| Mutex::new(()))
         .lock()
-        .unwrap()
+        .unwrap_or_else(|err| err.into_inner())
 }
 
 fn write_executable(path: &std::path::Path, body: &str) {
@@ -72,6 +72,10 @@ fn read_log(result: &SpawnResult) -> String {
 
 fn lua_string(path: &Path) -> String {
     format!("{:?}", path.to_string_lossy())
+}
+
+fn lua_literal(value: &str) -> String {
+    format!("{value:?}")
 }
 
 fn namespace(root: &Path) -> String {
@@ -128,6 +132,83 @@ fn read_single_supervisor_journal(runtime_root: &Path) -> String {
         .collect::<Vec<_>>();
     assert_eq!(entries.len(), 1, "journal files={entries:?}");
     fs::read_to_string(&entries[0]).unwrap()
+}
+
+fn write_reliable_supervise_repo(root: &Path, fact: &Path, queue: &str) {
+    fs::create_dir_all(root.join("departments/worker")).unwrap();
+    fs::create_dir_all(root.join("raisers")).unwrap();
+    write_fkst_env(root);
+    fs::write(root.join("input.txt"), "ready").unwrap();
+    fs::write(
+        root.join("raisers/input.lua"),
+        format!(
+            r#"return {{ type = "file_watch", glob = {}, produces = {} }}"#,
+            lua_string(&root.join("input.txt")),
+            lua_literal(queue)
+        ),
+    )
+    .unwrap();
+    fs::write(
+        root.join("departments/worker/main.lua"),
+        format!(
+            r#"
+local M = {{}}
+M.spec = {{ consumes = {{ {} }}, stall_window = "5s" }}
+function pipeline(event)
+  local f = assert(io.open({}, "w"))
+  f:write(tostring(event.payload.path))
+  f:close()
+end
+return M
+"#,
+            lua_literal(queue),
+            lua_string(fact)
+        ),
+    )
+    .unwrap();
+    write_single_package_workspace(root);
+}
+
+fn write_reliable_supervise_repo_with_failure_fact_subscriber(root: &Path, fact: &Path) {
+    write_reliable_supervise_repo(root, fact, "tick");
+    fs::create_dir_all(root.join("departments/failure_sink")).unwrap();
+    fs::write(
+        root.join("departments/failure_sink/main.lua"),
+        r#"
+local M = {}
+M.spec = { consumes = { "fkst.failure_fact" }, stall_window = "5s", retry = false }
+function pipeline(event)
+end
+return M
+"#,
+    )
+    .unwrap();
+}
+
+fn run_reliable_supervise_once(
+    root: &Path,
+    runtime_root: &Path,
+    durable_root: &Path,
+    extra_env: &[(&str, &str)],
+) -> std::process::Output {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_fkst-framework"));
+    command
+        .current_dir(root)
+        .arg("supervise")
+        .arg("--project-root")
+        .arg(root)
+        .arg("--package-root")
+        .arg(root)
+        .arg("--framework-bin")
+        .arg(env!("CARGO_BIN_EXE_fkst-framework"))
+        .env("FKST_RUNTIME_ROOT", runtime_root)
+        .env("FKST_DURABLE_ROOT", durable_root)
+        .env_remove("XPC_SERVICE_NAME")
+        .env_remove("FKST_LAUNCHD_LABEL");
+    for (key, value) in extra_env {
+        command.env(key, value);
+    }
+    command.output().unwrap()
 }
 
 #[test]
@@ -200,6 +281,187 @@ return M
         !root.join(".fkst/runtime/codex-permits").exists(),
         "supervise should not create codex permits"
     );
+}
+
+#[test]
+fn durable_supervise_refuses_without_restart_authority_before_side_effects() {
+    let _lock = supervise_smoke_lock();
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let runtime_root = root.join(".fkst/runtime");
+    let durable_root = root.join(".fkst/durable");
+    let fact = root.join("seen.txt");
+    write_reliable_supervise_repo(root, &fact, "tick");
+
+    let output = run_reliable_supervise_once(root, &runtime_root, &durable_root, &[]);
+
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "stdout={}\nstderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("durable supervise requires launchd restart authority evidence"),
+        "stderr={stderr}"
+    );
+    assert!(
+        !fact.exists(),
+        "department side effect should not exist before authority"
+    );
+    assert!(
+        !durable_root.join("delivery.redb").exists(),
+        "durable store should not be opened before authority"
+    );
+    let journal = read_single_supervisor_journal(&runtime_root);
+    assert!(
+        journal.contains("event=startup_failed ")
+            && journal.contains("reason=missing_restart_authority:"),
+        "journal={journal}"
+    );
+}
+
+#[test]
+fn durable_supervise_refusal_persists_failure_fact_when_subscribed() {
+    let _lock = supervise_smoke_lock();
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let runtime_root = root.join(".fkst/runtime");
+    let durable_root = root.join(".fkst/durable");
+    let fact = root.join("seen.txt");
+    write_reliable_supervise_repo_with_failure_fact_subscriber(root, &fact);
+
+    let output = run_reliable_supervise_once(root, &runtime_root, &durable_root, &[]);
+
+    assert_eq!(output.status.code(), Some(2));
+    assert!(
+        durable_root.join("delivery.redb").exists(),
+        "failure fact subscriber should use the existing durable fact path"
+    );
+    let observe = Command::new(env!("CARGO_BIN_EXE_fkst-framework"))
+        .arg("observe")
+        .arg("--durable-root")
+        .arg(&durable_root)
+        .arg("--json")
+        .output()
+        .unwrap();
+    assert!(
+        observe.status.success(),
+        "stdout={}\nstderr={}",
+        String::from_utf8_lossy(&observe.stdout),
+        String::from_utf8_lossy(&observe.stderr)
+    );
+    let snapshot: serde_json::Value = serde_json::from_slice(&observe.stdout).unwrap();
+    let deliveries = snapshot["deliveries"].as_array().unwrap();
+    let delivery = deliveries
+        .iter()
+        .find(|delivery| delivery["queue"] == "fkst.failure_fact")
+        .unwrap_or_else(|| panic!("snapshot={snapshot}"));
+    assert_eq!(delivery["dept"], "failure_sink");
+}
+
+#[test]
+fn durable_supervise_with_launchd_evidence_reaches_runtime_path() {
+    let _lock = supervise_smoke_lock();
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let runtime_root = root.join(".fkst/runtime");
+    let durable_root = root.join(".fkst/durable");
+    let fact = root.join("seen.txt");
+    write_reliable_supervise_repo(root, &fact, "tick");
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_fkst-framework"))
+        .current_dir(root)
+        .arg("supervise")
+        .arg("--project-root")
+        .arg(root)
+        .arg("--package-root")
+        .arg(root)
+        .arg("--framework-bin")
+        .arg(env!("CARGO_BIN_EXE_fkst-framework"))
+        .env("FKST_RUNTIME_ROOT", &runtime_root)
+        .env("FKST_DURABLE_ROOT", &durable_root)
+        .env("XPC_SERVICE_NAME", "com.example.fkst.test")
+        .env("FKST_LAUNCHD_LABEL", "com.example.fkst.test")
+        .spawn()
+        .unwrap();
+
+    let body = wait_for_file_containing(&fact, "input.txt", Duration::from_secs(10))
+        .unwrap_or_else(|| {
+            let _ = child.kill();
+            panic!("timed out waiting for {}", fact.display());
+        });
+    nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(child.id() as i32),
+        nix::sys::signal::Signal::SIGTERM,
+    )
+    .unwrap();
+    let status = child.wait().unwrap();
+    assert!(status.success(), "status={status}");
+    assert!(body.contains("input.txt"), "body={body}");
+    assert!(
+        durable_root.join("delivery.redb").exists(),
+        "durable store should be open after authority"
+    );
+    let journal = read_single_supervisor_journal(&runtime_root);
+    assert!(
+        journal.contains("event=published ") && journal.contains("queue=tick"),
+        "journal={journal}"
+    );
+}
+
+#[test]
+fn durable_supervise_ignores_parent_orphan_style_evidence() {
+    let _lock = supervise_smoke_lock();
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let runtime_root = root.join(".fkst/runtime");
+    let durable_root = root.join(".fkst/durable");
+    let fact = root.join("seen.txt");
+    write_reliable_supervise_repo(root, &fact, "tick");
+
+    let output = run_reliable_supervise_once(
+        root,
+        &runtime_root,
+        &durable_root,
+        &[("FKST_RESTART_AUTHORITY_PARENT_PID", "1")],
+    );
+
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("durable supervise requires launchd restart authority evidence"),
+        "stderr={stderr}"
+    );
+    assert!(!fact.exists());
+}
+
+#[test]
+fn durable_supervise_rejects_empty_restart_authority_evidence() {
+    let _lock = supervise_smoke_lock();
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let runtime_root = root.join(".fkst/runtime");
+    let durable_root = root.join(".fkst/durable");
+    let fact = root.join("seen.txt");
+    write_reliable_supervise_repo(root, &fact, "tick");
+
+    let output = run_reliable_supervise_once(
+        root,
+        &runtime_root,
+        &durable_root,
+        &[("XPC_SERVICE_NAME", ""), ("FKST_LAUNCHD_LABEL", "")],
+    );
+
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("durable supervise requires launchd restart authority evidence"),
+        "stderr={stderr}"
+    );
+    assert!(!fact.exists());
 }
 
 #[test]

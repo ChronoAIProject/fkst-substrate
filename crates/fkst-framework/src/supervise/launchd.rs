@@ -72,6 +72,11 @@ impl LaunchdDeploymentUnit {
             path_to_utf8(&self.durable_root)
                 .with_context(|| format!("render {}", self.durable_root.display()))?,
         );
+        push_string_key(
+            &mut out,
+            super::restart_authority::LAUNCHD_LABEL_ENV,
+            &self.label,
+        );
         out.push_str("  </dict>\n");
         out.push_str("  <key>KeepAlive</key>\n");
         out.push_str("  <true/>\n");
