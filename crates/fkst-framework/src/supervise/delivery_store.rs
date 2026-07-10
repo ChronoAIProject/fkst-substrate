@@ -2107,10 +2107,7 @@ mod tests {
         assert!(expired.dead_lettered.is_empty());
         let current = store.get("late-return").unwrap().unwrap();
         assert_eq!(current.subscriber_absent_since_ms, None);
-        assert_eq!(
-            store.get_dead("late-return").unwrap(),
-            None
-        );
+        assert_eq!(store.get_dead("late-return").unwrap(), None);
     }
 
     #[test]
