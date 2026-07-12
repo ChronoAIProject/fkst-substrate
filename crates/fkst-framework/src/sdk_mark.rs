@@ -5,23 +5,48 @@ use fkst_common::{
 };
 use mlua::{Function, Lua, Result};
 use nix::fcntl::{flock, FlockArg};
+use std::collections::BTreeSet;
 use std::os::fd::AsRawFd;
 use std::path::Path;
+use std::sync::{Arc, Mutex};
 
 use crate::{runtime_context, sdk_log};
 
+pub(crate) const ONCE_REPLAY_BYPASS_ENV: &str = "FKST_INTERNAL_ONCE_REPLAY_BYPASS";
+
 pub fn register(lua: &Lua, host_root: &Path, saga_recovery: bool) -> Result<()> {
+    let replay_bypass = take_replay_bypass_env();
+    let invocation_marks = Arc::new(Mutex::new(BTreeSet::<String>::new()));
     let host_root = host_root.to_path_buf();
     lua.globals().set(
         "once",
         lua.create_function(move |_, (key, f): (String, Function)| {
-            once(&host_root, saga_recovery, key, f)
+            let bypass_marker = replay_bypass
+                && !invocation_marks
+                    .lock()
+                    .map_err(|_| mlua::Error::external("once replay set lock poisoned"))?
+                    .contains(&key);
+            let invocation_key = key.clone();
+            let ran = once(&host_root, saga_recovery, bypass_marker, key, f)?;
+            if replay_bypass && ran {
+                invocation_marks
+                    .lock()
+                    .map_err(|_| mlua::Error::external("once replay set lock poisoned"))?
+                    .insert(invocation_key);
+            }
+            Ok(ran)
         })?,
     )?;
     Ok(())
 }
 
-fn once(host_root: &Path, saga_recovery: bool, key: String, f: Function) -> Result<bool> {
+fn once(
+    host_root: &Path,
+    saga_recovery: bool,
+    replay_bypass: bool,
+    key: String,
+    f: Function,
+) -> Result<bool> {
     if !saga_recovery {
         return Err(mlua::Error::external(anyhow::anyhow!(
             "once requires saga_recovery capability"
@@ -54,7 +79,8 @@ fn once(host_root: &Path, saga_recovery: bool, key: String, f: Function) -> Resu
         key,
         RUNTIME_MARK_LEAF,
     );
-    if marker.exists() {
+    let marker_preexisting = marker.exists();
+    if marker_preexisting && !replay_bypass {
         sdk_log::info(&format!("once decision=skip-marked key={key}"));
         drop(lock_file);
         return Ok(false);
@@ -63,6 +89,11 @@ fn once(host_root: &Path, saga_recovery: bool, key: String, f: Function) -> Resu
     let result = f.call::<()>(());
     match result {
         Ok(()) => {
+            if marker_preexisting {
+                sdk_log::info(&format!("once decision=ran-replay-marked key={key}"));
+                drop(lock_file);
+                return Ok(true);
+            }
             let marker_parent = marker.parent().ok_or_else(|| {
                 mlua::Error::external(anyhow::anyhow!(
                     "once marker target '{}' has no parent",
@@ -93,4 +124,10 @@ fn once(host_root: &Path, saga_recovery: bool, key: String, f: Function) -> Resu
             Err(err)
         }
     }
+}
+
+fn take_replay_bypass_env() -> bool {
+    let enabled = std::env::var(ONCE_REPLAY_BYPASS_ENV).as_deref() == Ok("1");
+    std::env::remove_var(ONCE_REPLAY_BYPASS_ENV);
+    enabled
 }
