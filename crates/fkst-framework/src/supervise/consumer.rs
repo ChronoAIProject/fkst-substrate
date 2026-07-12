@@ -395,7 +395,7 @@ fn dispatch_due(
         if running.contains_key(&record.delivery_id) {
             continue;
         }
-        let args = match spawn_args(
+        let mut args = match spawn_args(
             decl,
             project_root,
             roots,
@@ -419,6 +419,7 @@ fn dispatch_due(
                 continue;
             }
         };
+        args.replay_scratch_bypass = requires_replay_scratch_bypass(&record);
         let dept_name = name.to_string();
         let router = router.clone();
         let complete_tx = complete_tx.clone();
@@ -961,6 +962,10 @@ fn event_from_record(record: &DeliveryRecord) -> Event {
     }
 }
 
+fn requires_replay_scratch_bypass(record: &DeliveryRecord) -> bool {
+    record.lease_generation > 1
+}
+
 #[allow(clippy::too_many_arguments)]
 fn spawn_args(
     decl: &DepartmentDecl,
@@ -987,6 +992,7 @@ fn spawn_args(
         codex_permit_slots,
         log_dir: log_dir.to_path_buf(),
         raised_auth_token: Some(ulid::Ulid::new().to_string()),
+        replay_scratch_bypass: false,
         owner_namespace: decl.owner_namespace.clone(),
         process_groups,
     })
@@ -1002,6 +1008,7 @@ struct SpawnArgs {
     codex_permit_slots: usize,
     log_dir: PathBuf,
     raised_auth_token: Option<String>,
+    replay_scratch_bypass: bool,
     owner_namespace: String,
     process_groups: ProcessGroupRegistry,
 }
@@ -1032,6 +1039,7 @@ async fn spawn_and_report_with_stdout_observer(
         &args.log_dir,
         args.process_groups.clone(),
         args.raised_auth_token.as_deref(),
+        args.replay_scratch_bypass,
         stdout_observer,
     )
     .await?;
@@ -1221,6 +1229,51 @@ mod tests {
             base: Duration::from_millis(1),
             cap: Duration::from_millis(1),
         }
+    }
+
+    #[test]
+    fn replay_scratch_bypass_follows_engine_lease_generation() {
+        let mut delivery = record("one");
+        delivery.lease_generation = 1;
+        assert!(!requires_replay_scratch_bypass(&delivery));
+
+        delivery.lease_generation = 2;
+        assert!(requires_replay_scratch_bypass(&delivery));
+    }
+
+    #[test]
+    fn raised_publish_failure_schedules_replay_with_scratch_bypass() {
+        let temp = TempDir::new().unwrap();
+        let store = Arc::new(DeliveryStore::open(temp.path().join("delivery.redb")).unwrap());
+        store.enqueue(&record("parent")).unwrap();
+        let leased = store
+            .lease_for_dept("worker", now_unix_millis(), 1, Duration::from_secs(30))
+            .unwrap()
+            .remove(0);
+        assert_eq!(leased.lease_generation, 1);
+        let router = router_with_dead_letter(store.clone());
+
+        finish_test_durable_record(
+            &store,
+            &router,
+            Some(&policy(3)),
+            leased,
+            TestDurableCompletion {
+                exit_code: 0,
+                error: None,
+                raises: vec![Event::new("missing", serde_json::json!({"result": true}))],
+            },
+            &SupervisorJournal::disabled(),
+        )
+        .unwrap();
+
+        let replay = store
+            .lease_for_dept("worker", u64::MAX, 1, Duration::from_secs(30))
+            .unwrap()
+            .remove(0);
+        assert_eq!(replay.attempt, 1);
+        assert_eq!(replay.lease_generation, 2);
+        assert!(requires_replay_scratch_bypass(&replay));
     }
 
     fn write_executable(path: &Path, body: &str) {
@@ -1702,6 +1755,7 @@ units = [{units}]
             stall_window: Duration::from_secs(30),
             codex_permit_slots: 1,
             raised_auth_token: Some("trusted-token".to_string()),
+            replay_scratch_bypass: false,
             log_dir: log_dir.clone(),
             owner_namespace: "pkg".to_string(),
             process_groups: ProcessGroupRegistry::default(),
@@ -1787,6 +1841,7 @@ units = [{units}]
             stall_window: Duration::from_secs(30),
             codex_permit_slots: 1,
             raised_auth_token: Some("trusted-token".to_string()),
+            replay_scratch_bypass: false,
             log_dir,
             owner_namespace: "pkg".to_string(),
             process_groups: ProcessGroupRegistry::default(),
