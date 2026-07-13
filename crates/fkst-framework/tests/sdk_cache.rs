@@ -90,6 +90,53 @@ fn cache_set_then_get_roundtrips_value() {
 }
 
 #[test]
+fn reliable_replay_bypasses_preexisting_cache_but_reads_invocation_writes() {
+    let host = tempdir().unwrap();
+    let runtime = tempdir().unwrap();
+    let first = Lua::new();
+    register_for_host(&first, host.path());
+    in_sandbox(
+        host.path(),
+        |sandbox| {
+            sandbox.runtime_root(runtime.path());
+        },
+        || {
+            first
+                .load(r#"cache_set("completion/key", "stale")"#)
+                .exec()
+                .unwrap()
+        },
+    );
+
+    let (before, after): (Option<String>, String) = in_sandbox(
+        host.path(),
+        |sandbox| {
+            sandbox.runtime_root(runtime.path());
+            sandbox.set_env(sdk_cache::CACHE_REPLAY_BYPASS_ENV, "1");
+        },
+        || {
+            let replay = Lua::new();
+            register_for_host(&replay, host.path());
+            assert!(std::env::var_os(sdk_cache::CACHE_REPLAY_BYPASS_ENV).is_none());
+            replay
+                .load(
+                    r#"
+                    local before = cache_get("completion/key")
+                    cache_set("completion/key", "recomputed")
+                    return before, cache_get("completion/key")
+                    "#,
+                )
+                .eval()
+                .unwrap()
+        },
+    );
+
+    assert_eq!(before, None);
+    assert_eq!(after, "recomputed");
+    assert_cache_file_value(&cache_path(runtime.path(), "completion/key"), "recomputed");
+}
+
+#[test]
 fn cache_set_then_get_uses_readable_hierarchical_path() {
     let lua = Lua::new();
     let host = tempdir().unwrap();

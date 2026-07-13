@@ -130,6 +130,41 @@ fn read_single_supervisor_journal(runtime_root: &Path) -> String {
     fs::read_to_string(&entries[0]).unwrap()
 }
 
+fn wait_for_journal_event(
+    runtime_root: &Path,
+    event: &str,
+    dept: &str,
+    timeout: Duration,
+) -> Option<String> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Ok(entries) = fs::read_dir(runtime_root.join("logs")) {
+            for path in entries.filter_map(Result::ok).map(|entry| entry.path()) {
+                let is_journal = path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with("supervisor-") && name.ends_with(".log"));
+                if !is_journal {
+                    continue;
+                }
+                if let Ok(body) = fs::read_to_string(path) {
+                    let matched = body.lines().any(|line| {
+                        line.starts_with(&format!("event={event} "))
+                            && line.contains(&format!(" dept={dept} "))
+                    });
+                    if matched {
+                        return Some(body);
+                    }
+                }
+            }
+        }
+        if Instant::now() >= deadline {
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
 #[test]
 fn supervise_dispatches_file_watch_event_to_department() {
     let _lock = supervise_smoke_lock();
@@ -696,6 +731,163 @@ return M
     );
     assert!(body.contains("consensus.proposal\n"), "body={body}");
     assert!(body.contains("cross-package\n"), "body={body}");
+}
+
+#[test]
+fn supervise_replay_reemits_before_ack_despite_preexisting_scratch() {
+    let _lock = supervise_smoke_lock();
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let package = root.join("package");
+    let facts = root.join("facts");
+    let runtime_root = root.join("runtime");
+    let durable_root = root.join("durable");
+    let first_attempt = facts.join("first-attempt");
+    let result_fact = facts.join("result");
+    fs::create_dir_all(package.join("departments/worker")).unwrap();
+    fs::create_dir_all(package.join("departments/sink")).unwrap();
+    fs::create_dir_all(package.join("raisers")).unwrap();
+    fs::create_dir_all(&facts).unwrap();
+    write_fkst_env(&package);
+    fs::write(package.join("input.txt"), "ready").unwrap();
+    fs::write(
+        package.join("raisers/input.lua"),
+        format!(
+            r#"return {{ type = "file_watch", glob = {}, produces = "jobs" }}"#,
+            lua_string(&package.join("input.txt"))
+        ),
+    )
+    .unwrap();
+    fs::write(
+        package.join("departments/worker/main.lua"),
+        format!(
+            r#"
+local M = {{}}
+M.spec = {{
+  consumes = {{ "jobs" }},
+  produces = {{ "missing", "result" }},
+  stall_window = "5s",
+  retry = {{ max_attempts = 3, base = "1s", cap = "1s" }},
+}}
+function pipeline(event)
+  local attempt = io.open({}, "r")
+  if attempt == nil then
+    local created = assert(io.open({}, "w"))
+    created:write("first")
+    created:close()
+    local ran = once("completion/result", function()
+      cache_set("completion/result", "stale")
+      raise("missing", {{ value = "publication-failure" }})
+    end)
+    assert(ran)
+    return
+  end
+  attempt:close()
+
+  if cache_get("completion/result") ~= nil then
+    return
+  end
+  local replayed = once("completion/result", function()
+    local payload = {{ dedup_key = "replay-result", value = "ready" }}
+    raise("result", payload)
+    raise("result", payload)
+  end)
+  assert(replayed)
+end
+return M
+"#,
+            lua_string(&first_attempt),
+            lua_string(&first_attempt)
+        ),
+    )
+    .unwrap();
+    fs::write(
+        package.join("departments/sink/main.lua"),
+        format!(
+            r#"
+local M = {{}}
+M.spec = {{ consumes = {{ "result" }}, stall_window = "5s" }}
+function pipeline(event)
+  local f = assert(io.open({}, "a"))
+  f:write(event.payload.value .. "\n")
+  f:close()
+end
+return M
+"#,
+            lua_string(&result_fact)
+        ),
+    )
+    .unwrap();
+    write_single_package_workspace(&package);
+    let manifest_path = package.join("fkst.toml");
+    let manifest = fs::read_to_string(&manifest_path).unwrap().replace(
+        "persistence_class = \"stateless_adapter\"",
+        "persistence_class = \"saga\"",
+    );
+    fs::write(manifest_path, manifest).unwrap();
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_fkst-framework"))
+        .current_dir(&package)
+        .arg("supervise")
+        .arg("--project-root")
+        .arg(&package)
+        .arg("--package-root")
+        .arg(&package)
+        .arg("--framework-bin")
+        .arg(env!("CARGO_BIN_EXE_fkst-framework"))
+        .env("FKST_RUNTIME_ROOT", &runtime_root)
+        .env("FKST_DURABLE_ROOT", &durable_root)
+        .spawn()
+        .unwrap();
+
+    let result = wait_for_file_containing(&result_fact, "ready\n", Duration::from_secs(15))
+        .unwrap_or_else(|| {
+            let _ = child.kill();
+            panic!(
+                "timed out waiting for replay result {}",
+                result_fact.display()
+            );
+        });
+    wait_for_journal_event(&runtime_root, "acked", "sink", Duration::from_secs(5)).unwrap_or_else(
+        || {
+            let _ = child.kill();
+            panic!("timed out waiting for sink ACK");
+        },
+    );
+    std::thread::sleep(Duration::from_secs(1));
+
+    nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(child.id() as i32),
+        nix::sys::signal::Signal::SIGTERM,
+    )
+    .unwrap();
+    let status = child.wait().unwrap();
+    assert!(status.success(), "status={status}");
+    let journal = read_single_supervisor_journal(&runtime_root);
+
+    assert_eq!(result.lines().collect::<Vec<_>>(), ["ready"]);
+    assert!(runtime_root.join("cache/completion/result/=value").exists());
+    assert!(runtime_root.join("marks/completion/result/=mark").exists());
+    assert!(journal.lines().any(|line| {
+        line.starts_with("event=retried ")
+            && line.contains(" dept=worker ")
+            && line.contains("reason=raised\\spublish\\serror:")
+    }));
+    assert!(journal.lines().any(|line| {
+        line.starts_with("event=acked ")
+            && line.contains(" dept=worker ")
+            && line.contains(" reason=completed")
+    }));
+    assert_eq!(
+        journal
+            .lines()
+            .filter(|line| {
+                line.starts_with("event=dept_child_spawn ") && line.contains(" dept=sink ")
+            })
+            .count(),
+        1,
+        "duplicate replay raises must collapse to one durable sink delivery"
+    );
 }
 
 #[tokio::test]

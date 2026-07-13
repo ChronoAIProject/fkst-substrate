@@ -19,6 +19,8 @@ use tracing::info;
 
 static NEXT_FRAMEWORK_CHILD_LOG_ID: AtomicU64 = AtomicU64::new(1);
 const RAISED_AUTH_TOKEN_ENV: &str = "FKST_RAISED_AUTH_TOKEN";
+const CACHE_REPLAY_BYPASS_ENV: &str = "FKST_INTERNAL_CACHE_REPLAY_BYPASS";
+const ONCE_REPLAY_BYPASS_ENV: &str = "FKST_INTERNAL_ONCE_REPLAY_BYPASS";
 const ENGINE_BINARY_PATH_ENV_KEYS: &[&str] =
     &["BIN", "FKST_FRAMEWORK_BIN", "FKST_CODEX_WORKER_BIN"];
 
@@ -72,6 +74,7 @@ pub async fn spawn_framework(
         log_dir,
         process_groups,
         None,
+        false,
         None,
     )
     .await
@@ -90,6 +93,7 @@ pub async fn spawn_framework_with_stdout_observer(
     log_dir: &Path,
     process_groups: ProcessGroupRegistry,
     raised_auth_token: Option<&str>,
+    replay_scratch_bypass: bool,
     stdout_observer: Option<StdoutLineObserver>,
 ) -> Result<SpawnResult> {
     let start = std::time::Instant::now();
@@ -126,6 +130,9 @@ pub async fn spawn_framework_with_stdout_observer(
     if raised_auth_token.is_some() {
         log.write_line("RAISED_AUTH=enabled");
     }
+    if replay_scratch_bypass {
+        log.write_line("REPLAY_SCRATCH_BYPASS=enabled");
+    }
 
     let mut cmd = Command::new(binary);
     cmd.arg("run")
@@ -152,6 +159,13 @@ pub async fn spawn_framework_with_stdout_observer(
     );
     if let Some(token) = raised_auth_token {
         cmd.env(RAISED_AUTH_TOKEN_ENV, token);
+    }
+    if replay_scratch_bypass {
+        cmd.env(CACHE_REPLAY_BYPASS_ENV, "1");
+        cmd.env(ONCE_REPLAY_BYPASS_ENV, "1");
+    } else {
+        cmd.env_remove(CACHE_REPLAY_BYPASS_ENV);
+        cmd.env_remove(ONCE_REPLAY_BYPASS_ENV);
     }
     scrub_engine_binary_path_env(&mut cmd);
     cmd.current_dir(host_root);
@@ -458,4 +472,48 @@ fn filename_timestamp() -> String {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_else(|_| Duration::from_secs(0));
     format!("{}-{:09}", duration.as_secs(), duration.subsec_nanos())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[tokio::test]
+    async fn replay_scratch_bypass_is_private_child_process_metadata() {
+        let temp = tempfile::tempdir().unwrap();
+        let binary = temp.path().join("fkst-framework");
+        std::fs::write(
+            &binary,
+            format!(
+                "#!/bin/sh\nprintf '%s:%s' \"${}\" \"${}\"\n",
+                CACHE_REPLAY_BYPASS_ENV, ONCE_REPLAY_BYPASS_ENV,
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let lua = temp.path().join("dept.lua");
+        std::fs::write(&lua, "return {}\n").unwrap();
+
+        let result = spawn_framework_with_stdout_observer(
+            &binary,
+            &lua,
+            temp.path(),
+            &[temp.path().to_path_buf()],
+            "pkg",
+            "{}",
+            1,
+            "worker",
+            &temp.path().join("logs"),
+            ProcessGroupRegistry::default(),
+            None,
+            true,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.exit_code, 0);
+        assert_eq!(result.stdout, "1:1");
+    }
 }

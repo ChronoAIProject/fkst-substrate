@@ -102,6 +102,55 @@ fn once_runs_first_time_and_writes_marker() {
 }
 
 #[test]
+fn reliable_replay_bypasses_preexisting_once_marker() {
+    let host = tempdir().unwrap();
+    let runtime = tempdir().unwrap();
+    let first = Lua::new();
+    register_for_host(&first, host.path());
+    in_sandbox(
+        host.path(),
+        |sandbox| {
+            sandbox.runtime_root(runtime.path());
+        },
+        || {
+            first
+                .load(r#"once("completion/key", function() end)"#)
+                .exec()
+                .unwrap()
+        },
+    );
+
+    let (first, second, count): (bool, bool, i64) = in_sandbox(
+        host.path(),
+        |sandbox| {
+            sandbox.runtime_root(runtime.path());
+            sandbox.set_env(sdk_mark::ONCE_REPLAY_BYPASS_ENV, "1");
+        },
+        || {
+            let replay = Lua::new();
+            register_for_host(&replay, host.path());
+            assert!(std::env::var_os(sdk_mark::ONCE_REPLAY_BYPASS_ENV).is_none());
+            replay
+                .load(
+                    r#"
+                    local count = 0
+                    local first = once("completion/key", function() count = count + 1 end)
+                    local second = once("completion/key", function() count = count + 1 end)
+                    return first, second, count
+                    "#,
+                )
+                .eval()
+                .unwrap()
+        },
+    );
+
+    assert!(first);
+    assert!(!second);
+    assert_eq!(count, 1);
+    assert!(runtime.path().join("marks/completion/key/=mark").exists());
+}
+
+#[test]
 fn once_allows_prefix_extended_keys() {
     let lua = Lua::new();
     let host = tempdir().unwrap();

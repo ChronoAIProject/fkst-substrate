@@ -5,11 +5,12 @@ use fkst_common::{
 };
 use mlua::{Lua, Result};
 use nix::fcntl::{flock, FlockArg};
+use std::collections::BTreeSet;
 use std::fs::{File, OpenOptions};
 use std::os::fd::AsRawFd;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::runtime_context;
@@ -17,6 +18,7 @@ use crate::runtime_context;
 const HEADER_PREFIX: &str = "fkst-cache-v1 expires_at=";
 const HEADER_NEVER: &str = "never";
 static TEMP_ID: AtomicU64 = AtomicU64::new(0);
+pub(crate) const CACHE_REPLAY_BYPASS_ENV: &str = "FKST_INTERNAL_CACHE_REPLAY_BYPASS";
 
 pub(crate) type Clock = Arc<dyn Fn() -> u128 + Send + Sync>;
 
@@ -25,40 +27,78 @@ pub fn register(lua: &Lua, host_root: &Path) -> Result<()> {
 }
 
 pub(crate) fn register_with_clock(lua: &Lua, host_root: &Path, clock: Clock) -> Result<()> {
+    let replay_bypass = take_replay_bypass_env();
+    let invocation_writes = Arc::new(Mutex::new(BTreeSet::<String>::new()));
     let set_host_root = host_root.to_path_buf();
     let set_clock = clock.clone();
+    let set_invocation_writes = invocation_writes.clone();
     lua.globals().set(
         "cache_set",
         lua.create_function(
             move |_, (key, value, ttl_seconds): (String, mlua::String, Option<f64>)| {
+                let invocation_key = key.clone();
                 cache_set(
                     &set_host_root,
                     key,
                     value.as_bytes().as_ref(),
                     ttl_seconds,
                     &set_clock,
-                )
+                )?;
+                if replay_bypass {
+                    set_invocation_writes
+                        .lock()
+                        .map_err(|_| mlua::Error::external("cache replay write set lock poisoned"))?
+                        .insert(invocation_key);
+                }
+                Ok(())
             },
         )?,
     )?;
 
     let expire_host_root = host_root.to_path_buf();
+    let expire_invocation_writes = invocation_writes.clone();
     lua.globals().set(
         "cache_expire",
-        lua.create_function(move |_, key: String| cache_expire(&expire_host_root, key))?,
+        lua.create_function(move |_, key: String| {
+            cache_expire(&expire_host_root, key.clone())?;
+            if replay_bypass {
+                expire_invocation_writes
+                    .lock()
+                    .map_err(|_| mlua::Error::external("cache replay write set lock poisoned"))?
+                    .remove(&key);
+            }
+            Ok(())
+        })?,
     )?;
 
     let get_host_root = host_root.to_path_buf();
     let get_clock = clock;
+    let get_invocation_writes = invocation_writes;
     lua.globals().set(
         "cache_get",
         lua.create_function(move |lua, key: String| {
+            if replay_bypass {
+                validate_runtime_key(&key).map_err(mlua::Error::external)?;
+                if !get_invocation_writes
+                    .lock()
+                    .map_err(|_| mlua::Error::external("cache replay write set lock poisoned"))?
+                    .contains(&key)
+                {
+                    return Ok(None);
+                }
+            }
             cache_get(&get_host_root, key, &get_clock)?
                 .map(|value| lua.create_string(&value))
                 .transpose()
         })?,
     )?;
     Ok(())
+}
+
+fn take_replay_bypass_env() -> bool {
+    let enabled = std::env::var(CACHE_REPLAY_BYPASS_ENV).as_deref() == Ok("1");
+    std::env::remove_var(CACHE_REPLAY_BYPASS_ENV);
+    enabled
 }
 
 fn cache_set(
