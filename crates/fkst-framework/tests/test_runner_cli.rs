@@ -2256,6 +2256,81 @@ return {
 }
 
 #[test]
+fn test_runner_isolates_codex_logs_between_top_level_tests() {
+    let host = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
+    fs::create_dir_all(host.path().join("tests")).unwrap();
+    fs::write(
+        host.path().join("tests/codex_log_isolation_test.lua"),
+        r#"
+local t = fkst.test
+
+local function leaked_run_exists()
+  local runs = fkst.codex_runs()
+  for _, group in ipairs({ runs.running, runs.recent }) do
+    for _, run in ipairs(group) do
+      if run.dedup_key == "top-level-test-a" then
+        return true
+      end
+    end
+  end
+  return false
+end
+
+return {
+  test_01_records_mocked_codex_status = function()
+    t.mock_command("codex exec", { stdout = "done", exit_code = 0 })
+    local result = spawn_codex_sync({
+      prompt = "record top-level test status",
+      dedup_key = "top-level-test-a",
+    })
+    t.eq(result.exit_code, 0)
+    t.is_true(leaked_run_exists(), "test A could not see its own Codex status")
+  end,
+
+  test_02_cannot_see_prior_test_codex_status = function()
+    t.eq(leaked_run_exists(), false, "test B saw test A's Codex status")
+  end,
+}
+"#,
+    )
+    .unwrap();
+
+    write_single_package_workspace(host.path());
+    let output = framework_command()
+        .arg("test")
+        .arg("--project-root")
+        .arg(host.path())
+        .arg("--package-root")
+        .arg(host.path())
+        .current_dir(host.path())
+        .env("FKST_RUNTIME_ROOT", host.path().join(".fkst/runtime"))
+        .env("FKST_RUNTIME_LOG_DIR", host.path().join("ambient-logs"))
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}",
+        stdout(&output),
+        stderr(&output)
+    );
+    let out = stdout(&output);
+    assert!(
+        out.contains(
+            "PASS tests/codex_log_isolation_test.lua::test_01_records_mocked_codex_status"
+        ),
+        "stdout: {out}"
+    );
+    assert!(
+        out.contains(
+            "PASS tests/codex_log_isolation_test.lua::test_02_cannot_see_prior_test_codex_status"
+        ),
+        "stdout: {out}"
+    );
+    assert!(out.contains("2 passed, 0 failed"), "stdout: {out}");
+}
+
+#[test]
 fn test_runner_records_and_replays_external_command_cassettes() {
     let host = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
     fs::create_dir_all(host.path().join("tests/cassettes")).unwrap();

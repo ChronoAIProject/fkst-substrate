@@ -14,6 +14,7 @@ use crate::lua_coverage::LuaCoverage;
 use crate::manifest::UnitCatalog;
 use crate::path_resolver::PackageRoots;
 use crate::raise::RaiseBuffer;
+use crate::sdk_codex::RUNTIME_LOG_DIR_ENV;
 use crate::sdk_observe::MockObserveState;
 use crate::test_department_env::{DeptRunEnvGuard, DeptRunOptions};
 
@@ -107,7 +108,7 @@ pub(crate) fn run_tests(
                     mock_observe
                         .reset()
                         .with_context(|| format!("reset mock observe for {relpath}::{name}"))?;
-                    match func.call::<()>(()) {
+                    match run_top_level_test(&func) {
                         Ok(()) => {
                             println!("PASS {relpath}::{name}");
                             passed += 1;
@@ -151,6 +152,25 @@ pub(crate) fn run_tests(
             .with_context(|| format!("write coverage outputs {}", path.display()))?;
     }
     Ok(if failed == 0 { 0 } else { 1 })
+}
+
+fn run_top_level_test(func: &Function) -> mlua::Result<()> {
+    with_top_level_runtime_log_dir(|| func.call::<()>(()))
+}
+
+pub(crate) fn with_top_level_runtime_log_dir<T>(
+    run: impl FnOnce() -> mlua::Result<T>,
+) -> mlua::Result<T> {
+    let temp = tempfile::Builder::new()
+        .prefix("fkst-top-level-test")
+        .tempdir()
+        .map_err(mlua::Error::external)?;
+    let runtime_log_dir = temp.path().join("logs");
+    let _guard = DeptRunEnvGuard::apply(DeptRunOptions::default_env().with_env_var(
+        RUNTIME_LOG_DIR_ENV,
+        runtime_log_dir.to_string_lossy().into_owned(),
+    ))?;
+    run()
 }
 
 #[derive(Debug, Serialize)]

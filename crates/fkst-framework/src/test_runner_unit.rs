@@ -1,10 +1,17 @@
 use super::external_command::{MockCommandResult, MockCommandState};
 use super::path_resolver::PackageRoots;
+use super::sdk_codex::RUNTIME_LOG_DIR_ENV;
 use super::sdk_observe::MockObserveState;
-use super::test_runner::{run_department, TestRunCache, TestRunCacheStats};
+use super::test_department_env::{DeptRunEnvGuard, DeptRunOptions};
+use super::test_runner::{
+    run_department, with_top_level_runtime_log_dir, TestRunCache, TestRunCacheStats,
+};
 use mlua::{LuaSerdeExt, Table, Value};
 use std::path::Path;
+use std::sync::Mutex;
 use tempfile::TempDir;
+
+static RUNTIME_LOG_ENV_LOCK: Mutex<()> = Mutex::new(());
 
 fn write(path: &Path, body: &str) {
     if let Some(parent) = path.parent() {
@@ -35,6 +42,51 @@ root = "."
 
 fn table_len(table: Table) -> usize {
     table.pairs::<Value, Value>().count()
+}
+
+#[test]
+fn top_level_runtime_log_dir_restores_and_cleans_up_after_error_and_panic() {
+    let _lock = RUNTIME_LOG_ENV_LOCK.lock().unwrap();
+    let ambient = TempDir::new().unwrap();
+    let ambient_log_dir = ambient.path().join("ambient-logs");
+    let _ambient_guard = DeptRunEnvGuard::apply(DeptRunOptions::default_env().with_env_var(
+        RUNTIME_LOG_DIR_ENV,
+        ambient_log_dir.to_string_lossy().into_owned(),
+    ))
+    .unwrap();
+
+    let mut error_log_dir = None;
+    let error = with_top_level_runtime_log_dir(|| {
+        let active = std::env::var_os(RUNTIME_LOG_DIR_ENV).unwrap();
+        assert_ne!(active, ambient_log_dir.as_os_str());
+        error_log_dir = Some(std::path::PathBuf::from(active));
+        Err::<(), _>(mlua::Error::runtime("expected top-level test error"))
+    });
+    assert!(error.is_err());
+    assert_eq!(
+        std::env::var_os(RUNTIME_LOG_DIR_ENV).as_deref(),
+        Some(ambient_log_dir.as_os_str())
+    );
+    let error_log_dir = error_log_dir.unwrap();
+    assert!(!error_log_dir.exists());
+
+    let mut panic_log_dir = None;
+    let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ = with_top_level_runtime_log_dir::<()>(|| {
+            let active = std::env::var_os(RUNTIME_LOG_DIR_ENV).unwrap();
+            assert_ne!(active, ambient_log_dir.as_os_str());
+            panic_log_dir = Some(std::path::PathBuf::from(active));
+            panic!("expected top-level test panic");
+        });
+    }));
+    assert!(panic.is_err());
+    assert_eq!(
+        std::env::var_os(RUNTIME_LOG_DIR_ENV).as_deref(),
+        Some(ambient_log_dir.as_os_str())
+    );
+    let panic_log_dir = panic_log_dir.unwrap();
+    assert_ne!(error_log_dir, panic_log_dir);
+    assert!(!panic_log_dir.exists());
 }
 
 #[test]
