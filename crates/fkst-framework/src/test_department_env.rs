@@ -17,6 +17,11 @@ impl DeptRunOptions {
         }
     }
 
+    pub(crate) fn with_env_var(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.env.push((key.into(), value.into()));
+        self
+    }
+
     pub(crate) fn from_lua(opts: Option<Table>) -> mlua::Result<Self> {
         let Some(opts) = opts else {
             return Ok(Self::default_env());

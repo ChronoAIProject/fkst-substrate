@@ -11,6 +11,7 @@
 use crate::external_command::MockCommandState;
 use crate::lua_coverage::LuaCoverage;
 use crate::path_resolver::PackageRoots;
+use crate::sdk_codex::RUNTIME_LOG_DIR_ENV;
 use crate::sdk_observe::MockObserveState;
 use crate::supervise::consumer::{finish_test_durable_record, TestDurableCompletion};
 use crate::supervise::delivery_observe::{observe_snapshot, DeliveryObserveOptions};
@@ -86,6 +87,7 @@ fn run_graph(
         .tempdir()
         .map_err(mlua::Error::external)?;
     let database = temp.path().join("delivery.redb");
+    let runtime_log_dir = temp.path().join("logs");
     let store = Arc::new(DeliveryStore::open(&database).map_err(mlua::Error::external)?);
     let router = DeliveryRouter::new_with_clock(
         &cfg,
@@ -123,6 +125,7 @@ fn run_graph(
             mock_observe.clone(),
             &dept,
             &record,
+            &runtime_log_dir,
             coverage.clone(),
         )?;
         let step = TraceStep {
@@ -362,6 +365,7 @@ fn run_record(
     mock_observe: MockObserveState,
     dept: &DepartmentDecl,
     record: &DeliveryRecord,
+    runtime_log_dir: &Path,
     coverage: Option<LuaCoverage>,
 ) -> mlua::Result<RecordRunOutcome> {
     let lua_path = if dept.lua.is_absolute() {
@@ -383,7 +387,10 @@ fn run_record(
             ts: record.observed_at_ms,
         })
         .map_err(mlua::Error::external)?,
-        DeptRunOptions::default_env(),
+        DeptRunOptions::default_env().with_env_var(
+            RUNTIME_LOG_DIR_ENV,
+            runtime_log_dir.to_string_lossy().into_owned(),
+        ),
         coverage,
     )?;
     Ok(RecordRunOutcome {

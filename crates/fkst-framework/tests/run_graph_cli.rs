@@ -201,6 +201,169 @@ return {{
 }
 
 #[test]
+fn run_graph_isolates_codex_logs_per_run_and_preserves_intra_graph_visibility() {
+    let host = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
+    let package = tempfile::Builder::new()
+        .prefix("codexlog")
+        .tempdir()
+        .unwrap();
+    let ns = namespace(package.path());
+
+    write_department(
+        package.path(),
+        "worker",
+        r#"
+local M = {}
+M.spec = {
+  consumes = { "start" },
+  produces = { "observed" },
+}
+
+local function matching_run_exists()
+  local runs = fkst.codex_runs()
+  for _, group in ipairs({ runs.running, runs.recent }) do
+    for _, run in ipairs(group) do
+      if run.dedup_key == "shared-exec-ref" then
+        return true
+      end
+    end
+  end
+  return false
+end
+
+function M.pipeline(event)
+  if matching_run_exists() then
+    raise("observed", { spawned = false })
+    return
+  end
+
+  local result = spawn_codex_sync({
+    prompt = "graph codex work",
+    dedup_key = "shared-exec-ref",
+  })
+  assert(result.exit_code == 0, "expected mocked codex success")
+  raise("observed", { spawned = true })
+end
+return M
+"#,
+    );
+    write_department(
+        package.path(),
+        "observer",
+        r#"
+local M = {}
+M.spec = {
+  consumes = { "observed" },
+  produces = {},
+}
+
+local function matching_run_exists()
+  local runs = fkst.codex_runs()
+  for _, group in ipairs({ runs.running, runs.recent }) do
+    for _, run in ipairs(group) do
+      if run.dedup_key == "shared-exec-ref" then
+        return true
+      end
+    end
+  end
+  return false
+end
+
+function M.pipeline(event)
+  assert(event.payload.spawned, "ambient codex status suppressed in-graph spawn")
+  assert(matching_run_exists(), "in-graph codex status was not visible to a later step")
+end
+return M
+"#,
+    );
+    fs::create_dir_all(package.path().join("tests")).unwrap();
+    fs::write(
+        package.path().join("tests/run_graph_codex_log_test.lua"),
+        r#"
+local t = fkst.test
+
+local function matching_run_exists()
+  local runs = fkst.codex_runs()
+  for _, group in ipairs({ runs.running, runs.recent }) do
+    for _, run in ipairs(group) do
+      if run.dedup_key == "shared-exec-ref" then
+        return true
+      end
+    end
+  end
+  return false
+end
+
+return {
+  test_run_graph_codex_logs_are_hermetic_per_run = function()
+    t.mock_command("codex exec", { stdout = "ambient", exit_code = 0 })
+    local ambient = spawn_codex_sync({
+      prompt = "ambient codex work",
+      dedup_key = "shared-exec-ref",
+    })
+    t.eq(ambient.exit_code, 0)
+    t.is_true(matching_run_exists(), "ambient codex status seed was not visible")
+
+    t.mock_command("codex exec", { stdout = "first graph", exit_code = 0 })
+    t.mock_command("codex exec", { stdout = "second graph", exit_code = 0 })
+    local event = {
+      queue = "PLACEHOLDER.start",
+      payload = {},
+      source_ref = { kind = "external", reference = "unit/codex-log" },
+    }
+    local first = t.run_graph(event, { max_steps = 2 })
+    local second = t.run_graph(event, { max_steps = 2 })
+
+    t.eq(first.status, "quiescent")
+    t.eq(second.status, "quiescent")
+    t.eq(#first.steps, 2)
+    t.eq(#second.steps, 2)
+    t.eq(first.steps[2].status, "accepted", first.steps[2].error)
+    t.eq(second.steps[2].status, "accepted", second.steps[2].error)
+
+    local calls = t.command_calls()
+    t.eq(#calls, 3)
+    t.eq(calls[1].stdin, "ambient codex work")
+    t.eq(calls[2].stdin, "graph codex work")
+    t.eq(calls[3].stdin, "graph codex work")
+  end,
+}
+"#
+        .replace("PLACEHOLDER", &ns),
+    )
+    .unwrap();
+
+    write_workspace_for_roots(host.path(), &[package.path()]);
+    let mut cmd = framework_command();
+    let output = cmd
+        .arg("test")
+        .arg("--project-root")
+        .arg(host.path())
+        .arg("--package-root")
+        .arg(package.path())
+        .current_dir(host.path())
+        .env("FKST_RUNTIME_ROOT", host.path().join(".fkst/runtime"))
+        .env("FKST_RUNTIME_LOG_DIR", host.path().join("ambient-logs"))
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}",
+        stdout(&output),
+        stderr(&output)
+    );
+    let out = stdout(&output);
+    assert!(
+        out.contains(
+            "PASS tests/run_graph_codex_log_test.lua::test_run_graph_codex_logs_are_hermetic_per_run"
+        ),
+        "stdout: {out}"
+    );
+    assert!(out.contains("1 passed, 0 failed"), "stdout: {out}");
+}
+
+#[test]
 fn run_graph_step_cap_fails_loudly() {
     let host = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
     let package = tempfile::Builder::new()
