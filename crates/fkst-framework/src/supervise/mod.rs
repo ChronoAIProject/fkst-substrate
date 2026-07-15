@@ -512,6 +512,7 @@ mod tests {
                 owner_namespace: "pkg".to_string(),
                 consumes: vec!["jobs".to_string()],
                 produces: Vec::new(),
+                published_seam: Vec::new(),
                 ephemeral: if ephemeral {
                     vec!["jobs".to_string()]
                 } else {

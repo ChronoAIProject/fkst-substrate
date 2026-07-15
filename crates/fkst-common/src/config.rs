@@ -45,6 +45,8 @@ pub struct DepartmentDecl {
     #[serde(default)]
     pub produces: Vec<String>,
     #[serde(default)]
+    pub published_seam: Vec<String>,
+    #[serde(default)]
     pub ephemeral: Vec<String>,
     pub stall_window: String,
     #[serde(default)]

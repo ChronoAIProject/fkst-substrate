@@ -696,6 +696,7 @@ mod tests {
                 owner_namespace: "pkg".to_string(),
                 consumes: vec!["jobs".to_string()],
                 produces: Vec::new(),
+                published_seam: Vec::new(),
                 ephemeral: if ephemeral {
                     vec!["jobs".to_string()]
                 } else {
@@ -740,6 +741,7 @@ mod tests {
                     owner_namespace: owner_namespace.to_string(),
                     consumes: vec![queue_name.to_string()],
                     produces: Vec::new(),
+                    published_seam: Vec::new(),
                     ephemeral: Vec::new(),
                     stall_window: "30s".to_string(),
                     graph_json: false,
@@ -775,6 +777,7 @@ mod tests {
                 owner_namespace: "pkg".to_string(),
                 consumes: vec!["merge-ready".to_string()],
                 produces: Vec::new(),
+                published_seam: Vec::new(),
                 ephemeral: if ephemeral {
                     vec!["merge-ready".to_string()]
                 } else {

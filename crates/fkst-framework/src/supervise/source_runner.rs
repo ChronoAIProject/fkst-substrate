@@ -605,6 +605,7 @@ mod tests {
                 owner_namespace: "pkg".to_string(),
                 consumes: vec![queue_name.to_string()],
                 produces: Vec::new(),
+                published_seam: Vec::new(),
                 ephemeral: vec![queue_name.to_string()],
                 stall_window: "30s".to_string(),
                 graph_json: false,

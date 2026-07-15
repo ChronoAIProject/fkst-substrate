@@ -111,6 +111,7 @@ fn minimal_config(lua_rel: PathBuf, owner_root: &std::path::Path) -> Config {
             owner_namespace: "pkg".to_string(),
             consumes: vec!["self_test".into()],
             produces: vec![],
+            published_seam: vec![],
             ephemeral: vec![],
             stall_window: "30s".into(),
             graph_json: false,

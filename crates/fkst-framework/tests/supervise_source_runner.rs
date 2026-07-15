@@ -55,6 +55,7 @@ fn fanout_router(queue_name: &str) -> (Fanout, DeliveryRouter) {
             lua: "departments/test/main.lua".into(),
             consumes: vec![queue_name.to_string()],
             produces: Vec::new(),
+            published_seam: Vec::new(),
             ephemeral: vec![queue_name.to_string()],
             stall_window: "30s".to_string(),
             graph_json: false,
