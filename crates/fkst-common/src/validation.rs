@@ -633,6 +633,58 @@ mod tests {
     }
 
     #[test]
+    fn closed_world_published_seam_does_not_exempt_other_departments_queue() {
+        // The external-seam exemption requires the SAME department to both
+        // consume the queue AND declare it in its own published_seam. A
+        // department that publishes a seam it does not consume must not exempt
+        // a different department's producerless consumed queue.
+        let tmp = tempdir().unwrap();
+        let lua = touch(tmp.path(), "d.lua");
+        let mut cfg = cfg_minimal(&lua);
+        cfg.queue.insert(
+            "shared_ingress".into(),
+            QueueDecl {
+                capacity: 10,
+                fanout: false,
+            },
+        );
+        let publisher = serde_json::from_value(serde_json::json!({
+            "lua": "d.lua",
+            "owner_root": ".",
+            "owner_namespace": "pkg",
+            "consumes": [],
+            "produces": [],
+            "published_seam": ["shared_ingress"],
+            "ephemeral": [],
+            "stall_window": "30s",
+            "graph_json": false,
+            "retry": null
+        }))
+        .unwrap();
+        cfg.department.insert("publisher".into(), publisher);
+        let consumer = serde_json::from_value(serde_json::json!({
+            "lua": "d.lua",
+            "owner_root": ".",
+            "owner_namespace": "pkg",
+            "consumes": ["shared_ingress"],
+            "produces": [],
+            "published_seam": [],
+            "ephemeral": [],
+            "stall_window": "30s",
+            "graph_json": false,
+            "retry": null
+        }))
+        .unwrap();
+        cfg.department.insert("consumer".into(), consumer);
+
+        let err = validate_with_scope(&cfg, tmp.path(), ValidationScope::ClosedWorld).unwrap_err();
+        let message = err.to_string();
+
+        assert!(message.contains("shared_ingress"), "{message}");
+        assert!(message.contains("no producer"), "{message}");
+    }
+
+    #[test]
     fn partial_graph_consumer_without_producer_warns() {
         let tmp = tempdir().unwrap();
         let lua = touch(tmp.path(), "d.lua");
