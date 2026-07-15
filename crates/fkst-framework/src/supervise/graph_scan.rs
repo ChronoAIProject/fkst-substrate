@@ -286,6 +286,7 @@ fn scan_departments(
                 owner_namespace: graph_root.namespace.clone(),
                 consumes,
                 produces,
+                published_seam: published_seam.clone(),
                 ephemeral,
                 stall_window: if spec.stall_window.trim().is_empty() {
                     defaults.department_default_stall_window.clone()

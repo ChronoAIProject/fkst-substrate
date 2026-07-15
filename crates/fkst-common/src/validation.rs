@@ -78,7 +78,8 @@ pub fn validate_runtime_key(key: &str) -> Result<&str, FkstError> {
 /// - queues default to one active consumer unless `fanout = true`
 /// - queues with only producers emit startup warnings
 /// - closed-world queues with only consumers are rejected unless a built-in
-///   provider contract explicitly owns the queue
+///   provider contract owns the queue or a consuming department publishes it
+///   as an external seam
 /// - partial-graph queues with only consumers emit startup warnings
 /// - every department's `lua` path must exist on disk
 /// - queue capacity > 0
@@ -217,6 +218,15 @@ pub fn validate_with_scope(
         let mut producers = queue_producers(cfg, qname);
         if let Some(contract) = built_in_provider_for_queue(qname) {
             producers.push(contract.producer_label.to_string());
+        }
+        if let Some((department_name, _)) = cfg.department.iter().find(|(_, department)| {
+            department.consumes.iter().any(|queue| queue == qname)
+                && department.published_seam.iter().any(|queue| queue == qname)
+        }) {
+            producers.push(format!(
+                "external seam declared by department '{}'",
+                department_name
+            ));
         }
         let consumers = queue_consumers(cfg, qname);
         if producers.is_empty() && consumers.is_empty() {
@@ -443,6 +453,7 @@ mod tests {
                 owner_namespace: "pkg".to_string(),
                 consumes: vec!["tick".into()],
                 produces: Vec::new(),
+                published_seam: Vec::new(),
                 ephemeral: Vec::new(),
                 stall_window: "30s".into(),
                 graph_json: false,
@@ -563,7 +574,7 @@ mod tests {
     }
 
     #[test]
-    fn consumer_without_producer_fails() {
+    fn closed_world_consumer_without_published_seam_fails() {
         let tmp = tempdir().unwrap();
         let lua = touch(tmp.path(), "d.lua");
         let mut cfg = cfg_minimal(&lua);
@@ -585,6 +596,91 @@ mod tests {
 
         assert!(message.contains("consumed_only"), "{message}");
         assert!(message.contains("department 'd'"), "{message}");
+        assert!(message.contains("no producer"), "{message}");
+    }
+
+    #[test]
+    fn closed_world_published_seam_satisfies_producer_requirement() {
+        let tmp = tempdir().unwrap();
+        let lua = touch(tmp.path(), "d.lua");
+        let mut cfg = cfg_minimal(&lua);
+        cfg.queue.insert(
+            "external_ingress".into(),
+            QueueDecl {
+                capacity: 10,
+                fanout: false,
+            },
+        );
+        let external_consumer = serde_json::from_value(serde_json::json!({
+            "lua": "d.lua",
+            "owner_root": ".",
+            "owner_namespace": "pkg",
+            "consumes": ["external_ingress"],
+            "produces": [],
+            "published_seam": ["external_ingress"],
+            "ephemeral": [],
+            "stall_window": "30s",
+            "graph_json": false,
+            "retry": null
+        }))
+        .unwrap();
+        cfg.department
+            .insert("external_consumer".into(), external_consumer);
+
+        let warnings = validate_with_scope(&cfg, tmp.path(), ValidationScope::ClosedWorld).unwrap();
+
+        assert!(warnings.is_empty(), "{warnings:?}");
+    }
+
+    #[test]
+    fn closed_world_published_seam_does_not_exempt_other_departments_queue() {
+        // The external-seam exemption requires the SAME department to both
+        // consume the queue AND declare it in its own published_seam. A
+        // department that publishes a seam it does not consume must not exempt
+        // a different department's producerless consumed queue.
+        let tmp = tempdir().unwrap();
+        let lua = touch(tmp.path(), "d.lua");
+        let mut cfg = cfg_minimal(&lua);
+        cfg.queue.insert(
+            "shared_ingress".into(),
+            QueueDecl {
+                capacity: 10,
+                fanout: false,
+            },
+        );
+        let publisher = serde_json::from_value(serde_json::json!({
+            "lua": "d.lua",
+            "owner_root": ".",
+            "owner_namespace": "pkg",
+            "consumes": [],
+            "produces": [],
+            "published_seam": ["shared_ingress"],
+            "ephemeral": [],
+            "stall_window": "30s",
+            "graph_json": false,
+            "retry": null
+        }))
+        .unwrap();
+        cfg.department.insert("publisher".into(), publisher);
+        let consumer = serde_json::from_value(serde_json::json!({
+            "lua": "d.lua",
+            "owner_root": ".",
+            "owner_namespace": "pkg",
+            "consumes": ["shared_ingress"],
+            "produces": [],
+            "published_seam": [],
+            "ephemeral": [],
+            "stall_window": "30s",
+            "graph_json": false,
+            "retry": null
+        }))
+        .unwrap();
+        cfg.department.insert("consumer".into(), consumer);
+
+        let err = validate_with_scope(&cfg, tmp.path(), ValidationScope::ClosedWorld).unwrap_err();
+        let message = err.to_string();
+
+        assert!(message.contains("shared_ingress"), "{message}");
         assert!(message.contains("no producer"), "{message}");
     }
 
