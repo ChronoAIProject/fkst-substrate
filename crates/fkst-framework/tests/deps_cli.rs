@@ -593,6 +593,57 @@ fn cross_repo_deps_lock_writes_hashes_and_locked_catalog_resolves_external_libra
 }
 
 #[test]
+fn cross_repo_cached_mirror_fetches_new_non_default_branch_commit() {
+    let temp = tempfile::tempdir().unwrap();
+    let cache = temp.path().join("cache");
+    let source = temp.path().join("source");
+    let consumer = temp.path().join("consumer");
+    let initial_rev = init_external_library_repo(&source, None);
+    let default_branch = git(&source, &["branch", "--show-current"]);
+    consumer_workspace_with_external_source(
+        &consumer,
+        &source,
+        &initial_rev,
+        &["contract"],
+        &["contract"],
+    );
+
+    let initial_lock = deps(&consumer)
+        .arg("lock")
+        .env("FKST_CACHE_ROOT", &cache)
+        .output()
+        .unwrap();
+    assert_exit(&initial_lock, 0);
+
+    git_checked(&source, &["checkout", "-b", "feature/revision"]);
+    write(
+        &source.join("libraries/contract/public/api.lua"),
+        r#"return { value = "feature-contract" }"#,
+    );
+    git_checked(&source, &["add", "."]);
+    git_checked(&source, &["commit", "-m", "Advance feature branch"]);
+    let feature_rev = git(&source, &["rev-parse", "HEAD"]);
+    git_checked(&source, &["checkout", &default_branch]);
+    consumer_workspace_with_external_source(
+        &consumer,
+        &source,
+        &feature_rev,
+        &["contract"],
+        &["contract"],
+    );
+
+    let feature_lock = deps(&consumer)
+        .arg("lock")
+        .env("FKST_CACHE_ROOT", &cache)
+        .output()
+        .unwrap();
+
+    assert_exit(&feature_lock, 0);
+    let lock = fs::read_to_string(consumer.join("fkst.lock")).unwrap();
+    assert!(lock.contains(&format!(r#"rev = "{feature_rev}""#)), "{lock}");
+}
+
+#[test]
 fn cross_repo_unlocked_external_source_fails_closed_until_lock_is_written() {
     let temp = tempfile::tempdir().unwrap();
     let cache = temp.path().join("cache");
