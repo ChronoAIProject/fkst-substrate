@@ -637,7 +637,7 @@ fn export_source_tree(
         let output = Command::new("git")
             .arg("-C")
             .arg(&mirror)
-            .args(["fetch", "--tags", "--force", "--prune", &source.git])
+            .args(["fetch", "--tags", "--force", "--prune", "origin"])
             .output()
             .with_context(|| format!("fetch external source `{}` mirror", source.id))?;
         if !output.status.success() {
