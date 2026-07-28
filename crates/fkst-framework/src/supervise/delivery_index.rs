@@ -34,6 +34,10 @@ pub(crate) fn make_dead_due_index_key(dept: &str, dead_at_ms: u64, delivery_id: 
     )
 }
 
+pub(crate) fn make_dead_time_index_key(dead_at_ms: u64, delivery_id: &str) -> String {
+    format!("{dead_at_ms:0MILLIS_WIDTH$}/{delivery_id}")
+}
+
 pub(crate) fn collect_due_keys<T>(
     table: &T,
     dept: Option<&str>,
@@ -149,6 +153,22 @@ pub(crate) fn parse_dead_due_index_key(key: &str) -> Result<DueIndexKey> {
     let delivery_id = parts
         .next()
         .ok_or_else(|| anyhow!("dead delivery index key missing delivery id"))?;
+    let due_ms = due.parse::<u64>()?;
+    Ok(DueIndexKey {
+        key: key.to_string(),
+        due_ms,
+        delivery_id: delivery_id.to_string(),
+    })
+}
+
+pub(crate) fn parse_dead_time_index_key(key: &str) -> Result<DueIndexKey> {
+    let mut parts = key.splitn(2, '/');
+    let due = parts
+        .next()
+        .ok_or_else(|| anyhow!("dead delivery time index key missing due time"))?;
+    let delivery_id = parts
+        .next()
+        .ok_or_else(|| anyhow!("dead delivery time index key missing delivery id"))?;
     let due_ms = due.parse::<u64>()?;
     Ok(DueIndexKey {
         key: key.to_string(),

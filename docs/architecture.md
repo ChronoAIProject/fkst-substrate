@@ -294,6 +294,7 @@ engine 维护 durable 在途 delivery state，但它不是实体业务真相、a
 | `cache_get(key)` | `sdk_cache.rs`，best-effort scratch KV 读取，缺失 / 过期 / malformed / unreadable 返回 nil |
 | `cache_expire(key)` | `sdk_cache.rs`，best-effort scratch KV 显式删除，缺失视为成功 |
 | `graph_json()` | `sdk_graph.rs`，只读 composed graph JSON snapshot |
+| `fkst.observe([opts])` | `sdk_observe.rs`, generic durable delivery snapshot with opt-in DLQ keyset continuation |
 | `restricted_lua_load(opts)` | `sdk_restricted_lua.rs`, fresh Lua state restricted source loader |
 | `git_log_count(grep, since)` | `sdk_git.rs`，调用 `git log --grep --since --oneline` |
 | `git_log_grep(grep, since)` | `sdk_git.rs`，调用 `git log --format=%H` |
@@ -310,6 +311,8 @@ engine 维护 durable 在途 delivery state，但它不是实体业务真相、a
 `restricted_lua_load({ source, bindings?, mode?, name? })` evaluates small declarative Lua sources in a fresh restricted Lua state. The restricted chunk receives an empty `_ENV` plus caller-supplied `bindings`, defaults to text-only loading, and accepts bytecode only with explicit `mode = "bytecode"`. Ambient VM capabilities such as `require`, `load`, `_G`, `debug`, `package`, raw table primitives, metatable access, `io`, `os`, coroutine APIs, `string.dump`, and `("").dump` are unreachable. Results are copied back only as plain nil / boolean / number / string / table data; compile/runtime failures and non-plain returns fail closed with structured `restricted_lua` errors.
 
 `graph_json()` 是显式授权的只读 topology introspection。只有当前 Department 的 `M.spec.graph_json = true` 时可调用；未声明授权时调用失败。它按当前 fixed package roots input set 与 host root 重新扫描并验证 composed graph，返回 `fkst.graph.v1` JSON string。schema 包含 `nodes` 与 `edges`：raiser nodes 带 `source`，queue nodes 带 `fanout`，department nodes 带 `consumes`、`produces`、`ephemeral`、`stall_window` 与 materialized `retry` metadata；edges 表示 raiser→queue、queue→department 和 department→queue。node `id` 与 edge endpoint 使用 `kind:canonical_name` 形态，避免同名 raiser / queue / department 在图渲染时碰撞。输出排序稳定，不包含 `lua` path、`owner_root`、queue capacity 或 runtime state。
+
+`fkst.observe({ limit = n, include = { "errors", "entities" }, page = { section = "dead_letters", after? = cursor } })` opts into DLQ keyset traversal. `after` is omitted for the first page. The durable store maintains `dead_by_time` in `(dead_at_ms, delivery_id)` order, and both the live-owner socket path and offline path select at most `limit + 1` indexed rows in one read transaction. A lookahead row produces the versioned, section-bound opaque `page.next`; the final page omits `next`. Malformed cursors fail closed with `observe dead-letter cursor invalid`. Calls without `page` retain the existing scan and byte-identical serialization path. Each page observes the current mutable retained DLQ; the cursor prevents duplicate or skipped equal-timestamp rows in that ordering but does not freeze mutations across calls.
 
 `M.spec.retry` 默认启用；`retry=false` 表示失败不重试；`retry={...}` 支持 `max_attempts`、`base`、`cap` 子集覆盖。全局默认由 registry 的 `retry_default_max_attempts`、`retry_default_base`、`retry_default_cap` 提供。可靠 / 非可靠投递由 `M.spec.ephemeral` 决定，不由 retry 决定。可靠路径不依赖 payload dedup key、runtime marker 或 retry scratch 文件；delivery store 使用 `delivery_id`、`lease_generation` 和 redb 事务提供 fencing、ack、retry 和 dead 表。
 
