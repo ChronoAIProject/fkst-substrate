@@ -522,6 +522,15 @@ fn copy_if_present(
 mod tests {
     use super::*;
 
+    fn assert_observe_rejected(chunk: &str, expected: &str) {
+        let lua = Lua::new();
+        register(&lua, None).unwrap();
+
+        let err = lua.load(chunk).eval::<Value>().unwrap_err();
+
+        assert!(err.to_string().contains(expected), "{err}");
+    }
+
     #[test]
     fn observe_rejects_business_options() {
         let lua = Lua::new();
@@ -627,6 +636,46 @@ mod tests {
         assert!(err
             .to_string()
             .contains("observe dead-letter cursor invalid"));
+    }
+
+    #[test]
+    fn observe_rejects_page_combined_with_since() {
+        assert_observe_rejected(
+            "return fkst.observe({ since = 'dead-one', page = { section = 'dead_letters' } })",
+            "fkst.observe page cannot be combined with since",
+        );
+    }
+
+    #[test]
+    fn observe_rejects_unsupported_page_section() {
+        assert_observe_rejected(
+            "return fkst.observe({ page = { section = 'deliveries' } })",
+            "fkst.observe page section must be `dead_letters`",
+        );
+    }
+
+    #[test]
+    fn observe_rejects_unknown_page_option() {
+        assert_observe_rejected(
+            "return fkst.observe({ page = { section = 'dead_letters', restart = true } })",
+            "unknown fkst.observe page option `restart`",
+        );
+    }
+
+    #[test]
+    fn observe_rejects_non_string_page_cursor() {
+        assert_observe_rejected(
+            "return fkst.observe({ page = { section = 'dead_letters', after = 42 } })",
+            "observe dead-letter cursor invalid: after must be a string",
+        );
+    }
+
+    #[test]
+    fn observe_rejects_limit_above_maximum_before_page_read() {
+        assert_observe_rejected(
+            "return fkst.observe({ limit = 10001, page = { section = 'dead_letters' } })",
+            "observe limit must be between 1 and 10000",
+        );
     }
 
     #[test]

@@ -16,6 +16,7 @@ use support::manifest_fixture::{unit_name, write_single_package_workspace};
 const DELIVERY_BY_ID: TableDefinition<&str, &[u8]> = TableDefinition::new("delivery_by_id");
 const DEAD_BY_ID: TableDefinition<&str, &[u8]> = TableDefinition::new("dead_by_id");
 const DEAD_BY_TIME: TableDefinition<&str, ()> = TableDefinition::new("dead_by_time");
+const MAX_OBSERVE_LIMIT: usize = 10_000;
 
 fn framework_bin() -> &'static str {
     env!("CARGO_BIN_EXE_fkst-framework")
@@ -153,6 +154,49 @@ fn write_dead_letter_page_fixture(durable_root: &Path) {
             });
             dead.insert(delivery_id, serde_json::to_vec(&record).unwrap().as_slice())
                 .unwrap();
+            dead_by_time
+                .insert(format!("{dead_at_ms:020}/{delivery_id}").as_str(), &())
+                .unwrap();
+        }
+    }
+    write.commit().unwrap();
+    drop(db);
+}
+
+fn write_large_dead_letter_page_fixture(durable_root: &Path) {
+    let db = Database::create(durable_root.join("delivery.redb")).unwrap();
+    let write = db.begin_write().unwrap();
+    {
+        write.open_table(DELIVERY_BY_ID).unwrap();
+        let mut dead = write.open_table(DEAD_BY_ID).unwrap();
+        let mut dead_by_time = write.open_table(DEAD_BY_TIME).unwrap();
+        for index in 0..=MAX_OBSERVE_LIMIT {
+            let delivery_id = format!("dead-{index:05}");
+            let dead_at_ms = if index >= MAX_OBSERVE_LIMIT - 1 {
+                MAX_OBSERVE_LIMIT as u64
+            } else {
+                index as u64
+            };
+            let record = json!({
+                "delivery_id": delivery_id,
+                "queue": "input",
+                "dept": "worker",
+                "source": null,
+                "observed_at_ms": 900,
+                "not_before_ms": 900,
+                "dead_at_ms": dead_at_ms,
+                "attempts": 3,
+                "redrive_count": 0,
+                "replayable": false,
+                "permanent": true,
+                "error_excerpt": "final failure",
+                "record": null
+            });
+            dead.insert(
+                delivery_id.as_str(),
+                serde_json::to_vec(&record).unwrap().as_slice(),
+            )
+            .unwrap();
             dead_by_time
                 .insert(format!("{dead_at_ms:020}/{delivery_id}").as_str(), &())
                 .unwrap();
@@ -492,6 +536,147 @@ return M
     assert_eq!(raised["second_section"], "dead_letters");
     assert_eq!(raised["second_has_next"], false, "{raised}");
     assert_eq!(raised["second_count"], 1, "{raised}");
+}
+
+#[test]
+fn fkst_observe_traverses_stable_dead_letter_fixture_beyond_max_limit() {
+    let host = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
+    let durable = tempfile::Builder::new()
+        .prefix("fkst-durable")
+        .tempdir()
+        .unwrap();
+    write_large_dead_letter_page_fixture(durable.path());
+    fs::create_dir_all(host.path().join("departments/probe")).unwrap();
+    let probe = host.path().join("departments/probe/main.lua");
+    fs::write(
+        &probe,
+        r#"
+local M = {}
+M.spec = { consumes = { "tick" }, produces = { "seen" }, ephemeral = { "tick" } }
+
+function M.pipeline(event)
+  local limit = 10000
+  local expected_total = limit + 1
+  local legacy = fkst.observe({
+    limit = limit,
+    include = { "errors", "entities" },
+  })
+  local total = 0
+  local page_count = 0
+  local first_page_count = 0
+  local first_has_next = false
+  local final_page_count = 0
+  local duplicate_free = true
+  local ordered = true
+  local seen = {}
+  local previous_dead_at_ms = nil
+  local previous_delivery_id = nil
+  local boundary_dead_at_ms = nil
+  local first_after_boundary_dead_at_ms = nil
+  local after = nil
+
+  repeat
+    local page = fkst.observe({
+      limit = limit,
+      include = { "errors", "entities" },
+      page = { section = "dead_letters", after = after },
+    })
+    page_count = page_count + 1
+    if page_count > 2 then
+      error("unexpected additional dead-letter page")
+    end
+    if page_count == 1 then
+      first_page_count = #page.dead_letters
+    end
+    for _, entry in ipairs(page.dead_letters) do
+      local expected_delivery_id = string.format("dead-%05d", total)
+      if seen[entry.delivery_id] then
+        duplicate_free = false
+      end
+      seen[entry.delivery_id] = true
+      if entry.delivery_id ~= expected_delivery_id then
+        ordered = false
+      end
+      if previous_dead_at_ms ~= nil then
+        if entry.dead_at_ms < previous_dead_at_ms
+          or (entry.dead_at_ms == previous_dead_at_ms
+            and entry.delivery_id <= previous_delivery_id) then
+          ordered = false
+        end
+      end
+      previous_dead_at_ms = entry.dead_at_ms
+      previous_delivery_id = entry.delivery_id
+      if total == limit - 1 then
+        boundary_dead_at_ms = entry.dead_at_ms
+      elseif total == limit then
+        first_after_boundary_dead_at_ms = entry.dead_at_ms
+      end
+      total = total + 1
+    end
+    after = page.page.next
+    if page_count == 1 then
+      first_has_next = after ~= nil
+    end
+    if after == nil then
+      final_page_count = #page.dead_letters
+    end
+  until after == nil
+
+  raise("seen", {
+    total = total,
+    expected_total = expected_total,
+    duplicate_free = duplicate_free,
+    ordered = ordered,
+    equal_timestamp_boundary = boundary_dead_at_ms == first_after_boundary_dead_at_ms,
+    page_count = page_count,
+    first_page_count = first_page_count,
+    first_has_next = first_has_next,
+    final_page_count = final_page_count,
+    terminal_has_next = after ~= nil,
+    legacy_count = #legacy.dead_letters,
+    legacy_truncated = legacy.truncated.dead_letters,
+    legacy_has_page = legacy.page ~= nil,
+  })
+end
+
+return M
+"#,
+    )
+    .unwrap();
+    write_single_package_workspace(host.path());
+
+    let run = framework_command()
+        .arg("run")
+        .arg(&probe)
+        .arg("--project-root")
+        .arg(host.path())
+        .arg("--package-root")
+        .arg(host.path())
+        .arg("--owner-namespace")
+        .arg(unit_name(host.path()))
+        .arg("--event")
+        .arg(r#"{"queue":"tick","payload":{}}"#)
+        .current_dir(host.path())
+        .env("FKST_RUNTIME_ROOT", host.path().join(".fkst/runtime"))
+        .env("FKST_DURABLE_ROOT", durable.path())
+        .output()
+        .unwrap();
+
+    assert_exit(&run, 0);
+    let raised = raised_payload(&run);
+    assert_eq!(raised["total"], MAX_OBSERVE_LIMIT + 1, "{raised}");
+    assert_eq!(raised["expected_total"], MAX_OBSERVE_LIMIT + 1, "{raised}");
+    assert_eq!(raised["duplicate_free"], true, "{raised}");
+    assert_eq!(raised["ordered"], true, "{raised}");
+    assert_eq!(raised["equal_timestamp_boundary"], true, "{raised}");
+    assert_eq!(raised["page_count"], 2, "{raised}");
+    assert_eq!(raised["first_page_count"], MAX_OBSERVE_LIMIT, "{raised}");
+    assert_eq!(raised["first_has_next"], true, "{raised}");
+    assert_eq!(raised["final_page_count"], 1, "{raised}");
+    assert_eq!(raised["terminal_has_next"], false, "{raised}");
+    assert_eq!(raised["legacy_count"], MAX_OBSERVE_LIMIT, "{raised}");
+    assert_eq!(raised["legacy_truncated"], true, "{raised}");
+    assert_eq!(raised["legacy_has_page"], false, "{raised}");
 }
 
 #[test]
