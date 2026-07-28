@@ -506,6 +506,34 @@ mod tests {
     }
 
     #[test]
+    fn non_page_snapshot_serialization_is_unchanged() {
+        let snapshot = DeliveryObserveSnapshot {
+            schema_version: 1,
+            generated_at_ms: 1,
+            source: DeliveryObserveSource {
+                durable_root: "/durable".to_string(),
+                database: "/durable/delivery.redb".to_string(),
+                read_semantics: "one read".to_string(),
+                history_semantics: "mutable".to_string(),
+            },
+            limits: DeliveryObserveLimits {
+                max_deliveries: 2,
+                max_dead_letters: 2,
+            },
+            truncated: DeliveryObserveTruncated::default(),
+            queues: Vec::new(),
+            deliveries: Vec::new(),
+            dead_letters: Vec::new(),
+            page: None,
+        };
+
+        assert_eq!(
+            serde_json::to_string(&snapshot).unwrap(),
+            r#"{"schema_version":1,"generated_at_ms":1,"source":{"durable_root":"/durable","database":"/durable/delivery.redb","read_semantics":"one read","history_semantics":"mutable"},"limits":{"max_deliveries":2,"max_dead_letters":2},"truncated":{"deliveries":false,"dead_letters":false},"queues":[],"deliveries":[],"dead_letters":[]}"#
+        );
+    }
+
+    #[test]
     fn observe_snapshot_reports_queue_state_without_payload_body() {
         let temp = TempDir::new().unwrap();
         let store = store(&temp);

@@ -427,6 +427,13 @@ function M.pipeline(event)
     include = { "errors", "entities" },
     page = { section = "dead_letters" },
   })
+  local malformed_ok, malformed_error = pcall(function()
+    return fkst.observe({
+      limit = 2,
+      include = { "errors", "entities" },
+      page = { section = "dead_letters", after = "malformed" },
+    })
+  end)
   local second = fkst.observe({
     limit = 2,
     include = { "errors", "entities" },
@@ -441,6 +448,8 @@ function M.pipeline(event)
     first_section = first.page.section,
     first_has_next = first.page.next ~= nil,
     first_count = #first.dead_letters,
+    malformed_failed_closed = not malformed_ok
+      and string.find(tostring(malformed_error), "observe dead-letter cursor invalid", 1, true) ~= nil,
     second_section = second.page.section,
     second_has_next = second.page.next ~= nil,
     second_count = #second.dead_letters,
@@ -479,6 +488,7 @@ return M
     assert_eq!(raised["first_section"], "dead_letters");
     assert_eq!(raised["first_has_next"], true);
     assert_eq!(raised["first_count"], 2, "{raised}");
+    assert_eq!(raised["malformed_failed_closed"], true, "{raised}");
     assert_eq!(raised["second_section"], "dead_letters");
     assert_eq!(raised["second_has_next"], false, "{raised}");
     assert_eq!(raised["second_count"], 1, "{raised}");
