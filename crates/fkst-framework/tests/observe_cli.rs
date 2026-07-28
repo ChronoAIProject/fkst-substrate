@@ -15,6 +15,7 @@ use support::manifest_fixture::{unit_name, write_single_package_workspace};
 
 const DELIVERY_BY_ID: TableDefinition<&str, &[u8]> = TableDefinition::new("delivery_by_id");
 const DEAD_BY_ID: TableDefinition<&str, &[u8]> = TableDefinition::new("dead_by_id");
+const DEAD_BY_TIME: TableDefinition<&str, ()> = TableDefinition::new("dead_by_time");
 
 fn framework_bin() -> &'static str {
     env!("CARGO_BIN_EXE_fkst-framework")
@@ -118,6 +119,44 @@ fn write_observe_fixture(durable_root: &Path) {
             serde_json::to_vec(&dead_record).unwrap().as_slice(),
         )
         .unwrap();
+    }
+    write.commit().unwrap();
+    drop(db);
+}
+
+fn write_dead_letter_page_fixture(durable_root: &Path) {
+    let db = Database::create(durable_root.join("delivery.redb")).unwrap();
+    let write = db.begin_write().unwrap();
+    {
+        write.open_table(DELIVERY_BY_ID).unwrap();
+        let mut dead = write.open_table(DEAD_BY_ID).unwrap();
+        let mut dead_by_time = write.open_table(DEAD_BY_TIME).unwrap();
+        for (delivery_id, dept, dead_at_ms) in [
+            ("dead-c", "middle", 1_201_u64),
+            ("dead-b", "alpha", 1_200_u64),
+            ("dead-a", "zeta", 1_200_u64),
+        ] {
+            let record = json!({
+                "delivery_id": delivery_id,
+                "queue": "input",
+                "dept": dept,
+                "source": null,
+                "observed_at_ms": 900,
+                "not_before_ms": 900,
+                "dead_at_ms": dead_at_ms,
+                "attempts": 3,
+                "redrive_count": 0,
+                "replayable": false,
+                "permanent": true,
+                "error_excerpt": "final failure",
+                "record": null
+            });
+            dead.insert(delivery_id, serde_json::to_vec(&record).unwrap().as_slice())
+                .unwrap();
+            dead_by_time
+                .insert(format!("{dead_at_ms:020}/{delivery_id}").as_str(), &())
+                .unwrap();
+        }
     }
     write.commit().unwrap();
     drop(db);
@@ -364,6 +403,95 @@ return M
         "stdout: {}",
         stdout(&run)
     );
+}
+
+#[test]
+fn fkst_observe_traverses_durable_dead_letters_in_two_pages() {
+    let host = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
+    let durable = tempfile::Builder::new()
+        .prefix("fkst-durable")
+        .tempdir()
+        .unwrap();
+    write_dead_letter_page_fixture(durable.path());
+    fs::create_dir_all(host.path().join("departments/probe")).unwrap();
+    let probe = host.path().join("departments/probe/main.lua");
+    fs::write(
+        &probe,
+        r#"
+local M = {}
+M.spec = { consumes = { "tick" }, produces = { "seen" }, ephemeral = { "tick" } }
+
+function M.pipeline(event)
+  local first = fkst.observe({
+    limit = 2,
+    include = { "errors", "entities" },
+    page = { section = "dead_letters" },
+  })
+  local malformed_ok, malformed_error = pcall(function()
+    return fkst.observe({
+      limit = 2,
+      include = { "errors", "entities" },
+      page = { section = "dead_letters", after = "malformed" },
+    })
+  end)
+  local second = fkst.observe({
+    limit = 2,
+    include = { "errors", "entities" },
+    page = { section = "dead_letters", after = first.page.next },
+  })
+  raise("seen", {
+    delivery_ids = {
+      first.dead_letters[1].delivery_id,
+      first.dead_letters[2].delivery_id,
+      second.dead_letters[1].delivery_id,
+    },
+    first_section = first.page.section,
+    first_has_next = first.page.next ~= nil,
+    first_count = #first.dead_letters,
+    malformed_failed_closed = not malformed_ok
+      and string.find(tostring(malformed_error), "observe dead-letter cursor invalid", 1, true) ~= nil,
+    second_section = second.page.section,
+    second_has_next = second.page.next ~= nil,
+    second_count = #second.dead_letters,
+  })
+end
+
+return M
+"#,
+    )
+    .unwrap();
+    write_single_package_workspace(host.path());
+
+    let run = framework_command()
+        .arg("run")
+        .arg(&probe)
+        .arg("--project-root")
+        .arg(host.path())
+        .arg("--package-root")
+        .arg(host.path())
+        .arg("--owner-namespace")
+        .arg(unit_name(host.path()))
+        .arg("--event")
+        .arg(r#"{"queue":"tick","payload":{}}"#)
+        .current_dir(host.path())
+        .env("FKST_RUNTIME_ROOT", host.path().join(".fkst/runtime"))
+        .env("FKST_DURABLE_ROOT", durable.path())
+        .output()
+        .unwrap();
+
+    assert_exit(&run, 0);
+    let raised = raised_payload(&run);
+    assert_eq!(
+        raised["delivery_ids"],
+        json!(["dead-a", "dead-b", "dead-c"])
+    );
+    assert_eq!(raised["first_section"], "dead_letters");
+    assert_eq!(raised["first_has_next"], true);
+    assert_eq!(raised["first_count"], 2, "{raised}");
+    assert_eq!(raised["malformed_failed_closed"], true, "{raised}");
+    assert_eq!(raised["second_section"], "dead_letters");
+    assert_eq!(raised["second_has_next"], false, "{raised}");
+    assert_eq!(raised["second_count"], 1, "{raised}");
 }
 
 #[test]

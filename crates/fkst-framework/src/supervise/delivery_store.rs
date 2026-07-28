@@ -4,8 +4,9 @@
 #[cfg(test)]
 use super::delivery_index::count_index_entries;
 use super::delivery_index::{
-    collect_due_keys, make_dead_due_index_key, make_index_key, parse_dead_due_index_key,
-    DEAD_BY_DEPT_DUE, LEASED_BY_DEPT_UNTIL, READY_BY_DEPT_DUE,
+    collect_due_keys, make_dead_due_index_key, make_dead_time_index_key, make_index_key,
+    parse_dead_due_index_key, parse_dead_time_index_key, DEAD_BY_DEPT_DUE, LEASED_BY_DEPT_UNTIL,
+    READY_BY_DEPT_DUE,
 };
 #[cfg(test)]
 use super::delivery_retry::ERROR_EXCERPT_LIMIT;
@@ -21,13 +22,14 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::time::Duration;
 
-const SCHEMA_VERSION: &str = "9";
+const SCHEMA_VERSION: &str = "10";
 const TERMINAL_DEAD_RETENTION_MS: u64 = 24 * 60 * 60 * 1_000;
 const TERMINAL_DEAD_COMPACTION_LIMIT: usize = 1_024;
 const TERMINAL_SUPPRESSION_SLOTS: u64 = 16_777_216;
 
 const DELIVERY_BY_ID: TableDefinition<&str, &[u8]> = TableDefinition::new("delivery_by_id");
 const DEAD_BY_ID: TableDefinition<&str, &[u8]> = TableDefinition::new("dead_by_id");
+const DEAD_BY_TIME: TableDefinition<&str, ()> = TableDefinition::new("dead_by_time");
 const TERMINAL_DEAD_BY_TIME: TableDefinition<&str, ()> =
     TableDefinition::new("terminal_dead_by_time");
 const TERMINAL_SUPPRESSED_BY_ID: TableDefinition<&str, ()> =
@@ -120,15 +122,21 @@ impl DeliveryStore {
                 write.delete_table(DEAD_BY_ID)?;
             }
             write.open_table(DEAD_BY_ID)?;
+            write.open_table(DEAD_BY_TIME)?;
             write.open_table(TERMINAL_DEAD_BY_TIME)?;
             write.open_table(TERMINAL_SUPPRESSION_BY_SLOT)?;
             if current_version.as_deref() != Some(SCHEMA_VERSION) {
                 delete_old_global_indexes(&write)?;
                 rebuild_due_indexes(&write, DELIVERY_BY_ID)?;
-                if current_version.as_deref() != Some("3") {
+                if current_version
+                    .as_deref()
+                    .and_then(|version| version.parse::<u32>().ok())
+                    .map_or(true, |version| version < 3)
+                {
                     mark_existing_dead_records_permanent(&write)?;
                 }
                 rebuild_dead_due_index(&write)?;
+                rebuild_dead_time_index(&write)?;
                 rebuild_terminal_dead_tables(&write)?;
                 import_legacy_terminal_suppressed_ids(&write)?;
                 drop_legacy_terminal_suppressed_table(&write)?;
@@ -302,6 +310,7 @@ impl DeliveryStore {
             let mut lease_index = write.open_table(LEASED_BY_DEPT_UNTIL)?;
             let mut dead_table = write.open_table(DEAD_BY_ID)?;
             let mut dead_index = write.open_table(DEAD_BY_DEPT_DUE)?;
+            let mut dead_by_time = write.open_table(DEAD_BY_TIME)?;
             for delivery_id in candidates {
                 let Some(mut record) = read_delivery_table(&delivery, &delivery_id)? else {
                     continue;
@@ -369,7 +378,28 @@ impl DeliveryStore {
                     record: Some(record.clone()),
                 };
                 let bytes = serde_json::to_vec(&dead)?;
+                if let Some(previous) = read_dead_table(&dead_table, delivery_id.as_str())? {
+                    dead_by_time.remove(
+                        make_dead_time_index_key(
+                            previous.dead_at_ms,
+                            previous.delivery_id.as_str(),
+                        )
+                        .as_str(),
+                    )?;
+                    dead_index.remove(
+                        make_dead_due_index_key(
+                            &previous.dept,
+                            previous.dead_at_ms,
+                            previous.delivery_id.as_str(),
+                        )
+                        .as_str(),
+                    )?;
+                }
                 dead_table.insert(delivery_id.as_str(), bytes.as_slice())?;
+                dead_by_time.insert(
+                    make_dead_time_index_key(dead.dead_at_ms, delivery_id.as_str()).as_str(),
+                    &(),
+                )?;
                 dead_index.insert(
                     make_dead_due_index_key(&dead.dept, dead.dead_at_ms, delivery_id.as_str())
                         .as_str(),
@@ -383,6 +413,7 @@ impl DeliveryStore {
             drop(lease_index);
             drop(dead_table);
             drop(dead_index);
+            drop(dead_by_time);
             compact_terminal_dead_records(&write, now_ms)?;
         }
         if sweep.is_empty() {
@@ -730,9 +761,27 @@ impl DeliveryStore {
                         };
                         let bytes = serde_json::to_vec(&dead)?;
                         let mut dead_table = write.open_table(DEAD_BY_ID)?;
+                        let mut dead_by_time = write.open_table(DEAD_BY_TIME)?;
+                        let mut dead_index = write.open_table(DEAD_BY_DEPT_DUE)?;
+                        if let Some(previous) = read_dead_table(&dead_table, delivery_id)? {
+                            dead_by_time.remove(
+                                make_dead_time_index_key(previous.dead_at_ms, delivery_id).as_str(),
+                            )?;
+                            dead_index.remove(
+                                make_dead_due_index_key(
+                                    &previous.dept,
+                                    previous.dead_at_ms,
+                                    delivery_id,
+                                )
+                                .as_str(),
+                            )?;
+                        }
                         dead_table.insert(delivery_id, bytes.as_slice())?;
+                        dead_by_time.insert(
+                            make_dead_time_index_key(dead.dead_at_ms, delivery_id).as_str(),
+                            &(),
+                        )?;
                         if failure.replayable {
-                            let mut dead_index = write.open_table(DEAD_BY_DEPT_DUE)?;
                             dead_index.insert(
                                 make_dead_due_index_key(&dead.dept, dead.dead_at_ms, delivery_id)
                                     .as_str(),
@@ -827,15 +876,26 @@ impl DeliveryStore {
             let mut ready = write.open_table(READY_BY_DEPT_DUE)?;
             let mut dead_index = write.open_table(DEAD_BY_DEPT_DUE)?;
             let mut terminal_index = write.open_table(TERMINAL_DEAD_BY_TIME)?;
+            let mut dead_by_time = write.open_table(DEAD_BY_TIME)?;
             for key in due_keys {
                 let delivery_id = key.delivery_id;
                 let Some(mut dead) = read_dead_table(&dead_table, &delivery_id)? else {
                     dead_index.remove(key.key.as_str())?;
+                    dead_by_time.remove(
+                        make_dead_time_index_key(key.due_ms, delivery_id.as_str()).as_str(),
+                    )?;
                     mutated = true;
                     continue;
                 };
                 if dead.dead_at_ms != key.due_ms {
                     dead_index.remove(key.key.as_str())?;
+                    dead_by_time.remove(
+                        make_dead_time_index_key(key.due_ms, delivery_id.as_str()).as_str(),
+                    )?;
+                    dead_by_time.insert(
+                        make_dead_time_index_key(dead.dead_at_ms, delivery_id.as_str()).as_str(),
+                        &(),
+                    )?;
                     if should_index_dead_record(&dead) {
                         dead_index.insert(
                             make_dead_due_index_key(&dead.dept, dead.dead_at_ms, &delivery_id)
@@ -931,6 +991,9 @@ impl DeliveryStore {
                     &(),
                 )?;
                 dead_table.remove(delivery_id.as_str())?;
+                dead_by_time.remove(
+                    make_dead_time_index_key(dead.dead_at_ms, delivery_id.as_str()).as_str(),
+                )?;
                 result.redriven.push(record);
                 mutated = true;
             }
@@ -939,6 +1002,7 @@ impl DeliveryStore {
             drop(ready);
             drop(dead_index);
             drop(terminal_index);
+            drop(dead_by_time);
             mutated |= compact_terminal_dead_records(&write, now_ms)? > 0;
         }
         if mutated {
@@ -1094,6 +1158,59 @@ impl DeliveryStore {
         Ok(())
     }
 
+    pub(crate) fn scan_records_for_dead_letter_page(
+        &self,
+        after: Option<(u64, &str)>,
+        limit: usize,
+        mut visit_delivery: impl FnMut(DeliveryRecord) -> Result<()>,
+    ) -> Result<Vec<DeadRecord>> {
+        let read = self.db.begin_read()?;
+        let delivery = read.open_table(DELIVERY_BY_ID)?;
+        let dead = read.open_table(DEAD_BY_ID)?;
+        let dead_by_time = read.open_table(DEAD_BY_TIME)?;
+
+        for entry in delivery.iter()? {
+            let (delivery_id, bytes) = entry?;
+            let delivery_id = delivery_id.value().to_string();
+            let record = match serde_json::from_slice::<DeliveryRecord>(bytes.value()) {
+                Ok(record) => record,
+                Err(err) => {
+                    tracing::warn!(
+                        delivery_id = %delivery_id,
+                        error = %err,
+                        "skipping undecodable delivery record"
+                    );
+                    continue;
+                }
+            };
+            visit_delivery(record)?;
+        }
+
+        let mut records = Vec::new();
+        if let Some((dead_at_ms, delivery_id)) = after {
+            let start = make_dead_time_index_key(dead_at_ms, delivery_id);
+            for entry in dead_by_time.range::<&str>((
+                std::ops::Bound::Excluded(start.as_str()),
+                std::ops::Bound::Unbounded,
+            ))? {
+                let (key, _) = entry?;
+                collect_dead_letter_page_record(&dead, key.value(), &mut records)?;
+                if records.len() >= limit {
+                    break;
+                }
+            }
+        } else {
+            for entry in dead_by_time.iter()? {
+                let (key, _) = entry?;
+                collect_dead_letter_page_record(&dead, key.value(), &mut records)?;
+                if records.len() >= limit {
+                    break;
+                }
+            }
+        }
+        Ok(records)
+    }
+
     #[cfg(test)]
     fn ready_index_len(&self) -> Result<usize> {
         let read = self.db.begin_read()?;
@@ -1112,6 +1229,13 @@ impl DeliveryStore {
     fn dead_due_index_len(&self) -> Result<usize> {
         let read = self.db.begin_read()?;
         let dead = read.open_table(DEAD_BY_DEPT_DUE)?;
+        count_index_entries(&dead)
+    }
+
+    #[cfg(test)]
+    fn dead_time_index_len(&self) -> Result<usize> {
+        let read = self.db.begin_read()?;
+        let dead = read.open_table(DEAD_BY_TIME)?;
         count_index_entries(&dead)
     }
 
@@ -1255,6 +1379,30 @@ fn rebuild_dead_due_index(write: &redb::WriteTransaction) -> Result<()> {
                 &(),
             )?;
         }
+    }
+    Ok(())
+}
+
+fn rebuild_dead_time_index(write: &redb::WriteTransaction) -> Result<()> {
+    write.delete_table(DEAD_BY_TIME)?;
+    let dead_rows = {
+        let dead = write.open_table(DEAD_BY_ID)?;
+        let mut rows = Vec::new();
+        for entry in dead.iter()? {
+            let (key, bytes) = entry?;
+            rows.push((key.value().to_string(), bytes.value().to_vec()));
+        }
+        rows
+    };
+    let mut dead_by_time = write.open_table(DEAD_BY_TIME)?;
+    for (delivery_id, bytes) in dead_rows {
+        let Some(record) = decode_dead_record(&delivery_id, &bytes) else {
+            continue;
+        };
+        dead_by_time.insert(
+            make_dead_time_index_key(record.dead_at_ms, &delivery_id).as_str(),
+            &(),
+        )?;
     }
     Ok(())
 }
@@ -1428,15 +1576,24 @@ fn compact_terminal_dead_records(write: &redb::WriteTransaction, now_ms: u64) ->
     let mut dead = write.open_table(DEAD_BY_ID)?;
     let mut terminal_index = write.open_table(TERMINAL_DEAD_BY_TIME)?;
     let mut dead_due_index = write.open_table(DEAD_BY_DEPT_DUE)?;
+    let mut dead_by_time = write.open_table(DEAD_BY_TIME)?;
     for key in stale_keys {
         let delivery_id = key.delivery_id;
         let Some(record) = read_dead_table(&dead, &delivery_id)? else {
             terminal_index.remove(key.key.as_str())?;
+            dead_by_time
+                .remove(make_dead_time_index_key(key.due_ms, delivery_id.as_str()).as_str())?;
             compacted += 1;
             continue;
         };
         if record.dead_at_ms != key.due_ms || !is_terminal_dead_record(&record) {
             terminal_index.remove(key.key.as_str())?;
+            dead_by_time
+                .remove(make_dead_time_index_key(key.due_ms, delivery_id.as_str()).as_str())?;
+            dead_by_time.insert(
+                make_dead_time_index_key(record.dead_at_ms, delivery_id.as_str()).as_str(),
+                &(),
+            )?;
             if is_terminal_dead_record(&record) {
                 terminal_index.insert(
                     make_dead_due_index_key(&record.dept, record.dead_at_ms, &delivery_id).as_str(),
@@ -1454,6 +1611,8 @@ fn compact_terminal_dead_records(write: &redb::WriteTransaction, now_ms: u64) ->
             break;
         }
         dead.remove(delivery_id.as_str())?;
+        dead_by_time
+            .remove(make_dead_time_index_key(record.dead_at_ms, delivery_id.as_str()).as_str())?;
         terminal_index.remove(key.key.as_str())?;
         dead_due_index.remove(
             make_dead_due_index_key(&record.dept, record.dead_at_ms, &delivery_id).as_str(),
@@ -1461,6 +1620,28 @@ fn compact_terminal_dead_records(write: &redb::WriteTransaction, now_ms: u64) ->
         compacted += 1;
     }
     Ok(compacted)
+}
+
+fn collect_dead_letter_page_record(
+    dead: &redb::ReadOnlyTable<&str, &[u8]>,
+    index_key: &str,
+    records: &mut Vec<DeadRecord>,
+) -> Result<()> {
+    let parsed = parse_dead_time_index_key(index_key)?;
+    let record = read_dead_table_read_only(dead, &parsed.delivery_id)?.ok_or_else(|| {
+        anyhow::anyhow!(
+            "dead-letter page index missing record for delivery_id: {}",
+            parsed.delivery_id
+        )
+    })?;
+    if record.dead_at_ms != parsed.due_ms || record.delivery_id != parsed.delivery_id {
+        anyhow::bail!(
+            "dead-letter page index mismatch for delivery_id: {}",
+            parsed.delivery_id
+        );
+    }
+    records.push(record);
+    Ok(())
 }
 
 fn collect_compactable_terminal_dead_keys(
@@ -1649,6 +1830,13 @@ mod tests {
                     &(),
                 )
                 .unwrap();
+            let mut dead_by_time = write.open_table(DEAD_BY_TIME).unwrap();
+            dead_by_time
+                .insert(
+                    make_dead_time_index_key(dead.dead_at_ms, delivery_id).as_str(),
+                    &(),
+                )
+                .unwrap();
         }
         write.commit().unwrap();
     }
@@ -1679,6 +1867,13 @@ mod tests {
             terminal_index
                 .insert(
                     make_dead_due_index_key(&dead.dept, dead.dead_at_ms, delivery_id).as_str(),
+                    &(),
+                )
+                .unwrap();
+            let mut dead_by_time = write.open_table(DEAD_BY_TIME).unwrap();
+            dead_by_time
+                .insert(
+                    make_dead_time_index_key(dead.dead_at_ms, delivery_id).as_str(),
                     &(),
                 )
                 .unwrap();
@@ -2012,6 +2207,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(expired.dead_lettered.len(), 1);
+        assert_eq!(store.dead_time_index_len().unwrap(), 1);
         let dead = store.get_dead("orphan").unwrap().unwrap();
         assert_eq!(dead.delivery_id, "orphan");
         assert_eq!(dead.queue, "missing");
@@ -2031,6 +2227,27 @@ mod tests {
         assert!(store.get("orphan").unwrap().is_none());
         assert_eq!(store.ready_index_len().unwrap(), 0);
         assert_eq!(store.dead_due_index_len().unwrap(), 1);
+    }
+
+    #[test]
+    fn subscriber_absence_sweep_compacts_stale_terminal_dead_record() {
+        let temp = TempDir::new().unwrap();
+        let store = store(&temp);
+        insert_permanent_dead(&store, "old", 100);
+        let mut orphan = record("orphan", 100);
+        orphan.queue = "missing".to_string();
+        store.enqueue(&orphan).unwrap();
+        let now_ms = 100_u64
+            .saturating_add(TERMINAL_DEAD_RETENTION_MS)
+            .saturating_add(1);
+
+        let sweep = store
+            .sweep_subscriber_absence(&BTreeSet::new(), now_ms, Duration::ZERO, 10)
+            .unwrap();
+
+        assert_eq!(sweep.marked_absent.len(), 1);
+        assert!(store.get_dead("old").unwrap().is_none());
+        assert_eq!(store.dead_time_index_len().unwrap(), 0);
     }
 
     #[test]
@@ -2347,6 +2564,32 @@ mod tests {
         assert!(dead_json.get("payload").is_none());
         assert!(dead_json.get("record").is_some());
         assert_eq!(store.dead_due_index_len().unwrap(), 1);
+        assert_eq!(store.dead_time_index_len().unwrap(), 1);
+    }
+
+    #[test]
+    fn repeated_dead_letter_replaces_page_index_tuple() {
+        let temp = TempDir::new().unwrap();
+        let store = store(&temp);
+        store.enqueue(&record("one", 100)).unwrap();
+        store.lease(100, 1, Duration::from_millis(50)).unwrap();
+        store
+            .retry("one", 1, &failure("first", true), &policy(1), 120)
+            .unwrap();
+        store.enqueue(&record("one", 121)).unwrap();
+        store.lease(121, 1, Duration::from_millis(50)).unwrap();
+        store
+            .retry("one", 1, &failure("second", true), &policy(1), 130)
+            .unwrap();
+
+        let page = store
+            .scan_records_for_dead_letter_page(None, 2, |_| Ok(()))
+            .unwrap();
+
+        assert_eq!(page.len(), 1);
+        assert_eq!(page[0].delivery_id, "one");
+        assert_eq!(page[0].dead_at_ms, 130);
+        assert_eq!(store.dead_time_index_len().unwrap(), 1);
     }
 
     #[test]
@@ -2440,6 +2683,7 @@ mod tests {
         assert!(early.redriven.is_empty());
         assert!(early.permanent.is_empty());
         assert_eq!(store.dead_due_index_len().unwrap(), 1);
+        assert_eq!(store.dead_time_index_len().unwrap(), 1);
         let due = store.redrive_due(&policy, 170, 10).unwrap();
 
         assert_eq!(due.redriven.len(), 1);
@@ -2458,6 +2702,7 @@ mod tests {
         assert_eq!(leased.len(), 1);
         assert_eq!(leased[0].redrive_count, 1);
         assert_eq!(store.dead_due_index_len().unwrap(), 0);
+        assert_eq!(store.dead_time_index_len().unwrap(), 0);
     }
 
     #[test]
@@ -2843,6 +3088,7 @@ mod tests {
         assert!(store.get_dead("old").unwrap().is_none());
         assert!(store.get_dead("young").unwrap().is_some());
         assert_eq!(store.terminal_dead_index_len().unwrap(), 1);
+        assert_eq!(store.dead_time_index_len().unwrap(), 1);
         assert_eq!(store.terminal_suppression_slot_len().unwrap(), 2);
         assert!(store.terminal_suppresses("old").unwrap());
         assert!(store.terminal_suppresses("young").unwrap());
@@ -3328,6 +3574,17 @@ mod tests {
         let store = DeliveryStore::open(&path).unwrap();
 
         assert_eq!(store.dead_due_index_len().unwrap(), 1);
+        assert_eq!(store.dead_time_index_len().unwrap(), 3);
+        let dead_page = store
+            .scan_records_for_dead_letter_page(None, 4, |_| Ok(()))
+            .unwrap();
+        assert_eq!(
+            dead_page
+                .iter()
+                .map(|record| record.delivery_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["replayable", "permanent", "missing-record"]
+        );
         let redriven = store
             .redrive_due(
                 &RedrivePolicy {
@@ -3341,6 +3598,7 @@ mod tests {
         assert_eq!(redriven.redriven.len(), 1);
         assert_eq!(redriven.redriven[0].delivery_id, "replayable");
         assert_eq!(store.dead_due_index_len().unwrap(), 0);
+        assert_eq!(store.dead_time_index_len().unwrap(), 2);
         assert!(store.get_dead("permanent").unwrap().unwrap().permanent);
         assert!(store
             .get_dead("missing-record")

@@ -80,18 +80,27 @@ async fn serve_connection(
             .context("read observe request")?;
     }
     let response = match serde_json::from_str::<ObserveSocketRequest>(&line) {
-        Ok(request) => match observe_snapshot(
-            &store,
-            &endpoint.durable_root,
-            &endpoint.database,
-            &DeliveryObserveOptions {
-                now_ms: request.now_ms,
-                limit: request.limit.clamp(1, MAX_LIMIT),
-                since: request.since,
-                current_subscriber_queues: Some(current_subscriber_queues),
-            },
+        Ok(request) => match crate::observe::validate_dead_letter_page(
+            request.page.as_ref(),
+            request.since.as_deref(),
         ) {
-            Ok(snapshot) => ObserveSocketResponse::Ok { snapshot },
+            Ok(dead_letter_page) => match observe_snapshot(
+                &store,
+                &endpoint.durable_root,
+                &endpoint.database,
+                &DeliveryObserveOptions {
+                    now_ms: request.now_ms,
+                    limit: request.limit.clamp(1, MAX_LIMIT),
+                    since: request.since,
+                    dead_letter_page,
+                    current_subscriber_queues: Some(current_subscriber_queues),
+                },
+            ) {
+                Ok(snapshot) => ObserveSocketResponse::Ok { snapshot },
+                Err(err) => ObserveSocketResponse::Err {
+                    error: err.to_string(),
+                },
+            },
             Err(err) => ObserveSocketResponse::Err {
                 error: err.to_string(),
             },
@@ -100,7 +109,12 @@ async fn serve_connection(
             error: format!("decode observe request: {err}"),
         },
     };
-    let mut body = serde_json::to_vec(&response)?;
+    write_response(&mut stream, &response).await?;
+    Ok(())
+}
+
+async fn write_response(stream: &mut UnixStream, response: &ObserveSocketResponse) -> Result<()> {
+    let mut body = serde_json::to_vec(response)?;
     body.push(b'\n');
     stream
         .write_all(&body)
@@ -184,6 +198,7 @@ mod tests {
                 &observe::ObserveSnapshotOptions {
                     limit: 10,
                     since: None,
+                    page: None,
                 },
             )
         })
@@ -200,6 +215,29 @@ mod tests {
             QueueSubscriberStatus::Current
         );
         assert_eq!(snapshot.queues[0].has_current_subscriber, Some(true));
+
+        let page_layout = DurableLayout::new(temp.path()).unwrap();
+        let page_snapshot = tokio::task::spawn_blocking(move || {
+            observe::request_live_snapshot(
+                &page_layout,
+                &observe::ObserveSnapshotOptions {
+                    limit: 10,
+                    since: None,
+                    page: Some(observe::DeadLetterPageRequest {
+                        section: "dead_letters".to_string(),
+                        after: None,
+                    }),
+                },
+            )
+        })
+        .await
+        .unwrap()
+        .unwrap()
+        .expect("live owner process should answer paged observe request");
+
+        let page = page_snapshot.page.expect("page metadata must be present");
+        assert_eq!(page.section, "dead_letters");
+        assert_eq!(page.next, None);
 
         handle.abort();
     }

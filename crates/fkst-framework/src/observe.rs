@@ -3,7 +3,8 @@ use crate::supervise::delivery_observe::{
 };
 use crate::supervise::delivery_store::DeliveryStore;
 use anyhow::{Context, Result};
-use fkst_common::DurableLayout;
+use base64::Engine;
+use fkst_common::{validate_runtime_key, DurableLayout};
 use serde::{Deserialize, Serialize};
 use std::io::{BufReader, Read, Write};
 use std::os::unix::net::UnixStream;
@@ -24,6 +25,26 @@ pub(crate) struct ObserveOptions {
 pub(crate) struct ObserveSnapshotOptions {
     pub(crate) limit: usize,
     pub(crate) since: Option<String>,
+    pub(crate) page: Option<DeadLetterPageRequest>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct DeadLetterPageRequest {
+    pub(crate) section: String,
+    #[serde(default)]
+    pub(crate) after: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct DeadLetterPageOptions {
+    pub(crate) after: Option<DeadLetterPageCursor>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct DeadLetterPageCursor {
+    pub(crate) dead_at_ms: u64,
+    pub(crate) delivery_id: String,
 }
 
 pub(crate) fn parse_args(args: &[String]) -> Result<ObserveOptions> {
@@ -68,6 +89,7 @@ pub(crate) fn run(options: ObserveOptions) -> Result<i32> {
         &ObserveSnapshotOptions {
             limit: options.limit,
             since: None,
+            page: None,
         },
     )?;
     if options.json {
@@ -84,6 +106,8 @@ pub(crate) fn snapshot_for_durable_root(
 ) -> Result<DeliveryObserveSnapshot> {
     let limit = validate_limit(options.limit)?;
     validate_since(options.since.as_deref())?;
+    let dead_letter_page =
+        validate_dead_letter_page(options.page.as_ref(), options.since.as_deref())?;
     let durable_root = durable_root.into();
     let layout = DurableLayout::new(&durable_root)?;
     let database = layout.delivery_db_path();
@@ -92,6 +116,7 @@ pub(crate) fn snapshot_for_durable_root(
         &ObserveSnapshotOptions {
             limit,
             since: options.since.clone(),
+            page: options.page.clone(),
         },
     )? {
         Some(snapshot) => Ok(snapshot),
@@ -105,6 +130,7 @@ pub(crate) fn snapshot_for_durable_root(
                     now_ms: now_ms(),
                     limit,
                     since: options.since.clone(),
+                    dead_letter_page,
                     current_subscriber_queues: None,
                 },
             )
@@ -136,6 +162,7 @@ pub(crate) fn request_live_snapshot(
     let request = ObserveSocketRequest {
         limit: options.limit,
         since: options.since.clone(),
+        page: options.page.clone(),
         now_ms: now_ms(),
     };
     serde_json::to_writer(&mut stream, &request)?;
@@ -166,6 +193,8 @@ pub(crate) struct ObserveSocketRequest {
     pub(crate) limit: usize,
     #[serde(default)]
     pub(crate) since: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) page: Option<DeadLetterPageRequest>,
     pub(crate) now_ms: u64,
 }
 
@@ -278,6 +307,69 @@ pub(crate) fn validate_since(since: Option<&str>) -> Result<()> {
     Ok(())
 }
 
+pub(crate) fn validate_dead_letter_page(
+    page: Option<&DeadLetterPageRequest>,
+    since: Option<&str>,
+) -> Result<Option<DeadLetterPageOptions>> {
+    let Some(page) = page else {
+        return Ok(None);
+    };
+    if page.section != "dead_letters" {
+        anyhow::bail!("fkst.observe page section must be `dead_letters`");
+    }
+    if since.is_some() {
+        anyhow::bail!("fkst.observe page cannot be combined with since");
+    }
+    let after = page
+        .after
+        .as_deref()
+        .map(decode_dead_letter_cursor)
+        .transpose()?;
+    Ok(Some(DeadLetterPageOptions { after }))
+}
+
+pub(crate) fn encode_dead_letter_cursor(cursor: &DeadLetterPageCursor) -> Result<String> {
+    let envelope = DeadLetterCursorEnvelope {
+        version: 1,
+        section: "dead_letters".to_string(),
+        dead_at_ms: cursor.dead_at_ms,
+        delivery_id: cursor.delivery_id.clone(),
+    };
+    Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(serde_json::to_vec(&envelope)?))
+}
+
+fn decode_dead_letter_cursor(encoded: &str) -> Result<DeadLetterPageCursor> {
+    let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(encoded)
+        .map_err(|err| anyhow::anyhow!("observe dead-letter cursor invalid: base64: {err}"))?;
+    let envelope: DeadLetterCursorEnvelope = serde_json::from_slice(&decoded)
+        .map_err(|err| anyhow::anyhow!("observe dead-letter cursor invalid: json: {err}"))?;
+    if envelope.version != 1 {
+        anyhow::bail!(
+            "observe dead-letter cursor invalid: unsupported version {}",
+            envelope.version
+        );
+    }
+    if envelope.section != "dead_letters" {
+        anyhow::bail!("observe dead-letter cursor invalid: section mismatch");
+    }
+    validate_runtime_key(&envelope.delivery_id)
+        .map_err(|err| anyhow::anyhow!("observe dead-letter cursor invalid: delivery_id: {err}"))?;
+    Ok(DeadLetterPageCursor {
+        dead_at_ms: envelope.dead_at_ms,
+        delivery_id: envelope.delivery_id,
+    })
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct DeadLetterCursorEnvelope {
+    version: u32,
+    section: String,
+    dead_at_ms: u64,
+    delivery_id: String,
+}
+
 fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -289,6 +381,10 @@ fn now_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn cursor_fixture(value: serde_json::Value) -> String {
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(serde_json::to_vec(&value).unwrap())
+    }
 
     #[test]
     fn parse_requires_durable_root() {
@@ -315,10 +411,53 @@ mod tests {
             &ObserveSnapshotOptions {
                 limit: DEFAULT_LIMIT,
                 since: Some(String::new()),
+                page: None,
             },
         )
         .unwrap_err();
 
         assert!(format!("{err:#}").contains("observe since cursor must not be empty"));
+    }
+
+    #[test]
+    fn dead_letter_cursor_rejects_invalid_envelope() {
+        for cursor in [
+            cursor_fixture(serde_json::json!({
+                "version": 2,
+                "section": "dead_letters",
+                "dead_at_ms": 10,
+                "delivery_id": "dead-one"
+            })),
+            cursor_fixture(serde_json::json!({
+                "version": 1,
+                "section": "deliveries",
+                "dead_at_ms": 10,
+                "delivery_id": "dead-one"
+            })),
+            cursor_fixture(serde_json::json!({
+                "version": 1,
+                "section": "dead_letters",
+                "dead_at_ms": 10,
+                "delivery_id": "bad key"
+            })),
+        ] {
+            let err = decode_dead_letter_cursor(&cursor).unwrap_err();
+            assert!(format!("{err:#}").contains("observe dead-letter cursor invalid"));
+        }
+    }
+
+    #[test]
+    fn non_page_socket_request_serialization_is_unchanged() {
+        let request = ObserveSocketRequest {
+            limit: DEFAULT_LIMIT,
+            since: None,
+            page: None,
+            now_ms: 1,
+        };
+
+        assert_eq!(
+            serde_json::to_string(&request).unwrap(),
+            r#"{"limit":500,"since":null,"now_ms":1}"#
+        );
     }
 }
