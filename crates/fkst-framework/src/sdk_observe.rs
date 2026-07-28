@@ -116,6 +116,7 @@ struct ObserveSdkOptions {
     limit: usize,
     include: Option<BTreeSet<String>>,
     since: Option<String>,
+    page: Option<crate::observe::DeadLetterPageRequest>,
 }
 
 impl ObserveSdkOptions {
@@ -125,6 +126,7 @@ impl ObserveSdkOptions {
                 limit: crate::observe::DEFAULT_LIMIT,
                 include: None,
                 since: None,
+                page: None,
             });
         };
         reject_unknown_options(&opts)?;
@@ -135,10 +137,12 @@ impl ObserveSdkOptions {
         let include = parse_include(opts.get::<Option<Table>>("include")?)?;
         let since = opts.get::<Option<String>>("since")?;
         crate::observe::validate_since(since.as_deref()).map_err(mlua::Error::external)?;
+        let page = parse_page(opts.get::<Option<Table>>("page")?, since.as_deref())?;
         Ok(Self {
             limit,
             include,
             since,
+            page,
         })
     }
 
@@ -146,10 +150,20 @@ impl ObserveSdkOptions {
         crate::observe::ObserveSnapshotOptions {
             limit: self.limit,
             since: self.since.clone(),
+            page: self.page.clone(),
         }
     }
 
     fn apply_to_mock(&self, mut snapshot: JsonValue) -> mlua::Result<JsonValue> {
+        if let Some(page_request) = &self.page {
+            let page = crate::observe::validate_dead_letter_page(
+                Some(page_request),
+                self.since.as_deref(),
+            )
+            .map_err(mlua::Error::external)?
+            .expect("page request must produce page options");
+            apply_dead_letter_page(&mut snapshot, &page, self.limit)?;
+        }
         if let Some(since) = &self.since {
             apply_since(&mut snapshot, since)?;
         }
@@ -165,6 +179,90 @@ impl ObserveSdkOptions {
     }
 }
 
+fn apply_dead_letter_page(
+    snapshot: &mut JsonValue,
+    page: &crate::observe::DeadLetterPageOptions,
+    limit: usize,
+) -> mlua::Result<()> {
+    let object = snapshot.as_object_mut().ok_or_else(|| {
+        mlua::Error::external("fkst.observe snapshot must be an object when page is set")
+    })?;
+    let mut keyed = {
+        let entries = object
+            .get_mut("dead_letters")
+            .ok_or_else(|| {
+                mlua::Error::external(
+                    "fkst.observe snapshot field `dead_letters` is required when page is set",
+                )
+            })?
+            .as_array_mut()
+            .ok_or_else(|| {
+                mlua::Error::external("fkst.observe snapshot field `dead_letters` must be an array")
+            })?;
+        entries
+            .drain(..)
+            .map(|entry| {
+                let dead_at_ms = entry
+                    .get("dead_at_ms")
+                    .and_then(JsonValue::as_u64)
+                    .ok_or_else(|| {
+                        mlua::Error::external(
+                            "fkst.observe dead_letters page entry requires integer dead_at_ms",
+                        )
+                    })?;
+                let delivery_id = entry
+                    .get("delivery_id")
+                    .and_then(JsonValue::as_str)
+                    .filter(|delivery_id| !delivery_id.is_empty())
+                    .ok_or_else(|| {
+                        mlua::Error::external(
+                            "fkst.observe dead_letters page entry requires delivery_id",
+                        )
+                    })?
+                    .to_string();
+                Ok((dead_at_ms, delivery_id, entry))
+            })
+            .collect::<mlua::Result<Vec<_>>>()?
+    };
+    keyed.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
+    if let Some(after) = &page.after {
+        keyed.retain(|entry| {
+            (entry.0, entry.1.as_str()) > (after.dead_at_ms, after.delivery_id.as_str())
+        });
+    }
+    let has_more = keyed.len() > limit;
+    keyed.truncate(limit);
+    let next = if has_more {
+        keyed
+            .last()
+            .map(|entry| {
+                crate::observe::encode_dead_letter_cursor(&crate::observe::DeadLetterPageCursor {
+                    dead_at_ms: entry.0,
+                    delivery_id: entry.1.clone(),
+                })
+                .map_err(mlua::Error::external)
+            })
+            .transpose()?
+    } else {
+        None
+    };
+    *object
+        .get_mut("dead_letters")
+        .expect("dead_letters field was validated") =
+        JsonValue::Array(keyed.into_iter().map(|(_, _, entry)| entry).collect());
+    let mut page_result = JsonMap::new();
+    page_result.insert(
+        "section".to_string(),
+        JsonValue::String("dead_letters".to_string()),
+    );
+    if let Some(next) = next {
+        page_result.insert("next".to_string(), JsonValue::String(next));
+    }
+    object.insert("page".to_string(), JsonValue::Object(page_result));
+    update_truncated(object.get_mut("truncated"), false, has_more)?;
+    Ok(())
+}
+
 fn reject_unknown_options(opts: &Table) -> mlua::Result<()> {
     for pair in opts.pairs::<Value, Value>() {
         let (key, _) = pair?;
@@ -174,13 +272,57 @@ fn reject_unknown_options(opts: &Table) -> mlua::Result<()> {
             ));
         };
         let key = key.to_str()?;
-        if !matches!(key.as_ref(), "limit" | "include" | "since") {
+        if !matches!(key.as_ref(), "limit" | "include" | "since" | "page") {
             return Err(mlua::Error::external(format!(
                 "unknown fkst.observe option `{key}`"
             )));
         }
     }
     Ok(())
+}
+
+fn parse_page(
+    page: Option<Table>,
+    since: Option<&str>,
+) -> mlua::Result<Option<crate::observe::DeadLetterPageRequest>> {
+    let Some(page) = page else {
+        return Ok(None);
+    };
+    for pair in page.clone().pairs::<Value, Value>() {
+        let (key, _) = pair?;
+        let Value::String(key) = key else {
+            return Err(mlua::Error::external(
+                "fkst.observe page keys must be strings",
+            ));
+        };
+        let key = key.to_str()?;
+        if !matches!(key.as_ref(), "section" | "after") {
+            return Err(mlua::Error::external(format!(
+                "unknown fkst.observe page option `{key}`"
+            )));
+        }
+    }
+    let section = match page.get::<Value>("section")? {
+        Value::String(section) => section.to_str()?.to_string(),
+        _ => {
+            return Err(mlua::Error::external(
+                "fkst.observe page section must be a string",
+            ))
+        }
+    };
+    let after = match page.get::<Value>("after")? {
+        Value::Nil => None,
+        Value::String(after) => Some(after.to_str()?.to_string()),
+        _ => {
+            return Err(mlua::Error::external(
+                "observe dead-letter cursor invalid: after must be a string",
+            ))
+        }
+    };
+    let request = crate::observe::DeadLetterPageRequest { section, after };
+    crate::observe::validate_dead_letter_page(Some(&request), since)
+        .map_err(mlua::Error::external)?;
+    Ok(Some(request))
 }
 
 fn parse_include(include: Option<Table>) -> mlua::Result<Option<BTreeSet<String>>> {
@@ -348,6 +490,7 @@ fn apply_include(snapshot: JsonValue, include: &BTreeSet<String>) -> mlua::Resul
     let mut filtered = JsonMap::new();
     copy_if_present(&mut filtered, object, "schema_version");
     copy_if_present(&mut filtered, object, "generated_at_ms");
+    copy_if_present(&mut filtered, object, "page");
     if include.contains("entities") {
         copy_if_present(&mut filtered, object, "source");
         copy_if_present(&mut filtered, object, "limits");
@@ -472,6 +615,21 @@ mod tests {
     }
 
     #[test]
+    fn observe_rejects_malformed_dead_letter_cursor() {
+        let lua = Lua::new();
+        register(&lua, None).unwrap();
+
+        let err = lua
+            .load("return fkst.observe({ page = { section = 'dead_letters', after = 'bad' } })")
+            .eval::<Value>()
+            .unwrap_err();
+
+        assert!(err
+            .to_string()
+            .contains("observe dead-letter cursor invalid"));
+    }
+
+    #[test]
     fn mock_observe_applies_since_before_limit() {
         let lua = Lua::new();
         let mock = MockObserveState::new();
@@ -538,5 +696,57 @@ mod tests {
         assert!(value.get("queues").is_none());
         assert!(value.get("dead_letters").is_none());
         assert!(value.get("source").is_none());
+    }
+
+    #[test]
+    fn mock_observe_pages_dead_letters_by_durable_order() {
+        let lua = Lua::new();
+        let mock = MockObserveState::new();
+        register(&lua, Some(mock.clone())).unwrap();
+        mock.set(serde_json::json!({
+            "schema_version": 1,
+            "generated_at_ms": 10,
+            "source": {"durable_root": "/tmp/fkst"},
+            "limits": {"max_deliveries": 10, "max_dead_letters": 10},
+            "truncated": {"deliveries": false, "dead_letters": false},
+            "queues": [],
+            "deliveries": [],
+            "dead_letters": [
+                {"delivery_id": "dead-c", "dead_at_ms": 11},
+                {"delivery_id": "dead-b", "dead_at_ms": 10},
+                {"delivery_id": "dead-a", "dead_at_ms": 10}
+            ]
+        }))
+        .unwrap();
+
+        let first: JsonValue = lua
+            .from_value(
+                lua.load(
+                    "return fkst.observe({ limit = 2, include = { 'errors', 'entities' }, page = { section = 'dead_letters' } })",
+                )
+                .eval()
+                .unwrap(),
+            )
+            .unwrap();
+        let cursor = first["page"]["next"].as_str().unwrap();
+        let second: JsonValue = lua
+            .from_value(
+                lua.load(format!(
+                    "return fkst.observe({{ limit = 2, include = {{ 'errors', 'entities' }}, page = {{ section = 'dead_letters', after = '{cursor}' }} }})"
+                ))
+                .eval()
+                .unwrap(),
+            )
+            .unwrap();
+
+        assert_eq!(
+            first["dead_letters"],
+            serde_json::json!([
+                {"delivery_id": "dead-a", "dead_at_ms": 10},
+                {"delivery_id": "dead-b", "dead_at_ms": 10}
+            ])
+        );
+        assert_eq!(second["dead_letters"][0]["delivery_id"], "dead-c");
+        assert!(second["page"].get("next").is_none());
     }
 }

@@ -413,6 +413,7 @@ fn final_state(store: &DeliveryStore) -> mlua::Result<FinalState> {
             now_ms: TEST_OBSERVED_AT_MS,
             limit: MAX_TRACE_DELIVERIES,
             since: None,
+            dead_letter_page: None,
             current_subscriber_queues: None,
         },
     )

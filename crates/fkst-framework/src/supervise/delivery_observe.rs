@@ -1,6 +1,7 @@
 use super::delivery_store::{DeliveryScanRecord, DeliveryStore};
 use super::delivery_types::{DeadRecord, DeliveryRecord, SourceRef};
 use crate::manifest_hash::sha256_hex;
+use crate::observe::{DeadLetterPageCursor, DeadLetterPageOptions};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
@@ -12,6 +13,7 @@ pub(crate) struct DeliveryObserveOptions {
     pub(crate) now_ms: u64,
     pub(crate) limit: usize,
     pub(crate) since: Option<String>,
+    pub(crate) dead_letter_page: Option<DeadLetterPageOptions>,
     pub(crate) current_subscriber_queues: Option<BTreeSet<String>>,
 }
 
@@ -25,6 +27,15 @@ pub(crate) struct DeliveryObserveSnapshot {
     pub(crate) queues: Vec<QueueObserveState>,
     pub(crate) deliveries: Vec<DeliveryObserveEntry>,
     pub(crate) dead_letters: Vec<DeadLetterObserveEntry>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) page: Option<DeliveryObservePage>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub(crate) struct DeliveryObservePage {
+    pub(crate) section: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) next: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -139,25 +150,47 @@ pub(crate) fn observe_snapshot(
     if options.since.as_deref().is_some_and(str::is_empty) {
         anyhow::bail!("observe since cursor must not be empty");
     }
+    if options.dead_letter_page.is_some() && options.since.is_some() {
+        anyhow::bail!("fkst.observe page cannot be combined with since");
+    }
     let mut delivery_records = Vec::new();
     let mut dead_records = Vec::new();
     let mut queues = BTreeMap::<String, QueueAccumulator>::new();
 
-    store.scan_records(|record| {
-        match record {
-            DeliveryScanRecord::Delivery(record) => {
+    if let Some(page) = &options.dead_letter_page {
+        let after = page
+            .after
+            .as_ref()
+            .map(|cursor| (cursor.dead_at_ms, cursor.delivery_id.as_str()));
+        dead_records = store.scan_records_for_dead_letter_page(
+            after,
+            options.limit.saturating_add(1),
+            |record| {
                 queues
                     .entry(record.queue.clone())
                     .or_default()
                     .observe_delivery(&record, options.now_ms);
                 delivery_records.push(record);
+                Ok(())
+            },
+        )?;
+    } else {
+        store.scan_records(|record| {
+            match record {
+                DeliveryScanRecord::Delivery(record) => {
+                    queues
+                        .entry(record.queue.clone())
+                        .or_default()
+                        .observe_delivery(&record, options.now_ms);
+                    delivery_records.push(record);
+                }
+                DeliveryScanRecord::Dead(record) => {
+                    dead_records.push(record);
+                }
             }
-            DeliveryScanRecord::Dead(record) => {
-                dead_records.push(record);
-            }
-        }
-        Ok(())
-    })?;
+            Ok(())
+        })?;
+    }
 
     delivery_records.sort_by(|left, right| {
         left.queue
@@ -179,6 +212,29 @@ pub(crate) fn observe_snapshot(
         deliveries: apply_limit(&mut delivery_records, options.limit),
         dead_letters: apply_limit(&mut dead_records, options.limit),
     };
+    let page = options
+        .dead_letter_page
+        .as_ref()
+        .map(|_| {
+            let next = if truncated.dead_letters {
+                dead_records
+                    .last()
+                    .map(|record| {
+                        crate::observe::encode_dead_letter_cursor(&DeadLetterPageCursor {
+                            dead_at_ms: record.dead_at_ms,
+                            delivery_id: record.delivery_id.clone(),
+                        })
+                    })
+                    .transpose()?
+            } else {
+                None
+            };
+            Ok::<DeliveryObservePage, anyhow::Error>(DeliveryObservePage {
+                section: "dead_letters".to_string(),
+                next,
+            })
+        })
+        .transpose()?;
     let deliveries = delivery_records
         .into_iter()
         .map(|record| delivery_observe_entry(record, options.now_ms))
@@ -218,6 +274,7 @@ pub(crate) fn observe_snapshot(
             .collect(),
         deliveries,
         dead_letters,
+        page,
     })
 }
 
@@ -449,6 +506,34 @@ mod tests {
     }
 
     #[test]
+    fn non_page_snapshot_serialization_is_unchanged() {
+        let snapshot = DeliveryObserveSnapshot {
+            schema_version: 1,
+            generated_at_ms: 1,
+            source: DeliveryObserveSource {
+                durable_root: "/durable".to_string(),
+                database: "/durable/delivery.redb".to_string(),
+                read_semantics: "one read".to_string(),
+                history_semantics: "mutable".to_string(),
+            },
+            limits: DeliveryObserveLimits {
+                max_deliveries: 2,
+                max_dead_letters: 2,
+            },
+            truncated: DeliveryObserveTruncated::default(),
+            queues: Vec::new(),
+            deliveries: Vec::new(),
+            dead_letters: Vec::new(),
+            page: None,
+        };
+
+        assert_eq!(
+            serde_json::to_string(&snapshot).unwrap(),
+            r#"{"schema_version":1,"generated_at_ms":1,"source":{"durable_root":"/durable","database":"/durable/delivery.redb","read_semantics":"one read","history_semantics":"mutable"},"limits":{"max_deliveries":2,"max_dead_letters":2},"truncated":{"deliveries":false,"dead_letters":false},"queues":[],"deliveries":[],"dead_letters":[]}"#
+        );
+    }
+
+    #[test]
     fn observe_snapshot_reports_queue_state_without_payload_body() {
         let temp = TempDir::new().unwrap();
         let store = store(&temp);
@@ -471,6 +556,7 @@ mod tests {
                 now_ms: 150,
                 limit: 10,
                 since: None,
+                dead_letter_page: None,
                 current_subscriber_queues: None,
             },
         )
@@ -536,6 +622,7 @@ mod tests {
                 now_ms: 121,
                 limit: 10,
                 since: None,
+                dead_letter_page: None,
                 current_subscriber_queues: None,
             },
         )
@@ -567,6 +654,7 @@ mod tests {
                 now_ms: 100,
                 limit: 1,
                 since: None,
+                dead_letter_page: None,
                 current_subscriber_queues: None,
             },
         )
@@ -592,6 +680,7 @@ mod tests {
                 now_ms: 100,
                 limit: 1,
                 since: Some("delivery-001".to_string()),
+                dead_letter_page: None,
                 current_subscriber_queues: None,
             },
         )
@@ -620,6 +709,7 @@ mod tests {
                 now_ms: 100,
                 limit: 10,
                 since: None,
+                dead_letter_page: None,
                 current_subscriber_queues: Some(BTreeSet::from(["input".to_string()])),
             },
         )
