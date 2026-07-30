@@ -8,7 +8,7 @@ use fkst_common::{validate_runtime_key, DurableLayout};
 use serde::{Deserialize, Serialize};
 use std::io::{BufReader, Read, Write};
 use std::os::unix::net::UnixStream;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub(crate) const DEFAULT_LIMIT: usize = 500;
@@ -121,7 +121,7 @@ pub(crate) fn snapshot_for_durable_root(
     )? {
         Some(snapshot) => Ok(snapshot),
         None => {
-            let store = DeliveryStore::open_existing(&database)?;
+            let store = open_offline_store(&layout, &database)?;
             observe_snapshot(
                 &store,
                 layout.durable_root(),
@@ -137,6 +137,28 @@ pub(crate) fn snapshot_for_durable_root(
         }
     }?;
     Ok(snapshot)
+}
+
+fn open_offline_store(layout: &DurableLayout, database: &Path) -> Result<DeliveryStore> {
+    match DeliveryStore::open_existing(database) {
+        Ok(store) => Ok(store),
+        Err(err) if is_database_already_open(&err) => Err(err).with_context(|| {
+            format!(
+                "observe-live-owner-unavailable: live observe socket `{}` is unavailable while durable delivery database `{}` remains exclusively owned; restart the database-owning `supervise` process to restore the live endpoint, or stop that process before offline inspection",
+                socket_path(layout).display(),
+                database.display()
+            )
+        }),
+        Err(err) => Err(err),
+    }
+}
+
+fn is_database_already_open(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        cause
+            .downcast_ref::<redb::DatabaseError>()
+            .is_some_and(|err| matches!(err, redb::DatabaseError::DatabaseAlreadyOpen))
+    })
 }
 
 pub(crate) fn socket_path(layout: &DurableLayout) -> PathBuf {
