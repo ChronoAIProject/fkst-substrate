@@ -840,6 +840,42 @@ fn observe_rejects_missing_database_without_creating_it() {
 }
 
 #[test]
+fn observe_reports_actionable_error_when_live_owner_socket_is_unavailable() {
+    let durable = tempfile::Builder::new()
+        .prefix("fkst-durable")
+        .tempdir()
+        .unwrap();
+    let db_path = durable.path().join("delivery.redb");
+    let db = Database::create(&db_path).unwrap();
+    let write = db.begin_write().unwrap();
+    {
+        write.open_table(DELIVERY_BY_ID).unwrap();
+        write.open_table(DEAD_BY_ID).unwrap();
+    }
+    write.commit().unwrap();
+    let socket_path = observe_socket_path(durable.path());
+    let _ = fs::remove_file(&socket_path);
+
+    let output = framework_command()
+        .arg("observe")
+        .arg("--durable-root")
+        .arg(durable.path())
+        .arg("--json")
+        .output()
+        .unwrap();
+
+    assert_exit(&output, 2);
+    let err = stderr(&output);
+    assert!(err.contains("observe-live-owner-unavailable"), "{err}");
+    assert!(err.contains(&socket_path.display().to_string()), "{err}");
+    assert!(
+        err.contains("restart the database-owning `supervise` process to restore the live endpoint, or stop that process before offline inspection"),
+        "{err}"
+    );
+    drop(db);
+}
+
+#[test]
 fn observe_json_uses_live_socket_when_database_is_open() {
     let durable = tempfile::Builder::new()
         .prefix("fkst-durable")

@@ -3,13 +3,17 @@ use super::delivery_store::DeliveryStore;
 use anyhow::{Context, Result};
 use fkst_common::DurableLayout;
 use std::collections::BTreeSet;
+use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tracing::warn;
 
 use crate::observe::{ObserveSocketRequest, ObserveSocketResponse, MAX_LIMIT};
+
+const ACCEPT_RETRY_DELAY: Duration = Duration::from_millis(100);
 
 #[derive(Clone, Default)]
 pub(crate) struct ObserveEndpoint {
@@ -38,31 +42,41 @@ pub(crate) fn spawn_observe_server(
     remove_stale_socket(&endpoint.socket)?;
     let listener = UnixListener::bind(&endpoint.socket)
         .with_context(|| format!("bind observe socket `{}`", endpoint.socket.display()))?;
-    let socket = endpoint.socket.clone();
     Ok(tokio::spawn(async move {
         loop {
-            match listener.accept().await {
-                Ok((stream, _)) => {
-                    let store = store.clone();
-                    let endpoint = endpoint.clone();
-                    let current_subscriber_queues = current_subscriber_queues.clone();
-                    tokio::spawn(async move {
-                        if let Err(err) =
-                            serve_connection(stream, store, endpoint, current_subscriber_queues)
-                                .await
-                        {
-                            warn!(error = %err, "observe request failed");
-                        }
-                    });
+            let (stream, _) = accept_with_retry(|| listener.accept(), ACCEPT_RETRY_DELAY).await;
+            let store = store.clone();
+            let endpoint = endpoint.clone();
+            let current_subscriber_queues = current_subscriber_queues.clone();
+            tokio::spawn(async move {
+                if let Err(err) =
+                    serve_connection(stream, store, endpoint, current_subscriber_queues).await
+                {
+                    warn!(error = %err, "observe request failed");
                 }
-                Err(err) => {
-                    warn!(error = %err, "observe socket accept failed");
-                    break;
-                }
+            });
+        }
+    }))
+}
+
+async fn accept_with_retry<T, F, Fut>(mut accept: F, retry_delay: Duration) -> T
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = std::io::Result<T>>,
+{
+    loop {
+        match accept().await {
+            Ok(value) => return value,
+            Err(err) => {
+                warn!(
+                    error = %err,
+                    retry_delay_ms = retry_delay.as_millis() as u64,
+                    "observe socket accept failed; retrying"
+                );
+                tokio::time::sleep(retry_delay).await;
             }
         }
-        let _ = std::fs::remove_file(socket);
-    }))
+    }
 }
 
 async fn serve_connection(
@@ -143,6 +157,8 @@ mod tests {
     use crate::observe;
     use crate::supervise::delivery_observe::QueueSubscriberStatus;
     use crate::supervise::delivery_types::DeliveryRecord;
+    use std::collections::VecDeque;
+    use std::time::Duration;
     use tempfile::TempDir;
 
     fn record(id: &str) -> DeliveryRecord {
@@ -163,6 +179,37 @@ mod tests {
             not_before_ms: 10,
             last_error_excerpt: None,
         }
+    }
+
+    #[tokio::test]
+    async fn accept_retry_recovers_and_keeps_serving() {
+        let mut outcomes = VecDeque::from([
+            Err(std::io::Error::new(
+                std::io::ErrorKind::ConnectionAborted,
+                "first injected accept failure",
+            )),
+            Err(std::io::Error::new(
+                std::io::ErrorKind::ConnectionAborted,
+                "second injected accept failure",
+            )),
+            Ok("first connection"),
+            Ok("second connection"),
+        ]);
+
+        let first = accept_with_retry(
+            || std::future::ready(outcomes.pop_front().expect("accept outcome")),
+            Duration::ZERO,
+        )
+        .await;
+        let second = accept_with_retry(
+            || std::future::ready(outcomes.pop_front().expect("accept outcome")),
+            Duration::ZERO,
+        )
+        .await;
+
+        assert_eq!(first, "first connection");
+        assert_eq!(second, "second connection");
+        assert!(outcomes.is_empty());
     }
 
     #[tokio::test]
