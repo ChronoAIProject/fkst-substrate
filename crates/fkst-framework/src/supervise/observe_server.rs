@@ -42,24 +42,45 @@ pub(crate) fn spawn_observe_server(
     remove_stale_socket(&endpoint.socket)?;
     let listener = UnixListener::bind(&endpoint.socket)
         .with_context(|| format!("bind observe socket `{}`", endpoint.socket.display()))?;
-    Ok(tokio::spawn(async move {
-        loop {
-            let (stream, _) = accept_with_retry(|| listener.accept(), ACCEPT_RETRY_DELAY).await;
-            let store = store.clone();
-            let endpoint = endpoint.clone();
-            let current_subscriber_queues = current_subscriber_queues.clone();
-            tokio::spawn(async move {
-                if let Err(err) =
-                    serve_connection(stream, store, endpoint, current_subscriber_queues).await
-                {
-                    warn!(error = %err, "observe request failed");
-                }
-            });
-        }
-    }))
+    let listener = Arc::new(listener);
+    Ok(tokio::spawn(serve_observe_requests(
+        move || {
+            let listener = listener.clone();
+            async move { listener.accept().await.map(|(stream, _)| stream) }
+        },
+        store,
+        endpoint,
+        current_subscriber_queues,
+        ACCEPT_RETRY_DELAY,
+    )))
 }
 
-async fn accept_with_retry<T, F, Fut>(mut accept: F, retry_delay: Duration) -> T
+async fn serve_observe_requests<F, Fut>(
+    mut accept: F,
+    store: Arc<DeliveryStore>,
+    endpoint: ObserveEndpoint,
+    current_subscriber_queues: BTreeSet<String>,
+    retry_delay: Duration,
+) where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = std::io::Result<UnixStream>>,
+{
+    loop {
+        let stream = accept_with_retry(&mut accept, retry_delay).await;
+        let store = store.clone();
+        let endpoint = endpoint.clone();
+        let current_subscriber_queues = current_subscriber_queues.clone();
+        tokio::spawn(async move {
+            if let Err(err) =
+                serve_connection(stream, store, endpoint, current_subscriber_queues).await
+            {
+                warn!(error = %err, "observe request failed");
+            }
+        });
+    }
+}
+
+async fn accept_with_retry<T, F, Fut>(accept: &mut F, retry_delay: Duration) -> T
 where
     F: FnMut() -> Fut,
     Fut: Future<Output = std::io::Result<T>>,
@@ -157,7 +178,6 @@ mod tests {
     use crate::observe;
     use crate::supervise::delivery_observe::QueueSubscriberStatus;
     use crate::supervise::delivery_types::DeliveryRecord;
-    use std::collections::VecDeque;
     use std::time::Duration;
     use tempfile::TempDir;
 
@@ -182,34 +202,94 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn accept_retry_recovers_and_keeps_serving() {
-        let mut outcomes = VecDeque::from([
-            Err(std::io::Error::new(
-                std::io::ErrorKind::ConnectionAborted,
-                "first injected accept failure",
-            )),
-            Err(std::io::Error::new(
-                std::io::ErrorKind::ConnectionAborted,
-                "second injected accept failure",
-            )),
-            Ok("first connection"),
-            Ok("second connection"),
-        ]);
-
-        let first = accept_with_retry(
-            || std::future::ready(outcomes.pop_front().expect("accept outcome")),
+    async fn accept_failure_does_not_break_live_observation() {
+        let temp = TempDir::new().unwrap();
+        let layout = DurableLayout::new(temp.path()).unwrap();
+        let database = layout.delivery_db_path();
+        let store = Arc::new(DeliveryStore::open(&database).unwrap());
+        store.enqueue(&record("one")).unwrap();
+        let endpoint = endpoint_for_layout(&layout);
+        remove_stale_socket(&endpoint.socket).unwrap();
+        let listener = match UnixListener::bind(&endpoint.socket) {
+            Ok(listener) => Arc::new(listener),
+            Err(err)
+                if err.kind() == std::io::ErrorKind::PermissionDenied
+                    && endpoint.socket.starts_with("/tmp") =>
+            {
+                return;
+            }
+            Err(err) => panic!(
+                "bind observe socket `{}` failed: {err}",
+                endpoint.socket.display()
+            ),
+        };
+        let socket = endpoint.socket.clone();
+        let mut inject_failure = true;
+        let handle = tokio::spawn(serve_observe_requests(
+            move || {
+                let listener = listener.clone();
+                let fail = std::mem::take(&mut inject_failure);
+                async move {
+                    if fail {
+                        Err(std::io::Error::new(
+                            std::io::ErrorKind::ConnectionAborted,
+                            "injected accept failure",
+                        ))
+                    } else {
+                        listener.accept().await.map(|(stream, _)| stream)
+                    }
+                }
+            },
+            store.clone(),
+            endpoint,
+            BTreeSet::from(["jobs".to_string()]),
             Duration::ZERO,
-        )
-        .await;
-        let second = accept_with_retry(
-            || std::future::ready(outcomes.pop_front().expect("accept outcome")),
-            Duration::ZERO,
-        )
-        .await;
+        ));
 
-        assert_eq!(first, "first connection");
-        assert_eq!(second, "second connection");
-        assert!(outcomes.is_empty());
+        match DeliveryStore::open_existing(&database) {
+            Ok(_) => panic!("second redb open should fail while owner handle is open"),
+            Err(_) => {}
+        };
+
+        let first_root = temp.path().to_path_buf();
+        let first = tokio::task::spawn_blocking(move || {
+            observe::snapshot_for_durable_root(
+                first_root,
+                &observe::ObserveSnapshotOptions {
+                    limit: 10,
+                    since: None,
+                    page: None,
+                },
+            )
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(first.deliveries.len(), 1);
+        assert_eq!(first.deliveries[0].delivery_id, "one");
+
+        store.enqueue(&record("two")).unwrap();
+        let second_root = temp.path().to_path_buf();
+        let second = tokio::task::spawn_blocking(move || {
+            observe::snapshot_for_durable_root(
+                second_root,
+                &observe::ObserveSnapshotOptions {
+                    limit: 10,
+                    since: None,
+                    page: None,
+                },
+            )
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(second.deliveries.len(), 2);
+        assert_eq!(second.deliveries[0].delivery_id, "one");
+        assert_eq!(second.deliveries[1].delivery_id, "two");
+
+        handle.abort();
+        let _ = handle.await;
+        let _ = std::fs::remove_file(socket);
     }
 
     #[tokio::test]
