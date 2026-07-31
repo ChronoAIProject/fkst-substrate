@@ -33,6 +33,9 @@ pub(crate) struct DeliveryRecord {
     pub redrive_count: u64,
     #[serde(default)]
     pub collapse_by_dedup_id: bool,
+    /// A stable keyed duplicate arrived while this delivery was leased.
+    #[serde(default)]
+    pub pending_dirty: bool,
     #[serde(default)]
     pub subscriber_absent_since_ms: Option<u64>,
     pub lease_generation: u64,

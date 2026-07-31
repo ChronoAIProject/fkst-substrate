@@ -151,6 +151,7 @@ impl DeliveryRouter {
                     attempt: 0,
                     redrive_count: 0,
                     collapse_by_dedup_id: delivery_identity.collapse_by_dedup_id,
+                    pending_dirty: false,
                     subscriber_absent_since_ms: None,
                     lease_generation: 0,
                     lease_until_ms: None,

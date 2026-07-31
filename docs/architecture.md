@@ -271,6 +271,8 @@ durable 真相来自可观测事实：git commit、明确的 host filesystem fac
 
 consumer 的可靠路径由定时 tick 和 Fanout 唤醒触发，调用 delivery store `lease` 取 due 或过期 lease 的记录，构造标准 `Event{queue,payload,ts}` 后 spawn framework。exit 0 且所有 RAISED publish 成功才 `ack`；spawn error、stall、非零退出或 RAISED publish 失败都调用 `retry`。retry 达到 `max_attempts` 时 delivery 移入 redb dead 表，并 best-effort 经 Router publish `dead_letter` 通知；当前 delivery 自身来自 `dead_letter` 时抑制再次发送 `dead_letter`，避免自环。`Fanout` 在可靠路径只承担进程内唤醒，不再承载可靠事实。
 
+Stable raised `dedup_key` values use subscriber-scoped keyed-workqueue coalescing. A duplicate for a ready record remains collapsed. A duplicate for a leased record atomically sets one durable `pending_dirty` bit, and further duplicates remain collapsed. A successful `ack` atomically converts that dirty record into one clean ready follow-up instead of deleting it. Retry and lease-expiry transitions retain the bit; a terminal DLQ transition retains its tombstone and atomically promotes the one clean follow-up. Non-keyed delivery behavior is unchanged.
+
 When a pending durable delivery's queue has no current subscriber, supervise records the first continuously observed absence in `subscriber_absent_since_ms`. The supervisor-level sweep clears that timestamp if the subscriber returns before `FKST_SUBSCRIBER_ABSENT_DELIVERY_BUDGET`; otherwise it moves the delivery to the replayable DLQ with `error_excerpt = "subscriber-absent"`. This is driven by graph authority plus redb delivery state, not by a missing consumer.
 
 engine 维护 durable 在途 delivery state，但它不是实体业务真相、accepted state 或 rollback state。`处理中` 可以是 redb delivery lease、`with_lock` 租约（进程死后 fcntl lock 自动释放）或 worktree 等可观测事实；完成态仍是 commit、明确的 host filesystem fact 或外部源事实。
