@@ -93,12 +93,18 @@ fn real_observe(opts: &ObserveSdkOptions) -> mlua::Result<JsonValue> {
         .ok_or_else(|| {
             mlua::Error::external(format!("{DURABLE_ROOT_ENV} must be set for fkst.observe"))
         })?;
-    let snapshot = crate::observe::snapshot_for_durable_root(
-        PathBuf::from(durable_root),
-        &opts.snapshot_options(),
-    )
-    .map_err(mlua::Error::external)?;
-    serde_json::to_value(snapshot).map_err(mlua::Error::external)
+    if let Some(lineage) = &opts.lineage {
+        let result = crate::observe::lineage_for_durable_root(PathBuf::from(durable_root), lineage)
+            .map_err(mlua::Error::external)?;
+        serde_json::to_value(result).map_err(mlua::Error::external)
+    } else {
+        let snapshot = crate::observe::snapshot_for_durable_root(
+            PathBuf::from(durable_root),
+            &opts.snapshot_options(),
+        )
+        .map_err(mlua::Error::external)?;
+        serde_json::to_value(snapshot).map_err(mlua::Error::external)
+    }
 }
 
 fn fkst_table(lua: &Lua) -> mlua::Result<Table> {
@@ -117,6 +123,7 @@ struct ObserveSdkOptions {
     include: Option<BTreeSet<String>>,
     since: Option<String>,
     page: Option<crate::observe::DeadLetterPageRequest>,
+    lineage: Option<crate::observe::LineageObserveRequest>,
 }
 
 impl ObserveSdkOptions {
@@ -127,9 +134,20 @@ impl ObserveSdkOptions {
                 include: None,
                 since: None,
                 page: None,
+                lineage: None,
             });
         };
         reject_unknown_options(&opts)?;
+        let lineage = parse_lineage(opts.get::<Option<Table>>("lineage")?)?;
+        let has_snapshot_options = opts.contains_key("limit")?
+            || opts.contains_key("include")?
+            || opts.contains_key("since")?
+            || opts.contains_key("page")?;
+        if lineage.is_some() && has_snapshot_options {
+            return Err(mlua::Error::external(
+                "fkst.observe lineage cannot be combined with snapshot options",
+            ));
+        }
         let limit = opts
             .get::<Option<usize>>("limit")?
             .unwrap_or(crate::observe::DEFAULT_LIMIT);
@@ -143,6 +161,7 @@ impl ObserveSdkOptions {
             include,
             since,
             page,
+            lineage,
         })
     }
 
@@ -155,6 +174,9 @@ impl ObserveSdkOptions {
     }
 
     fn apply_to_mock(&self, mut snapshot: JsonValue) -> mlua::Result<JsonValue> {
+        if self.lineage.is_some() {
+            return Ok(snapshot);
+        }
         if let Some(page_request) = &self.page {
             let page = crate::observe::validate_dead_letter_page(
                 Some(page_request),
@@ -172,6 +194,9 @@ impl ObserveSdkOptions {
     }
 
     fn apply_include(&self, mut snapshot: JsonValue) -> mlua::Result<JsonValue> {
+        if self.lineage.is_some() {
+            return Ok(snapshot);
+        }
         if let Some(include) = &self.include {
             snapshot = apply_include(snapshot, include)?;
         }
@@ -272,13 +297,82 @@ fn reject_unknown_options(opts: &Table) -> mlua::Result<()> {
             ));
         };
         let key = key.to_str()?;
-        if !matches!(key.as_ref(), "limit" | "include" | "since" | "page") {
+        if !matches!(
+            key.as_ref(),
+            "limit" | "include" | "since" | "page" | "lineage"
+        ) {
             return Err(mlua::Error::external(format!(
                 "unknown fkst.observe option `{key}`"
             )));
         }
     }
     Ok(())
+}
+
+fn parse_lineage(
+    lineage: Option<Table>,
+) -> mlua::Result<Option<crate::observe::LineageObserveRequest>> {
+    let Some(lineage) = lineage else {
+        return Ok(None);
+    };
+    reject_nested_options(&lineage, &["queue", "dept", "source_ref"], "lineage")?;
+    let queue = required_nonempty_string(&lineage, "queue", "fkst.observe lineage")?;
+    let dept = required_nonempty_string(&lineage, "dept", "fkst.observe lineage")?;
+    let source_ref = match lineage.get::<Value>("source_ref")? {
+        Value::Table(source_ref) => source_ref,
+        _ => {
+            return Err(mlua::Error::external(
+                "fkst.observe lineage source_ref must be a table",
+            ))
+        }
+    };
+    reject_nested_options(&source_ref, &["kind", "ref"], "lineage source_ref")?;
+    let kind = required_nonempty_string(&source_ref, "kind", "fkst.observe lineage source_ref")?;
+    let reference =
+        required_nonempty_string(&source_ref, "ref", "fkst.observe lineage source_ref")?;
+    let kind = match kind.as_str() {
+        "file" | "file_watch" => crate::supervise::delivery_types::SourceKind::File,
+        "cron" => crate::supervise::delivery_types::SourceKind::Cron,
+        "git" => crate::supervise::delivery_types::SourceKind::Git,
+        "external" => crate::supervise::delivery_types::SourceKind::External,
+        _ => {
+            return Err(mlua::Error::external(format!(
+                "fkst.observe lineage source_ref kind `{kind}` is unsupported"
+            )))
+        }
+    };
+    Ok(Some(crate::observe::LineageObserveRequest {
+        queue,
+        dept,
+        source_ref: crate::supervise::delivery_types::SourceRef { kind, reference },
+    }))
+}
+
+fn reject_nested_options(table: &Table, allowed: &[&str], label: &str) -> mlua::Result<()> {
+    for pair in table.clone().pairs::<Value, Value>() {
+        let (key, _) = pair?;
+        let Value::String(key) = key else {
+            return Err(mlua::Error::external(format!(
+                "fkst.observe {label} keys must be strings"
+            )));
+        };
+        let key = key.to_str()?;
+        if !allowed.contains(&key.as_ref()) {
+            return Err(mlua::Error::external(format!(
+                "unknown fkst.observe {label} option `{key}`"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn required_nonempty_string(table: &Table, key: &str, label: &str) -> mlua::Result<String> {
+    match table.get::<Value>(key)? {
+        Value::String(value) if !value.as_bytes().is_empty() => Ok(value.to_str()?.to_string()),
+        _ => Err(mlua::Error::external(format!(
+            "{label} {key} must be a non-empty string"
+        ))),
+    }
 }
 
 fn parse_page(
@@ -560,6 +654,101 @@ mod tests {
             .unwrap();
 
         assert_eq!(value["queues"][0]["queue"], "input");
+    }
+
+    #[test]
+    fn mock_observe_returns_bounded_lineage_result() {
+        let lua = Lua::new();
+        let mock = MockObserveState::new();
+        register(&lua, Some(mock.clone())).unwrap();
+        mock.set(serde_json::json!({
+            "live_delivery": {
+                "delivery_id": "live-one",
+                "queue": "target.queue",
+                "dept": "target-dept"
+            },
+            "terminal_dead_letter": {
+                "delivery_id": "dead-one",
+                "queue": "target.queue",
+                "dept": "target-dept",
+                "attempts": 2,
+                "permanent": true,
+                "replayable": false
+            }
+        }))
+        .unwrap();
+
+        let value: JsonValue = lua
+            .from_value(
+                lua.load(
+                    r#"
+return fkst.observe({
+  lineage = {
+    queue = "target.queue",
+    dept = "target-dept",
+    source_ref = { kind = "external", ref = "owner/repo#issue/42" },
+  },
+})
+"#,
+                )
+                .eval()
+                .unwrap(),
+            )
+            .unwrap();
+
+        assert_eq!(value["live_delivery"]["delivery_id"], "live-one");
+        assert_eq!(value["terminal_dead_letter"]["delivery_id"], "dead-one");
+        assert!(value.get("truncated").is_none());
+    }
+
+    #[test]
+    fn lineage_observe_rejects_snapshot_options() {
+        assert_observe_rejected(
+            r#"
+return fkst.observe({
+  lineage = {
+    queue = "target.queue",
+    dept = "target-dept",
+    source_ref = { kind = "external", ref = "owner/repo#issue/42" },
+  },
+  limit = 1,
+})
+"#,
+            "fkst.observe lineage cannot be combined with snapshot options",
+        );
+    }
+
+    #[test]
+    fn lineage_observe_rejects_unknown_nested_options() {
+        assert_observe_rejected(
+            r#"
+return fkst.observe({
+  lineage = {
+    queue = "target.queue",
+    dept = "target-dept",
+    source_ref = { kind = "external", ref = "owner/repo#issue/42" },
+    retry = true,
+  },
+})
+"#,
+            "unknown fkst.observe lineage option `retry`",
+        );
+        assert_observe_rejected(
+            r#"
+return fkst.observe({
+  lineage = {
+    queue = "target.queue",
+    dept = "target-dept",
+    source_ref = {
+      kind = "external",
+      ref = "owner/repo#issue/42",
+      version = 1,
+    },
+  },
+})
+"#,
+            "unknown fkst.observe lineage source_ref option `version`",
+        );
     }
 
     #[test]
