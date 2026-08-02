@@ -31,6 +31,14 @@ pub(crate) struct DeliveryObserveSnapshot {
     pub(crate) page: Option<DeliveryObservePage>,
 }
 
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
+pub(crate) struct LineageObserveResult {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) live_delivery: Option<DeliveryObserveEntry>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) terminal_dead_letter: Option<DeadLetterObserveEntry>,
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub(crate) struct DeliveryObservePage {
     pub(crate) section: String,
@@ -275,6 +283,26 @@ pub(crate) fn observe_snapshot(
         deliveries,
         dead_letters,
         page,
+    })
+}
+
+pub(crate) fn observe_lineage(
+    store: &DeliveryStore,
+    queue: &str,
+    dept: &str,
+    source: &SourceRef,
+    now_ms: u64,
+) -> Result<LineageObserveResult> {
+    let lineage = store.lookup_lineage(queue, dept, source)?;
+    Ok(LineageObserveResult {
+        live_delivery: lineage
+            .live_delivery
+            .map(|record| delivery_observe_entry(record, now_ms))
+            .transpose()?,
+        terminal_dead_letter: lineage
+            .terminal_dead_letter
+            .map(dead_letter_observe_entry)
+            .transpose()?,
     })
 }
 
