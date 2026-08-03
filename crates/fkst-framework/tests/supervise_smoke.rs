@@ -130,6 +130,15 @@ fn read_single_supervisor_journal(runtime_root: &Path) -> String {
     fs::read_to_string(&entries[0]).unwrap()
 }
 
+fn journal_millis(line: &str, key: &str) -> u128 {
+    let prefix = format!("{key}=");
+    line.split_ascii_whitespace()
+        .find_map(|field| field.strip_prefix(&prefix))
+        .unwrap_or_else(|| panic!("missing {key} in journal record: {line}"))
+        .parse()
+        .unwrap_or_else(|err| panic!("invalid {key} in journal record: {err}: {line}"))
+}
+
 fn wait_for_journal_event(
     runtime_root: &Path,
     event: &str,
@@ -424,7 +433,7 @@ exit 0
 }
 
 #[test]
-fn supervise_explicit_package_root_reaches_child_framework() {
+fn supervise_explicit_package_root_child_emits_lifecycle_milestones() {
     let _lock = supervise_smoke_lock();
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();
@@ -464,6 +473,7 @@ local standard = require("fkst.standard_asset")
 local M = {{}}
 M.spec = {{ consumes = {{"{}.standard_input"}}, ephemeral = {{"{}.standard_input"}}, stall_window = standard.stall_window() }}
 function pipeline(event)
+  print("milestone-output")
   local f = assert(io.open({}, "w"))
   f:write("marker=" .. standard.marker() .. "\n")
   f:write("event_path=" .. tostring(event.payload.path) .. "\n")
@@ -532,10 +542,24 @@ return M
         journal.contains("event=dept_child_spawn ") && journal.contains(" dept=host.host_worker "),
         "journal={journal}"
     );
-    assert!(
-        journal.contains("event=dept_child_exit ") && journal.contains(" dept=host.host_worker "),
-        "journal={journal}"
-    );
+    let exit_record = journal
+        .lines()
+        .find(|line| {
+            line.starts_with("event=dept_child_exit ")
+                && line.contains(" dept=host.host_worker ")
+                && line.contains(" exit_code=0 ")
+        })
+        .unwrap_or_else(|| panic!("missing successful child exit record: {journal}"));
+    let spawn_return_ms = journal_millis(exit_record, "spawn_return_ms");
+    let first_pipe_read_ms = journal_millis(exit_record, "first_pipe_read_ms");
+    let wait_complete_ms = journal_millis(exit_record, "wait_complete_ms");
+    let capture_complete_ms = journal_millis(exit_record, "capture_complete_ms");
+    let elapsed_ms = journal_millis(exit_record, "elapsed_ms");
+    assert!(spawn_return_ms <= first_pipe_read_ms, "{exit_record}");
+    assert!(spawn_return_ms <= wait_complete_ms, "{exit_record}");
+    assert!(first_pipe_read_ms <= capture_complete_ms, "{exit_record}");
+    assert!(wait_complete_ms <= capture_complete_ms, "{exit_record}");
+    assert_eq!(capture_complete_ms, elapsed_ms, "{exit_record}");
     assert!(
         journal.contains("event=shutdown_initiated ") && journal.contains(" reason=signal:SIGTERM"),
         "journal={journal}"
