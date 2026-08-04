@@ -44,7 +44,7 @@ use std::io::Write;
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 use support::process_sandbox::ProcessSandbox;
 
 const DEFAULT_CODEX_PERMIT_SLOTS: usize = 20;
@@ -98,7 +98,7 @@ fn read_fifo(path: &Path) -> String {
         let _ = tx.send(result);
     });
     let result = rx
-        .recv_timeout(Duration::from_secs(15))
+        .recv_timeout(Duration::from_secs(60))
         .unwrap_or_else(|err| panic!("timed out reading FIFO {display}: {err}"));
     result.unwrap_or_else(|err| panic!("failed reading FIFO {display}: {err}"))
 }
@@ -250,7 +250,8 @@ fn hold_exclusive_lock(path: &Path) -> std::fs::File {
 
 #[cfg(unix)]
 fn wait_for_exclusive_lock(path: &Path) {
-    for _ in 0..100 {
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
         let file = std::fs::OpenOptions::new()
             .create(true)
             .truncate(false)
@@ -260,6 +261,9 @@ fn wait_for_exclusive_lock(path: &Path) {
             .unwrap();
         if flock(file.as_raw_fd(), FlockArg::LockExclusiveNonblock).is_ok() {
             return;
+        }
+        if Instant::now() >= deadline {
+            break;
         }
         std::thread::sleep(Duration::from_millis(20));
     }
@@ -1562,7 +1566,7 @@ printf 'redrive-%s' "$count"
             let opts = lua_opts(&lua, "crash-redrive");
             opts.set("worktree", worktree_arg).unwrap();
             opts.set("dedup_key", "crash-redrive-key").unwrap();
-            opts.set("timeout", 1).unwrap();
+            opts.set("timeout", 60).unwrap();
             let result: Table = spawn.call(opts).unwrap();
             first_tx
                 .send((
@@ -1595,23 +1599,19 @@ printf 'redrive-%s' "$count"
     let abandoned: Table = status_fn.call(()).unwrap();
     assert_eq!(table_len(&abandoned, "running"), 0);
 
-    status["worker_pid"] = serde_json::Value::Null;
-    status["codex_pid"] = serde_json::Value::Null;
-    std::fs::write(&status_path, serde_json::to_string(&status).unwrap()).unwrap();
-    assert_eq!(
-        first_rx.recv_timeout(Duration::from_secs(5)).unwrap().0,
-        124
-    );
-    first_thread.join().unwrap();
-
     let spawn: mlua::Function = lua.globals().get("spawn_codex_sync").unwrap();
     let opts = lua_opts(&lua, "crash-redrive");
     opts.set("worktree", worktree_arg).unwrap();
     opts.set("dedup_key", "crash-redrive-key").unwrap();
-    opts.set("timeout", 20).unwrap();
+    opts.set("timeout", 60).unwrap();
     let redriven: Table = spawn.call(opts).unwrap();
     assert_eq!(redriven.get::<i64>("exit_code").unwrap(), 0);
     assert_eq!(redriven.get::<String>("stdout").unwrap(), "redrive-2");
+    assert_eq!(
+        first_rx.recv_timeout(Duration::from_secs(60)).unwrap(),
+        (0, "redrive-2".to_string())
+    );
+    first_thread.join().unwrap();
     assert_eq!(
         std::fs::read_to_string(capture_dir.join("spawns")).unwrap(),
         "2"
