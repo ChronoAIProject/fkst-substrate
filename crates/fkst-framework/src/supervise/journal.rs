@@ -60,6 +60,22 @@ impl SupervisorJournal {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn open_at(path: &Path) -> Self {
+        let file = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(path)
+            .unwrap();
+        Self {
+            inner: Arc::new(Mutex::new(JournalWriter {
+                file: Some(file),
+                path: Some(path.to_path_buf()),
+            })),
+        }
+    }
+
     pub(crate) fn path(&self) -> Option<PathBuf> {
         self.inner
             .lock()

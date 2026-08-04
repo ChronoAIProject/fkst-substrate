@@ -10,6 +10,7 @@ use fkst_common::{
     runtime_key_file, validate_runtime_key, RuntimeKind, RuntimeLayout, RUNTIME_LOCK_LEAF,
 };
 use mlua::{Function, Lua, Result};
+use nix::errno::Errno;
 use nix::fcntl::{flock, FlockArg};
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
@@ -23,6 +24,43 @@ use crate::external_command::{
 };
 use crate::rate_pool::RatePoolRegistry;
 use crate::runtime_context;
+
+pub(crate) const LOCK_BUSY_EXIT_CODE: i32 = 75;
+const LOCK_BUSY_FACT_PREFIX: &str = "event=with_lock_busy error_class=lock_busy lock=";
+const LOCK_BUSY_FACT_SUFFIX: &str = " outcome=deferred";
+
+#[derive(Debug, thiserror::Error)]
+#[error("with_lock lock busy: {lock}")]
+pub(crate) struct LockBusy {
+    lock: String,
+}
+
+pub(crate) fn lock_busy_key(error: &anyhow::Error) -> Option<String> {
+    error.chain().find_map(|cause| {
+        cause
+            .downcast_ref::<LockBusy>()
+            .map(|busy| busy.lock.clone())
+            .or_else(|| {
+                cause.downcast_ref::<mlua::Error>().and_then(|lua_error| {
+                    lua_error.chain().find_map(|nested| {
+                        nested
+                            .downcast_ref::<LockBusy>()
+                            .map(|busy| busy.lock.clone())
+                    })
+                })
+            })
+    })
+}
+
+pub(crate) fn lock_busy_key_from_stderr(stderr: &str) -> Option<String> {
+    stderr.lines().find_map(|line| {
+        let lock = line
+            .strip_prefix(LOCK_BUSY_FACT_PREFIX)?
+            .strip_suffix(LOCK_BUSY_FACT_SUFFIX)?;
+        let validated = validate_runtime_key(lock).ok()?;
+        (validated == lock).then(|| lock.to_string())
+    })
+}
 
 pub fn register(lua: &Lua, host_root: &Path, config: ConfigContext) -> Result<()> {
     register_with_runner(lua, host_root, config, None)
@@ -93,7 +131,16 @@ fn register_with_lock(lua: &Lua, host_root: PathBuf) -> Result<()> {
                 .open(path)
                 .map_err(mlua::Error::external)?;
 
-            flock(file.as_raw_fd(), FlockArg::LockExclusive).map_err(mlua::Error::external)?;
+            match flock(file.as_raw_fd(), FlockArg::LockExclusiveNonblock) {
+                Ok(()) => {}
+                Err(Errno::EWOULDBLOCK) => {
+                    eprintln!("{LOCK_BUSY_FACT_PREFIX}{name}{LOCK_BUSY_FACT_SUFFIX}");
+                    return Err(mlua::Error::external(LockBusy {
+                        lock: name.to_string(),
+                    }));
+                }
+                Err(err) => return Err(mlua::Error::external(err)),
+            }
 
             let result = f.call::<mlua::Value>(());
             drop(file);

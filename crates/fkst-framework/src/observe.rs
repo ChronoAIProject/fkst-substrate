@@ -1,7 +1,9 @@
 use crate::supervise::delivery_observe::{
-    observe_snapshot, DeliveryObserveOptions, DeliveryObserveSnapshot,
+    observe_lineage, observe_snapshot, DeliveryObserveOptions, DeliveryObserveSnapshot,
+    LineageObserveResult,
 };
 use crate::supervise::delivery_store::DeliveryStore;
+use crate::supervise::delivery_types::SourceRef;
 use anyhow::{Context, Result};
 use base64::Engine;
 use fkst_common::{validate_runtime_key, DurableLayout};
@@ -26,6 +28,14 @@ pub(crate) struct ObserveSnapshotOptions {
     pub(crate) limit: usize,
     pub(crate) since: Option<String>,
     pub(crate) page: Option<DeadLetterPageRequest>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct LineageObserveRequest {
+    pub(crate) queue: String,
+    pub(crate) dept: String,
+    pub(crate) source_ref: SourceRef,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -139,6 +149,28 @@ pub(crate) fn snapshot_for_durable_root(
     Ok(snapshot)
 }
 
+pub(crate) fn lineage_for_durable_root(
+    durable_root: impl Into<PathBuf>,
+    lineage: &LineageObserveRequest,
+) -> Result<LineageObserveResult> {
+    let durable_root = durable_root.into();
+    let layout = DurableLayout::new(&durable_root)?;
+    let database = layout.delivery_db_path();
+    match request_live_lineage(&layout, lineage)? {
+        Some(result) => Ok(result),
+        None => {
+            let store = open_offline_store(&layout, &database)?;
+            observe_lineage(
+                &store,
+                &lineage.queue,
+                &lineage.dept,
+                &lineage.source_ref,
+                now_ms(),
+            )
+        }
+    }
+}
+
 fn open_offline_store(layout: &DurableLayout, database: &Path) -> Result<DeliveryStore> {
     match DeliveryStore::open_existing(database) {
         Ok(store) => Ok(store),
@@ -169,6 +201,56 @@ pub(crate) fn request_live_snapshot(
     layout: &DurableLayout,
     options: &ObserveSnapshotOptions,
 ) -> Result<Option<DeliveryObserveSnapshot>> {
+    let request = ObserveSocketRequest {
+        limit: options.limit,
+        since: options.since.clone(),
+        page: options.page.clone(),
+        lineage: None,
+        now_ms: now_ms(),
+    };
+    let Some(response) = request_live_observe(layout, &request)? else {
+        return Ok(None);
+    };
+    match response {
+        ObserveSocketResponse::Ok { snapshot } => Ok(Some(snapshot)),
+        ObserveSocketResponse::LineageOk { .. } => {
+            anyhow::bail!("live observe socket returned lineage result for snapshot request")
+        }
+        ObserveSocketResponse::Err { error } => {
+            anyhow::bail!("live observe socket failed: {error}")
+        }
+    }
+}
+
+pub(crate) fn request_live_lineage(
+    layout: &DurableLayout,
+    lineage: &LineageObserveRequest,
+) -> Result<Option<LineageObserveResult>> {
+    let request = ObserveSocketRequest {
+        limit: DEFAULT_LIMIT,
+        since: None,
+        page: None,
+        lineage: Some(lineage.clone()),
+        now_ms: now_ms(),
+    };
+    let Some(response) = request_live_observe(layout, &request)? else {
+        return Ok(None);
+    };
+    match response {
+        ObserveSocketResponse::LineageOk { lineage } => Ok(Some(lineage)),
+        ObserveSocketResponse::Ok { .. } => {
+            anyhow::bail!("live observe socket returned snapshot for lineage request")
+        }
+        ObserveSocketResponse::Err { error } => {
+            anyhow::bail!("live observe socket failed: {error}")
+        }
+    }
+}
+
+fn request_live_observe(
+    layout: &DurableLayout,
+    request: &ObserveSocketRequest,
+) -> Result<Option<ObserveSocketResponse>> {
     let path = socket_path(layout);
     if !path.exists() {
         return Ok(None);
@@ -181,13 +263,7 @@ pub(crate) fn request_live_snapshot(
                 .with_context(|| format!("connect live observe socket `{}`", path.display()))
         }
     };
-    let request = ObserveSocketRequest {
-        limit: options.limit,
-        since: options.since.clone(),
-        page: options.page.clone(),
-        now_ms: now_ms(),
-    };
-    serde_json::to_writer(&mut stream, &request)?;
+    serde_json::to_writer(&mut stream, request)?;
     stream.write_all(b"\n")?;
     stream.flush()?;
 
@@ -202,12 +278,7 @@ pub(crate) fn request_live_snapshot(
             path.display()
         )
     })?;
-    match response {
-        ObserveSocketResponse::Ok { snapshot } => Ok(Some(snapshot)),
-        ObserveSocketResponse::Err { error } => {
-            anyhow::bail!("live observe socket failed: {error}")
-        }
-    }
+    Ok(Some(response))
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -217,6 +288,8 @@ pub(crate) struct ObserveSocketRequest {
     pub(crate) since: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) page: Option<DeadLetterPageRequest>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) lineage: Option<LineageObserveRequest>,
     pub(crate) now_ms: u64,
 }
 
@@ -224,6 +297,7 @@ pub(crate) struct ObserveSocketRequest {
 #[serde(tag = "status", rename_all = "snake_case")]
 pub(crate) enum ObserveSocketResponse {
     Ok { snapshot: DeliveryObserveSnapshot },
+    LineageOk { lineage: LineageObserveResult },
     Err { error: String },
 }
 
@@ -403,6 +477,10 @@ fn now_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::supervise::delivery_store::{RetryFailure, RetryOutcome};
+    use crate::supervise::delivery_types::{DeliveryRecord, RetryPolicy, SourceKind, SourceRef};
+    use std::time::Duration;
+    use tempfile::TempDir;
 
     fn cursor_fixture(value: serde_json::Value) -> String {
         base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(serde_json::to_vec(&value).unwrap())
@@ -474,12 +552,86 @@ mod tests {
             limit: DEFAULT_LIMIT,
             since: None,
             page: None,
+            lineage: None,
             now_ms: 1,
         };
 
         assert_eq!(
             serde_json::to_string(&request).unwrap(),
             r#"{"limit":500,"since":null,"now_ms":1}"#
+        );
+    }
+
+    #[test]
+    fn offline_lineage_observe_reads_bounded_store_result() {
+        let temp = TempDir::new().unwrap();
+        let layout = DurableLayout::new(temp.path()).unwrap();
+        let store = DeliveryStore::open(layout.delivery_db_path()).unwrap();
+        let source_ref = SourceRef {
+            kind: SourceKind::External,
+            reference: "owner/repo#issue/42".to_string(),
+        };
+        let record = |delivery_id: &str| DeliveryRecord {
+            delivery_id: delivery_id.to_string(),
+            queue: "target.queue".to_string(),
+            dept: "target-dept".to_string(),
+            payload: serde_json::json!({"issue": 42}),
+            source: Some(source_ref.clone()),
+            cron_payload: None,
+            observed_at_ms: 10,
+            attempt: 0,
+            redrive_count: 0,
+            collapse_by_dedup_id: false,
+            pending_dirty: false,
+            subscriber_absent_since_ms: None,
+            lease_generation: 0,
+            lease_until_ms: None,
+            not_before_ms: 100,
+            last_error_excerpt: None,
+        };
+
+        store.enqueue(&record("terminal-one")).unwrap();
+        let leased = store
+            .lease(100, 1, Duration::from_secs(10))
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert_eq!(
+            store
+                .retry(
+                    &leased.delivery_id,
+                    leased.lease_generation,
+                    &RetryFailure {
+                        message: "terminal failure".to_string(),
+                        replayable: false,
+                    },
+                    &RetryPolicy {
+                        max_attempts: 1,
+                        base: Duration::from_millis(1),
+                        cap: Duration::from_millis(1),
+                    },
+                    200,
+                )
+                .unwrap(),
+            RetryOutcome::PermanentDead
+        );
+        store.enqueue(&record("live-one")).unwrap();
+        drop(store);
+
+        let result = lineage_for_durable_root(
+            temp.path(),
+            &LineageObserveRequest {
+                queue: "target.queue".to_string(),
+                dept: "target-dept".to_string(),
+                source_ref,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(result.live_delivery.unwrap().delivery_id, "live-one");
+        assert_eq!(
+            result.terminal_dead_letter.unwrap().delivery_id,
+            "terminal-one"
         );
     }
 }

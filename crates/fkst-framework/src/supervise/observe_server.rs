@@ -1,4 +1,4 @@
-use super::delivery_observe::{observe_snapshot, DeliveryObserveOptions};
+use super::delivery_observe::{observe_lineage, observe_snapshot, DeliveryObserveOptions};
 use super::delivery_store::DeliveryStore;
 use anyhow::{Context, Result};
 use fkst_common::DurableLayout;
@@ -115,31 +115,48 @@ async fn serve_connection(
             .context("read observe request")?;
     }
     let response = match serde_json::from_str::<ObserveSocketRequest>(&line) {
-        Ok(request) => match crate::observe::validate_dead_letter_page(
-            request.page.as_ref(),
-            request.since.as_deref(),
-        ) {
-            Ok(dead_letter_page) => match observe_snapshot(
-                &store,
-                &endpoint.durable_root,
-                &endpoint.database,
-                &DeliveryObserveOptions {
-                    now_ms: request.now_ms,
-                    limit: request.limit.clamp(1, MAX_LIMIT),
-                    since: request.since,
-                    dead_letter_page,
-                    current_subscriber_queues: Some(current_subscriber_queues),
-                },
-            ) {
-                Ok(snapshot) => ObserveSocketResponse::Ok { snapshot },
-                Err(err) => ObserveSocketResponse::Err {
-                    error: err.to_string(),
-                },
-            },
-            Err(err) => ObserveSocketResponse::Err {
-                error: err.to_string(),
-            },
-        },
+        Ok(request) => {
+            if let Some(lineage) = request.lineage {
+                match observe_lineage(
+                    &store,
+                    &lineage.queue,
+                    &lineage.dept,
+                    &lineage.source_ref,
+                    request.now_ms,
+                ) {
+                    Ok(lineage) => ObserveSocketResponse::LineageOk { lineage },
+                    Err(err) => ObserveSocketResponse::Err {
+                        error: err.to_string(),
+                    },
+                }
+            } else {
+                match crate::observe::validate_dead_letter_page(
+                    request.page.as_ref(),
+                    request.since.as_deref(),
+                ) {
+                    Ok(dead_letter_page) => match observe_snapshot(
+                        &store,
+                        &endpoint.durable_root,
+                        &endpoint.database,
+                        &DeliveryObserveOptions {
+                            now_ms: request.now_ms,
+                            limit: request.limit.clamp(1, MAX_LIMIT),
+                            since: request.since,
+                            dead_letter_page,
+                            current_subscriber_queues: Some(current_subscriber_queues),
+                        },
+                    ) {
+                        Ok(snapshot) => ObserveSocketResponse::Ok { snapshot },
+                        Err(err) => ObserveSocketResponse::Err {
+                            error: err.to_string(),
+                        },
+                    },
+                    Err(err) => ObserveSocketResponse::Err {
+                        error: err.to_string(),
+                    },
+                }
+            }
+        }
         Err(err) => ObserveSocketResponse::Err {
             error: format!("decode observe request: {err}"),
         },
@@ -177,7 +194,7 @@ mod tests {
     use super::*;
     use crate::observe;
     use crate::supervise::delivery_observe::QueueSubscriberStatus;
-    use crate::supervise::delivery_types::DeliveryRecord;
+    use crate::supervise::delivery_types::{DeliveryRecord, SourceKind, SourceRef};
     use std::time::Duration;
     use tempfile::TempDir;
 
@@ -200,6 +217,58 @@ mod tests {
             not_before_ms: 10,
             last_error_excerpt: None,
         }
+    }
+
+    #[tokio::test]
+    async fn connection_serves_bounded_lineage_result() {
+        let temp = TempDir::new().unwrap();
+        let layout = DurableLayout::new(temp.path()).unwrap();
+        let database = layout.delivery_db_path();
+        let store = Arc::new(DeliveryStore::open(&database).unwrap());
+        let source_ref = SourceRef {
+            kind: SourceKind::External,
+            reference: "owner/repo#issue/42".to_string(),
+        };
+        let mut delivery = record("one");
+        delivery.source = Some(source_ref.clone());
+        store.enqueue(&delivery).unwrap();
+        let endpoint = endpoint_for_layout(&layout);
+        let (server, mut client) = UnixStream::pair().unwrap();
+        let server_task = tokio::spawn(serve_connection(
+            server,
+            store,
+            endpoint,
+            BTreeSet::from(["jobs".to_string()]),
+        ));
+        let request = crate::observe::ObserveSocketRequest {
+            limit: crate::observe::DEFAULT_LIMIT,
+            since: None,
+            page: None,
+            lineage: Some(crate::observe::LineageObserveRequest {
+                queue: "jobs".to_string(),
+                dept: "worker".to_string(),
+                source_ref,
+            }),
+            now_ms: 100,
+        };
+        let mut body = serde_json::to_vec(&request).unwrap();
+        body.push(b'\n');
+        client.write_all(&body).await.unwrap();
+
+        let mut response_line = String::new();
+        BufReader::new(&mut client)
+            .read_line(&mut response_line)
+            .await
+            .unwrap();
+        server_task.await.unwrap().unwrap();
+        let response: crate::observe::ObserveSocketResponse =
+            serde_json::from_str(&response_line).unwrap();
+
+        let crate::observe::ObserveSocketResponse::LineageOk { lineage } = response else {
+            panic!("lineage request must return lineage_ok");
+        };
+        assert_eq!(lineage.live_delivery.unwrap().delivery_id, "one");
+        assert!(lineage.terminal_dead_letter.is_none());
     }
 
     #[tokio::test]

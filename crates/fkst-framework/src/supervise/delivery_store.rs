@@ -12,9 +12,12 @@ use super::delivery_index::{
 use super::delivery_retry::ERROR_EXCERPT_LIMIT;
 use super::delivery_retry::{backoff_delay, bounded_jitter, error_excerpt};
 use super::delivery_transition::{lease_key, read_delivery_table, rebuild_due_indexes};
-use super::delivery_types::{DeadRecord, DeliveryRecord, RedrivePolicy, RetryPolicy};
+use super::delivery_types::{
+    DeadRecord, DeliveryRecord, RedrivePolicy, RetryPolicy, SourceKind, SourceRef,
+};
 use super::delivery_watch::StoreOpWatch;
 use anyhow::{bail, Context, Result};
+use base64::Engine;
 use redb::{Database, ReadableTable, TableDefinition};
 #[cfg(test)]
 use std::cell::Cell;
@@ -36,6 +39,7 @@ const TERMINAL_SUPPRESSED_BY_ID: TableDefinition<&str, ()> =
     TableDefinition::new("terminal_suppressed_by_id");
 const TERMINAL_SUPPRESSION_BY_SLOT: TableDefinition<&str, &str> =
     TableDefinition::new("terminal_suppression_by_slot");
+const LINEAGE_BY_SOURCE: TableDefinition<&str, &str> = TableDefinition::new("lineage_by_source");
 const META: TableDefinition<&str, &str> = TableDefinition::new("meta");
 const OLD_READY_BY_DUE: TableDefinition<(u64, &str), ()> = TableDefinition::new("ready_by_due");
 const OLD_LEASED_BY_UNTIL: TableDefinition<(u64, &str), ()> =
@@ -45,6 +49,7 @@ const OLD_LEASED_BY_UNTIL: TableDefinition<(u64, &str), ()> =
 thread_local! {
     static WRITE_TXN_COUNT: Cell<usize> = const { Cell::new(0) };
     static WRITE_COMMIT_COUNT: Cell<usize> = const { Cell::new(0) };
+    static LINEAGE_INDEX_READ_COUNT: Cell<usize> = const { Cell::new(0) };
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -52,6 +57,13 @@ pub(crate) enum RetryOutcome {
     Scheduled,
     DeadPendingRedrive,
     PermanentDead,
+    Stale,
+    Missing,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum LockBusyDeferOutcome {
+    Scheduled,
     Stale,
     Missing,
 }
@@ -96,6 +108,12 @@ pub(crate) struct DeliveryStore {
     db: Database,
 }
 
+#[derive(Debug, PartialEq)]
+pub(crate) struct LineageLookup {
+    pub(crate) live_delivery: Option<DeliveryRecord>,
+    pub(crate) terminal_dead_letter: Option<DeadRecord>,
+}
+
 pub(crate) enum DeliveryScanRecord {
     Delivery(DeliveryRecord),
     Dead(DeadRecord),
@@ -125,6 +143,7 @@ impl DeliveryStore {
             write.open_table(DEAD_BY_TIME)?;
             write.open_table(TERMINAL_DEAD_BY_TIME)?;
             write.open_table(TERMINAL_SUPPRESSION_BY_SLOT)?;
+            write.open_table(LINEAGE_BY_SOURCE)?;
             if current_version.as_deref() != Some(SCHEMA_VERSION) {
                 delete_old_global_indexes(&write)?;
                 rebuild_due_indexes(&write, DELIVERY_BY_ID)?;
@@ -141,6 +160,7 @@ impl DeliveryStore {
                 import_legacy_terminal_suppressed_ids(&write)?;
                 drop_legacy_terminal_suppressed_table(&write)?;
                 drop_legacy_terminal_suppression_filter(&write)?;
+                rebuild_lineage_index(&write)?;
             }
             let mut meta = write.open_table(META)?;
             meta.insert("schema_version", SCHEMA_VERSION)?;
@@ -197,6 +217,7 @@ impl DeliveryStore {
             }
             let bytes = serde_json::to_vec(record)?;
             delivery.insert(record.delivery_id.as_str(), bytes.as_slice())?;
+            insert_delivery_lineage_index(&write, record)?;
             let mut ready = write.open_table(READY_BY_DEPT_DUE)?;
             ready.insert(
                 make_index_key(&record.dept, record.not_before_ms, &record.delivery_id).as_str(),
@@ -205,6 +226,54 @@ impl DeliveryStore {
         }
         commit_write(write)?;
         Ok(())
+    }
+
+    pub(crate) fn lookup_lineage(
+        &self,
+        queue: &str,
+        dept: &str,
+        source: &SourceRef,
+    ) -> Result<LineageLookup> {
+        let read = self.db.begin_read()?;
+        let lineage = read.open_table(LINEAGE_BY_SOURCE)?;
+        let delivery = read.open_table(DELIVERY_BY_ID)?;
+        let dead = read.open_table(DEAD_BY_ID)?;
+
+        let mut live_delivery = None;
+        let live_prefix = lineage_index_prefix(queue, dept, source, "live");
+        let live_end = format!("{live_prefix}\u{10ffff}");
+        for entry in lineage.range::<&str>(live_prefix.as_str()..=live_end.as_str())? {
+            let (_, delivery_id) = entry?;
+            count_lineage_index_read();
+            let Some(record) = read_delivery_read_only(&delivery, delivery_id.value())? else {
+                continue;
+            };
+            live_delivery = Some(record);
+            break;
+        }
+
+        let mut terminal_dead_letter = None;
+        let dead_prefix = lineage_index_prefix(queue, dept, source, "terminal");
+        let dead_end = format!("{dead_prefix}\u{10ffff}");
+        let mut terminal_entries =
+            lineage.range::<&str>(dead_prefix.as_str()..=dead_end.as_str())?;
+        while let Some(entry) = terminal_entries.next_back() {
+            let (_, delivery_id) = entry?;
+            count_lineage_index_read();
+            let Some(record) = read_dead_table_read_only(&dead, delivery_id.value())? else {
+                continue;
+            };
+            if !is_terminal_tombstone(&record) {
+                continue;
+            }
+            terminal_dead_letter = Some(record);
+            break;
+        }
+
+        Ok(LineageLookup {
+            live_delivery,
+            terminal_dead_letter,
+        })
     }
 
     pub(crate) fn rebind_deliveries_to_current_subscribers(
@@ -255,6 +324,7 @@ impl DeliveryStore {
             for (delivery_id, mut record, new_dept) in candidates {
                 let old_dept = record.dept.clone();
                 let leased = record.lease_until_ms.is_some();
+                remove_delivery_lineage_index(&write, &record)?;
                 if let Some(lease_until) = record.lease_until_ms {
                     lease_index.remove(
                         make_index_key(&old_dept, lease_until, delivery_id.as_str()).as_str(),
@@ -269,6 +339,7 @@ impl DeliveryStore {
                 record.dept = new_dept.clone();
                 let bytes = serde_json::to_vec(&record)?;
                 delivery.insert(delivery_id.as_str(), bytes.as_slice())?;
+                insert_delivery_lineage_index(&write, &record)?;
                 if let Some(lease_until) = record.lease_until_ms {
                     lease_index.insert(
                         make_index_key(&record.dept, lease_until, delivery_id.as_str()).as_str(),
@@ -369,6 +440,7 @@ impl DeliveryStore {
                             .as_str(),
                     )?;
                 }
+                remove_delivery_lineage_index(&write, &record)?;
                 record.lease_until_ms = None;
                 record.not_before_ms = now_ms;
                 record.last_error_excerpt = Some(SUBSCRIBER_ABSENT_DEAD_REASON.to_string());
@@ -389,6 +461,7 @@ impl DeliveryStore {
                 };
                 let bytes = serde_json::to_vec(&dead)?;
                 if let Some(previous) = read_dead_table(&dead_table, delivery_id.as_str())? {
+                    remove_dead_lineage_index(&write, &previous)?;
                     dead_by_time.remove(
                         make_dead_time_index_key(
                             previous.dead_at_ms,
@@ -406,6 +479,7 @@ impl DeliveryStore {
                     )?;
                 }
                 dead_table.insert(delivery_id.as_str(), bytes.as_slice())?;
+                insert_dead_lineage_index(&write, &dead)?;
                 dead_by_time.insert(
                     make_dead_time_index_key(dead.dead_at_ms, delivery_id.as_str()).as_str(),
                     &(),
@@ -711,10 +785,12 @@ impl DeliveryStore {
                     } else {
                         return Ok(false);
                     }
+                    remove_delivery_lineage_index(&write, &current)?;
                     let follow_up_due = current.not_before_ms;
                     if prepare_dirty_follow_up(&mut current, follow_up_due) {
                         let bytes = serde_json::to_vec(&current)?;
                         delivery.insert(delivery_id, bytes.as_slice())?;
+                        insert_delivery_lineage_index(&write, &current)?;
                         let mut ready = write.open_table(READY_BY_DEPT_DUE)?;
                         ready.insert(
                             make_index_key(&current.dept, current.not_before_ms, delivery_id)
@@ -734,6 +810,59 @@ impl DeliveryStore {
         };
         commit_write(write)?;
         Ok(applied)
+    }
+
+    pub(crate) fn defer_lock_busy(
+        &self,
+        delivery_id: &str,
+        lease_generation: u64,
+        lock: &str,
+        policy: &RetryPolicy,
+        now_ms: u64,
+    ) -> Result<LockBusyDeferOutcome> {
+        let mut op = StoreOpWatch::new("defer_lock_busy", "<unknown>");
+        let write = self.begin_write()?;
+        let outcome = {
+            let mut delivery = write.open_table(DELIVERY_BY_ID)?;
+            match read_delivery_table(&delivery, delivery_id)? {
+                Some(mut current) => {
+                    op.set_dept(&current.dept);
+                    match current.lease_until_ms {
+                        Some(lease_until) if current.lease_generation == lease_generation => {
+                            let mut lease_index = write.open_table(LEASED_BY_DEPT_UNTIL)?;
+                            lease_index.remove(
+                                make_index_key(&current.dept, lease_until, delivery_id).as_str(),
+                            )?;
+                            remove_delivery_lineage_index(&write, &current)?;
+
+                            let defer_ordinal = current.lease_generation.max(1);
+                            let delay = backoff_delay(policy.base, policy.cap, defer_ordinal);
+                            let jitter = bounded_jitter(delivery_id, defer_ordinal, policy.base);
+                            current.not_before_ms = now_ms
+                                .saturating_add(duration_millis(delay))
+                                .saturating_add(duration_millis(jitter));
+                            current.lease_until_ms = None;
+                            current.last_error_excerpt =
+                                Some(error_excerpt(&format!("lock busy lock={lock}")));
+                            let bytes = serde_json::to_vec(&current)?;
+                            delivery.insert(delivery_id, bytes.as_slice())?;
+                            insert_delivery_lineage_index(&write, &current)?;
+                            let mut ready = write.open_table(READY_BY_DEPT_DUE)?;
+                            ready.insert(
+                                make_index_key(&current.dept, current.not_before_ms, delivery_id)
+                                    .as_str(),
+                                &(),
+                            )?;
+                            LockBusyDeferOutcome::Scheduled
+                        }
+                        _ => LockBusyDeferOutcome::Stale,
+                    }
+                }
+                None => LockBusyDeferOutcome::Missing,
+            }
+        };
+        commit_write(write)?;
+        Ok(outcome)
     }
 
     pub(crate) fn retry(
@@ -786,6 +915,7 @@ impl DeliveryStore {
                         let mut dead_by_time = write.open_table(DEAD_BY_TIME)?;
                         let mut dead_index = write.open_table(DEAD_BY_DEPT_DUE)?;
                         if let Some(previous) = read_dead_table(&dead_table, delivery_id)? {
+                            remove_dead_lineage_index(&write, &previous)?;
                             dead_by_time.remove(
                                 make_dead_time_index_key(previous.dead_at_ms, delivery_id).as_str(),
                             )?;
@@ -799,10 +929,12 @@ impl DeliveryStore {
                             )?;
                         }
                         dead_table.insert(delivery_id, bytes.as_slice())?;
+                        insert_dead_lineage_index(&write, &dead)?;
                         dead_by_time.insert(
                             make_dead_time_index_key(dead.dead_at_ms, delivery_id).as_str(),
                             &(),
                         )?;
+                        remove_delivery_lineage_index(&write, &current)?;
                         let promoted_dirty_follow_up =
                             !failure.replayable && prepare_dirty_follow_up(&mut current, now_ms);
                         if failure.replayable {
@@ -821,6 +953,7 @@ impl DeliveryStore {
                             if promoted_dirty_follow_up {
                                 let bytes = serde_json::to_vec(&current)?;
                                 delivery.insert(delivery_id, bytes.as_slice())?;
+                                insert_delivery_lineage_index(&write, &current)?;
                                 let mut ready = write.open_table(READY_BY_DEPT_DUE)?;
                                 ready.insert(
                                     make_index_key(
@@ -844,6 +977,7 @@ impl DeliveryStore {
                             RetryOutcome::PermanentDead
                         }
                     } else {
+                        remove_delivery_lineage_index(&write, &current)?;
                         let delay = backoff_delay(policy.base, policy.cap, attempt);
                         let jitter = bounded_jitter(delivery_id, attempt, policy.base);
                         current.not_before_ms = now_ms
@@ -851,6 +985,7 @@ impl DeliveryStore {
                             .saturating_add(duration_millis(jitter));
                         let bytes = serde_json::to_vec(&current)?;
                         delivery.insert(delivery_id, bytes.as_slice())?;
+                        insert_delivery_lineage_index(&write, &current)?;
                         let mut ready = write.open_table(READY_BY_DEPT_DUE)?;
                         ready.insert(
                             make_index_key(&current.dept, current.not_before_ms, delivery_id)
@@ -961,6 +1096,7 @@ impl DeliveryStore {
                     dead.replayable = false;
                     let bytes = serde_json::to_vec(&dead)?;
                     dead_table.insert(delivery_id.as_str(), bytes.as_slice())?;
+                    insert_dead_lineage_index(&write, &dead)?;
                     terminal_index.insert(
                         make_dead_due_index_key(&dead.dept, dead.dead_at_ms, delivery_id.as_str())
                             .as_str(),
@@ -979,6 +1115,7 @@ impl DeliveryStore {
                     dead.record = None;
                     let bytes = serde_json::to_vec(&dead)?;
                     dead_table.insert(delivery_id.as_str(), bytes.as_slice())?;
+                    insert_dead_lineage_index(&write, &dead)?;
                     terminal_index.insert(
                         make_dead_due_index_key(&dead.dept, dead.dead_at_ms, delivery_id.as_str())
                             .as_str(),
@@ -987,6 +1124,7 @@ impl DeliveryStore {
                     if promoted_dirty_follow_up {
                         let bytes = serde_json::to_vec(&record)?;
                         delivery.insert(delivery_id.as_str(), bytes.as_slice())?;
+                        insert_delivery_lineage_index(&write, &record)?;
                         ready.insert(
                             make_index_key(&record.dept, record.not_before_ms, &delivery_id)
                                 .as_str(),
@@ -1017,6 +1155,7 @@ impl DeliveryStore {
                         Some(error_excerpt("redrive collision with live delivery"));
                     let bytes = serde_json::to_vec(&dead)?;
                     dead_table.insert(delivery_id.as_str(), bytes.as_slice())?;
+                    insert_dead_lineage_index(&write, &dead)?;
                     terminal_index.insert(
                         make_dead_due_index_key(&dead.dept, dead.dead_at_ms, delivery_id.as_str())
                             .as_str(),
@@ -1037,6 +1176,8 @@ impl DeliveryStore {
                 record.subscriber_absent_since_ms = None;
                 let bytes = serde_json::to_vec(&record)?;
                 delivery.insert(delivery_id.as_str(), bytes.as_slice())?;
+                remove_dead_lineage_index(&write, &dead)?;
+                insert_delivery_lineage_index(&write, &record)?;
                 ready.insert(
                     make_index_key(&record.dept, record.not_before_ms, delivery_id.as_str())
                         .as_str(),
@@ -1323,6 +1464,16 @@ impl DeliveryStore {
         (WRITE_TXN_COUNT.get(), WRITE_COMMIT_COUNT.get())
     }
 
+    #[cfg(test)]
+    fn reset_lineage_index_read_count() {
+        LINEAGE_INDEX_READ_COUNT.set(0);
+    }
+
+    #[cfg(test)]
+    fn lineage_index_read_count() -> usize {
+        LINEAGE_INDEX_READ_COUNT.get()
+    }
+
     fn begin_write(&self) -> Result<redb::WriteTransaction> {
         begin_write(&self.db)
     }
@@ -1380,6 +1531,199 @@ fn prepare_dirty_follow_up(record: &mut DeliveryRecord, not_before_ms: u64) -> b
     record.last_error_excerpt = None;
     true
 }
+
+fn rebuild_lineage_index(write: &redb::WriteTransaction) -> Result<()> {
+    write.delete_table(LINEAGE_BY_SOURCE)?;
+    let deliveries = {
+        let table = write.open_table(DELIVERY_BY_ID)?;
+        let mut records = Vec::new();
+        for entry in table.iter()? {
+            let (delivery_id, bytes) = entry?;
+            let record = match serde_json::from_slice::<DeliveryRecord>(bytes.value()) {
+                Ok(record) => record,
+                Err(err) => {
+                    tracing::warn!(
+                        delivery_id = %delivery_id.value(),
+                        error = %err,
+                        "skipping undecodable delivery record during lineage index rebuild"
+                    );
+                    continue;
+                }
+            };
+            records.push(record);
+        }
+        records
+    };
+    let dead_records = {
+        let table = write.open_table(DEAD_BY_ID)?;
+        let mut records = Vec::new();
+        for entry in table.iter()? {
+            let (delivery_id, bytes) = entry?;
+            let Some(record) = decode_dead_record(delivery_id.value(), bytes.value()) else {
+                continue;
+            };
+            records.push(record);
+        }
+        records
+    };
+    for record in &deliveries {
+        insert_delivery_lineage_index(write, record)?;
+    }
+    for record in &dead_records {
+        insert_dead_lineage_index(write, record)?;
+    }
+    Ok(())
+}
+
+fn insert_delivery_lineage_index(
+    write: &redb::WriteTransaction,
+    record: &DeliveryRecord,
+) -> Result<()> {
+    let Some(source) = &record.source else {
+        return Ok(());
+    };
+    let mut lineage = write.open_table(LINEAGE_BY_SOURCE)?;
+    lineage.insert(
+        lineage_index_key(
+            &record.queue,
+            &record.dept,
+            source,
+            "live",
+            record.not_before_ms,
+            &record.delivery_id,
+        )
+        .as_str(),
+        record.delivery_id.as_str(),
+    )?;
+    Ok(())
+}
+
+fn remove_delivery_lineage_index(
+    write: &redb::WriteTransaction,
+    record: &DeliveryRecord,
+) -> Result<()> {
+    let Some(source) = &record.source else {
+        return Ok(());
+    };
+    let mut lineage = write.open_table(LINEAGE_BY_SOURCE)?;
+    lineage.remove(
+        lineage_index_key(
+            &record.queue,
+            &record.dept,
+            source,
+            "live",
+            record.not_before_ms,
+            &record.delivery_id,
+        )
+        .as_str(),
+    )?;
+    Ok(())
+}
+
+fn insert_dead_lineage_index(write: &redb::WriteTransaction, record: &DeadRecord) -> Result<()> {
+    if !is_terminal_tombstone(record) {
+        return Ok(());
+    }
+    let Some(source) = &record.source else {
+        return Ok(());
+    };
+    let mut lineage = write.open_table(LINEAGE_BY_SOURCE)?;
+    lineage.insert(
+        lineage_index_key(
+            &record.queue,
+            &record.dept,
+            source,
+            "terminal",
+            record.dead_at_ms,
+            &record.delivery_id,
+        )
+        .as_str(),
+        record.delivery_id.as_str(),
+    )?;
+    Ok(())
+}
+
+fn remove_dead_lineage_index(write: &redb::WriteTransaction, record: &DeadRecord) -> Result<()> {
+    if !is_terminal_tombstone(record) {
+        return Ok(());
+    }
+    let Some(source) = &record.source else {
+        return Ok(());
+    };
+    let mut lineage = write.open_table(LINEAGE_BY_SOURCE)?;
+    lineage.remove(
+        lineage_index_key(
+            &record.queue,
+            &record.dept,
+            source,
+            "terminal",
+            record.dead_at_ms,
+            &record.delivery_id,
+        )
+        .as_str(),
+    )?;
+    Ok(())
+}
+
+fn lineage_index_key(
+    queue: &str,
+    dept: &str,
+    source: &SourceRef,
+    record_kind: &str,
+    sort_ms: u64,
+    delivery_id: &str,
+) -> String {
+    format!(
+        "{}at/{sort_ms:020}/id/{}",
+        lineage_index_prefix(queue, dept, source, record_kind),
+        encode_ordered_lineage_id(delivery_id)
+    )
+}
+
+fn lineage_index_prefix(queue: &str, dept: &str, source: &SourceRef, record_kind: &str) -> String {
+    format!(
+        "v1/queue/{}/dept/{}/source/{}/{}/{record_kind}/",
+        encode_lineage_segment(queue),
+        encode_lineage_segment(dept),
+        source_kind_key(&source.kind),
+        encode_lineage_segment(&source.reference),
+    )
+}
+
+fn encode_lineage_segment(value: &str) -> String {
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(value.as_bytes())
+}
+
+fn encode_ordered_lineage_id(value: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = String::with_capacity(value.len().saturating_mul(2));
+    for byte in value.bytes() {
+        encoded.push(char::from(HEX[usize::from(byte >> 4)]));
+        encoded.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    encoded
+}
+
+fn source_kind_key(kind: &SourceKind) -> &'static str {
+    match kind {
+        SourceKind::File => "file",
+        SourceKind::Cron => "cron",
+        SourceKind::Git => "git",
+        SourceKind::External => "external",
+    }
+}
+
+fn is_terminal_tombstone(record: &DeadRecord) -> bool {
+    !record.delivery_id.is_empty() && record.attempts >= 1 && record.permanent && !record.replayable
+}
+
+#[cfg(test)]
+fn count_lineage_index_read() {
+    LINEAGE_INDEX_READ_COUNT.set(LINEAGE_INDEX_READ_COUNT.get() + 1);
+}
+
+#[cfg(not(test))]
+fn count_lineage_index_read() {}
 
 fn expired_lease_quota(batch_limit: usize) -> usize {
     if batch_limit == 0 {
@@ -1676,6 +2020,7 @@ fn compact_terminal_dead_records(write: &redb::WriteTransaction, now_ms: u64) ->
         if record.dead_at_ms > cutoff_ms {
             break;
         }
+        remove_dead_lineage_index(write, &record)?;
         dead.remove(delivery_id.as_str())?;
         dead_by_time
             .remove(make_dead_time_index_key(record.dead_at_ms, delivery_id.as_str()).as_str())?;
@@ -1866,6 +2211,13 @@ mod tests {
         }
     }
 
+    fn lineage_source(reference: impl Into<String>) -> SourceRef {
+        SourceRef {
+            kind: SourceKind::External,
+            reference: reference.into(),
+        }
+    }
+
     fn insert_replayable_dead(store: &DeliveryStore, delivery_id: &str, dead_at_ms: u64) {
         let mut delivery = record(delivery_id, 100);
         delivery.delivery_id = delivery_id.to_string();
@@ -1973,6 +2325,286 @@ mod tests {
     }
 
     #[test]
+    fn lineage_lookup_cost_is_independent_of_backlog_size() {
+        let temp = TempDir::new().unwrap();
+        let store = store(&temp);
+        let source = lineage_source("owner/repo#issue/42");
+        let mut baseline_terminal = record("terminal-baseline", 0);
+        baseline_terminal.source = Some(source.clone());
+        store.enqueue(&baseline_terminal).unwrap();
+        let leased = store
+            .lease_for_dept("worker", 100, 1, Duration::from_millis(50))
+            .unwrap()
+            .remove(0);
+        store
+            .retry(
+                &leased.delivery_id,
+                leased.lease_generation,
+                &failure("final", false),
+                &policy(1),
+                150,
+            )
+            .unwrap();
+        let mut target = record("target", 100);
+        target.source = Some(source.clone());
+        store.enqueue(&target).unwrap();
+
+        DeliveryStore::reset_lineage_index_read_count();
+        let before = store.lookup_lineage("input", "worker", &source).unwrap();
+        let before_reads = DeliveryStore::lineage_index_read_count();
+        assert_eq!(
+            before
+                .live_delivery
+                .as_ref()
+                .map(|row| row.delivery_id.as_str()),
+            Some("target")
+        );
+        assert_eq!(
+            before
+                .terminal_dead_letter
+                .as_ref()
+                .map(|row| row.delivery_id.as_str()),
+            Some("terminal-baseline")
+        );
+
+        for index in 0..1_000 {
+            let mut unrelated = record(&format!("unrelated-{index:04}"), 100);
+            unrelated.source = Some(lineage_source(format!(
+                "owner/repo#issue/unrelated-{index}"
+            )));
+            store.enqueue(&unrelated).unwrap();
+        }
+
+        DeliveryStore::reset_lineage_index_read_count();
+        let after = store.lookup_lineage("input", "worker", &source).unwrap();
+        let after_reads = DeliveryStore::lineage_index_read_count();
+        assert_eq!(
+            after
+                .live_delivery
+                .as_ref()
+                .map(|row| row.delivery_id.as_str()),
+            Some("target")
+        );
+        assert_eq!(after_reads, before_reads);
+
+        for index in 0..100 {
+            let mut same_lineage = record(&format!("same-lineage-{index:04}"), 200 + index);
+            same_lineage.source = Some(source.clone());
+            store.enqueue(&same_lineage).unwrap();
+        }
+        for index in 0..20 {
+            let mut same_lineage_terminal = record(&format!("terminal-{index:04}"), 0);
+            same_lineage_terminal.source = Some(source.clone());
+            store.enqueue(&same_lineage_terminal).unwrap();
+            let leased = store
+                .lease_for_dept("worker", 100, 1, Duration::from_millis(50))
+                .unwrap()
+                .remove(0);
+            store
+                .retry(
+                    &leased.delivery_id,
+                    leased.lease_generation,
+                    &failure("final", false),
+                    &policy(1),
+                    300 + index,
+                )
+                .unwrap();
+        }
+
+        DeliveryStore::reset_lineage_index_read_count();
+        let after_same_lineage = store.lookup_lineage("input", "worker", &source).unwrap();
+        let after_same_lineage_reads = DeliveryStore::lineage_index_read_count();
+        assert_eq!(
+            after_same_lineage
+                .live_delivery
+                .as_ref()
+                .map(|row| row.delivery_id.as_str()),
+            Some("target")
+        );
+        assert_eq!(
+            after_same_lineage
+                .terminal_dead_letter
+                .as_ref()
+                .map(|row| row.delivery_id.as_str()),
+            Some("terminal-0019")
+        );
+        assert_eq!(after_same_lineage_reads, before_reads);
+    }
+
+    #[test]
+    fn lineage_index_tracks_rebind_ack_dead_letter_and_redrive_transitions() {
+        let temp = TempDir::new().unwrap();
+        let store = store(&temp);
+        let source = lineage_source("owner/repo#issue/42");
+        let mut target = record("target", 100);
+        target.queue = "jobs".to_string();
+        target.dept = "old_worker".to_string();
+        target.source = Some(source.clone());
+        store.enqueue(&target).unwrap();
+
+        store
+            .rebind_deliveries_to_current_subscribers(&BTreeMap::from([(
+                "jobs".to_string(),
+                "new_worker".to_string(),
+            )]))
+            .unwrap();
+        assert!(store
+            .lookup_lineage("jobs", "old_worker", &source)
+            .unwrap()
+            .live_delivery
+            .is_none());
+        assert_eq!(
+            store
+                .lookup_lineage("jobs", "new_worker", &source)
+                .unwrap()
+                .live_delivery
+                .unwrap()
+                .delivery_id,
+            "target"
+        );
+
+        let leased = store
+            .lease_for_dept("new_worker", 100, 1, Duration::from_millis(50))
+            .unwrap()
+            .remove(0);
+        store
+            .retry(
+                &leased.delivery_id,
+                leased.lease_generation,
+                &failure("final", false),
+                &policy(1),
+                200,
+            )
+            .unwrap();
+        let terminal = store.lookup_lineage("jobs", "new_worker", &source).unwrap();
+        assert!(terminal.live_delivery.is_none());
+        assert_eq!(terminal.terminal_dead_letter.unwrap().delivery_id, "target");
+
+        let ack_source = lineage_source("owner/repo#issue/43");
+        let mut acked = record("acked", 100);
+        acked.source = Some(ack_source.clone());
+        store.enqueue(&acked).unwrap();
+        let leased = store
+            .lease_for_dept("worker", 100, 1, Duration::from_millis(50))
+            .unwrap()
+            .remove(0);
+        assert!(store
+            .ack(&leased.delivery_id, leased.lease_generation)
+            .unwrap());
+        assert!(store
+            .lookup_lineage("input", "worker", &ack_source)
+            .unwrap()
+            .live_delivery
+            .is_none());
+
+        let scheduled_source = lineage_source("owner/repo#issue/45");
+        let mut scheduled_first = record("scheduled-first", 100);
+        scheduled_first.dept = "schedule-worker".to_string();
+        scheduled_first.source = Some(scheduled_source.clone());
+        let mut scheduled_second = record("scheduled-second", 200);
+        scheduled_second.dept = "schedule-worker".to_string();
+        scheduled_second.source = Some(scheduled_source.clone());
+        store.enqueue(&scheduled_first).unwrap();
+        store.enqueue(&scheduled_second).unwrap();
+        let leased = store
+            .lease_for_dept("schedule-worker", 100, 1, Duration::from_millis(50))
+            .unwrap()
+            .remove(0);
+        store
+            .retry(
+                &leased.delivery_id,
+                leased.lease_generation,
+                &failure("retry", true),
+                &policy(2),
+                300,
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .lookup_lineage("input", "schedule-worker", &scheduled_source)
+                .unwrap()
+                .live_delivery
+                .unwrap()
+                .delivery_id,
+            "scheduled-second"
+        );
+
+        let replay_source = lineage_source("owner/repo#issue/44");
+        let mut replayed = record("replayed", 100);
+        replayed.source = Some(replay_source.clone());
+        store.enqueue(&replayed).unwrap();
+        let leased = store
+            .lease_for_dept("worker", 100, 1, Duration::from_millis(50))
+            .unwrap()
+            .remove(0);
+        store
+            .retry(
+                &leased.delivery_id,
+                leased.lease_generation,
+                &failure("transient", true),
+                &policy(1),
+                200,
+            )
+            .unwrap();
+        let pending_redrive = store
+            .lookup_lineage("input", "worker", &replay_source)
+            .unwrap();
+        assert!(pending_redrive.live_delivery.is_none());
+        assert!(pending_redrive.terminal_dead_letter.is_none());
+
+        store
+            .redrive_due(
+                &RedrivePolicy {
+                    max_redrives: 3,
+                    cooldown: Duration::ZERO,
+                },
+                200,
+                1,
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .lookup_lineage("input", "worker", &replay_source)
+                .unwrap()
+                .live_delivery
+                .unwrap()
+                .delivery_id,
+            "replayed"
+        );
+        let leased = store
+            .lease_for_dept("worker", 200, 1, Duration::from_millis(50))
+            .unwrap()
+            .remove(0);
+        store
+            .retry(
+                &leased.delivery_id,
+                leased.lease_generation,
+                &failure("transient again", true),
+                &policy(1),
+                250,
+            )
+            .unwrap();
+        store
+            .redrive_due(
+                &RedrivePolicy {
+                    max_redrives: 1,
+                    cooldown: Duration::ZERO,
+                },
+                250,
+                1,
+            )
+            .unwrap();
+        let terminal = store
+            .lookup_lineage("input", "worker", &replay_source)
+            .unwrap();
+        assert!(terminal.live_delivery.is_none());
+        assert_eq!(
+            terminal.terminal_dead_letter.unwrap().delivery_id,
+            "replayed"
+        );
+    }
+
+    #[test]
     fn duplicate_enqueue_same_content_is_noop() {
         let temp = TempDir::new().unwrap();
         let store = store(&temp);
@@ -2060,8 +2692,10 @@ mod tests {
     fn leased_keyed_duplicates_coalesce_into_one_follow_up_after_ack() {
         let temp = TempDir::new().unwrap();
         let store = store(&temp);
+        let source = lineage_source("owner/repo#issue/dirty-ack");
         let mut original = record("one", 100);
         original.collapse_by_dedup_id = true;
+        original.source = Some(source.clone());
         store.enqueue(&original).unwrap();
         let leased = store
             .lease(100, 1, Duration::from_millis(50))
@@ -2087,6 +2721,15 @@ mod tests {
         assert_eq!(follow_up.lease_until_ms, None);
         assert_eq!(store.ready_index_len().unwrap(), 1);
         assert_eq!(store.leased_index_len().unwrap(), 0);
+        assert_eq!(
+            store
+                .lookup_lineage("input", "worker", &source)
+                .unwrap()
+                .live_delivery
+                .unwrap()
+                .delivery_id,
+            "one"
+        );
         let leased_follow_up = store.lease(100, 10, Duration::from_millis(50)).unwrap();
         assert_eq!(leased_follow_up.len(), 1);
         assert!(store
@@ -2096,6 +2739,11 @@ mod tests {
             )
             .unwrap());
         assert!(store.get("one").unwrap().is_none());
+        assert!(store
+            .lookup_lineage("input", "worker", &source)
+            .unwrap()
+            .live_delivery
+            .is_none());
     }
 
     #[test]
@@ -2236,8 +2884,10 @@ mod tests {
     fn permanent_dead_keyed_delivery_promotes_one_dirty_follow_up() {
         let temp = TempDir::new().unwrap();
         let store = store(&temp);
+        let source = lineage_source("owner/repo#issue/dirty-terminal");
         let mut original = record("one", 100);
         original.collapse_by_dedup_id = true;
+        original.source = Some(source.clone());
         store.enqueue(&original).unwrap();
         let leased = store
             .lease(100, 1, Duration::from_millis(50))
@@ -2265,6 +2915,9 @@ mod tests {
         assert_eq!(store.ready_index_len().unwrap(), 1);
         assert_eq!(store.leased_index_len().unwrap(), 0);
         assert!(!store.terminal_suppresses("one").unwrap());
+        let lineage = store.lookup_lineage("input", "worker", &source).unwrap();
+        assert_eq!(lineage.live_delivery.unwrap().delivery_id, "one");
+        assert_eq!(lineage.terminal_dead_letter.unwrap().delivery_id, "one");
         assert_eq!(
             store
                 .lease(120, 10, Duration::from_millis(50))
@@ -4045,6 +4698,67 @@ mod tests {
         assert_eq!(store.terminal_dead_index_len().unwrap(), 0);
         assert_eq!(store.terminal_suppression_slot_len().unwrap(), 1);
         assert!(store.terminal_suppresses("terminal").unwrap());
+    }
+
+    #[test]
+    fn schema_v10_open_backfills_lineage_index_with_exact_terminal_predicate() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("delivery.redb");
+        let source = lineage_source("owner/repo#issue/42");
+        let mut live = record("live", 100);
+        live.source = Some(source.clone());
+        let dead_record = |delivery_id: &str, dead_at_ms: u64, attempts: u64| DeadRecord {
+            delivery_id: delivery_id.to_string(),
+            queue: "input".to_string(),
+            dept: "worker".to_string(),
+            source: Some(source.clone()),
+            observed_at_ms: 10,
+            not_before_ms: 100,
+            dead_at_ms,
+            attempts,
+            redrive_count: 0,
+            replayable: false,
+            permanent: true,
+            error_excerpt: Some("final".to_string()),
+            record: None,
+        };
+        let older = dead_record("older", 200, 1);
+        let same_time_earlier = dead_record("latest-a", 300, 2);
+        let latest = dead_record("latest-b", 300, 2);
+        let no_attempt = dead_record("no-attempt", 400, 0);
+        {
+            let db = Database::create(&path).unwrap();
+            let write = db.begin_write().unwrap();
+            {
+                let mut delivery = write.open_table(DELIVERY_BY_ID).unwrap();
+                delivery
+                    .insert(
+                        live.delivery_id.as_str(),
+                        serde_json::to_vec(&live).unwrap().as_slice(),
+                    )
+                    .unwrap();
+                let mut dead = write.open_table(DEAD_BY_ID).unwrap();
+                for record in [&older, &same_time_earlier, &latest, &no_attempt] {
+                    dead.insert(
+                        record.delivery_id.as_str(),
+                        serde_json::to_vec(record).unwrap().as_slice(),
+                    )
+                    .unwrap();
+                }
+                let mut meta = write.open_table(META).unwrap();
+                meta.insert("schema_version", "10").unwrap();
+            }
+            write.commit().unwrap();
+        }
+
+        let store = DeliveryStore::open(&path).unwrap();
+        let lineage = store.lookup_lineage("input", "worker", &source).unwrap();
+
+        assert_eq!(lineage.live_delivery.unwrap().delivery_id, "live");
+        assert_eq!(
+            lineage.terminal_dead_letter.unwrap().delivery_id,
+            "latest-b"
+        );
     }
 
     #[test]

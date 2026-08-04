@@ -33,6 +33,7 @@ use crate::process_tree::ProcessGroupRegistry;
 use consumer::spawn_consumer;
 use delivery_router::DeliveryRouter;
 use delivery_store::{DeliveryStore, SubscriberAbsentSweep};
+use delivery_types::RetryPolicy;
 use event_fanout::Fanout;
 use failure_fact::schema_validation_failure_fact;
 use journal::SupervisorJournal;
@@ -139,6 +140,16 @@ pub async fn supervise(roots: PackageRoots, framework_bin: PathBuf) -> Result<()
         config_context.resolved_positive_usize(ConfigKey::MaxInFlightPerDept)?;
     let durable_admission_burst_per_dept =
         config_context.resolved_positive_usize(ConfigKey::DurableAdmissionBurstPerDept)?;
+    let lock_busy_default_backoff = RetryPolicy {
+        max_attempts: config_context.resolved_positive_usize(ConfigKey::RetryDefaultMaxAttempts)?
+            as u64,
+        base: parse_duration(
+            &config_context.resolved_positive_duration_string(ConfigKey::RetryDefaultBase)?,
+        )?,
+        cap: parse_duration(
+            &config_context.resolved_positive_duration_string(ConfigKey::RetryDefaultCap)?,
+        )?,
+    };
     let subscriber_absent_budget = parse_duration(
         &config_context
             .resolved_positive_duration_string(ConfigKey::SubscriberAbsentDeliveryBudget)?,
@@ -195,6 +206,7 @@ pub async fn supervise(roots: PackageRoots, framework_bin: PathBuf) -> Result<()
                 codex_permit_slots,
                 max_in_flight_per_dept,
                 durable_admission_burst_per_dept,
+                lock_busy_default_backoff.clone(),
                 process_groups.clone(),
                 journal.clone(),
             )

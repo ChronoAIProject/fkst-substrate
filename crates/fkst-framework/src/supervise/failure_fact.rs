@@ -13,6 +13,7 @@ pub(crate) enum ErrorClass {
     DeliveryFailure,
     FrameworkChildNonzero,
     FrameworkChildSpawn,
+    LockBusy,
     RaisedPublish,
     SpawnArgs,
     StoreOpWatchdog,
@@ -25,12 +26,37 @@ impl ErrorClass {
             Self::DeliveryFailure => "delivery_failure",
             Self::FrameworkChildNonzero => "framework_child_nonzero",
             Self::FrameworkChildSpawn => "framework_child_spawn",
+            Self::LockBusy => "lock_busy",
             Self::RaisedPublish => "raised_publish",
             Self::SpawnArgs => "spawn_args",
             Self::StoreOpWatchdog => "store_op_watchdog",
             Self::SchemaValidation => "schema_validation",
         }
     }
+}
+
+pub(crate) fn lock_busy_failure_fact(
+    origin_dept: &str,
+    origin_queue: &str,
+    record: Option<&DeliveryRecord>,
+    lock: Option<&str>,
+) -> Event {
+    let error_class = ErrorClass::LockBusy;
+    let lock_label = lock.unwrap_or("unknown");
+    let error = format!("lock busy lock={lock_label}");
+    failure_fact_event(json!({
+        "schema": FAILURE_FACT_SCHEMA,
+        "error_class": error_class.as_str(),
+        "fingerprint": fingerprint(error_class, lock_label),
+        "error": error,
+        "lock": lock,
+        "attempt": record.map(|record| record.attempt),
+        "delivery_id": record.map(|record| record.delivery_id.as_str()),
+        "origin_queue": origin_queue,
+        "origin_dept": origin_dept,
+        "source_ref": source_ref_json(record.and_then(|record| record.source.as_ref())),
+        "observed_at_ms": record.map(|record| record.observed_at_ms),
+    }))
 }
 
 pub(crate) fn classify_delivery_error(error: &str) -> ErrorClass {

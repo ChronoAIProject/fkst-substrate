@@ -16,6 +16,7 @@
 //!   0 = pipeline ok
 //!   1 = lua error / pipeline error
 //!   2 = SDK / IO / arg parsing error
+//!   75 = with_lock contention; supervise-owned transient defer
 //!   124 = codex subprocess timed out and was killed by SIGKILL -pgid
 
 use anyhow::{Context, Result};
@@ -681,6 +682,10 @@ fn run_pipeline(
         None,
     ) {
         Ok(()) => 0,
+        Err(e) if sdk_git::lock_busy_key(&e).is_some() => {
+            eprintln!("[framework] pipeline deferred: {:#}", e);
+            sdk_git::LOCK_BUSY_EXIT_CODE
+        }
         Err(e) => {
             eprintln!("[framework] pipeline failed: {:#}", e);
             1
