@@ -713,10 +713,13 @@ fn run_adoptable_codex_request(
         return Ok(result);
     }
     let existing = read_adoption_record(&paths.status)?;
-    let running = existing.as_ref().filter(|record| {
-        record.status == CODEX_ADOPTION_STATUS_RUNNING && adoption_effect_alive(&paths.dir, record)
-    });
-    if running.is_none() {
+    let running = match existing.as_ref() {
+        Some(record) if record.status == CODEX_ADOPTION_STATUS_RUNNING => {
+            adoption_effect_alive(&paths.dir, record).map_err(mlua::Error::external)?
+        }
+        _ => false,
+    };
+    if !running {
         start_adoption_worker(&request, &paths, host_root, config)?;
     }
     drop(lock_file);
@@ -1189,28 +1192,15 @@ fn try_acquire_adoption_worker_witness(
     }
 }
 
-fn adoption_effect_alive(work_dir: &Path, record: &CodexAdoptionRecord) -> bool {
-    let path = match adoption_worker_witness_path(work_dir, &record.run_id) {
-        Ok(path) => path,
-        Err(err) => {
-            eprintln!(
-                "WARN: codex adoption lifetime witness invalid run_id={} error={err}",
-                record.run_id
-            );
-            return false;
-        }
-    };
-    match lifetime_witness_held(&path) {
-        Ok(held) => held,
-        Err(err) => {
-            eprintln!(
-                "WARN: codex adoption lifetime witness probe failed run_id={} path={} error={err}",
-                record.run_id,
-                path.display()
-            );
-            false
-        }
-    }
+fn adoption_effect_alive(work_dir: &Path, record: &CodexAdoptionRecord) -> anyhow::Result<bool> {
+    let path = adoption_worker_witness_path(work_dir, &record.run_id)?;
+    lifetime_witness_held(&path).map_err(|err| {
+        anyhow::anyhow!(
+            "codex adoption lifetime witness probe failed run_id={} path={} error={err}",
+            record.run_id,
+            path.display()
+        )
+    })
 }
 
 fn adoption_intent_alive(work_dir: &Path) -> bool {
@@ -1222,7 +1212,7 @@ fn adoption_intent_alive(work_dir: &Path) -> bool {
                 "WARN: codex adoption intent witness probe failed path={} error={err}",
                 path.display()
             );
-            false
+            true
         }
     }
 }
@@ -1676,13 +1666,13 @@ fn claim_adoption_worker(
         drop(lock_file);
         return Ok(None);
     }
-    if existing.as_ref().is_some_and(|record| {
-        record.status == CODEX_ADOPTION_STATUS_RUNNING
-            && record.worker_pid != Some(current_pid)
-            && adoption_effect_alive(&options.work_dir, record)
+    if let Some(record) = existing.as_ref().filter(|record| {
+        record.status == CODEX_ADOPTION_STATUS_RUNNING && record.worker_pid != Some(current_pid)
     }) {
-        drop(lock_file);
-        return Ok(None);
+        if adoption_effect_alive(&options.work_dir, record)? {
+            drop(lock_file);
+            return Ok(None);
+        }
     }
     adoption.worker_pid = Some(current_pid);
     adoption.status = CODEX_ADOPTION_STATUS_RUNNING.to_string();
@@ -2091,7 +2081,7 @@ fn read_codex_status_records(host_root: &Path) -> anyhow::Result<Vec<CodexStatus
                             "WARN: codex lifetime witness probe failed path={} error={err}",
                             path.display()
                         );
-                        false
+                        true
                     }
                 };
                 for line in body.lines() {
@@ -2195,9 +2185,17 @@ fn adoption_status_for_observe(record: &CodexAdoptionRecord, work_dir: &Path) ->
         CODEX_ADOPTION_STATUS_INTENT if adoption_intent_alive(work_dir) => {
             CODEX_ADOPTION_STATUS_RUNNING
         }
-        CODEX_ADOPTION_STATUS_RUNNING if adoption_effect_alive(work_dir, record) => {
-            CODEX_ADOPTION_STATUS_RUNNING
-        }
+        CODEX_ADOPTION_STATUS_RUNNING => match adoption_effect_alive(work_dir, record) {
+            Ok(true) => CODEX_ADOPTION_STATUS_RUNNING,
+            Ok(false) => "completed",
+            Err(err) => {
+                eprintln!(
+                    "WARN: codex adoption lifetime witness indeterminate run_id={} error={err}",
+                    record.run_id
+                );
+                CODEX_ADOPTION_STATUS_RUNNING
+            }
+        },
         _ => "completed",
     }
 }
@@ -3450,6 +3448,40 @@ mod tests {
             .unwrap();
         assert_eq!(visible.run_id, "codex-new-incarnation");
         assert_eq!(visible.status, CODEX_ADOPTION_STATUS_RUNNING);
+    }
+
+    #[test]
+    fn invalid_adoption_incarnation_is_not_evidence_of_death() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("adoption");
+        let paths = CodexAdoptionPaths {
+            key: "same-key".to_string(),
+            prompt: dir.join("prompt.txt"),
+            stdout: dir.join("stdout.txt"),
+            stderr: dir.join("stderr.txt"),
+            effect: dir.join("effect.json"),
+            effect_log: dir.join("effect-receipts.log"),
+            result: dir.join("result.json"),
+            status: dir.join("status.json"),
+            dir,
+        };
+        let mut request = command_test_request();
+        request.run_id = "invalid/incarnation".to_string();
+        let record = adoption_record_from_request(
+            &request,
+            &paths,
+            CODEX_ADOPTION_STATUS_RUNNING,
+            Some(std::process::id()),
+            None,
+        );
+
+        let probe = adoption_effect_alive(&paths.dir, &record);
+
+        assert!(probe.is_err());
+        assert_eq!(
+            adoption_status_for_observe(&record, &paths.dir),
+            CODEX_ADOPTION_STATUS_RUNNING
+        );
     }
 
     #[test]
