@@ -1203,10 +1203,20 @@ fn adoption_effect_alive(work_dir: &Path, record: &CodexAdoptionRecord) -> anyho
     })
 }
 
-fn adoption_intent_alive(work_dir: &Path) -> bool {
+fn adoption_intent_alive(work_dir: &Path, record: &CodexAdoptionRecord) -> bool {
     let path = work_dir.join("run.lock");
     match lifetime_witness_held(&path) {
-        Ok(held) => held,
+        Ok(true) => true,
+        Ok(false) => match adoption_effect_alive(work_dir, record) {
+            Ok(held) => held,
+            Err(err) => {
+                eprintln!(
+                    "WARN: codex adoption intent worker witness probe failed run_id={} error={err}",
+                    record.run_id
+                );
+                true
+            }
+        },
         Err(err) => {
             eprintln!(
                 "WARN: codex adoption intent witness probe failed path={} error={err}",
@@ -2234,7 +2244,7 @@ fn adoption_status_exit_code(record: &CodexAdoptionRecord, observed_status: &str
 fn adoption_status_for_observe(record: &CodexAdoptionRecord, work_dir: &Path) -> &'static str {
     match record.status.as_str() {
         CODEX_ADOPTION_STATUS_COMPLETED => "completed",
-        CODEX_ADOPTION_STATUS_INTENT if adoption_intent_alive(work_dir) => {
+        CODEX_ADOPTION_STATUS_INTENT if adoption_intent_alive(work_dir, record) => {
             CODEX_ADOPTION_STATUS_RUNNING
         }
         CODEX_ADOPTION_STATUS_RUNNING => match adoption_effect_alive(work_dir, record) {
@@ -3593,6 +3603,39 @@ mod tests {
         let probe = adoption_effect_alive(&paths.dir, &record);
 
         assert!(probe.is_err());
+        assert_eq!(
+            adoption_status_for_observe(&record, &paths.dir),
+            CODEX_ADOPTION_STATUS_RUNNING
+        );
+    }
+
+    #[test]
+    fn adoption_intent_stays_running_after_worker_witness_handoff() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("adoption");
+        let paths = CodexAdoptionPaths {
+            key: "same-key".to_string(),
+            prompt: dir.join("prompt.txt"),
+            stdout: dir.join("stdout.txt"),
+            stderr: dir.join("stderr.txt"),
+            effect: dir.join("effect.json"),
+            effect_log: dir.join("effect-receipts.log"),
+            result: dir.join("result.json"),
+            status: dir.join("status.json"),
+            dir,
+        };
+        let request = command_test_request();
+        let record = adoption_record_from_request(
+            &request,
+            &paths,
+            CODEX_ADOPTION_STATUS_INTENT,
+            None,
+            None,
+        );
+        let _worker_witness = try_acquire_adoption_worker_witness(&paths.dir, &record.run_id)
+            .unwrap()
+            .unwrap();
+
         assert_eq!(
             adoption_status_for_observe(&record, &paths.dir),
             CODEX_ADOPTION_STATUS_RUNNING
