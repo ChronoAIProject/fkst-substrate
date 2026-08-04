@@ -21,8 +21,9 @@ use external_command::{CommandCassetteMode, CommandCassetteOptions, MockCommandS
 use mlua::Lua;
 use sdk_git::{parse_worktree_paths, register};
 use std::path::Path;
-use std::process::Command;
+use std::process::{Child, Command, Output, Stdio};
 use std::sync::OnceLock;
+use std::time::{Duration, Instant};
 use support::process_sandbox::ProcessSandbox;
 use tempfile::tempdir;
 
@@ -147,6 +148,50 @@ fn assert_lua_error_contains(err: mlua::Error, parts: &[&str]) {
     }
 }
 
+fn framework_lock_command(host: &Path, runtime: &Path, lua: &Path, entered: &Path) -> Command {
+    let event = serde_json::json!({
+        "queue": "jobs",
+        "payload": {
+            "entered": entered,
+        },
+        "ts": 1,
+    });
+    let mut command = Command::new(env!("CARGO_BIN_EXE_fkst-framework"));
+    command
+        .arg("run")
+        .arg(lua)
+        .arg("--project-root")
+        .arg(host)
+        .arg("--package-root")
+        .arg(host)
+        .arg("--event")
+        .arg(event.to_string())
+        .current_dir(host)
+        .env_remove("FKST_SUPERVISOR_PID")
+        .env("FKST_RUNTIME_ROOT", runtime)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    command
+}
+
+fn wait_for_output_promptly(mut child: Child, timeout: Duration) -> Output {
+    let started = Instant::now();
+    loop {
+        if child.try_wait().unwrap().is_some() {
+            return child.wait_with_output().unwrap();
+        }
+        if started.elapsed() >= timeout {
+            let _ = child.kill();
+            let output = child.wait_with_output().unwrap();
+            panic!(
+                "child did not exit within {timeout:?}: stderr={}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
 #[test]
 fn with_lock_runs_fn() {
     let lua = Lua::new();
@@ -178,6 +223,88 @@ fn with_lock_runs_fn() {
         .join("locks/github-proxy/issue/owner/repo/42/=lock")
         .exists());
     assert!(!host.path().join("worker-req-001").exists());
+}
+
+#[test]
+fn with_lock_contention_defers_process_without_running_callback_then_reacquires() {
+    let process_sandbox = ProcessSandbox::new();
+    let (_process_lock, _process_guard) = process_sandbox.enter();
+    let host = tempdir().unwrap();
+    let runtime = tempdir().unwrap();
+    support::manifest_fixture::write_single_package_workspace(host.path());
+    let department = host.path().join("departments/worker/main.lua");
+    std::fs::create_dir_all(department.parent().unwrap()).unwrap();
+    std::fs::write(
+        &department,
+        r#"
+local M = {}
+M.spec = { consumes = { "jobs" }, ephemeral = { "jobs" }, stall_window = "30s" }
+function M.pipeline(event)
+  with_lock("shared/work", function()
+    file.write(event.payload.entered, "entered\n")
+  end)
+end
+return M
+"#,
+    )
+    .unwrap();
+
+    let contender_entered = runtime.path().join("contender-entered");
+    let layout = fkst_common::RuntimeLayout::new(runtime.path()).unwrap();
+    let lock_path = fkst_common::runtime_key_file(
+        &layout.runtime_dir(fkst_common::RuntimeKind::Locks),
+        "shared/work",
+        fkst_common::RUNTIME_LOCK_LEAF,
+    );
+    std::fs::create_dir_all(lock_path.parent().unwrap()).unwrap();
+    let holder = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(lock_path)
+        .unwrap();
+    nix::fcntl::flock(
+        std::os::fd::AsRawFd::as_raw_fd(&holder),
+        nix::fcntl::FlockArg::LockExclusive,
+    )
+    .unwrap();
+
+    let contender_started = Instant::now();
+    let contender =
+        framework_lock_command(host.path(), runtime.path(), &department, &contender_entered)
+            .spawn()
+            .unwrap();
+    let busy = wait_for_output_promptly(contender, Duration::from_secs(30));
+    let busy_elapsed = contender_started.elapsed();
+    let busy_stderr = String::from_utf8_lossy(&busy.stderr);
+
+    assert_eq!(busy.status.code(), Some(sdk_git::LOCK_BUSY_EXIT_CODE));
+    assert!(
+        busy_stderr.contains(
+            "event=with_lock_busy error_class=lock_busy lock=shared/work outcome=deferred"
+        ),
+        "stderr: {busy_stderr}"
+    );
+    assert!(busy_elapsed < Duration::from_secs(30));
+    assert!(
+        !contender_entered.exists(),
+        "busy callback must not execute"
+    );
+
+    drop(holder);
+
+    let acquired =
+        framework_lock_command(host.path(), runtime.path(), &department, &contender_entered)
+            .spawn()
+            .unwrap();
+    let acquired = wait_for_output_promptly(acquired, Duration::from_secs(30));
+    assert!(
+        acquired.status.success(),
+        "reacquire stderr: {}",
+        String::from_utf8_lossy(&acquired.stderr)
+    );
+    assert!(contender_entered.exists());
 }
 
 #[test]

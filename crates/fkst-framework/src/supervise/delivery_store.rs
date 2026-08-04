@@ -62,6 +62,13 @@ pub(crate) enum RetryOutcome {
 }
 
 #[derive(Debug, PartialEq, Eq)]
+pub(crate) enum LockBusyDeferOutcome {
+    Scheduled,
+    Stale,
+    Missing,
+}
+
+#[derive(Debug, PartialEq, Eq)]
 pub(crate) struct RetryFailure {
     pub message: String,
     pub replayable: bool,
@@ -780,6 +787,59 @@ impl DeliveryStore {
         };
         commit_write(write)?;
         Ok(applied)
+    }
+
+    pub(crate) fn defer_lock_busy(
+        &self,
+        delivery_id: &str,
+        lease_generation: u64,
+        lock: &str,
+        policy: &RetryPolicy,
+        now_ms: u64,
+    ) -> Result<LockBusyDeferOutcome> {
+        let mut op = StoreOpWatch::new("defer_lock_busy", "<unknown>");
+        let write = self.begin_write()?;
+        let outcome = {
+            let mut delivery = write.open_table(DELIVERY_BY_ID)?;
+            match read_delivery_table(&delivery, delivery_id)? {
+                Some(mut current) => {
+                    op.set_dept(&current.dept);
+                    match current.lease_until_ms {
+                        Some(lease_until) if current.lease_generation == lease_generation => {
+                            let mut lease_index = write.open_table(LEASED_BY_DEPT_UNTIL)?;
+                            lease_index.remove(
+                                make_index_key(&current.dept, lease_until, delivery_id).as_str(),
+                            )?;
+                            remove_delivery_lineage_index(&write, &current)?;
+
+                            let defer_ordinal = current.lease_generation.max(1);
+                            let delay = backoff_delay(policy.base, policy.cap, defer_ordinal);
+                            let jitter = bounded_jitter(delivery_id, defer_ordinal, policy.base);
+                            current.not_before_ms = now_ms
+                                .saturating_add(duration_millis(delay))
+                                .saturating_add(duration_millis(jitter));
+                            current.lease_until_ms = None;
+                            current.last_error_excerpt =
+                                Some(error_excerpt(&format!("lock busy lock={lock}")));
+                            let bytes = serde_json::to_vec(&current)?;
+                            delivery.insert(delivery_id, bytes.as_slice())?;
+                            insert_delivery_lineage_index(&write, &current)?;
+                            let mut ready = write.open_table(READY_BY_DEPT_DUE)?;
+                            ready.insert(
+                                make_index_key(&current.dept, current.not_before_ms, delivery_id)
+                                    .as_str(),
+                                &(),
+                            )?;
+                            LockBusyDeferOutcome::Scheduled
+                        }
+                        _ => LockBusyDeferOutcome::Stale,
+                    }
+                }
+                None => LockBusyDeferOutcome::Missing,
+            }
+        };
+        commit_write(write)?;
+        Ok(outcome)
     }
 
     pub(crate) fn retry(
