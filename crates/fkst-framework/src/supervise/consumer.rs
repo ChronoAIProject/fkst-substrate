@@ -1,12 +1,14 @@
 //! Per-department consumer task.
 
 use super::delivery_router::{now_unix_millis, DeliveryRouter, DerivedDelivery, PublishEnvelope};
-use super::delivery_store::{DeliveryStore, RetryFailure, RetryOutcome};
+use super::delivery_store::{DeliveryStore, LockBusyDeferOutcome, RetryFailure, RetryOutcome};
 use super::delivery_types::{
     DeadRecord, DeliveryRecord, RedrivePolicy, RetryPolicy, SourceKind, SourceRef,
 };
 use super::event_fanout::Fanout;
-use super::failure_fact::{dead_record_payload, delivery_failure_fact, FAILURE_FACT_QUEUE};
+use super::failure_fact::{
+    dead_record_payload, delivery_failure_fact, lock_busy_failure_fact, FAILURE_FACT_QUEUE,
+};
 use super::journal::{optional_path, SupervisorJournal};
 use super::raised::{parse_authenticated_raised, parse_authenticated_raised_line};
 use super::source_runner::parse_duration;
@@ -43,6 +45,7 @@ pub async fn spawn_consumer(
     codex_permit_slots: usize,
     max_in_flight: usize,
     admission_burst: usize,
+    lock_busy_default_backoff: RetryPolicy,
     process_groups: ProcessGroupRegistry,
     journal: SupervisorJournal,
 ) -> JoinHandle<()> {
@@ -78,6 +81,7 @@ pub async fn spawn_consumer(
             .map(policy_from_decl)
             .transpose()
             .expect("validation already accepted retry");
+        let lock_busy_backoff = retry_policy.clone().unwrap_or(lock_busy_default_backoff);
 
         let (ephemeral_tx, mut ephemeral_rx) = mpsc::channel::<Event>(queue_capacity);
         let mut ephemeral_open = !receivers.is_empty();
@@ -197,7 +201,15 @@ pub async fn spawn_consumer(
                 maybe_done = complete_rx.recv(), if !running.is_empty() => {
                     if let Some(done) = maybe_done {
                         running.remove(&done.record.delivery_id);
-                        finish_durable_record(&name, store.as_deref(), &router, retry_policy.as_ref(), done, &journal);
+                        finish_durable_record(
+                            &name,
+                            store.as_deref(),
+                            &router,
+                            retry_policy.as_ref(),
+                            &lock_busy_backoff,
+                            done,
+                            &journal,
+                        );
                     }
                 }
             }
@@ -257,6 +269,7 @@ fn spawn_ephemeral(
     process_groups: ProcessGroupRegistry,
     journal: SupervisorJournal,
 ) {
+    let origin_queue = event.queue.clone();
     let args = match spawn_args(
         decl,
         project_root,
@@ -311,6 +324,18 @@ fn spawn_ephemeral(
             .await
         {
             Ok(result) => {
+                if let Some(lock_busy) = lock_busy_from_spawn_result(&result) {
+                    record_lock_busy_fact(
+                        &router,
+                        &journal,
+                        &dept_name,
+                        &origin_queue,
+                        None,
+                        lock_busy.lock.as_deref(),
+                        "ephemeral_dropped",
+                    );
+                    return;
+                }
                 if result.exit_code != 0 {
                     return;
                 }
@@ -480,6 +505,15 @@ async fn run_durable_record(
     });
     let result =
         spawn_and_report_with_stdout_observer(dept_name, &args, stdout_observer, journal).await;
+    if let Ok(result) = &result {
+        if let Some(lock_busy) = lock_busy_from_spawn_result(result) {
+            return CompletedDelivery {
+                record,
+                failure: None,
+                lock_busy: Some(lock_busy),
+            };
+        }
+    }
     let failure = match result {
         Ok(result) if result.exit_code == 0 => {
             let publish_error_message = match publish_error.lock() {
@@ -492,6 +526,7 @@ async fn run_durable_record(
                     failure: Some(DeliveryFailure::permanent(format!(
                         "raised publish error: {err}"
                     ))),
+                    lock_busy: None,
                 };
             }
             let next_ordinal = match next_ordinal.lock() {
@@ -500,6 +535,7 @@ async fn run_durable_record(
                     return CompletedDelivery {
                         record,
                         failure: Some(DeliveryFailure::permanent("raised ordinal lock poisoned")),
+                        lock_busy: None,
                     }
                 }
             };
@@ -539,7 +575,11 @@ async fn run_durable_record(
         }
     };
 
-    CompletedDelivery { record, failure }
+    CompletedDelivery {
+        record,
+        failure,
+        lock_busy: None,
+    }
 }
 
 fn finish_durable_record(
@@ -547,6 +587,7 @@ fn finish_durable_record(
     store: Option<&DeliveryStore>,
     router: &DeliveryRouter,
     retry_policy: Option<&RetryPolicy>,
+    lock_busy_backoff: &RetryPolicy,
     done: CompletedDelivery,
     journal: &SupervisorJournal,
 ) {
@@ -554,6 +595,17 @@ fn finish_durable_record(
         error!(dept = %dept_name, "reliable consumer missing delivery store");
         return;
     };
+    if let Some(lock_busy) = done.lock_busy {
+        defer_lock_busy_record(
+            store,
+            router,
+            &done.record,
+            lock_busy.lock.as_deref(),
+            lock_busy_backoff,
+            journal,
+        );
+        return;
+    }
     if let Some(error) = done.failure {
         retry_record(store, router, retry_policy, &done.record, error, journal);
         return;
@@ -610,6 +662,84 @@ fn finish_durable_record(
             );
         }
     }
+}
+
+fn defer_lock_busy_record(
+    store: &DeliveryStore,
+    router: &DeliveryRouter,
+    record: &DeliveryRecord,
+    lock: Option<&str>,
+    policy: &RetryPolicy,
+    journal: &SupervisorJournal,
+) {
+    let lock_label = lock.unwrap_or("unknown");
+    let (outcome, error_message) = match store.defer_lock_busy(
+        &record.delivery_id,
+        record.lease_generation,
+        lock_label,
+        policy,
+        now_unix_millis(),
+    ) {
+        Ok(LockBusyDeferOutcome::Scheduled) => ("deferred", None),
+        Ok(LockBusyDeferOutcome::Stale | LockBusyDeferOutcome::Missing) => {
+            ("stale_or_missing", None)
+        }
+        Err(err) => ("defer_failed", Some(err.to_string())),
+    };
+    record_lock_busy_fact(
+        router,
+        journal,
+        &record.dept,
+        &record.queue,
+        Some(record),
+        lock,
+        outcome,
+    );
+    if let Some(error_message) = error_message {
+        error!(
+            dept = %record.dept,
+            delivery_id = %record.delivery_id,
+            lock = %lock_label,
+            error = %error_message,
+            "lock busy delivery defer failed"
+        );
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn record_lock_busy_fact(
+    router: &DeliveryRouter,
+    journal: &SupervisorJournal,
+    dept: &str,
+    queue: &str,
+    record: Option<&DeliveryRecord>,
+    lock: Option<&str>,
+    outcome: &str,
+) {
+    journal.event(
+        "lock_busy",
+        [
+            ("dept", dept.to_string()),
+            (
+                "delivery_id",
+                record.map_or_else(
+                    || "ephemeral".to_string(),
+                    |record| record.delivery_id.clone(),
+                ),
+            ),
+            ("origin_queue", queue.to_string()),
+            ("error_class", "lock_busy".to_string()),
+            ("lock", lock.unwrap_or("unknown").to_string()),
+            ("outcome", outcome.to_string()),
+        ],
+    );
+    publish_failure_fact(router, lock_busy_failure_fact(dept, queue, record, lock));
+}
+
+fn lock_busy_from_spawn_result(result: &SpawnResult) -> Option<LockBusy> {
+    (result.exit_code == crate::sdk_git::LOCK_BUSY_EXIT_CODE).then(|| LockBusy {
+        lock: crate::sdk_git::lock_busy_key_from_stderr(&result.stderr),
+    })
 }
 
 fn renew_running(
@@ -1099,9 +1229,14 @@ struct RunningDelivery {
     handle: JoinHandle<()>,
 }
 
+struct LockBusy {
+    lock: Option<String>,
+}
+
 struct CompletedDelivery {
     record: DeliveryRecord,
     failure: Option<DeliveryFailure>,
+    lock_busy: Option<LockBusy>,
 }
 
 pub(crate) struct TestDurableCompletion {
@@ -1122,7 +1257,11 @@ pub(crate) fn finish_test_durable_record(
         let failure = publish_test_raised_events(router, completion.raises, &record)
             .err()
             .map(|err| DeliveryFailure::permanent(format!("raised publish error: {err}")));
-        CompletedDelivery { record, failure }
+        CompletedDelivery {
+            record,
+            failure,
+            lock_busy: None,
+        }
     } else {
         CompletedDelivery {
             record,
@@ -1132,10 +1271,24 @@ pub(crate) fn finish_test_durable_record(
                     .unwrap_or_else(|| format!("exit={}", completion.exit_code)),
                 replayable: completion.exit_code == 124,
             }),
+            lock_busy: None,
         }
     };
     let dept = done.record.dept.clone();
-    finish_durable_record(&dept, Some(store), router, retry_policy, done, journal);
+    let default_lock_busy_backoff = RetryPolicy {
+        max_attempts: 1,
+        base: DISPATCH_INTERVAL,
+        cap: DISPATCH_INTERVAL,
+    };
+    finish_durable_record(
+        &dept,
+        Some(store),
+        router,
+        retry_policy,
+        retry_policy.unwrap_or(&default_lock_busy_backoff),
+        done,
+        journal,
+    );
     Ok(())
 }
 
@@ -1188,8 +1341,41 @@ mod tests {
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
+    use std::sync::{Mutex, MutexGuard, OnceLock};
     use tempfile::TempDir;
     use tokio::time::timeout;
+
+    static RESOURCE_HEAVY_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+    struct ResourceHeavyTestGuard {
+        _process_lock: MutexGuard<'static, ()>,
+        _file_lock: fs::File,
+    }
+
+    fn resource_heavy_test_lock() -> ResourceHeavyTestGuard {
+        let process_lock = RESOURCE_HEAVY_TEST_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let path = std::env::temp_dir().join("fkst-framework-resource-heavy-tests.lock");
+        let file_lock = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(path)
+            .unwrap();
+        nix::fcntl::flock(
+            std::os::fd::AsRawFd::as_raw_fd(&file_lock),
+            nix::fcntl::FlockArg::LockExclusive,
+        )
+        .unwrap();
+
+        ResourceHeavyTestGuard {
+            _process_lock: process_lock,
+            _file_lock: file_lock,
+        }
+    }
 
     fn package_namespace(root: &Path) -> String {
         root.canonicalize()
@@ -1279,6 +1465,21 @@ mod tests {
     fn write_executable(path: &Path, body: &str) {
         fs::write(path, format!("#!/bin/sh\n{body}\n")).unwrap();
         fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    fn built_framework_binary() -> PathBuf {
+        let test_binary = std::env::current_exe().unwrap();
+        let binary = test_binary
+            .parent()
+            .and_then(Path::parent)
+            .unwrap()
+            .join("fkst-framework");
+        assert!(binary.is_file(), "missing binary: {}", binary.display());
+        binary
+    }
+
+    fn shell_quote_path(path: &Path) -> String {
+        format!("'{}'", path.to_string_lossy().replace('\'', "'\"'\"'"))
     }
 
     fn write_single_package_workspace(root: &Path) {
@@ -1610,6 +1811,62 @@ units = [{units}]
         DeliveryRouter::new(&cfg, fanout, None, None)
     }
 
+    fn router_with_reliable_jobs_and_failure_fact(
+        store: Arc<DeliveryStore>,
+        fanout: Fanout,
+    ) -> DeliveryRouter {
+        let mut queue = BTreeMap::new();
+        for name in ["jobs", "fkst.failure_fact"] {
+            queue.insert(
+                name.to_string(),
+                QueueDecl {
+                    capacity: 8,
+                    fanout: false,
+                },
+            );
+        }
+        let mut department = BTreeMap::new();
+        department.insert(
+            "worker".to_string(),
+            DepartmentDecl {
+                lua: "departments/worker/main.lua".into(),
+                owner_root: std::path::PathBuf::from("."),
+                owner_namespace: "pkg".to_string(),
+                consumes: vec!["jobs".to_string()],
+                produces: Vec::new(),
+                published_seam: Vec::new(),
+                ephemeral: Vec::new(),
+                stall_window: "30s".to_string(),
+                graph_json: false,
+                retry: None,
+            },
+        );
+        department.insert(
+            "triage".to_string(),
+            DepartmentDecl {
+                lua: "departments/triage/main.lua".into(),
+                owner_root: std::path::PathBuf::from("."),
+                owner_namespace: "pkg".to_string(),
+                consumes: vec!["fkst.failure_fact".to_string()],
+                produces: Vec::new(),
+                published_seam: Vec::new(),
+                ephemeral: vec!["fkst.failure_fact".to_string()],
+                stall_window: "30s".to_string(),
+                graph_json: false,
+                retry: None,
+            },
+        );
+        let cfg = Config {
+            queue,
+            raiser: BTreeMap::new(),
+            department,
+            limits: LimitsDecl {
+                global_codex_processes: 1,
+            },
+        };
+        DeliveryRouter::new(&cfg, fanout, Some(store), None)
+    }
+
     fn authenticated_raised_stdout(token: &str, entries: serde_json::Value) -> String {
         let encoded =
             base64::engine::general_purpose::URL_SAFE.encode(serde_json::to_vec(&entries).unwrap());
@@ -1700,6 +1957,7 @@ units = [{units}]
 
     #[tokio::test]
     async fn durable_stdout_raised_line_does_not_publish() {
+        let _resource_guard = resource_heavy_test_lock();
         let temp = TempDir::new().unwrap();
         let binary = temp.path().join("fkst-framework");
         let lua = temp.path().join("dept.lua");
@@ -1782,7 +2040,74 @@ units = [{units}]
     }
 
     #[tokio::test]
+    async fn ephemeral_lock_busy_publishes_fact_without_durable_record() {
+        let _resource_guard = resource_heavy_test_lock();
+        let temp = TempDir::new().unwrap();
+        let binary = temp.path().join("fkst-framework");
+        let lua = temp.path().join("departments/worker/main.lua");
+        let log_dir = temp.path().join("logs");
+        fs::create_dir_all(lua.parent().unwrap()).unwrap();
+        fs::write(&lua, "return {}\n").unwrap();
+        write_executable(
+            &binary,
+            "printf 'event=with_lock_busy error_class=lock_busy lock=shared/work outcome=deferred\\n' >&2\nexit 75",
+        );
+        write_single_package_workspace(temp.path());
+        let roots = PackageRoots::resolve(temp.path(), vec![temp.path().to_path_buf()]).unwrap();
+        let decl = DepartmentDecl {
+            lua: "departments/worker/main.lua".into(),
+            owner_root: temp.path().canonicalize().unwrap(),
+            owner_namespace: package_namespace(temp.path()),
+            consumes: vec!["jobs".to_string()],
+            produces: Vec::new(),
+            published_seam: Vec::new(),
+            ephemeral: vec!["jobs".to_string()],
+            stall_window: "30s".to_string(),
+            graph_json: false,
+            retry: None,
+        };
+        let fanout = Fanout::new();
+        let mut failure_rx = fanout.subscribe("fkst.failure_fact", 8).await;
+        let router = router_with_failure_fact_and_fanout(fanout);
+        let journal_path = temp.path().join("supervisor.log");
+        let journal = SupervisorJournal::open_at(&journal_path);
+
+        spawn_ephemeral(
+            "worker",
+            &decl,
+            temp.path(),
+            &roots,
+            &binary,
+            &router,
+            &log_dir,
+            Event::new("jobs", serde_json::json!({"n": 1})),
+            Duration::from_secs(30),
+            1,
+            ProcessGroupRegistry::default(),
+            journal,
+        );
+
+        let fact = timeout(Duration::from_secs(2), failure_rx.recv())
+            .await
+            .expect("ephemeral lock busy fact should publish promptly")
+            .expect("failure fact subscription should remain open");
+        assert_eq!(fact.payload["error_class"], "lock_busy");
+        assert_eq!(fact.payload["lock"], "shared/work");
+        assert!(fact.payload["delivery_id"].is_null());
+        assert!(fact.payload["attempt"].is_null());
+
+        let journal = fs::read_to_string(journal_path).unwrap();
+        assert!(journal.contains("event=lock_busy"), "journal: {journal}");
+        assert!(
+            journal.contains("outcome=ephemeral_dropped"),
+            "journal: {journal}"
+        );
+        assert!(!temp.path().join("delivery.redb").exists());
+    }
+
+    #[tokio::test]
     async fn durable_authenticated_raised_publishes_before_child_exit() {
+        let _resource_guard = resource_heavy_test_lock();
         let temp = TempDir::new().unwrap();
         let binary = temp.path().join("fkst-framework");
         let lua = temp.path().join("dept.lua");
@@ -1883,6 +2208,7 @@ units = [{units}]
 
     #[tokio::test]
     async fn durable_dispatch_admits_one_new_child_per_pass_under_backlog() {
+        let _resource_guard = resource_heavy_test_lock();
         let temp = TempDir::new().unwrap();
         let store = Arc::new(DeliveryStore::open(temp.path().join("delivery.redb")).unwrap());
         store.enqueue(&record("one")).unwrap();
@@ -2032,6 +2358,7 @@ units = [{units}]
                 Some(store.as_ref()),
                 &router,
                 None,
+                &policy(3),
                 done,
                 &SupervisorJournal::disabled(),
             );
@@ -2043,6 +2370,7 @@ units = [{units}]
 
     #[tokio::test]
     async fn durable_dispatch_receives_rebound_delivery_after_consumer_swap() {
+        let _resource_guard = resource_heavy_test_lock();
         let temp = TempDir::new().unwrap();
         let store = Arc::new(DeliveryStore::open(temp.path().join("delivery.redb")).unwrap());
         let mut stale = record_for_dept("swapped", "old_worker");
@@ -2115,6 +2443,7 @@ units = [{units}]
             Some(store.as_ref()),
             &router,
             None,
+            &policy(3),
             done,
             &SupervisorJournal::disabled(),
         );
@@ -2124,6 +2453,7 @@ units = [{units}]
 
     #[tokio::test]
     async fn durable_dispatch_admits_burst_children_in_one_pass() {
+        let _resource_guard = resource_heavy_test_lock();
         // Guards the dispatch path itself (not just durable_dispatch_capacity arithmetic):
         // with admission_burst = 2 a single dispatch_due pass must lease+spawn exactly two
         // children, proving FKST_DURABLE_ADMISSION_BURST_PER_DEPT > 1 actually admits more
@@ -2227,6 +2557,7 @@ units = [{units}]
                 Some(store.as_ref()),
                 &router,
                 None,
+                &policy(3),
                 done,
                 &SupervisorJournal::disabled(),
             );
@@ -2235,6 +2566,7 @@ units = [{units}]
 
     #[tokio::test]
     async fn durable_dispatch_cap_is_per_department_not_global() {
+        let _resource_guard = resource_heavy_test_lock();
         let temp = TempDir::new().unwrap();
         let store = Arc::new(DeliveryStore::open(temp.path().join("delivery.redb")).unwrap());
         store
@@ -2340,6 +2672,7 @@ units = [{units}]
                 Some(store.as_ref()),
                 &router,
                 None,
+                &policy(3),
                 done,
                 &SupervisorJournal::disabled(),
             );
@@ -2351,6 +2684,7 @@ units = [{units}]
 
     #[tokio::test]
     async fn durable_dispatch_does_not_duplicate_same_dept_while_running() {
+        let _resource_guard = resource_heavy_test_lock();
         let temp = TempDir::new().unwrap();
         let store = Arc::new(DeliveryStore::open(temp.path().join("delivery.redb")).unwrap());
         store.enqueue(&record("one")).unwrap();
@@ -2444,6 +2778,7 @@ units = [{units}]
             Some(store.as_ref()),
             &router,
             None,
+            &policy(3),
             done,
             &SupervisorJournal::disabled(),
         );
@@ -2480,6 +2815,7 @@ units = [{units}]
             Some(store.as_ref()),
             &router,
             None,
+            &policy(3),
             done,
             &SupervisorJournal::disabled(),
         );
@@ -2562,6 +2898,328 @@ units = [{units}]
             .ack(&leased[0].delivery_id, leased[0].lease_generation)
             .unwrap());
 
+        assert!(store.get("one").unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn reserved_lock_busy_exit_without_stderr_defers_without_attempt_or_dead_letter() {
+        let _resource_guard = resource_heavy_test_lock();
+        let temp = TempDir::new().unwrap();
+        let binary = temp.path().join("fkst-framework");
+        let lua = temp.path().join("departments/worker/main.lua");
+        let log_dir = temp.path().join("logs");
+        fs::create_dir_all(lua.parent().unwrap()).unwrap();
+        fs::write(&lua, "return {}\n").unwrap();
+        write_executable(&binary, "exit 75");
+
+        let store = Arc::new(DeliveryStore::open(temp.path().join("delivery.redb")).unwrap());
+        store.enqueue(&record("one")).unwrap();
+        let leased = store
+            .lease_for_dept("worker", now_unix_millis(), 1, Duration::from_secs(30))
+            .unwrap()
+            .remove(0);
+        let fanout = Fanout::new();
+        let mut failure_rx = fanout.subscribe("fkst.failure_fact", 8).await;
+        let router = router_with_reliable_jobs_and_failure_fact(store.clone(), fanout);
+        let journal_path = temp.path().join("supervisor.log");
+        let journal = SupervisorJournal::open_at(&journal_path);
+        let before_defer = now_unix_millis();
+        let args = SpawnArgs {
+            framework_bin: binary,
+            lua_full: lua,
+            project_root: temp.path().into(),
+            graph_package_roots: vec![temp.path().into()],
+            event_json: "{}".to_string(),
+            stall_window: Duration::from_secs(30),
+            codex_permit_slots: 1,
+            raised_auth_token: Some("trusted-token".to_string()),
+            replay_scratch_bypass: false,
+            log_dir,
+            owner_namespace: "pkg".to_string(),
+            process_groups: ProcessGroupRegistry::default(),
+        };
+
+        let done = timeout(
+            Duration::from_secs(5),
+            run_durable_record("worker", &router, leased, args, &journal),
+        )
+        .await
+        .expect("reserved lock busy child must return promptly");
+        let lock_busy = done
+            .lock_busy
+            .as_ref()
+            .expect("exit 75 must classify as lock busy");
+        assert!(lock_busy.lock.is_none());
+        assert!(done.failure.is_none());
+
+        let retry_policy = policy(1);
+        finish_durable_record(
+            "worker",
+            Some(store.as_ref()),
+            &router,
+            Some(&retry_policy),
+            &retry_policy,
+            done,
+            &journal,
+        );
+
+        let deferred = store
+            .get("one")
+            .unwrap()
+            .expect("delivery must remain live");
+        assert_eq!(deferred.attempt, 0);
+        assert!(deferred.lease_until_ms.is_none());
+        assert!(deferred.not_before_ms > before_defer);
+        assert!(store.get_dead("one").unwrap().is_none());
+
+        let fact = timeout(Duration::from_secs(2), failure_rx.recv())
+            .await
+            .expect("lock busy failure fact should publish promptly")
+            .expect("failure fact subscription should remain open");
+        assert_eq!(fact.payload["error_class"], "lock_busy");
+        assert!(fact.payload["lock"].is_null());
+        assert_eq!(fact.payload["delivery_id"], "one");
+        assert_eq!(fact.payload["attempt"], 0);
+
+        let journal_body = fs::read_to_string(journal_path).unwrap();
+        assert!(
+            journal_body.contains("event=lock_busy"),
+            "journal: {journal_body}"
+        );
+        assert!(
+            journal_body.contains("lock=unknown"),
+            "journal: {journal_body}"
+        );
+        assert!(
+            journal_body.contains("outcome=deferred"),
+            "journal: {journal_body}"
+        );
+        assert!(
+            !journal_body.contains("event=acked"),
+            "journal: {journal_body}"
+        );
+        assert!(
+            !journal_body.contains("event=dead_lettered"),
+            "journal: {journal_body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn real_lock_contention_defers_without_attempt_or_dead_letter_then_reacquires() {
+        let _resource_guard = resource_heavy_test_lock();
+        let temp = TempDir::new().unwrap();
+        let lock = format!("test/lock-busy-{}", ulid::Ulid::new());
+        let callback_entered = temp.path().join("callback-entered");
+        let lua = temp.path().join("departments/worker/main.lua");
+        let log_dir = temp.path().join("logs");
+        let runtime_root = temp.path().join("runtime");
+        let framework = temp.path().join("fkst-framework-with-runtime");
+        write_executable(
+            &framework,
+            &format!(
+                "export FKST_RUNTIME_ROOT={}\nexec {} \"$@\"",
+                shell_quote_path(&runtime_root),
+                shell_quote_path(&built_framework_binary()),
+            ),
+        );
+        fs::create_dir_all(lua.parent().unwrap()).unwrap();
+        fs::write(
+            &lua,
+            format!(
+                r#"
+local M = {{}}
+M.spec = {{ consumes = {{ "jobs" }}, stall_window = "30s" }}
+function M.pipeline(event)
+  with_lock("{lock}", function()
+    file.write(event.payload.entered, "entered\n")
+  end)
+end
+return M
+"#,
+            ),
+        )
+        .unwrap();
+        write_single_package_workspace(temp.path());
+        let roots = PackageRoots::resolve(temp.path(), vec![temp.path().to_path_buf()]).unwrap();
+        let decl = DepartmentDecl {
+            lua: "departments/worker/main.lua".into(),
+            owner_root: temp.path().canonicalize().unwrap(),
+            owner_namespace: package_namespace(temp.path()),
+            consumes: vec!["jobs".to_string()],
+            produces: Vec::new(),
+            published_seam: Vec::new(),
+            ephemeral: Vec::new(),
+            stall_window: "30s".to_string(),
+            graph_json: false,
+            retry: None,
+        };
+
+        let layout = fkst_common::RuntimeLayout::new(&runtime_root).unwrap();
+        let lock_path = fkst_common::runtime_key_file(
+            &layout.runtime_dir(fkst_common::RuntimeKind::Locks),
+            &lock,
+            fkst_common::RUNTIME_LOCK_LEAF,
+        );
+        fs::create_dir_all(lock_path.parent().unwrap()).unwrap();
+        let holder = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .unwrap();
+        nix::fcntl::flock(
+            std::os::fd::AsRawFd::as_raw_fd(&holder),
+            nix::fcntl::FlockArg::LockExclusive,
+        )
+        .unwrap();
+
+        let store = Arc::new(DeliveryStore::open(temp.path().join("delivery.redb")).unwrap());
+        let mut pending = record("one");
+        pending.payload = serde_json::json!({"entered": callback_entered});
+        store.enqueue(&pending).unwrap();
+        let leased = store
+            .lease_for_dept("worker", now_unix_millis(), 1, Duration::from_secs(30))
+            .unwrap()
+            .remove(0);
+        let fanout = Fanout::new();
+        let mut failure_rx = fanout.subscribe("fkst.failure_fact", 8).await;
+        let router = router_with_reliable_jobs_and_failure_fact(store.clone(), fanout);
+        let journal_path = temp.path().join("supervisor.log");
+        let journal = SupervisorJournal::open_at(&journal_path);
+        let before_defer = now_unix_millis();
+        let args = spawn_args(
+            &decl,
+            temp.path(),
+            &roots,
+            &framework,
+            &log_dir,
+            event_from_record(&leased),
+            Duration::from_secs(30),
+            1,
+            ProcessGroupRegistry::default(),
+        )
+        .unwrap();
+
+        let done = timeout(
+            Duration::from_secs(30),
+            run_durable_record("worker", &router, leased, args, &journal),
+        )
+        .await
+        .expect("contended framework child must return promptly");
+        assert_eq!(
+            done.lock_busy
+                .as_ref()
+                .and_then(|lock_busy| lock_busy.lock.as_deref()),
+            Some(lock.as_str())
+        );
+        assert!(done.failure.is_none());
+        assert!(!callback_entered.exists(), "busy callback must not execute");
+
+        let retry_policy = policy(1);
+        finish_durable_record(
+            "worker",
+            Some(store.as_ref()),
+            &router,
+            Some(&retry_policy),
+            &retry_policy,
+            done,
+            &journal,
+        );
+
+        let deferred = store
+            .get("one")
+            .unwrap()
+            .expect("delivery must remain live");
+        assert_eq!(deferred.attempt, 0);
+        assert!(deferred.lease_until_ms.is_none());
+        assert!(deferred.not_before_ms > before_defer);
+        assert!(store.get_dead("one").unwrap().is_none());
+        assert!(store
+            .lease_for_dept("worker", before_defer, 1, Duration::from_secs(30))
+            .unwrap()
+            .is_empty());
+
+        let fact = timeout(Duration::from_secs(1), failure_rx.recv())
+            .await
+            .expect("lock busy failure fact should publish promptly")
+            .expect("failure fact subscription should remain open");
+        assert_eq!(fact.payload["error_class"], "lock_busy");
+        assert_eq!(fact.payload["lock"], lock);
+        assert_eq!(fact.payload["attempt"], 0);
+        assert!(fact.payload["fingerprint"]
+            .as_str()
+            .unwrap()
+            .starts_with("lock_busy:"));
+
+        let journal_body = fs::read_to_string(journal_path).unwrap();
+        assert!(
+            journal_body.contains("event=lock_busy"),
+            "journal: {journal_body}"
+        );
+        assert!(
+            journal_body.contains("error_class=lock_busy"),
+            "journal: {journal_body}"
+        );
+        assert!(
+            journal_body.contains(&format!("lock={lock}")),
+            "journal: {journal_body}"
+        );
+        assert!(
+            journal_body.contains("outcome=deferred"),
+            "journal: {journal_body}"
+        );
+
+        let child_logs = fs::read_dir(&log_dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| fs::read_to_string(entry.path()).unwrap())
+            .collect::<String>();
+        assert!(
+            child_logs.contains(&format!(
+                "event=with_lock_busy error_class=lock_busy lock={lock} outcome=deferred"
+            )),
+            "child logs: {child_logs}"
+        );
+
+        let due_later = store
+            .lease_for_dept("worker", u64::MAX, 1, Duration::from_secs(30))
+            .unwrap()
+            .remove(0);
+        assert_eq!(due_later.attempt, 0);
+
+        drop(holder);
+        let mut args = spawn_args(
+            &decl,
+            temp.path(),
+            &roots,
+            &framework,
+            &log_dir,
+            event_from_record(&due_later),
+            Duration::from_secs(30),
+            1,
+            ProcessGroupRegistry::default(),
+        )
+        .unwrap();
+        args.replay_scratch_bypass = requires_replay_scratch_bypass(&due_later);
+        let done = timeout(
+            Duration::from_secs(30),
+            run_durable_record("worker", &router, due_later, args, &journal),
+        )
+        .await
+        .expect("framework child must acquire after holder releases");
+        assert!(done.lock_busy.is_none());
+        assert!(done.failure.is_none());
+        finish_durable_record(
+            "worker",
+            Some(store.as_ref()),
+            &router,
+            Some(&retry_policy),
+            &retry_policy,
+            done,
+            &journal,
+        );
+        assert!(callback_entered.exists());
         assert!(store.get("one").unwrap().is_none());
     }
 
