@@ -392,6 +392,7 @@ impl DeliveryStore {
             let mut dead_table = write.open_table(DEAD_BY_ID)?;
             let mut dead_index = write.open_table(DEAD_BY_DEPT_DUE)?;
             let mut dead_by_time = write.open_table(DEAD_BY_TIME)?;
+            let mut terminal_index = write.open_table(TERMINAL_DEAD_BY_TIME)?;
             for delivery_id in candidates {
                 let Some(mut record) = read_delivery_table(&delivery, &delivery_id)? else {
                     continue;
@@ -477,6 +478,14 @@ impl DeliveryStore {
                         )
                         .as_str(),
                     )?;
+                    terminal_index.remove(
+                        make_dead_due_index_key(
+                            &previous.dept,
+                            previous.dead_at_ms,
+                            previous.delivery_id.as_str(),
+                        )
+                        .as_str(),
+                    )?;
                 }
                 dead_table.insert(delivery_id.as_str(), bytes.as_slice())?;
                 insert_dead_lineage_index(&write, &dead)?;
@@ -498,6 +507,7 @@ impl DeliveryStore {
             drop(dead_table);
             drop(dead_index);
             drop(dead_by_time);
+            drop(terminal_index);
             compact_terminal_dead_records(&write, now_ms)?;
         }
         if sweep.is_empty() {
@@ -914,12 +924,21 @@ impl DeliveryStore {
                         let mut dead_table = write.open_table(DEAD_BY_ID)?;
                         let mut dead_by_time = write.open_table(DEAD_BY_TIME)?;
                         let mut dead_index = write.open_table(DEAD_BY_DEPT_DUE)?;
+                        let mut terminal_index = write.open_table(TERMINAL_DEAD_BY_TIME)?;
                         if let Some(previous) = read_dead_table(&dead_table, delivery_id)? {
                             remove_dead_lineage_index(&write, &previous)?;
                             dead_by_time.remove(
                                 make_dead_time_index_key(previous.dead_at_ms, delivery_id).as_str(),
                             )?;
                             dead_index.remove(
+                                make_dead_due_index_key(
+                                    &previous.dept,
+                                    previous.dead_at_ms,
+                                    delivery_id,
+                                )
+                                .as_str(),
+                            )?;
+                            terminal_index.remove(
                                 make_dead_due_index_key(
                                     &previous.dept,
                                     previous.dead_at_ms,
@@ -944,7 +963,6 @@ impl DeliveryStore {
                                 &(),
                             )?;
                         } else {
-                            let mut terminal_index = write.open_table(TERMINAL_DEAD_BY_TIME)?;
                             terminal_index.insert(
                                 make_dead_due_index_key(&dead.dept, dead.dead_at_ms, delivery_id)
                                     .as_str(),
@@ -2928,6 +2946,75 @@ mod tests {
     }
 
     #[test]
+    fn repeated_dirty_terminalization_does_not_suppress_promoted_follow_up() {
+        let temp = TempDir::new().unwrap();
+        let store = store(&temp);
+        let mut original = record("one", 100);
+        original.collapse_by_dedup_id = true;
+        store.enqueue(&original).unwrap();
+        let first = store
+            .lease(100, 1, Duration::from_millis(50))
+            .unwrap()
+            .remove(0);
+        store.enqueue(&original).unwrap();
+        let first_dead_at = 120;
+        assert_eq!(
+            store
+                .retry(
+                    &first.delivery_id,
+                    first.lease_generation,
+                    &failure("first permanent", false),
+                    &policy(1),
+                    first_dead_at,
+                )
+                .unwrap(),
+            RetryOutcome::PermanentDead
+        );
+
+        let second = store
+            .lease(first_dead_at, 1, Duration::from_millis(50))
+            .unwrap()
+            .remove(0);
+        store.enqueue(&original).unwrap();
+        let second_dead_at = first_dead_at
+            .saturating_add(TERMINAL_DEAD_RETENTION_MS)
+            .saturating_add(1);
+        assert_eq!(
+            store
+                .retry(
+                    &second.delivery_id,
+                    second.lease_generation,
+                    &failure("second permanent", false),
+                    &policy(1),
+                    second_dead_at,
+                )
+                .unwrap(),
+            RetryOutcome::PermanentDead
+        );
+
+        assert_eq!(store.terminal_dead_index_len().unwrap(), 1);
+        assert!(!store.terminal_suppresses("one").unwrap());
+        let follow_up = store
+            .lease(second_dead_at, 1, Duration::from_millis(50))
+            .unwrap()
+            .remove(0);
+        assert!(store
+            .ack(&follow_up.delivery_id, follow_up.lease_generation)
+            .unwrap());
+        let mut next = original;
+        next.observed_at_ms = second_dead_at.saturating_add(1);
+        next.not_before_ms = second_dead_at.saturating_add(1);
+        store.enqueue(&next).unwrap();
+        assert_eq!(
+            store
+                .lease(next.not_before_ms, 1, Duration::from_millis(50))
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
     fn renew_lease_extends_matching_generation() {
         let temp = TempDir::new().unwrap();
         let store = store(&temp);
@@ -3503,6 +3590,45 @@ mod tests {
         assert!(dead_json.get("record").is_some());
         assert_eq!(store.dead_due_index_len().unwrap(), 1);
         assert_eq!(store.dead_time_index_len().unwrap(), 1);
+    }
+
+    #[test]
+    fn subscriber_absence_replacement_removes_previous_terminal_index() {
+        let temp = TempDir::new().unwrap();
+        let store = store(&temp);
+        let mut original = record("one", 100);
+        original.collapse_by_dedup_id = true;
+        store.enqueue(&original).unwrap();
+        let leased = store
+            .lease(100, 1, Duration::from_millis(50))
+            .unwrap()
+            .remove(0);
+        store.enqueue(&original).unwrap();
+        assert_eq!(
+            store
+                .retry(
+                    &leased.delivery_id,
+                    leased.lease_generation,
+                    &failure("permanent", false),
+                    &policy(1),
+                    120,
+                )
+                .unwrap(),
+            RetryOutcome::PermanentDead
+        );
+        assert_eq!(store.terminal_dead_index_len().unwrap(), 1);
+
+        let current_subscribers = BTreeSet::new();
+        store
+            .sweep_subscriber_absence(&current_subscribers, 130, Duration::ZERO, 10)
+            .unwrap();
+        let sweep = store
+            .sweep_subscriber_absence(&current_subscribers, 131, Duration::ZERO, 10)
+            .unwrap();
+
+        assert_eq!(sweep.dead_lettered.len(), 1);
+        assert!(sweep.dead_lettered[0].replayable);
+        assert_eq!(store.terminal_dead_index_len().unwrap(), 0);
     }
 
     #[test]
@@ -4486,6 +4612,13 @@ mod tests {
         let decoded: DeliveryRecord = serde_json::from_value(encoded).unwrap();
 
         assert!(!decoded.pending_dirty);
+    }
+
+    #[test]
+    fn clean_delivery_record_serialization_omits_pending_dirty() {
+        let encoded = serde_json::to_value(record("one", 100)).unwrap();
+
+        assert!(encoded.get("pending_dirty").is_none());
     }
 
     #[test]

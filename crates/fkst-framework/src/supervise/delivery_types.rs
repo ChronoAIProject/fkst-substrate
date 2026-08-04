@@ -34,7 +34,7 @@ pub(crate) struct DeliveryRecord {
     #[serde(default)]
     pub collapse_by_dedup_id: bool,
     /// A stable keyed duplicate arrived while this delivery was leased.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_false")]
     pub pending_dirty: bool,
     #[serde(default)]
     pub subscriber_absent_since_ms: Option<u64>,
@@ -80,4 +80,8 @@ pub(crate) struct RedrivePolicy {
 
 fn default_dead_permanent() -> bool {
     true
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
