@@ -1092,25 +1092,66 @@ fn acquire_lifetime_witness_from_disk(path: &Path) -> anyhow::Result<std::fs::Fi
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let file = std::fs::OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .read(true)
-        .write(true)
-        .open(path)?;
-    flock(file.as_raw_fd(), FlockArg::LockExclusive).map_err(anyhow::Error::from)?;
-    Ok(file)
+    for _ in 0..8 {
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(path)?;
+        flock(file.as_raw_fd(), FlockArg::LockExclusive).map_err(anyhow::Error::from)?;
+        if lifetime_witness_path_matches(&file, path)? {
+            return Ok(file);
+        }
+    }
+    anyhow::bail!(
+        "codex lifetime witness path changed repeatedly while locking: {}",
+        path.display()
+    )
 }
 
-fn lifetime_witness_held(path: &Path) -> anyhow::Result<bool> {
-    let file = match std::fs::OpenOptions::new().read(true).open(path) {
-        Ok(file) => file,
+#[cfg(unix)]
+fn lifetime_witness_path_matches(file: &std::fs::File, path: &Path) -> anyhow::Result<bool> {
+    use std::os::unix::fs::MetadataExt;
+
+    let locked = file.metadata()?;
+    let visible = match std::fs::metadata(path) {
+        Ok(metadata) => metadata,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
         Err(err) => return Err(err.into()),
     };
+    Ok(locked.dev() == visible.dev() && locked.ino() == visible.ino())
+}
+
+#[cfg(not(unix))]
+fn lifetime_witness_path_matches(_file: &std::fs::File, path: &Path) -> anyhow::Result<bool> {
+    Ok(path.exists())
+}
+
+fn lifetime_witness_held(path: &Path) -> anyhow::Result<bool> {
+    match probe_lifetime_witness(path)? {
+        LifetimeWitnessProbe::Held => Ok(true),
+        LifetimeWitnessProbe::Missing | LifetimeWitnessProbe::Unlocked(_) => Ok(false),
+    }
+}
+
+enum LifetimeWitnessProbe {
+    Missing,
+    Unlocked(std::fs::File),
+    Held,
+}
+
+fn probe_lifetime_witness(path: &Path) -> anyhow::Result<LifetimeWitnessProbe> {
+    let file = match std::fs::OpenOptions::new().read(true).open(path) {
+        Ok(file) => file,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(LifetimeWitnessProbe::Missing)
+        }
+        Err(err) => return Err(err.into()),
+    };
     match flock(file.as_raw_fd(), FlockArg::LockExclusiveNonblock) {
-        Ok(()) => Ok(false),
-        Err(nix::errno::Errno::EWOULDBLOCK) => Ok(true),
+        Ok(()) => Ok(LifetimeWitnessProbe::Unlocked(file)),
+        Err(nix::errno::Errno::EWOULDBLOCK) => Ok(LifetimeWitnessProbe::Held),
         Err(err) => Err(err.into()),
     }
 }
@@ -2848,6 +2889,7 @@ struct CodexLogEntry {
     path: PathBuf,
     len: u64,
     modified: SystemTime,
+    unlocked_witness: Option<std::fs::File>,
 }
 
 fn prune_codex_logs(
@@ -2895,17 +2937,32 @@ fn prune_codex_logs(
         if !metadata.is_file() {
             continue;
         }
+        let unlocked_witness = match probe_lifetime_witness(&path) {
+            Ok(LifetimeWitnessProbe::Unlocked(file)) => Some(file),
+            Ok(LifetimeWitnessProbe::Held) => None,
+            Ok(LifetimeWitnessProbe::Missing) => continue,
+            Err(err) => {
+                eprintln!(
+                    "WARN: codex log prune witness probe failed path={} error={err}",
+                    path.display()
+                );
+                None
+            }
+        };
         let modified = metadata.modified().unwrap_or(UNIX_EPOCH);
-        if let Some(max_age) = policy.max_age {
-            if now.duration_since(modified).unwrap_or(Duration::ZERO) > max_age {
-                remove_codex_log(&path);
-                continue;
+        if unlocked_witness.is_some() {
+            if let Some(max_age) = policy.max_age {
+                if now.duration_since(modified).unwrap_or(Duration::ZERO) > max_age {
+                    remove_codex_log(&path);
+                    continue;
+                }
             }
         }
         retained.push(CodexLogEntry {
             path,
             len: metadata.len(),
             modified,
+            unlocked_witness,
         });
     }
 
@@ -2930,6 +2987,9 @@ fn prune_codex_logs_by_size(mut entries: Vec<CodexLogEntry>, max_bytes: u64) {
     for entry in entries {
         if total <= max_bytes {
             break;
+        }
+        if entry.unlocked_witness.is_none() {
+            continue;
         }
         remove_codex_log(&entry.path);
         total = total.saturating_sub(entry.len);

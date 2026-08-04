@@ -2208,10 +2208,17 @@ printf 'ok'
     let log_dir = tmp.path().join("runtime/codex");
     std::fs::create_dir_all(&log_dir).unwrap();
     let old_log = log_dir.join("old.log");
+    let active_log = log_dir.join("active.log");
     let fresh_log = log_dir.join("fresh.log");
     let ignored = log_dir.join("old.txt");
     let now = SystemTime::now();
     write_log_with_mtime(&old_log, "old", now - Duration::from_secs(2 * 60 * 60));
+    write_log_with_mtime(
+        &active_log,
+        "active",
+        now - Duration::from_secs(2 * 60 * 60),
+    );
+    let _active_witness = hold_exclusive_lock(&active_log);
     write_log_with_mtime(&fresh_log, "fresh", now - Duration::from_secs(5 * 60));
     write_log_with_mtime(&ignored, "ignored", now - Duration::from_secs(2 * 60 * 60));
 
@@ -2231,6 +2238,7 @@ printf 'ok'
 
     assert_eq!(result.get::<i64>("exit_code").unwrap(), 0);
     assert!(!old_log.exists());
+    assert!(active_log.exists());
     assert!(fresh_log.exists());
     assert!(ignored.exists());
     assert!(current_log.exists());
@@ -2251,10 +2259,13 @@ printf 'ok'
 
     let log_dir = tmp.path().join("runtime/codex");
     std::fs::create_dir_all(&log_dir).unwrap();
+    let active = log_dir.join("active.log");
     let oldest = log_dir.join("oldest.log");
     let middle = log_dir.join("middle.log");
     let newest = log_dir.join("newest.log");
     let now = SystemTime::now();
+    write_log_with_mtime(&active, "active", now - Duration::from_secs(40));
+    let _active_witness = hold_exclusive_lock(&active);
     write_log_with_mtime(&oldest, "aaaaaa", now - Duration::from_secs(30));
     write_log_with_mtime(&middle, "bbbbbb", now - Duration::from_secs(20));
     write_log_with_mtime(&newest, "cccccc", now - Duration::from_secs(10));
@@ -2264,7 +2275,7 @@ printf 'ok'
     sandbox.prepend_path(&bin_dir);
     sandbox.runtime_log_dir(tmp.path().join("runtime"));
     sandbox.set_env("FKST_CODEX_LOG_MAX_AGE", "0");
-    sandbox.set_env("FKST_CODEX_LOG_MAX_BYTES", "12");
+    sandbox.set_env("FKST_CODEX_LOG_MAX_BYTES", "18");
     let (_lock, _guard) = sandbox.enter();
 
     let lua = Lua::new();
@@ -2274,6 +2285,7 @@ printf 'ok'
     let current_log = PathBuf::from(result.get::<String>("log_path").unwrap());
 
     assert_eq!(result.get::<i64>("exit_code").unwrap(), 0);
+    assert!(active.exists());
     assert!(!oldest.exists());
     assert!(middle.exists());
     assert!(newest.exists());
