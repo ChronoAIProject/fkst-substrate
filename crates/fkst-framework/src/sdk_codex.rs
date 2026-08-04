@@ -2441,6 +2441,26 @@ fn write_codex_effect_receipt(request: &CodexRequest, result: &CodexResult) -> a
     let Some(effect_log_path) = request.effect_log_path.as_deref() else {
         anyhow::bail!("codex effect receipt path missing for keyed adoption");
     };
+    let status_path = request
+        .adoption_status_path
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("codex adoption status path missing for effect receipt"))?;
+    let work_dir = status_path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("codex adoption status path has no parent"))?;
+    let lock_file = open_adoption_run_lock(work_dir)?;
+    flock(lock_file.as_raw_fd(), FlockArg::LockExclusive).map_err(anyhow::Error::from)?;
+    let current = read_adoption_record_from_disk(status_path)?;
+    if !current
+        .as_ref()
+        .is_some_and(|record| adoption_record_is_current(record, &request.run_id, effect_key))
+    {
+        eprintln!(
+            "WARN: codex adoption effect receipt publication fenced run_id={} key={effect_key}",
+            request.run_id
+        );
+        return Ok(());
+    }
     let receipt = CodexAdoptionEffectRecord {
         effect_key: effect_key.to_string(),
         ended_at_ms: unix_duration().as_millis() as u64,
@@ -3448,6 +3468,48 @@ mod tests {
             .unwrap();
         assert_eq!(visible.run_id, "codex-new-incarnation");
         assert_eq!(visible.status, CODEX_ADOPTION_STATUS_RUNNING);
+    }
+
+    #[test]
+    fn stale_adoption_incarnation_cannot_publish_effect_receipt() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("adoption");
+        let paths = CodexAdoptionPaths {
+            key: "same-key".to_string(),
+            prompt: dir.join("prompt.txt"),
+            stdout: dir.join("stdout.txt"),
+            stderr: dir.join("stderr.txt"),
+            effect: dir.join("effect.json"),
+            effect_log: dir.join("effect-receipts.log"),
+            result: dir.join("result.json"),
+            status: dir.join("status.json"),
+            dir,
+        };
+        let mut old_request = command_test_request();
+        old_request.run_id = "codex-old-incarnation".to_string();
+        old_request.adoption_status_path = Some(paths.status.clone());
+        old_request.effect_key = Some(paths.key.clone());
+        old_request.effect_log_path = Some(paths.effect_log.clone());
+        let old = adoption_record_from_request(
+            &old_request,
+            &paths,
+            CODEX_ADOPTION_STATUS_RUNNING,
+            Some(std::process::id()),
+            None,
+        );
+        let mut current = old.clone();
+        current.run_id = "codex-new-incarnation".to_string();
+        write_adoption_record(&paths.status, &current).unwrap();
+        let result = CodexResult::success(
+            "old-output".to_string(),
+            String::new(),
+            0,
+            old_request.log_path.to_string_lossy().into_owned(),
+        );
+
+        write_codex_effect_receipt(&old_request, &result).unwrap();
+
+        assert!(!paths.effect_log.exists());
     }
 
     #[test]
