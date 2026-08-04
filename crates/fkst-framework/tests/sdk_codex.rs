@@ -232,6 +232,43 @@ fn adoption_work_dir(root: &Path) -> PathBuf {
         .path()
 }
 
+#[cfg(unix)]
+fn hold_exclusive_lock(path: &Path) -> std::fs::File {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).unwrap();
+    }
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(path)
+        .unwrap();
+    flock(file.as_raw_fd(), FlockArg::LockExclusive).unwrap();
+    file
+}
+
+#[cfg(unix)]
+fn wait_for_exclusive_lock(path: &Path) {
+    for _ in 0..100 {
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(path)
+            .unwrap();
+        if flock(file.as_raw_fd(), FlockArg::LockExclusiveNonblock).is_ok() {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    panic!(
+        "timed out waiting for lifetime witness release: {}",
+        path.display()
+    );
+}
+
 fn wait_for_adoption_status(root: &Path, expected: &str) {
     for _ in 0..100 {
         if adoption_status_values(root)
@@ -271,6 +308,47 @@ fn codex_runs_fn(lua: &Lua) -> Function {
         .unwrap()
         .get("codex_runs")
         .unwrap()
+}
+
+#[cfg(unix)]
+#[test]
+fn codex_runs_projects_generic_running_only_while_its_log_witness_is_held() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut sandbox = ProcessSandbox::new();
+    sandbox.enter_cwd(tmp.path()).runtime_root(".fkst/runtime");
+    sandbox.runtime_log_dir(tmp.path().join("runtime"));
+    let (_lock, _guard) = sandbox.enter();
+
+    let log_path = tmp.path().join("runtime/codex/generic.log");
+    let witness = hold_exclusive_lock(&log_path);
+    let record = serde_json::json!({
+        "run_id": "codex-generic-crash",
+        "role": "implementer",
+        "started_at": "2026-08-05T00:00:00Z",
+        "started_at_ms": 1_786_000_000_000_u64,
+        "timeout_seconds": 3600,
+        "status": "running",
+        "permit_slot": null,
+        "output_tail_path": null
+    });
+    std::fs::write(&log_path, format!("CODEX_STATUS:{record}\n")).unwrap();
+
+    let lua = Lua::new();
+    register(&lua).unwrap();
+    let status_fn = codex_runs_fn(&lua);
+    let live: Table = status_fn.call(()).unwrap();
+    assert_eq!(table_len(&live, "running"), 1);
+    assert_eq!(table_len(&live, "recent"), 0);
+
+    drop(witness);
+
+    let reconciled: Table = status_fn.call(()).unwrap();
+    assert_eq!(table_len(&reconciled, "running"), 0);
+    let recent: Table = reconciled.get("recent").unwrap();
+    assert_eq!(recent.raw_len(), 1);
+    let abandoned: Table = recent.get(1).unwrap();
+    assert_eq!(abandoned.get::<String>("status").unwrap(), "failed");
+    assert_eq!(abandoned.get::<i64>("exit_code").unwrap(), -1);
 }
 
 #[test]
@@ -1197,6 +1275,7 @@ printf 'effect-key-%s' "$count"
     let opts = lua_opts(&lua, "effect-key-recovery");
     opts.set("worktree", worktree_arg).unwrap();
     opts.set("dedup_key", "recover-effect-key").unwrap();
+    opts.set("timeout", 1).unwrap();
     let first: Table = spawn.call(opts.clone()).unwrap();
     assert_eq!(first.get::<String>("stdout").unwrap(), "effect-key-1");
     assert_eq!(
@@ -1214,9 +1293,11 @@ printf 'effect-key-%s' "$count"
     status["status"] = serde_json::Value::String("running".to_string());
     status["ended_at_ms"] = serde_json::Value::Null;
     status["exit_code"] = serde_json::Value::Null;
-    status["worker_pid"] = serde_json::Value::Null;
-    status["codex_pid"] = serde_json::Value::Null;
+    status["worker_pid"] = serde_json::Value::from(std::process::id());
+    status["codex_pid"] = serde_json::Value::from(std::process::id());
     std::fs::write(&status_path, serde_json::to_string(&status).unwrap()).unwrap();
+    let run_id = status["run_id"].as_str().unwrap();
+    let _lifetime = hold_exclusive_lock(&adoption_path.join(format!("worker-{run_id}.lock")));
 
     let recovered: Table = spawn.call(opts.clone()).unwrap();
     assert_eq!(recovered.get::<String>("stdout").unwrap(), "effect-key-1");
@@ -1388,6 +1469,13 @@ printf 'adopted-%s' "$count"
     });
     assert_eq!(read_fifo(&started_fifo), "started");
 
+    let status_path = adoption_work_dir(tmp.path()).join("status.json");
+    let mut status: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&status_path).unwrap()).unwrap();
+    status["worker_pid"] = serde_json::Value::Null;
+    status["codex_pid"] = serde_json::Value::Null;
+    std::fs::write(&status_path, serde_json::to_string(&status).unwrap()).unwrap();
+
     let lua = Lua::new();
     register(&lua).unwrap();
     let spawn: mlua::Function = lua.globals().get("spawn_codex_sync").unwrap();
@@ -1418,6 +1506,115 @@ printf 'adopted-%s' "$count"
     assert_eq!(
         std::fs::read_to_string(capture_dir.join("spawns")).unwrap(),
         "1"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn killed_adoption_worker_is_reconciled_and_same_key_redrives_once() {
+    use nix::sys::signal::{killpg, Signal};
+    use nix::unistd::Pid;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let bin_dir = tmp.path().join("bin");
+    let worktree = tmp.path().join("wt");
+    let capture_dir = tmp.path().join("capture");
+    let started_fifo = tmp.path().join("started.fifo");
+    std::fs::create_dir_all(&worktree).unwrap();
+    std::fs::create_dir_all(&capture_dir).unwrap();
+    make_fifo(&started_fifo);
+    install_codex_script(
+        &bin_dir,
+        r#"#!/bin/sh
+cat >/dev/null
+count_file="$CAPTURE_DIR/spawns"
+count=0
+if [ -f "$count_file" ]; then
+  count=$(cat "$count_file")
+fi
+count=$((count + 1))
+printf '%s' "$count" > "$count_file"
+if [ "$count" -eq 1 ]; then
+  printf 'started' > "$STARTED_FIFO"
+  while :; do sleep 1; done
+fi
+printf 'redrive-%s' "$count"
+"#,
+    );
+
+    let mut sandbox = ProcessSandbox::new();
+    sandbox.enter_cwd(tmp.path()).runtime_root(".fkst/runtime");
+    sandbox.prepend_path(&bin_dir);
+    sandbox.set_env("CAPTURE_DIR", capture_dir.to_string_lossy().into_owned());
+    sandbox.set_env("STARTED_FIFO", started_fifo.to_string_lossy().into_owned());
+    sandbox.set_env(CODEX_WORKER_BIN_ENV, framework_bin());
+    sandbox.runtime_log_dir(tmp.path().join("runtime"));
+    let (_lock, _guard) = sandbox.enter();
+
+    let worktree_arg = worktree.to_string_lossy().into_owned();
+    let (first_tx, first_rx) = std::sync::mpsc::channel();
+    let first_thread = std::thread::spawn({
+        let worktree_arg = worktree_arg.clone();
+        move || {
+            let lua = Lua::new();
+            register(&lua).unwrap();
+            let spawn: mlua::Function = lua.globals().get("spawn_codex_sync").unwrap();
+            let opts = lua_opts(&lua, "crash-redrive");
+            opts.set("worktree", worktree_arg).unwrap();
+            opts.set("dedup_key", "crash-redrive-key").unwrap();
+            opts.set("timeout", 1).unwrap();
+            let result: Table = spawn.call(opts).unwrap();
+            first_tx
+                .send((
+                    result.get::<i64>("exit_code").unwrap(),
+                    result.get::<String>("stdout").unwrap(),
+                ))
+                .unwrap();
+        }
+    });
+    assert_eq!(read_fifo(&started_fifo), "started");
+
+    let adoption_path = adoption_work_dir(tmp.path());
+    let status_path = adoption_path.join("status.json");
+    let mut status: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&status_path).unwrap()).unwrap();
+    let run_id = status["run_id"].as_str().unwrap().to_string();
+    let worker_pid = status["worker_pid"].as_i64().unwrap() as i32;
+    let codex_pid = status["codex_pid"].as_i64().unwrap() as i32;
+    killpg(Pid::from_raw(codex_pid), Signal::SIGKILL).unwrap();
+    killpg(Pid::from_raw(worker_pid), Signal::SIGKILL).unwrap();
+    wait_for_exclusive_lock(&adoption_path.join(format!("worker-{run_id}.lock")));
+
+    status["worker_pid"] = serde_json::Value::from(std::process::id());
+    status["codex_pid"] = serde_json::Value::from(std::process::id());
+    std::fs::write(&status_path, serde_json::to_string(&status).unwrap()).unwrap();
+
+    let lua = Lua::new();
+    register(&lua).unwrap();
+    let status_fn = codex_runs_fn(&lua);
+    let abandoned: Table = status_fn.call(()).unwrap();
+    assert_eq!(table_len(&abandoned, "running"), 0);
+
+    status["worker_pid"] = serde_json::Value::Null;
+    status["codex_pid"] = serde_json::Value::Null;
+    std::fs::write(&status_path, serde_json::to_string(&status).unwrap()).unwrap();
+    assert_eq!(
+        first_rx.recv_timeout(Duration::from_secs(5)).unwrap().0,
+        124
+    );
+    first_thread.join().unwrap();
+
+    let spawn: mlua::Function = lua.globals().get("spawn_codex_sync").unwrap();
+    let opts = lua_opts(&lua, "crash-redrive");
+    opts.set("worktree", worktree_arg).unwrap();
+    opts.set("dedup_key", "crash-redrive-key").unwrap();
+    opts.set("timeout", 20).unwrap();
+    let redriven: Table = spawn.call(opts).unwrap();
+    assert_eq!(redriven.get::<i64>("exit_code").unwrap(), 0);
+    assert_eq!(redriven.get::<String>("stdout").unwrap(), "redrive-2");
+    assert_eq!(
+        std::fs::read_to_string(capture_dir.join("spawns")).unwrap(),
+        "2"
     );
 }
 

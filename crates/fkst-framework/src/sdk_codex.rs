@@ -626,6 +626,7 @@ fn run_codex_request(
         return run_adoptable_codex_request(request, paths, host_root, config);
     }
 
+    let _lifetime_witness = acquire_log_lifetime_witness(&request);
     let mut status = CodexStatusRecord::from_request(&request, None);
     write_codex_status(&request.log_path, &status);
     if let Err(err) = ensure_pool_with_context(host_root, config) {
@@ -707,13 +708,13 @@ fn run_adoptable_codex_request(
         drop(lock_file);
         return Ok(result);
     }
-    if let Some(result) = recover_completed_adoption_result(&paths)? {
+    if let Some(result) = recover_completed_adoption_result_locked(&paths)? {
         drop(lock_file);
         return Ok(result);
     }
     let existing = read_adoption_record(&paths.status)?;
     let running = existing.as_ref().filter(|record| {
-        record.status == CODEX_ADOPTION_STATUS_RUNNING && adoption_effect_alive(record)
+        record.status == CODEX_ADOPTION_STATUS_RUNNING && adoption_effect_alive(&paths.dir, record)
     });
     if running.is_none() {
         start_adoption_worker(&request, &paths, host_root, config)?;
@@ -728,6 +729,7 @@ fn run_mocked_codex_request(
     config: &ConfigContext,
     runner: &MockCommandState,
 ) -> Result<CodexResult> {
+    let _lifetime_witness = acquire_log_lifetime_witness(&request);
     let args = command_args_for_request(&request);
     let cmd_line = format_command("codex", &args);
     let invocation = MockCommandInvocation {
@@ -911,15 +913,27 @@ fn read_completed_adoption_result(paths: &CodexAdoptionPaths) -> Result<Option<C
 }
 
 fn recover_completed_adoption_result(paths: &CodexAdoptionPaths) -> Result<Option<CodexResult>> {
+    let lock_file = open_adoption_run_lock(&paths.dir).map_err(mlua::Error::external)?;
+    flock(lock_file.as_raw_fd(), FlockArg::LockExclusive).map_err(mlua::Error::external)?;
+    let result = recover_completed_adoption_result_locked(paths);
+    drop(lock_file);
+    result
+}
+
+fn recover_completed_adoption_result_locked(
+    paths: &CodexAdoptionPaths,
+) -> Result<Option<CodexResult>> {
     let recovered =
-        recover_completed_adoption_result_from_disk(paths).map_err(mlua::Error::external)?;
+        recover_completed_adoption_result_locked_from_disk(paths).map_err(mlua::Error::external)?;
     if !recovered {
         return Ok(None);
     };
     read_completed_adoption_result(paths)
 }
 
-fn recover_completed_adoption_result_from_disk(paths: &CodexAdoptionPaths) -> anyhow::Result<bool> {
+fn recover_completed_adoption_result_locked_from_disk(
+    paths: &CodexAdoptionPaths,
+) -> anyhow::Result<bool> {
     if let Some(result) = read_adoption_result_record_from_disk(&paths.result)? {
         return promote_completed_adoption_result(paths, result);
     }
@@ -949,10 +963,7 @@ fn recover_completed_adoption_effect_by_key(paths: &CodexAdoptionPaths) -> anyho
     let Some(record) = read_adoption_record_from_disk(&paths.status)? else {
         return Ok(false);
     };
-    if record.status == CODEX_ADOPTION_STATUS_COMPLETED
-        || record.key != paths.key
-        || adoption_effect_alive(&record)
-    {
+    if record.status == CODEX_ADOPTION_STATUS_COMPLETED || record.key != paths.key {
         return Ok(false);
     }
     let Some(effect) = read_adoption_effect_record_from_disk(&paths.effect)? else {
@@ -967,10 +978,7 @@ fn recover_completed_external_codex_effect_by_key(
     let Some(record) = read_adoption_record_from_disk(&paths.status)? else {
         return Ok(false);
     };
-    if record.status == CODEX_ADOPTION_STATUS_COMPLETED
-        || record.key != paths.key
-        || adoption_effect_alive(&record)
-    {
+    if record.status == CODEX_ADOPTION_STATUS_COMPLETED || record.key != paths.key {
         return Ok(false);
     }
     let Some(effect) = read_codex_effect_record_from_log(&paths.effect_log, &paths.key)? else {
@@ -1066,33 +1074,135 @@ fn read_optional_string(path: &Path) -> anyhow::Result<String> {
     }
 }
 
-fn adoption_worker_alive(record: &CodexAdoptionRecord) -> bool {
-    let Some(pid) = record.worker_pid else {
-        return false;
-    };
-    process_exists(pid)
-}
-
-fn adoption_effect_alive(record: &CodexAdoptionRecord) -> bool {
-    record.worker_pid.is_some_and(process_exists) || record.codex_pid.is_some_and(process_exists)
-}
-
-#[cfg(unix)]
-fn process_exists(pid: u32) -> bool {
-    use nix::errno::Errno;
-    use nix::sys::signal::kill;
-    use nix::unistd::Pid;
-
-    match kill(Pid::from_raw(pid as i32), None) {
-        Ok(()) => true,
-        Err(Errno::EPERM) => true,
-        Err(_) => false,
+fn acquire_log_lifetime_witness(request: &CodexRequest) -> Option<std::fs::File> {
+    match acquire_lifetime_witness_from_disk(&request.log_path) {
+        Ok(file) => Some(file),
+        Err(err) => {
+            eprintln!(
+                "WARN: codex lifetime witness unavailable run_id={} path={} error={err}",
+                request.run_id,
+                request.log_path.display()
+            );
+            None
+        }
     }
 }
 
-#[cfg(not(unix))]
-fn process_exists(_pid: u32) -> bool {
-    false
+fn acquire_lifetime_witness_from_disk(path: &Path) -> anyhow::Result<std::fs::File> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(path)?;
+    flock(file.as_raw_fd(), FlockArg::LockExclusive).map_err(anyhow::Error::from)?;
+    Ok(file)
+}
+
+fn lifetime_witness_held(path: &Path) -> anyhow::Result<bool> {
+    let file = match std::fs::OpenOptions::new().read(true).open(path) {
+        Ok(file) => file,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(err) => return Err(err.into()),
+    };
+    match flock(file.as_raw_fd(), FlockArg::LockExclusiveNonblock) {
+        Ok(()) => Ok(false),
+        Err(nix::errno::Errno::EWOULDBLOCK) => Ok(true),
+        Err(err) => Err(err.into()),
+    }
+}
+
+fn adoption_worker_witness_path(work_dir: &Path, run_id: &str) -> anyhow::Result<PathBuf> {
+    if run_id.is_empty()
+        || run_id.len() > 200
+        || !run_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+    {
+        anyhow::bail!("codex adoption run_id invalid for lifetime witness: {run_id}");
+    }
+    Ok(work_dir.join(format!("worker-{run_id}.lock")))
+}
+
+fn try_acquire_adoption_worker_witness(
+    work_dir: &Path,
+    run_id: &str,
+) -> anyhow::Result<Option<std::fs::File>> {
+    let path = adoption_worker_witness_path(work_dir, run_id)?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(path)?;
+    match flock(file.as_raw_fd(), FlockArg::LockExclusiveNonblock) {
+        Ok(()) => Ok(Some(file)),
+        Err(nix::errno::Errno::EWOULDBLOCK) => Ok(None),
+        Err(err) => Err(err.into()),
+    }
+}
+
+fn adoption_effect_alive(work_dir: &Path, record: &CodexAdoptionRecord) -> bool {
+    let path = match adoption_worker_witness_path(work_dir, &record.run_id) {
+        Ok(path) => path,
+        Err(err) => {
+            eprintln!(
+                "WARN: codex adoption lifetime witness invalid run_id={} error={err}",
+                record.run_id
+            );
+            return false;
+        }
+    };
+    match lifetime_witness_held(&path) {
+        Ok(held) => held,
+        Err(err) => {
+            eprintln!(
+                "WARN: codex adoption lifetime witness probe failed run_id={} path={} error={err}",
+                record.run_id,
+                path.display()
+            );
+            false
+        }
+    }
+}
+
+fn adoption_intent_alive(work_dir: &Path) -> bool {
+    let path = work_dir.join("run.lock");
+    match lifetime_witness_held(&path) {
+        Ok(held) => held,
+        Err(err) => {
+            eprintln!(
+                "WARN: codex adoption intent witness probe failed path={} error={err}",
+                path.display()
+            );
+            false
+        }
+    }
+}
+
+fn open_adoption_run_lock(work_dir: &Path) -> anyhow::Result<std::fs::File> {
+    std::fs::create_dir_all(work_dir)?;
+    let path = work_dir.join("run.lock");
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(path)?;
+    Ok(file)
+}
+
+fn adoption_record_is_current(record: &CodexAdoptionRecord, run_id: &str, key: &str) -> bool {
+    if record.status != CODEX_ADOPTION_STATUS_RUNNING {
+        return false;
+    }
+    record.run_id == run_id && record.key == key
 }
 
 fn start_adoption_worker(
@@ -1120,11 +1230,7 @@ fn start_adoption_worker(
     #[cfg(unix)]
     command.process_group(0);
     let child = command.spawn().map_err(mlua::Error::external)?;
-    let mut running = intent;
-    running.status = CODEX_ADOPTION_STATUS_RUNNING.to_string();
-    running.worker_pid = Some(child.id());
     drop(child);
-    promote_visible_adoption_running(&paths.status, &running).map_err(mlua::Error::external)?;
     Ok(())
 }
 
@@ -1309,9 +1415,24 @@ fn write_adoption_child_pid(request: &CodexRequest, child_pid: u32) {
     let Some(path) = request.adoption_status_path.as_deref() else {
         return;
     };
+    let Some(work_dir) = path.parent() else {
+        return;
+    };
+    let Some(key) = request.effect_key.as_deref() else {
+        return;
+    };
+    let Ok(lock_file) = open_adoption_run_lock(work_dir) else {
+        return;
+    };
+    if flock(lock_file.as_raw_fd(), FlockArg::LockExclusive).is_err() {
+        return;
+    }
     let Ok(Some(mut record)) = read_adoption_record(path) else {
         return;
     };
+    if !adoption_record_is_current(&record, &request.run_id, key) {
+        return;
+    }
     record.codex_pid = Some(child_pid);
     let expected_status = record.status.clone();
     if let Err(err) = write_visible_adoption_record(path, &record, &expected_status) {
@@ -1445,9 +1566,10 @@ pub(crate) fn run_codex_worker(options: CodexWorkerOptions) -> anyhow::Result<i3
         error_kind: None,
         error: None,
     };
-    if !claim_adoption_worker(&options, &mut adoption)? {
+    let Some(_adoption_lifetime_witness) = claim_adoption_worker(&options, &mut adoption)? else {
         return Ok(0);
-    }
+    };
+    let _status_lifetime_witness = acquire_log_lifetime_witness(&request);
     let mut status = CodexStatusRecord::from_request(&request, None);
     write_codex_status(&request.log_path, &status);
 
@@ -1475,10 +1597,96 @@ pub(crate) fn run_codex_worker(options: CodexWorkerOptions) -> anyhow::Result<i3
     };
 
     let ended_at_ms = unix_duration().as_millis() as u64;
+    let paths = adoption_paths_from_worker_options(&options);
+    if !publish_adoption_result_if_current(&paths, &mut adoption, &result, ended_at_ms)? {
+        eprintln!(
+            "WARN: codex adoption result publication fenced run_id={} key={}",
+            adoption.run_id, adoption.key
+        );
+    }
+    status.finish(result.exit_code);
+    write_codex_status(Path::new(&result.log_path), &status);
+    Ok(0)
+}
+
+fn claim_adoption_worker(
+    options: &CodexWorkerOptions,
+    adoption: &mut CodexAdoptionRecord,
+) -> anyhow::Result<Option<std::fs::File>> {
+    let lock_file = open_adoption_run_lock(&options.work_dir)?;
+    flock(lock_file.as_raw_fd(), FlockArg::LockExclusive).map_err(anyhow::Error::from)?;
+    let paths = adoption_paths_from_worker_options(options);
+    if recover_completed_adoption_result_locked_from_disk(&paths)? {
+        drop(lock_file);
+        return Ok(None);
+    }
+    let Some(lifetime_witness) =
+        try_acquire_adoption_worker_witness(&options.work_dir, &options.run_id)?
+    else {
+        drop(lock_file);
+        return Ok(None);
+    };
+    let current_pid = std::process::id();
+    let existing = read_adoption_record_from_disk(&options.status_file)?;
+    if existing
+        .as_ref()
+        .is_some_and(|record| record.status == CODEX_ADOPTION_STATUS_COMPLETED)
+    {
+        drop(lock_file);
+        return Ok(None);
+    }
+    if existing.as_ref().is_some_and(|record| {
+        record.status == CODEX_ADOPTION_STATUS_RUNNING
+            && record.worker_pid != Some(current_pid)
+            && adoption_effect_alive(&options.work_dir, record)
+    }) {
+        drop(lock_file);
+        return Ok(None);
+    }
+    adoption.worker_pid = Some(current_pid);
+    adoption.status = CODEX_ADOPTION_STATUS_RUNNING.to_string();
+    write_visible_adoption_record(
+        &options.status_file,
+        adoption,
+        CODEX_ADOPTION_STATUS_RUNNING,
+    )?;
+    drop(lock_file);
+    Ok(Some(lifetime_witness))
+}
+
+fn adoption_paths_from_worker_options(options: &CodexWorkerOptions) -> CodexAdoptionPaths {
+    CodexAdoptionPaths {
+        key: options.key.clone(),
+        dir: options.work_dir.clone(),
+        prompt: options.prompt_file.clone(),
+        stdout: options.stdout_file.clone(),
+        stderr: options.stderr_file.clone(),
+        effect: options.effect_file.clone(),
+        effect_log: options.effect_log_file.clone(),
+        result: options.result_file.clone(),
+        status: options.status_file.clone(),
+    }
+}
+
+fn publish_adoption_result_if_current(
+    paths: &CodexAdoptionPaths,
+    adoption: &mut CodexAdoptionRecord,
+    result: &CodexResult,
+    ended_at_ms: u64,
+) -> anyhow::Result<bool> {
+    let lock_file = open_adoption_run_lock(&paths.dir)?;
+    flock(lock_file.as_raw_fd(), FlockArg::LockExclusive).map_err(anyhow::Error::from)?;
+    let Some(current) = read_adoption_record_from_disk(&paths.status)? else {
+        return Ok(false);
+    };
+    if !adoption_record_is_current(&current, &adoption.run_id, &adoption.key) {
+        return Ok(false);
+    }
+
     write_adoption_effect_record(
-        &options.effect_file,
+        &paths.effect,
         &CodexAdoptionEffectRecord {
-            effect_key: options.key.clone(),
+            effect_key: adoption.key.clone(),
             ended_at_ms,
             stdout: result.stdout.clone(),
             stderr: result.stderr.clone(),
@@ -1487,10 +1695,10 @@ pub(crate) fn run_codex_worker(options: CodexWorkerOptions) -> anyhow::Result<i3
             error: result.error.clone(),
         },
     )?;
-    write_atomic(&options.stdout_file, result.stdout.as_bytes())?;
-    write_atomic(&options.stderr_file, result.stderr.as_bytes())?;
+    write_atomic(&paths.stdout, result.stdout.as_bytes())?;
+    write_atomic(&paths.stderr, result.stderr.as_bytes())?;
     write_adoption_result_record(
-        &options.result_file,
+        &paths.result,
         &CodexAdoptionResultRecord {
             ended_at_ms,
             exit_code: result.exit_code,
@@ -1503,68 +1711,7 @@ pub(crate) fn run_codex_worker(options: CodexWorkerOptions) -> anyhow::Result<i3
     adoption.exit_code = Some(result.exit_code);
     adoption.error_kind = result.error_kind.clone();
     adoption.error = result.error.clone();
-    write_visible_adoption_record(
-        &options.status_file,
-        &adoption,
-        CODEX_ADOPTION_STATUS_COMPLETED,
-    )?;
-    status.finish(result.exit_code);
-    write_codex_status(Path::new(&result.log_path), &status);
-    Ok(0)
-}
-
-fn claim_adoption_worker(
-    options: &CodexWorkerOptions,
-    adoption: &mut CodexAdoptionRecord,
-) -> anyhow::Result<bool> {
-    let lock_path = options.work_dir.join("run.lock");
-    let lock_file = std::fs::OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .read(true)
-        .write(true)
-        .open(lock_path)?;
-    flock(lock_file.as_raw_fd(), FlockArg::LockExclusive).map_err(anyhow::Error::from)?;
-    let paths = CodexAdoptionPaths {
-        key: options.key.clone(),
-        dir: options.work_dir.clone(),
-        prompt: options.prompt_file.clone(),
-        stdout: options.stdout_file.clone(),
-        stderr: options.stderr_file.clone(),
-        effect: options.effect_file.clone(),
-        effect_log: options.effect_log_file.clone(),
-        result: options.result_file.clone(),
-        status: options.status_file.clone(),
-    };
-    if recover_completed_adoption_result_from_disk(&paths)? {
-        drop(lock_file);
-        return Ok(false);
-    }
-    let current_pid = std::process::id();
-    let existing = read_adoption_record_from_disk(&options.status_file)?;
-    if existing
-        .as_ref()
-        .is_some_and(|record| record.status == CODEX_ADOPTION_STATUS_COMPLETED)
-    {
-        drop(lock_file);
-        return Ok(false);
-    }
-    if existing.as_ref().is_some_and(|record| {
-        record.status == CODEX_ADOPTION_STATUS_RUNNING
-            && record.worker_pid != Some(current_pid)
-            && adoption_effect_alive(record)
-    }) {
-        drop(lock_file);
-        return Ok(false);
-    }
-    adoption.worker_pid = Some(current_pid);
-    adoption.status = CODEX_ADOPTION_STATUS_RUNNING.to_string();
-    write_visible_adoption_record(
-        &options.status_file,
-        adoption,
-        CODEX_ADOPTION_STATUS_RUNNING,
-    )?;
-    drop(lock_file);
+    write_visible_adoption_record(&paths.status, adoption, CODEX_ADOPTION_STATUS_COMPLETED)?;
     Ok(true)
 }
 
@@ -1650,19 +1797,6 @@ fn write_visible_adoption_record(
         );
     }
     Ok(())
-}
-
-fn promote_visible_adoption_running(
-    path: &Path,
-    record: &CodexAdoptionRecord,
-) -> anyhow::Result<()> {
-    if read_adoption_record_from_disk(path)?
-        .as_ref()
-        .is_some_and(|record| record.status == CODEX_ADOPTION_STATUS_COMPLETED)
-    {
-        return Ok(());
-    }
-    write_visible_adoption_record(path, record, CODEX_ADOPTION_STATUS_RUNNING)
 }
 
 fn write_atomic(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
@@ -1909,12 +2043,28 @@ fn read_codex_status_records(host_root: &Path) -> anyhow::Result<Vec<CodexStatus
                     continue;
                 }
                 let body = std::fs::read_to_string(&path)?;
+                let witness_held = match lifetime_witness_held(&path) {
+                    Ok(held) => held,
+                    Err(err) => {
+                        eprintln!(
+                            "WARN: codex lifetime witness probe failed path={} error={err}",
+                            path.display()
+                        );
+                        false
+                    }
+                };
                 for line in body.lines() {
                     let Some(json) = line.strip_prefix(CODEX_STATUS_LOG_PREFIX) else {
                         continue;
                     };
                     match serde_json::from_str::<CodexStatusRecord>(json) {
-                        Ok(record) => records.push(record),
+                        Ok(mut record) => {
+                            if record.status == "running" && !witness_held {
+                                record.status = "abandoned".to_string();
+                                record.exit_code = Some(-1);
+                            }
+                            records.push(record);
+                        }
                         Err(err) => eprintln!(
                             "WARN: codex status log line skipped path={} error={err}",
                             path.display()
@@ -1942,9 +2092,10 @@ fn read_adoption_status_records(host_root: &Path) -> anyhow::Result<Vec<CodexSta
     let mut records = Vec::new();
     for entry in entries {
         let entry = entry?;
-        let status_path = entry.path().join("status.json");
+        let work_dir = entry.path();
+        let status_path = work_dir.join("status.json");
         match read_adoption_record(&status_path) {
-            Ok(Some(record)) => records.push(codex_status_record_from_adoption(record)),
+            Ok(Some(record)) => records.push(codex_status_record_from_adoption(record, &work_dir)),
             Ok(None) => {}
             Err(err) => {
                 eprintln!(
@@ -1958,10 +2109,13 @@ fn read_adoption_status_records(host_root: &Path) -> anyhow::Result<Vec<CodexSta
     Ok(records)
 }
 
-fn codex_status_record_from_adoption(record: CodexAdoptionRecord) -> CodexStatusRecord {
+fn codex_status_record_from_adoption(
+    record: CodexAdoptionRecord,
+    work_dir: &Path,
+) -> CodexStatusRecord {
     let ended_at_ms = record.ended_at_ms;
-    let exit_code = adoption_status_exit_code(&record);
-    let status = adoption_status_for_observe(&record).to_string();
+    let status = adoption_status_for_observe(&record, work_dir);
+    let exit_code = adoption_status_exit_code(&record, status);
     CodexStatusRecord {
         run_id: record.run_id,
         role: record.role,
@@ -1975,7 +2129,7 @@ fn codex_status_record_from_adoption(record: CodexAdoptionRecord) -> CodexStatus
         ended_at: ended_at_ms.map(unix_millis_to_iso8601),
         ended_at_ms,
         elapsed_ms: ended_at_ms.map(|ended| ended.saturating_sub(record.started_at_ms)),
-        status,
+        status: status.to_string(),
         exit_code,
         permit_slot: None,
         output_tail_path: Some(
@@ -1986,19 +2140,21 @@ fn codex_status_record_from_adoption(record: CodexAdoptionRecord) -> CodexStatus
     }
 }
 
-fn adoption_status_exit_code(record: &CodexAdoptionRecord) -> Option<i32> {
-    if adoption_status_for_observe(record) == CODEX_ADOPTION_STATUS_RUNNING {
+fn adoption_status_exit_code(record: &CodexAdoptionRecord, observed_status: &str) -> Option<i32> {
+    if observed_status == CODEX_ADOPTION_STATUS_RUNNING {
         None
     } else {
         Some(record.exit_code.unwrap_or(-1))
     }
 }
 
-fn adoption_status_for_observe(record: &CodexAdoptionRecord) -> &'static str {
+fn adoption_status_for_observe(record: &CodexAdoptionRecord, work_dir: &Path) -> &'static str {
     match record.status.as_str() {
         CODEX_ADOPTION_STATUS_COMPLETED => "completed",
-        CODEX_ADOPTION_STATUS_INTENT => CODEX_ADOPTION_STATUS_RUNNING,
-        CODEX_ADOPTION_STATUS_RUNNING if adoption_effect_alive(record) => {
+        CODEX_ADOPTION_STATUS_INTENT if adoption_intent_alive(work_dir) => {
+            CODEX_ADOPTION_STATUS_RUNNING
+        }
+        CODEX_ADOPTION_STATUS_RUNNING if adoption_effect_alive(work_dir, record) => {
             CODEX_ADOPTION_STATUS_RUNNING
         }
         _ => "completed",
@@ -3187,6 +3343,53 @@ mod tests {
 
             assert_eq!(options.sandbox, Some(sandbox));
         }
+    }
+
+    #[test]
+    fn stale_adoption_incarnation_cannot_publish_shared_result() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("adoption");
+        let paths = CodexAdoptionPaths {
+            key: "same-key".to_string(),
+            prompt: dir.join("prompt.txt"),
+            stdout: dir.join("stdout.txt"),
+            stderr: dir.join("stderr.txt"),
+            effect: dir.join("effect.json"),
+            effect_log: dir.join("effect-receipts.log"),
+            result: dir.join("result.json"),
+            status: dir.join("status.json"),
+            dir,
+        };
+        let mut request = command_test_request();
+        request.run_id = "codex-old-incarnation".to_string();
+        let mut old = adoption_record_from_request(
+            &request,
+            &paths,
+            CODEX_ADOPTION_STATUS_RUNNING,
+            Some(std::process::id()),
+            None,
+        );
+        let mut current = old.clone();
+        current.run_id = "codex-new-incarnation".to_string();
+        write_adoption_record(&paths.status, &current).unwrap();
+        let result = CodexResult::success(
+            "old-output".to_string(),
+            String::new(),
+            0,
+            request.log_path.to_string_lossy().into_owned(),
+        );
+
+        let published = publish_adoption_result_if_current(&paths, &mut old, &result, 123).unwrap();
+
+        assert!(!published);
+        assert!(!paths.effect.exists());
+        assert!(!paths.result.exists());
+        assert!(!paths.stdout.exists());
+        let visible = read_adoption_record_from_disk(&paths.status)
+            .unwrap()
+            .unwrap();
+        assert_eq!(visible.run_id, "codex-new-incarnation");
+        assert_eq!(visible.status, CODEX_ADOPTION_STATUS_RUNNING);
     }
 
     #[test]
