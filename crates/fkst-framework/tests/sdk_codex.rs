@@ -273,6 +273,25 @@ fn wait_for_exclusive_lock(path: &Path) {
     );
 }
 
+#[cfg(unix)]
+fn wait_for_child_exit(pid: i32) {
+    use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
+    use nix::unistd::Pid;
+
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        match waitpid(Pid::from_raw(pid), Some(WaitPidFlag::WNOHANG)) {
+            Ok(WaitStatus::StillAlive) => {}
+            Ok(_) | Err(nix::errno::Errno::ECHILD) => return,
+            Err(err) => panic!("failed waiting for child {pid}: {err}"),
+        }
+        if Instant::now() >= deadline {
+            panic!("timed out waiting for child {pid} to exit");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
 fn wait_for_adoption_status(root: &Path, expected: &str) {
     for _ in 0..100 {
         if adoption_status_values(root)
@@ -1605,7 +1624,7 @@ mv "$status_file.tmp" "$status_file"
 
 #[cfg(unix)]
 #[test]
-fn killed_adoption_worker_is_reconciled_and_same_key_redrives_once() {
+fn live_orphan_codex_remains_running_then_same_key_redrives_once_after_exit() {
     use nix::sys::signal::{killpg, Signal};
     use nix::unistd::Pid;
 
@@ -1675,17 +1694,26 @@ printf 'redrive-%s' "$count"
     let run_id = status["run_id"].as_str().unwrap().to_string();
     let worker_pid = status["worker_pid"].as_i64().unwrap() as i32;
     let codex_pid = status["codex_pid"].as_i64().unwrap() as i32;
-    killpg(Pid::from_raw(codex_pid), Signal::SIGKILL).unwrap();
     killpg(Pid::from_raw(worker_pid), Signal::SIGKILL).unwrap();
+    wait_for_child_exit(worker_pid);
+
+    let lua = Lua::new();
+    register(&lua).unwrap();
+    let status_fn = codex_runs_fn(&lua);
+    let live_orphan: Table = status_fn.call(()).unwrap();
+    assert_eq!(table_len(&live_orphan, "running"), 1);
+    assert_eq!(
+        std::fs::read_to_string(capture_dir.join("spawns")).unwrap(),
+        "1"
+    );
+
+    killpg(Pid::from_raw(codex_pid), Signal::SIGKILL).unwrap();
     wait_for_exclusive_lock(&adoption_path.join(format!("worker-{run_id}.lock")));
 
     status["worker_pid"] = serde_json::Value::from(std::process::id());
     status["codex_pid"] = serde_json::Value::from(std::process::id());
     std::fs::write(&status_path, serde_json::to_string(&status).unwrap()).unwrap();
 
-    let lua = Lua::new();
-    register(&lua).unwrap();
-    let status_fn = codex_runs_fn(&lua);
     let abandoned: Table = status_fn.call(()).unwrap();
     assert_eq!(table_len(&abandoned, "running"), 0);
 

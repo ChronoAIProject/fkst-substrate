@@ -626,7 +626,7 @@ fn run_codex_request(
         return run_adoptable_codex_request(request, paths, host_root, config);
     }
 
-    let _lifetime_witness = acquire_log_lifetime_witness(&request);
+    let lifetime_witness = acquire_log_lifetime_witness(&request);
     let mut status = CodexStatusRecord::from_request(&request, None);
     write_codex_status(&request.log_path, &status);
     if let Err(err) = ensure_pool_with_context(host_root, config) {
@@ -679,7 +679,11 @@ fn run_codex_request(
         }
     };
 
-    let result = run_codex_request_with_permit(request, config);
+    let result = run_codex_request_with_permit(
+        request,
+        config,
+        lifetime_witness.as_ref().map(AsRawFd::as_raw_fd),
+    );
     status.finish(result.exit_code);
     write_codex_status(Path::new(&result.log_path), &status);
     Ok(result)
@@ -1662,7 +1666,7 @@ pub(crate) fn run_codex_worker(options: CodexWorkerOptions) -> anyhow::Result<i3
         error_kind: None,
         error: None,
     };
-    let Some(_adoption_lifetime_witness) =
+    let Some(adoption_lifetime_witness) =
         claim_adoption_worker(&options, &mut adoption, &run_lock)?
     else {
         return Ok(0);
@@ -1676,7 +1680,11 @@ pub(crate) fn run_codex_worker(options: CodexWorkerOptions) -> anyhow::Result<i3
         Ok(permit) => {
             status.permit_slot = Some(permit.slot);
             write_codex_status(&request.log_path, &status);
-            let result = run_codex_request_with_permit(request, &config);
+            let result = run_codex_request_with_permit(
+                request,
+                &config,
+                Some(adoption_lifetime_witness.as_raw_fd()),
+            );
             drop(permit);
             result
         }
@@ -2288,7 +2296,11 @@ fn lease_expires_at_ms(started_at_ms: u64, timeout_seconds: i64) -> Option<u64> 
         .and_then(|timeout_ms| started_at_ms.checked_add(timeout_ms))
 }
 
-fn run_codex_request_with_permit(mut request: CodexRequest, config: &ConfigContext) -> CodexResult {
+fn run_codex_request_with_permit(
+    mut request: CodexRequest,
+    config: &ConfigContext,
+    lifetime_witness_fd: Option<RawFd>,
+) -> CodexResult {
     let shim_dir = match prepare_rate_shims_for_codex(config) {
         Ok(shim_dir) => shim_dir,
         Err(err) => {
@@ -2305,7 +2317,7 @@ fn run_codex_request_with_permit(mut request: CodexRequest, config: &ConfigConte
         }
     };
     let codex_program = resolve_codex_program(shim_dir.as_deref());
-    let (mut cmd, cmd_line) = command_for_request(&request, &codex_program);
+    let (mut cmd, cmd_line) = command_for_request(&request, &codex_program, lifetime_witness_fd);
     if let Some(shim_dir) = shim_dir.as_deref() {
         crate::rate_shim::prepend_shim_dir_to_path(&mut cmd, shim_dir);
     }
@@ -2793,12 +2805,21 @@ fn logged_failure(
     )
 }
 
-fn command_for_request(request: &CodexRequest, program: &Path) -> (Command, String) {
+fn command_for_request(
+    request: &CodexRequest,
+    program: &Path,
+    lifetime_witness_fd: Option<RawFd>,
+) -> (Command, String) {
     let mut cmd = Command::new(program);
     let cmd_args = command_args_for_request(request);
     cmd.args(&cmd_args);
     #[cfg(unix)]
-    cmd.process_group(0);
+    {
+        cmd.process_group(0);
+        if let Some(fd) = lifetime_witness_fd {
+            inherit_fd_on_exec(&mut cmd, fd);
+        }
+    }
     cmd.stdin(Stdio::piped());
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
@@ -3645,7 +3666,7 @@ mod tests {
     #[test]
     fn codex_command_strips_github_token_env() {
         let request = command_test_request();
-        let (cmd, _) = command_for_request(&request, Path::new("codex"));
+        let (cmd, _) = command_for_request(&request, Path::new("codex"), None);
         let envs = cmd.get_envs().collect::<Vec<_>>();
 
         assert!(envs
