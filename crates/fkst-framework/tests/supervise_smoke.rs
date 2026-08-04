@@ -512,6 +512,16 @@ return M
         let _ = child.kill();
         panic!("timed out waiting for {}", fact.display());
     });
+    wait_for_journal_event(
+        &runtime_root,
+        "dept_child_exit",
+        "host.host_worker",
+        Duration::from_secs(10),
+    )
+    .unwrap_or_else(|| {
+        let _ = child.kill();
+        panic!("timed out waiting for successful Department child exit");
+    });
     nix::sys::signal::kill(
         nix::unistd::Pid::from_raw(child.id() as i32),
         nix::sys::signal::Signal::SIGTERM,
