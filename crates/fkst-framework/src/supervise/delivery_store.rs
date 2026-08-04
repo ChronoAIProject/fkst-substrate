@@ -1125,9 +1125,22 @@ impl DeliveryStore {
                     mutated = true;
                     continue;
                 };
+                if is_subscriber_absent_dead_record(&dead) {
+                    let Some(current_dept_by_queue) = current_dept_by_queue else {
+                        continue;
+                    };
+                    let Some(current_dept) = current_dept_by_queue.get(&record.queue) else {
+                        continue;
+                    };
+                    record.dept.clone_from(current_dept);
+                }
                 if dead.redrive_count >= policy.max_redrives {
                     dead_index.remove(key.key.as_str())?;
-                    let promoted_dirty_follow_up = prepare_dirty_follow_up(&mut record, now_ms);
+                    let live_fulfills_dirty_follow_up = record.collapse_by_dedup_id
+                        && record.pending_dirty
+                        && delivery.get(delivery_id.as_str())?.is_some();
+                    let promoted_dirty_follow_up = !live_fulfills_dirty_follow_up
+                        && prepare_dirty_follow_up(&mut record, now_ms);
                     dead.permanent = true;
                     dead.replayable = false;
                     dead.record = None;
@@ -1148,21 +1161,12 @@ impl DeliveryStore {
                                 .as_str(),
                             &(),
                         )?;
-                    } else {
+                    } else if !live_fulfills_dirty_follow_up {
                         suppress_terminal_delivery(&write, delivery_id.as_str())?;
                     }
                     result.permanent.push(dead);
                     mutated = true;
                     continue;
-                }
-                if is_subscriber_absent_dead_record(&dead) {
-                    let Some(current_dept_by_queue) = current_dept_by_queue else {
-                        continue;
-                    };
-                    let Some(current_dept) = current_dept_by_queue.get(&record.queue) else {
-                        continue;
-                    };
-                    record.dept.clone_from(current_dept);
                 }
                 if delivery.get(delivery_id.as_str())?.is_some() {
                     dead_index.remove(key.key.as_str())?;
@@ -4149,6 +4153,154 @@ mod tests {
         assert_eq!(follow_up.not_before_ms, 121);
         assert_eq!(store.ready_index_len().unwrap(), 1);
         assert!(!store.terminal_suppresses("one").unwrap());
+    }
+
+    #[test]
+    fn terminal_redrive_cap_preserves_newer_ready_keyed_delivery() {
+        let temp = TempDir::new().unwrap();
+        let store = store(&temp);
+        let mut original = record("one", 100);
+        original.collapse_by_dedup_id = true;
+        original.payload = serde_json::json!({"version": "original"});
+        store.enqueue(&original).unwrap();
+        let leased = store
+            .lease(100, 1, Duration::from_millis(50))
+            .unwrap()
+            .remove(0);
+        store.enqueue(&original).unwrap();
+        assert_eq!(
+            store
+                .retry(
+                    &leased.delivery_id,
+                    leased.lease_generation,
+                    &failure("transient", true),
+                    &policy(1),
+                    120,
+                )
+                .unwrap(),
+            RetryOutcome::DeadPendingRedrive
+        );
+        let mut newer = original;
+        newer.payload = serde_json::json!({"version": "newer"});
+        newer.observed_at_ms = 121;
+        newer.not_before_ms = 121;
+        store.enqueue(&newer).unwrap();
+
+        let capped = store
+            .redrive_due(
+                &RedrivePolicy {
+                    max_redrives: 0,
+                    cooldown: Duration::ZERO,
+                },
+                122,
+                10,
+            )
+            .unwrap();
+
+        assert_eq!(capped.permanent.len(), 1);
+        assert_eq!(store.get("one").unwrap().unwrap(), newer);
+        assert_eq!(store.ready_index_len().unwrap(), 1);
+        assert_eq!(store.leased_index_len().unwrap(), 0);
+        assert!(!store.terminal_suppresses("one").unwrap());
+    }
+
+    #[test]
+    fn terminal_redrive_cap_preserves_newer_leased_keyed_delivery() {
+        let temp = TempDir::new().unwrap();
+        let store = store(&temp);
+        let mut original = record("one", 100);
+        original.collapse_by_dedup_id = true;
+        original.payload = serde_json::json!({"version": "original"});
+        store.enqueue(&original).unwrap();
+        let leased = store
+            .lease(100, 1, Duration::from_millis(50))
+            .unwrap()
+            .remove(0);
+        store.enqueue(&original).unwrap();
+        assert_eq!(
+            store
+                .retry(
+                    &leased.delivery_id,
+                    leased.lease_generation,
+                    &failure("transient", true),
+                    &policy(1),
+                    120,
+                )
+                .unwrap(),
+            RetryOutcome::DeadPendingRedrive
+        );
+        let mut newer = original;
+        newer.payload = serde_json::json!({"version": "newer"});
+        newer.observed_at_ms = 121;
+        newer.not_before_ms = 121;
+        store.enqueue(&newer).unwrap();
+        let newer_lease = store
+            .lease(121, 1, Duration::from_millis(50))
+            .unwrap()
+            .remove(0);
+
+        let capped = store
+            .redrive_due(
+                &RedrivePolicy {
+                    max_redrives: 0,
+                    cooldown: Duration::ZERO,
+                },
+                122,
+                10,
+            )
+            .unwrap();
+
+        assert_eq!(capped.permanent.len(), 1);
+        assert_eq!(store.get("one").unwrap().unwrap(), newer_lease);
+        assert_eq!(store.ready_index_len().unwrap(), 0);
+        assert_eq!(store.leased_index_len().unwrap(), 1);
+        assert!(!store.terminal_suppresses("one").unwrap());
+    }
+
+    #[test]
+    fn terminal_redrive_cap_rebinds_subscriber_absence_dirty_follow_up() {
+        let temp = TempDir::new().unwrap();
+        let store = store(&temp);
+        let mut original = record("one", 100);
+        original.queue = "jobs".to_string();
+        original.dept = "old_worker".to_string();
+        original.collapse_by_dedup_id = true;
+        store.enqueue(&original).unwrap();
+        store
+            .lease_for_dept("old_worker", 100, 1, Duration::from_millis(50))
+            .unwrap();
+        store.enqueue(&original).unwrap();
+        store
+            .sweep_subscriber_absence(&BTreeSet::new(), 110, Duration::ZERO, 10)
+            .unwrap();
+        store
+            .sweep_subscriber_absence(&BTreeSet::new(), 111, Duration::ZERO, 10)
+            .unwrap();
+
+        let capped = store
+            .redrive_due_with_current_subscribers(
+                &RedrivePolicy {
+                    max_redrives: 0,
+                    cooldown: Duration::ZERO,
+                },
+                &BTreeMap::from([("jobs".to_string(), "new_worker".to_string())]),
+                112,
+                10,
+            )
+            .unwrap();
+
+        assert_eq!(capped.permanent.len(), 1);
+        let follow_up = store.get("one").unwrap().unwrap();
+        assert_eq!(follow_up.dept, "new_worker");
+        assert_eq!(follow_up.subscriber_absent_since_ms, None);
+        assert_eq!(store.ready_index_len().unwrap(), 1);
+        assert_eq!(
+            store
+                .lease_for_dept("new_worker", 112, 1, Duration::from_millis(50))
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     #[test]
