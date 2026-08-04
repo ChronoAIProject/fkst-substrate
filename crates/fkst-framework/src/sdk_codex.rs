@@ -12,7 +12,7 @@ use std::collections::HashSet;
 use std::ffi::OsStr;
 use std::fmt::Write as FmtWrite;
 use std::io::{Read, Write};
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -720,7 +720,7 @@ fn run_adoptable_codex_request(
         _ => false,
     };
     if !running {
-        start_adoption_worker(&request, &paths, host_root, config)?;
+        start_adoption_worker(&request, &paths, host_root, config, &lock_file)?;
     }
     drop(lock_file);
     wait_for_adoption_result(&request, &paths)
@@ -732,7 +732,6 @@ fn run_mocked_codex_request(
     config: &ConfigContext,
     runner: &MockCommandState,
 ) -> Result<CodexResult> {
-    let _lifetime_witness = acquire_log_lifetime_witness(&request);
     let args = command_args_for_request(&request);
     let cmd_line = format_command("codex", &args);
     let invocation = MockCommandInvocation {
@@ -758,6 +757,7 @@ fn run_mocked_codex_request(
             return Ok(result);
         }
     };
+    let _lifetime_witness = acquire_log_lifetime_witness(&request);
     let mut status = CodexStatusRecord::from_request(&request, None);
     write_codex_status(&request.log_path, &status);
     write_live_output_tail(
@@ -1229,6 +1229,49 @@ fn open_adoption_run_lock(work_dir: &Path) -> anyhow::Result<std::fs::File> {
     Ok(file)
 }
 
+#[cfg(unix)]
+fn inherit_fd_on_exec(command: &mut Command, fd: RawFd) {
+    unsafe {
+        command.pre_exec(move || {
+            let flags = nix::libc::fcntl(fd, nix::libc::F_GETFD);
+            if flags == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if nix::libc::fcntl(fd, nix::libc::F_SETFD, flags & !nix::libc::FD_CLOEXEC) == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+}
+
+fn inherited_adoption_run_lock(options: &CodexWorkerOptions) -> anyhow::Result<std::fs::File> {
+    if options.run_lock_fd < 0 {
+        anyhow::bail!(
+            "codex adoption inherited run lock fd invalid: {}",
+            options.run_lock_fd
+        );
+    }
+    if unsafe { nix::libc::fcntl(options.run_lock_fd, nix::libc::F_GETFD) } == -1 {
+        return Err(anyhow::Error::from(std::io::Error::last_os_error()));
+    }
+    let file = unsafe { std::fs::File::from_raw_fd(options.run_lock_fd) };
+    let path = options.work_dir.join("run.lock");
+    if !lifetime_witness_path_matches(&file, &path)? {
+        anyhow::bail!(
+            "codex adoption inherited run lock path mismatch: {}",
+            path.display()
+        );
+    }
+    flock(file.as_raw_fd(), FlockArg::LockExclusiveNonblock).map_err(|err| {
+        anyhow::anyhow!(
+            "codex adoption inherited run lock not exclusively owned path={} error={err}",
+            path.display()
+        )
+    })?;
+    Ok(file)
+}
+
 fn adoption_record_is_current(record: &CodexAdoptionRecord, run_id: &str, key: &str) -> bool {
     if record.status != CODEX_ADOPTION_STATUS_RUNNING {
         return false;
@@ -1241,6 +1284,7 @@ fn start_adoption_worker(
     paths: &CodexAdoptionPaths,
     host_root: &Path,
     config: &ConfigContext,
+    run_lock: &std::fs::File,
 ) -> Result<()> {
     ensure_pool_with_context(host_root, config)?;
     std::fs::create_dir_all(&paths.dir).map_err(mlua::Error::external)?;
@@ -1252,14 +1296,18 @@ fn start_adoption_worker(
     wait_for_test_hook("FKST_TEST_AFTER_ADOPTION_INTENT");
     fail_for_test_hook("FKST_TEST_FAIL_AFTER_ADOPTION_INTENT")?;
     let worker_bin = codex_worker_bin().map_err(mlua::Error::external)?;
-    let args = codex_worker_args(request, paths, host_root);
+    let run_lock_fd = run_lock.as_raw_fd();
+    let args = codex_worker_args(request, paths, host_root, run_lock_fd);
     let mut command = Command::new(&worker_bin);
     command.args(&args);
     command.stdin(Stdio::null());
     command.stdout(Stdio::null());
     command.stderr(Stdio::null());
     #[cfg(unix)]
-    command.process_group(0);
+    {
+        command.process_group(0);
+        inherit_fd_on_exec(&mut command, run_lock_fd);
+    }
     let child = command.spawn().map_err(mlua::Error::external)?;
     drop(child);
     Ok(())
@@ -1317,6 +1365,7 @@ fn codex_worker_args(
     request: &CodexRequest,
     paths: &CodexAdoptionPaths,
     host_root: &Path,
+    run_lock_fd: RawFd,
 ) -> Vec<String> {
     let mut args = vec![
         "__codex-worker".to_string(),
@@ -1324,6 +1373,8 @@ fn codex_worker_args(
         host_root.to_string_lossy().into_owned(),
         "--work-dir".to_string(),
         paths.dir.to_string_lossy().into_owned(),
+        "--run-lock-fd".to_string(),
+        run_lock_fd.to_string(),
         "--prompt-file".to_string(),
         paths.prompt.to_string_lossy().into_owned(),
         "--stdout-file".to_string(),
@@ -1478,6 +1529,7 @@ fn write_adoption_child_pid(request: &CodexRequest, child_pid: u32) {
 pub(crate) struct CodexWorkerOptions {
     host_root: PathBuf,
     work_dir: PathBuf,
+    run_lock_fd: RawFd,
     prompt_file: PathBuf,
     stdout_file: PathBuf,
     stderr_file: PathBuf,
@@ -1504,6 +1556,7 @@ pub(crate) fn parse_worker_args(args: Vec<String>) -> anyhow::Result<CodexWorker
     let mut parser = WorkerArgParser::new(args);
     let host_root = parser.required_path("--host-root")?;
     let work_dir = parser.required_path("--work-dir")?;
+    let run_lock_fd = parser.required_string("--run-lock-fd")?.parse::<RawFd>()?;
     let prompt_file = parser.required_path("--prompt-file")?;
     let stdout_file = parser.required_path("--stdout-file")?;
     let stderr_file = parser.required_path("--stderr-file")?;
@@ -1531,6 +1584,7 @@ pub(crate) fn parse_worker_args(args: Vec<String>) -> anyhow::Result<CodexWorker
     Ok(CodexWorkerOptions {
         host_root,
         work_dir,
+        run_lock_fd,
         prompt_file,
         stdout_file,
         stderr_file,
@@ -1555,6 +1609,7 @@ pub(crate) fn parse_worker_args(args: Vec<String>) -> anyhow::Result<CodexWorker
 }
 
 pub(crate) fn run_codex_worker(options: CodexWorkerOptions) -> anyhow::Result<i32> {
+    let run_lock = inherited_adoption_run_lock(&options)?;
     std::fs::create_dir_all(&options.work_dir)?;
     let prompt = std::fs::read_to_string(&options.prompt_file)?;
     let request = CodexRequest {
@@ -1597,9 +1652,12 @@ pub(crate) fn run_codex_worker(options: CodexWorkerOptions) -> anyhow::Result<i3
         error_kind: None,
         error: None,
     };
-    let Some(_adoption_lifetime_witness) = claim_adoption_worker(&options, &mut adoption)? else {
+    let Some(_adoption_lifetime_witness) =
+        claim_adoption_worker(&options, &mut adoption, &run_lock)?
+    else {
         return Ok(0);
     };
+    drop(run_lock);
     let _status_lifetime_witness = acquire_log_lifetime_witness(&request);
     let mut status = CodexStatusRecord::from_request(&request, None);
     write_codex_status(&request.log_path, &status);
@@ -1643,18 +1701,15 @@ pub(crate) fn run_codex_worker(options: CodexWorkerOptions) -> anyhow::Result<i3
 fn claim_adoption_worker(
     options: &CodexWorkerOptions,
     adoption: &mut CodexAdoptionRecord,
+    _run_lock: &std::fs::File,
 ) -> anyhow::Result<Option<std::fs::File>> {
-    let lock_file = open_adoption_run_lock(&options.work_dir)?;
-    flock(lock_file.as_raw_fd(), FlockArg::LockExclusive).map_err(anyhow::Error::from)?;
     let paths = adoption_paths_from_worker_options(options);
     if recover_completed_adoption_result_locked_from_disk(&paths)? {
-        drop(lock_file);
         return Ok(None);
     }
     let Some(lifetime_witness) =
         try_acquire_adoption_worker_witness(&options.work_dir, &options.run_id)?
     else {
-        drop(lock_file);
         return Ok(None);
     };
     let current_pid = std::process::id();
@@ -1663,14 +1718,12 @@ fn claim_adoption_worker(
         .as_ref()
         .is_some_and(|record| record.status == CODEX_ADOPTION_STATUS_COMPLETED)
     {
-        drop(lock_file);
         return Ok(None);
     }
     if let Some(record) = existing.as_ref().filter(|record| {
         record.status == CODEX_ADOPTION_STATUS_RUNNING && record.worker_pid != Some(current_pid)
     }) {
         if adoption_effect_alive(&options.work_dir, record)? {
-            drop(lock_file);
             return Ok(None);
         }
     }
@@ -1681,7 +1734,6 @@ fn claim_adoption_worker(
         adoption,
         CODEX_ADOPTION_STATUS_RUNNING,
     )?;
-    drop(lock_file);
     Ok(Some(lifetime_witness))
 }
 
@@ -3416,10 +3468,11 @@ mod tests {
             CodexSandbox::DangerFullAccess,
         ] {
             request.sandbox = Some(sandbox);
-            let args = codex_worker_args(&request, &paths, Path::new("host-root"));
+            let args = codex_worker_args(&request, &paths, Path::new("host-root"), 42);
             let options = parse_worker_args(args.into_iter().skip(1).collect()).unwrap();
 
             assert_eq!(options.sandbox, Some(sandbox));
+            assert_eq!(options.run_lock_fd, 42);
         }
     }
 

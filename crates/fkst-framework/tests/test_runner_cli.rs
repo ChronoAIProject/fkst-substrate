@@ -1,7 +1,8 @@
 use base64::Engine;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Child, Command, Output, Stdio};
+use std::time::{Duration, Instant};
 
 mod support;
 
@@ -60,6 +61,24 @@ fn run_lua_tests(host: &Path, package: &Path) -> Output {
         .env("FKST_RUNTIME_ROOT", host.join(".fkst/runtime"))
         .output()
         .unwrap()
+}
+
+fn wait_for_output_promptly(mut child: Child, timeout: Duration) -> Output {
+    let started = Instant::now();
+    loop {
+        if child.try_wait().unwrap().is_some() {
+            return child.wait_with_output().unwrap();
+        }
+        if started.elapsed() >= timeout {
+            let _ = child.kill();
+            let output = child.wait_with_output().unwrap();
+            panic!(
+                "child did not exit within {timeout:?}: stderr={}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
 }
 
 fn run_lua_tests_with_packages(host: &Path, packages: &[&Path]) -> Output {
@@ -2333,6 +2352,19 @@ return {
 #[test]
 fn test_runner_records_and_replays_external_command_cassettes() {
     let host = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
+    let bin_dir = host.path().join("bin");
+    fs::create_dir_all(&bin_dir).unwrap();
+    let codex = bin_dir.join("codex");
+    fs::write(
+        &codex,
+        "#!/bin/sh\ncat >/dev/null\nprintf 'codex-secret-token'\n",
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&codex, fs::Permissions::from_mode(0o755)).unwrap();
+    }
     fs::create_dir_all(host.path().join("tests/cassettes")).unwrap();
     fs::write(
         host.path().join("tests/vcr_command_test.lua"),
@@ -2351,10 +2383,14 @@ return {
       local result = exec_sync("printf secret-token")
       t.eq(result.stdout, "secret-token")
       t.eq(result.exit_code, 0)
+      local codex_result = spawn_codex_sync({ prompt = "secret-token" })
+      t.eq(codex_result.stdout, "codex-secret-token")
+      t.eq(codex_result.exit_code, 0)
     end)
     local calls = t.command_calls()
-    t.eq(#calls, 1)
+    t.eq(#calls, 2)
     t.eq(calls[1].rendered, "printf secret-token")
+    t.eq(calls[2].program, "codex")
   end,
 
   test_02_replay_returns_cassette_without_live_command = function()
@@ -2368,10 +2404,14 @@ return {
       local result = exec_sync("printf secret-token")
       t.eq(result.stdout, "<TOKEN>")
       t.eq(result.exit_code, 0)
+      local codex_result = spawn_codex_sync({ prompt = "secret-token" })
+      t.eq(codex_result.stdout, "codex-<TOKEN>")
+      t.eq(codex_result.exit_code, 0)
     end)
     local calls = t.command_calls()
-    t.eq(#calls, 1)
+    t.eq(#calls, 2)
     t.eq(calls[1].stdout, "<TOKEN>")
+    t.eq(calls[2].stdout, "codex-<TOKEN>")
   end,
 
   test_03_replay_mismatch_fails_closed = function()
@@ -2391,7 +2431,25 @@ return {
     )
     .unwrap();
 
-    let output = run_lua_tests(host.path(), host.path());
+    write_single_package_workspace(host.path());
+    let path = std::env::join_paths(std::iter::once(bin_dir).chain(std::env::split_paths(
+        &std::env::var_os("PATH").unwrap_or_default(),
+    )))
+    .unwrap();
+    let child = framework_command()
+        .arg("test")
+        .arg("--project-root")
+        .arg(host.path())
+        .arg("--package-root")
+        .arg(host.path())
+        .current_dir(host.path())
+        .env("FKST_RUNTIME_ROOT", host.path().join(".fkst/runtime"))
+        .env("PATH", path)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let output = wait_for_output_promptly(child, Duration::from_secs(15));
 
     assert!(
         output.status.success(),

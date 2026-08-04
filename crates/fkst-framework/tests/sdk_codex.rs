@@ -1515,6 +1515,96 @@ printf 'adopted-%s' "$count"
 
 #[cfg(unix)]
 #[test]
+fn codex_runs_keeps_spawned_adoption_intent_running_during_worker_handoff() {
+    let tmp = tempfile::tempdir().unwrap();
+    let worktree = tmp.path().join("wt");
+    let worker = tmp.path().join("fake-worker");
+    let started_fifo = tmp.path().join("started.fifo");
+    let release_fifo = tmp.path().join("release.fifo");
+    std::fs::create_dir_all(&worktree).unwrap();
+    make_fifo(&started_fifo);
+    make_fifo(&release_fifo);
+    install_codex_script(
+        tmp.path(),
+        r#"#!/bin/sh
+stdout_file=
+stderr_file=
+result_file=
+status_file=
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --stdout-file) stdout_file="$2"; shift 2 ;;
+    --stderr-file) stderr_file="$2"; shift 2 ;;
+    --result-file) result_file="$2"; shift 2 ;;
+    --status-file) status_file="$2"; shift 2 ;;
+    *) shift ;;
+  esac
+done
+printf 'started' > "$STARTED_FIFO"
+read _ < "$RELEASE_FIFO"
+printf 'handoff-result' > "$stdout_file"
+: > "$stderr_file"
+printf '{"ended_at_ms":1,"exit_code":0,"error_kind":null,"error":null}' > "$result_file"
+sed -e 's/"status":"intent"/"status":"completed"/' \
+    -e 's/"ended_at_ms":null/"ended_at_ms":1/' \
+    -e 's/"exit_code":null/"exit_code":0/' \
+    "$status_file" > "$status_file.tmp"
+mv "$status_file.tmp" "$status_file"
+"#,
+    );
+    std::fs::rename(tmp.path().join("codex"), &worker).unwrap();
+
+    let mut sandbox = ProcessSandbox::new();
+    sandbox.enter_cwd(tmp.path()).runtime_root(".fkst/runtime");
+    sandbox.set_env("STARTED_FIFO", started_fifo.to_string_lossy().into_owned());
+    sandbox.set_env("RELEASE_FIFO", release_fifo.to_string_lossy().into_owned());
+    sandbox.set_env(CODEX_WORKER_BIN_ENV, worker.to_string_lossy().into_owned());
+    sandbox.runtime_log_dir(tmp.path().join("runtime"));
+    let (_lock, _guard) = sandbox.enter();
+
+    let worktree_arg = worktree.to_string_lossy().into_owned();
+    let (result_tx, result_rx) = std::sync::mpsc::channel();
+    let caller = std::thread::spawn(move || {
+        let lua = Lua::new();
+        register(&lua).unwrap();
+        let spawn: mlua::Function = lua.globals().get("spawn_codex_sync").unwrap();
+        let opts = lua_opts(&lua, "handoff");
+        opts.set("worktree", worktree_arg).unwrap();
+        opts.set("dedup_key", "handoff-key").unwrap();
+        let result: Table = spawn.call(opts).unwrap();
+        result_tx
+            .send((
+                result.get::<i64>("exit_code").unwrap(),
+                result.get::<String>("stdout").unwrap(),
+            ))
+            .unwrap();
+    });
+    assert_eq!(read_fifo(&started_fifo), "started");
+
+    let lua = Lua::new();
+    register(&lua).unwrap();
+    let status_fn = codex_runs_fn(&lua);
+    let deadline = Instant::now() + Duration::from_secs(1);
+    let projected_running = loop {
+        let snapshot: Table = status_fn.call(()).unwrap();
+        let running = table_len(&snapshot, "running");
+        if running == 0 || Instant::now() >= deadline {
+            break running;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+
+    write_fifo(&release_fifo, "go\n");
+    assert_eq!(
+        result_rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+        (0, "handoff-result".to_string())
+    );
+    caller.join().unwrap();
+    assert_eq!(projected_running, 1);
+}
+
+#[cfg(unix)]
+#[test]
 fn killed_adoption_worker_is_reconciled_and_same_key_redrives_once() {
     use nix::sys::signal::{killpg, Signal};
     use nix::unistd::Pid;
