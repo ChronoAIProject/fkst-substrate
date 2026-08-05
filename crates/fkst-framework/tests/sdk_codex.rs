@@ -1738,6 +1738,123 @@ printf 'redrive-%s' "$count"
 
 #[cfg(unix)]
 #[test]
+fn stale_waiter_timeout_does_not_kill_newer_adoption_incarnation() {
+    use nix::sys::signal::{killpg, Signal};
+    use nix::unistd::Pid;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let bin_dir = tmp.path().join("bin");
+    let worktree = tmp.path().join("wt");
+    let capture_dir = tmp.path().join("capture");
+    let first_started_fifo = tmp.path().join("first-started.fifo");
+    let redrive_started_fifo = tmp.path().join("redrive-started.fifo");
+    std::fs::create_dir_all(&worktree).unwrap();
+    std::fs::create_dir_all(&capture_dir).unwrap();
+    make_fifo(&first_started_fifo);
+    make_fifo(&redrive_started_fifo);
+    install_codex_script(
+        &bin_dir,
+        r#"#!/bin/sh
+cat >/dev/null
+count_file="$CAPTURE_DIR/spawns"
+count=0
+if [ -f "$count_file" ]; then
+  count=$(cat "$count_file")
+fi
+count=$((count + 1))
+printf '%s' "$count" > "$count_file"
+if [ "$count" -eq 1 ]; then
+  printf 'started' > "$FIRST_STARTED_FIFO"
+  while :; do sleep 1; done
+fi
+printf 'started' > "$REDRIVE_STARTED_FIFO"
+sleep 4
+printf 'redrive-%s' "$count"
+"#,
+    );
+
+    let mut sandbox = ProcessSandbox::new();
+    sandbox.enter_cwd(tmp.path()).runtime_root(".fkst/runtime");
+    sandbox.prepend_path(&bin_dir);
+    sandbox.set_env("CAPTURE_DIR", capture_dir.to_string_lossy().into_owned());
+    sandbox.set_env(
+        "FIRST_STARTED_FIFO",
+        first_started_fifo.to_string_lossy().into_owned(),
+    );
+    sandbox.set_env(
+        "REDRIVE_STARTED_FIFO",
+        redrive_started_fifo.to_string_lossy().into_owned(),
+    );
+    sandbox.set_env(CODEX_WORKER_BIN_ENV, framework_bin());
+    sandbox.runtime_log_dir(tmp.path().join("runtime"));
+    let (_lock, _guard) = sandbox.enter();
+
+    let worktree_arg = worktree.to_string_lossy().into_owned();
+    let (first_tx, first_rx) = std::sync::mpsc::channel();
+    let first_thread = std::thread::spawn({
+        let worktree_arg = worktree_arg.clone();
+        move || {
+            let lua = Lua::new();
+            register(&lua).unwrap();
+            let spawn: mlua::Function = lua.globals().get("spawn_codex_sync").unwrap();
+            let opts = lua_opts(&lua, "stale-waiter");
+            opts.set("worktree", worktree_arg).unwrap();
+            opts.set("dedup_key", "stale-waiter-key").unwrap();
+            opts.set("timeout", 1).unwrap();
+            let result: Table = spawn.call(opts).unwrap();
+            first_tx
+                .send(result.get::<i64>("exit_code").unwrap())
+                .unwrap();
+        }
+    });
+    assert_eq!(read_fifo(&first_started_fifo), "started");
+
+    let adoption_path = adoption_work_dir(tmp.path());
+    let status: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(adoption_path.join("status.json")).unwrap())
+            .unwrap();
+    let run_id = status["run_id"].as_str().unwrap();
+    let worker_pid = status["worker_pid"].as_i64().unwrap() as i32;
+    let codex_pid = status["codex_pid"].as_i64().unwrap() as i32;
+    killpg(Pid::from_raw(worker_pid), Signal::SIGKILL).unwrap();
+    wait_for_child_exit(worker_pid);
+    killpg(Pid::from_raw(codex_pid), Signal::SIGKILL).unwrap();
+    wait_for_exclusive_lock(&adoption_path.join(format!("worker-{run_id}.lock")));
+
+    let (redrive_tx, redrive_rx) = std::sync::mpsc::channel();
+    let redrive_thread = std::thread::spawn(move || {
+        let lua = Lua::new();
+        register(&lua).unwrap();
+        let spawn: mlua::Function = lua.globals().get("spawn_codex_sync").unwrap();
+        let opts = lua_opts(&lua, "stale-waiter");
+        opts.set("worktree", worktree_arg).unwrap();
+        opts.set("dedup_key", "stale-waiter-key").unwrap();
+        opts.set("timeout", 5).unwrap();
+        let result: Table = spawn.call(opts).unwrap();
+        redrive_tx
+            .send((
+                result.get::<i64>("exit_code").unwrap(),
+                result.get::<String>("stdout").unwrap(),
+            ))
+            .unwrap();
+    });
+    assert_eq!(read_fifo(&redrive_started_fifo), "started");
+
+    assert_eq!(first_rx.recv_timeout(Duration::from_secs(6)).unwrap(), 124);
+    assert_eq!(
+        redrive_rx.recv_timeout(Duration::from_secs(10)).unwrap(),
+        (0, "redrive-2".to_string())
+    );
+    first_thread.join().unwrap();
+    redrive_thread.join().unwrap();
+    assert_eq!(
+        std::fs::read_to_string(capture_dir.join("spawns")).unwrap(),
+        "2"
+    );
+}
+
+#[cfg(unix)]
+#[test]
 fn spawn_codex_sync_racing_stale_intent_performs_effect_once() {
     let tmp = tempfile::tempdir().unwrap();
     let bin_dir = tmp.path().join("bin");

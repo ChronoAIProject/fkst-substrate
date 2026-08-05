@@ -1465,8 +1465,11 @@ fn wait_for_adoption_result(
             return Ok(result);
         }
         if Instant::now() >= deadline {
-            if let Some(record) = read_adoption_record(&paths.status)? {
-                kill_adoption_worker_group(&record);
+            if let Err(err) = kill_current_adoption_worker_group(request, paths) {
+                eprintln!(
+                    "WARN: codex adoption timeout cleanup skipped run_id={} key={} error={err}",
+                    request.run_id, paths.key
+                );
             }
             let message = format!(
                 "adopted codex timed out waiting for result after {}s wall clock",
@@ -1483,6 +1486,24 @@ fn wait_for_adoption_result(
         }
         std::thread::sleep(CODEX_ADOPTION_POLL);
     }
+}
+
+fn kill_current_adoption_worker_group(
+    request: &CodexRequest,
+    paths: &CodexAdoptionPaths,
+) -> anyhow::Result<()> {
+    let lock_file = open_adoption_run_lock(&paths.dir)?;
+    flock(lock_file.as_raw_fd(), FlockArg::LockExclusive).map_err(anyhow::Error::from)?;
+    let Some(record) = read_adoption_record_from_disk(&paths.status)? else {
+        return Ok(());
+    };
+    if !adoption_record_is_current(&record, &request.run_id, &paths.key) {
+        return Ok(());
+    }
+    if adoption_effect_alive(&paths.dir, &record)? {
+        kill_adoption_worker_group(&record);
+    }
+    Ok(())
 }
 
 #[cfg(unix)]
