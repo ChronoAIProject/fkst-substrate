@@ -2293,19 +2293,9 @@ fn adoption_status_for_observe(record: &CodexAdoptionRecord, work_dir: &Path) ->
 fn latest_codex_status_records(records: Vec<CodexStatusRecord>) -> Vec<CodexStatusRecord> {
     let mut latest = std::collections::HashMap::<String, CodexStatusRecord>::new();
     for record in records {
-        let key = record.run_id.clone();
-        match latest.get(&key) {
-            Some(existing) if status_record_time(existing) > status_record_time(&record) => {}
-            _ => {
-                latest.insert(key, record);
-            }
-        }
+        latest.insert(record.run_id.clone(), record);
     }
     latest.into_values().collect()
-}
-
-fn status_record_time(record: &CodexStatusRecord) -> u64 {
-    record.ended_at_ms.unwrap_or(record.started_at_ms)
 }
 
 fn lease_expires_at_ms(started_at_ms: u64, timeout_seconds: i64) -> Option<u64> {

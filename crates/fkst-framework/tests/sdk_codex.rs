@@ -375,6 +375,51 @@ fn codex_runs_projects_generic_running_only_while_its_log_witness_is_held() {
 }
 
 #[test]
+fn codex_runs_uses_log_order_when_wall_clock_moves_backwards() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut sandbox = ProcessSandbox::new();
+    sandbox.enter_cwd(tmp.path()).runtime_root(".fkst/runtime");
+    sandbox.runtime_log_dir(tmp.path().join("runtime"));
+    let (_lock, _guard) = sandbox.enter();
+
+    let log_path = tmp.path().join("runtime/codex/clock-rollback.log");
+    std::fs::create_dir_all(log_path.parent().unwrap()).unwrap();
+    let running = serde_json::json!({
+        "run_id": "codex-clock-rollback",
+        "started_at": "2026-08-05T00:00:00Z",
+        "started_at_ms": 200_u64,
+        "status": "running",
+        "permit_slot": null
+    });
+    let completed = serde_json::json!({
+        "run_id": "codex-clock-rollback",
+        "started_at": "2026-08-05T00:00:00Z",
+        "started_at_ms": 200_u64,
+        "ended_at": "2026-08-04T23:59:59Z",
+        "ended_at_ms": 100_u64,
+        "status": "completed",
+        "exit_code": 0,
+        "permit_slot": null
+    });
+    std::fs::write(
+        &log_path,
+        format!("CODEX_STATUS:{running}\nCODEX_STATUS:{completed}\n"),
+    )
+    .unwrap();
+
+    let lua = Lua::new();
+    register(&lua).unwrap();
+    let snapshot: Table = codex_runs_fn(&lua).call(()).unwrap();
+
+    assert_eq!(table_len(&snapshot, "running"), 0);
+    let recent: Table = snapshot.get("recent").unwrap();
+    assert_eq!(recent.raw_len(), 1);
+    let terminal: Table = recent.get(1).unwrap();
+    assert_eq!(terminal.get::<String>("status").unwrap(), "done");
+    assert_eq!(terminal.get::<i64>("exit_code").unwrap(), 0);
+}
+
+#[test]
 fn fixed_surface_does_not_register_await_any_await_or_sleep() {
     let lua = Lua::new();
     register(&lua).unwrap();
