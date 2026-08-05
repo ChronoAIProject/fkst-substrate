@@ -676,6 +676,7 @@ mod tests {
     use super::super::delivery_store::DeliveryStore;
     use super::*;
     use fkst_common::config::{Config, DepartmentDecl, LimitsDecl, QueueDecl};
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::Duration;
     use tempfile::TempDir;
 
@@ -1273,6 +1274,68 @@ mod tests {
             leased[0].payload,
             serde_json::json!({"entity": "issue-512", "dedup_key": "issue-512/proposal-a"})
         );
+    }
+
+    #[test]
+    fn reliable_raised_dedup_key_during_active_lease_promotes_one_follow_up() {
+        let cfg = config(false);
+        let temp = TempDir::new().unwrap();
+        let store = Arc::new(DeliveryStore::open(temp.path().join("delivery.redb")).unwrap());
+        let now_ms = Arc::new(AtomicU64::new(100));
+        let clock_now_ms = now_ms.clone();
+        let router = DeliveryRouter::new_with_clock(
+            &cfg,
+            Fanout::new(),
+            Some(store.clone()),
+            None,
+            Arc::new(move || clock_now_ms.load(Ordering::SeqCst)),
+        );
+
+        for observation in 1..=5 {
+            router
+                .publish(PublishEnvelope {
+                    event: Event::new(
+                        "jobs",
+                        serde_json::json!({
+                            "dedup_key": "issue-512/proposal-a",
+                            "observation": observation
+                        }),
+                    ),
+                    source: Some(cron_source(&format!("tick/slot/{observation}"))),
+                    cron_payload: None,
+                    derived: Some(DerivedDelivery {
+                        parent_delivery_id: format!("parent-{observation}"),
+                        ordinal: 0,
+                    }),
+                })
+                .unwrap();
+            if observation == 1 {
+                let leased = store
+                    .lease_for_dept("worker", 100, 1, Duration::from_millis(50))
+                    .unwrap();
+                assert_eq!(leased.len(), 1);
+                now_ms.store(120, Ordering::SeqCst);
+            }
+        }
+
+        let active = store
+            .lease_for_dept("worker", 120, 1, Duration::from_millis(50))
+            .unwrap();
+        assert!(active.is_empty());
+        let delivery_id = "delivery/v3/raised/queue/jobs/dept/worker/dedup/issue-512_2F_proposal-a";
+        let dirty = store.get(delivery_id).unwrap().unwrap();
+        assert!(dirty.pending_dirty);
+        assert!(store.ack(delivery_id, dirty.lease_generation).unwrap());
+
+        let follow_up = store
+            .lease_for_dept("worker", 120, 10, Duration::from_millis(50))
+            .unwrap();
+        assert_eq!(follow_up.len(), 1);
+        assert!(!follow_up[0].pending_dirty);
+        assert!(store
+            .ack(delivery_id, follow_up[0].lease_generation)
+            .unwrap());
+        assert!(store.get(delivery_id).unwrap().is_none());
     }
 
     #[test]
