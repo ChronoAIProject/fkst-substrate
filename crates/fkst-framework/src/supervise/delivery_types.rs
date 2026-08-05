@@ -33,7 +33,7 @@ pub(crate) struct DeliveryRecord {
     pub redrive_count: u64,
     #[serde(default)]
     pub collapse_by_dedup_id: bool,
-    /// A stable keyed duplicate arrived while this delivery was leased.
+    /// A stable keyed duplicate arrived while this delivery's lease was active.
     #[serde(default, skip_serializing_if = "is_false")]
     pub pending_dirty: bool,
     #[serde(default)]

@@ -189,7 +189,9 @@ impl DeliveryStore {
                 if current.collapse_by_dedup_id || record.collapse_by_dedup_id {
                     if current.collapse_by_dedup_id
                         && record.collapse_by_dedup_id
-                        && current.lease_until_ms.is_some()
+                        && current
+                            .lease_until_ms
+                            .is_some_and(|lease_until_ms| lease_until_ms > record.not_before_ms)
                         && !current.pending_dirty
                     {
                         current.pending_dirty = true;
@@ -2788,6 +2790,35 @@ mod tests {
             .remove(0);
         assert!(store
             .ack(&leased.delivery_id, leased.lease_generation)
+            .unwrap());
+        assert!(store.get("one").unwrap().is_none());
+        assert_eq!(store.ready_index_len().unwrap(), 0);
+    }
+
+    #[test]
+    fn expired_keyed_duplicate_remains_collapsed_without_follow_up() {
+        let temp = TempDir::new().unwrap();
+        let store = store(&temp);
+        let mut original = record("one", 100);
+        original.collapse_by_dedup_id = true;
+        store.enqueue(&original).unwrap();
+        let first = store
+            .lease(100, 1, Duration::from_millis(50))
+            .unwrap()
+            .remove(0);
+        let mut duplicate = original;
+        duplicate.observed_at_ms = first.lease_until_ms.unwrap();
+        duplicate.not_before_ms = first.lease_until_ms.unwrap();
+
+        store.enqueue(&duplicate).unwrap();
+
+        assert!(!store.get("one").unwrap().unwrap().pending_dirty);
+        let redelivered = store
+            .lease(first.lease_until_ms.unwrap(), 1, Duration::from_millis(50))
+            .unwrap()
+            .remove(0);
+        assert!(store
+            .ack(&redelivered.delivery_id, redelivered.lease_generation)
             .unwrap());
         assert!(store.get("one").unwrap().is_none());
         assert_eq!(store.ready_index_len().unwrap(), 0);
