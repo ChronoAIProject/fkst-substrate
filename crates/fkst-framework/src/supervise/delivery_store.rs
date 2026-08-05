@@ -1170,7 +1170,10 @@ impl DeliveryStore {
                     mutated = true;
                     continue;
                 }
-                if delivery.get(delivery_id.as_str())?.is_some() {
+                if let Some(live) = read_delivery_table(&delivery, delivery_id.as_str())? {
+                    let live_fulfills_dirty_follow_up = record.collapse_by_dedup_id
+                        && record.pending_dirty
+                        && live.collapse_by_dedup_id;
                     dead_index.remove(key.key.as_str())?;
                     dead.permanent = true;
                     dead.replayable = false;
@@ -1185,7 +1188,9 @@ impl DeliveryStore {
                             .as_str(),
                         &(),
                     )?;
-                    suppress_terminal_delivery(&write, delivery_id.as_str())?;
+                    if !live_fulfills_dirty_follow_up {
+                        suppress_terminal_delivery(&write, delivery_id.as_str())?;
+                    }
                     result.permanent.push(dead);
                     mutated = true;
                     continue;
@@ -4053,6 +4058,69 @@ mod tests {
         assert_eq!(result.permanent.len(), 1);
         assert!(store.get_dead("one").unwrap().unwrap().permanent);
         assert_eq!(store.dead_due_index_len().unwrap(), 0);
+    }
+
+    #[test]
+    fn redrive_collision_preserves_reusable_live_keyed_delivery() {
+        let temp = TempDir::new().unwrap();
+        let store = store(&temp);
+        let mut original = record("one", 100);
+        original.collapse_by_dedup_id = true;
+        store.enqueue(&original).unwrap();
+        let leased = store
+            .lease(100, 1, Duration::from_millis(50))
+            .unwrap()
+            .remove(0);
+        store.enqueue(&original).unwrap();
+        assert_eq!(
+            store
+                .retry(
+                    &leased.delivery_id,
+                    leased.lease_generation,
+                    &failure("transient", true),
+                    &policy(1),
+                    120,
+                )
+                .unwrap(),
+            RetryOutcome::DeadPendingRedrive
+        );
+
+        let mut newer = original.clone();
+        newer.payload = serde_json::json!({"version": "newer"});
+        newer.observed_at_ms = 121;
+        newer.not_before_ms = 121;
+        store.enqueue(&newer).unwrap();
+        let collision = store
+            .redrive_due(
+                &RedrivePolicy {
+                    max_redrives: 3,
+                    cooldown: Duration::ZERO,
+                },
+                122,
+                10,
+            )
+            .unwrap();
+
+        assert_eq!(collision.permanent.len(), 1);
+        assert!(!store.terminal_suppresses("one").unwrap());
+        let live = store
+            .lease(122, 1, Duration::from_millis(50))
+            .unwrap()
+            .remove(0);
+        assert_eq!(live.payload, serde_json::json!({"version": "newer"}));
+        assert!(store.ack(&live.delivery_id, live.lease_generation).unwrap());
+
+        let mut subsequent = original;
+        subsequent.observed_at_ms = 123;
+        subsequent.not_before_ms = 123;
+        store.enqueue(&subsequent).unwrap();
+        assert_eq!(
+            store
+                .lease(123, 1, Duration::from_millis(50))
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     #[test]
