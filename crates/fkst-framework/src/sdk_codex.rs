@@ -482,11 +482,12 @@ fn codex_request_from_opts(opts: Table, runtime_dept: Option<String>) -> Result<
     let timeout_seconds = timeout
         .filter(|seconds| *seconds > 0)
         .unwrap_or(DEFAULT_CODEX_TIMEOUT_SECONDS);
-    let log_path = codex_log_path(worktree.as_deref());
+    let run_id = codex_run_id();
+    let log_path = codex_log_path(worktree.as_deref(), &run_id);
     let output_tail_path = codex_output_tail_path(&log_path);
     let started_at_ms = unix_duration().as_millis() as u64;
     Ok(CodexRequest {
-        run_id: codex_run_id(),
+        run_id,
         prompt,
         context,
         worktree,
@@ -2943,7 +2944,7 @@ fn default_runtime_log_dir() -> PathBuf {
     PathBuf::from(".fkst-logs")
 }
 
-fn codex_log_path(worktree: Option<&str>) -> PathBuf {
+fn codex_log_path(worktree: Option<&str>, run_id: &str) -> PathBuf {
     let basename = worktree
         .and_then(|wt| Path::new(wt).file_name())
         .and_then(OsStr::to_str)
@@ -2952,7 +2953,7 @@ fn codex_log_path(worktree: Option<&str>) -> PathBuf {
     let timestamp = filename_timestamp();
     runtime_log_dir()
         .join("codex")
-        .join(format!("{basename}-{timestamp}.log"))
+        .join(format!("{basename}-{timestamp}-{run_id}.log"))
 }
 
 fn codex_output_tail_path(log_path: &Path) -> PathBuf {
@@ -3407,6 +3408,24 @@ mod tests {
         assert!(
             token.parse::<ulid::Ulid>().is_ok(),
             "codex run id must contain a process-independent incarnation token: {run_id}"
+        );
+    }
+
+    #[test]
+    fn generic_log_witness_path_is_bound_to_run_incarnation() {
+        let lua = Lua::new();
+        let opts = lua.create_table().unwrap();
+        opts.set("prompt", "observe generic ownership").unwrap();
+        let request = codex_request_from_opts(opts, None).unwrap();
+        let file_name = request
+            .log_path
+            .file_name()
+            .and_then(OsStr::to_str)
+            .unwrap();
+
+        assert!(
+            file_name.contains(&request.run_id),
+            "generic lifetime witness path must identify its run incarnation: {file_name}"
         );
     }
 
