@@ -2477,10 +2477,9 @@ fn wait_for_codex_child(
         } => {
             if exit_code == 0 {
                 if let Err(message) = stdin_result {
-                    let result = logged_failure(
+                    return logged_failure(
                         request, cmd_line, "stdin", message, stdout, stderr, exit_code,
                     );
-                    return codex_result_with_effect_receipt(request, result);
                 }
             }
             let result = CodexResult::success(
@@ -2506,11 +2505,7 @@ fn wait_for_codex_child(
             stdout,
             stderr,
             exit_code,
-        } => {
-            let result =
-                logged_failure(request, cmd_line, kind, message, stdout, stderr, exit_code);
-            codex_result_with_effect_receipt(request, result)
-        }
+        } => logged_failure(request, cmd_line, kind, message, stdout, stderr, exit_code),
     }
 }
 
@@ -2802,6 +2797,15 @@ fn logged_failure(
     } else {
         format!("{stderr}\n{message}")
     };
+    let result = CodexResult::failure(
+        kind,
+        message,
+        stdout.clone(),
+        stderr,
+        exit_code,
+        request.log_path.to_string_lossy().into_owned(),
+    );
+    let result = codex_result_with_effect_receipt(request, result);
     write_live_output_tail(
         Some(&request.output_tail_path),
         stdout.as_bytes(),
@@ -2815,14 +2819,7 @@ fn logged_failure(
         cmd_line,
         request.timeout_seconds,
     );
-    CodexResult::failure(
-        kind,
-        message,
-        stdout,
-        stderr,
-        exit_code,
-        request.log_path.to_string_lossy().into_owned(),
-    )
+    result
 }
 
 fn command_for_request(
@@ -3626,6 +3623,55 @@ mod tests {
         write_codex_effect_receipt(&old_request, &result).unwrap();
 
         assert!(!paths.effect_log.exists());
+    }
+
+    #[test]
+    fn keyed_failure_receipt_precedes_debug_log_publication() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("adoption");
+        let shared_log = dir.join("publication-order.log");
+        let paths = CodexAdoptionPaths {
+            key: "same-key".to_string(),
+            prompt: dir.join("prompt.txt"),
+            stdout: dir.join("stdout.txt"),
+            stderr: dir.join("stderr.txt"),
+            effect: dir.join("effect.json"),
+            effect_log: shared_log.clone(),
+            result: dir.join("result.json"),
+            status: dir.join("status.json"),
+            dir,
+        };
+        let mut request = command_test_request();
+        request.log_path = shared_log.clone();
+        request.output_tail_path = codex_output_tail_path(&shared_log);
+        request.adoption_status_path = Some(paths.status.clone());
+        request.effect_key = Some(paths.key.clone());
+        request.effect_log_path = Some(paths.effect_log.clone());
+        let current = adoption_record_from_request(
+            &request,
+            &paths,
+            CODEX_ADOPTION_STATUS_RUNNING,
+            Some(std::process::id()),
+            None,
+        );
+        write_adoption_record(&paths.status, &current).unwrap();
+
+        let result = logged_failure(
+            &request,
+            "codex exec -",
+            "timeout",
+            "codex timed out".to_string(),
+            "partial-output".to_string(),
+            String::new(),
+            124,
+        );
+
+        assert_eq!(result.error_kind.as_deref(), Some("timeout"));
+        let body = std::fs::read_to_string(shared_log).unwrap();
+        assert!(
+            body.starts_with(CODEX_EFFECT_LOG_PREFIX),
+            "trusted effect receipt must precede debug output: {body}"
+        );
     }
 
     #[test]
