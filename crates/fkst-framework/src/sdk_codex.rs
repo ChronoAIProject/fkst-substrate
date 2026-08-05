@@ -56,7 +56,6 @@ const GITHUB_AUTH_ENV_KEYS: &[&str] = &[
     "GITHUB_ENTERPRISE_TOKEN",
 ];
 static NEXT_PIPELINE_OWNER_ID: AtomicU64 = AtomicU64::new(1);
-static NEXT_CODEX_RUN_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum CodexSandbox {
@@ -3202,8 +3201,7 @@ fn parse_optional_u64(raw: &str) -> std::result::Result<Option<u64>, String> {
 }
 
 fn codex_run_id() -> String {
-    let sequence = NEXT_CODEX_RUN_ID.fetch_add(1, Ordering::Relaxed);
-    format!("codex-{}-{sequence}", filename_timestamp())
+    format!("codex-{}", ulid::Ulid::new())
 }
 
 fn filename_timestamp() -> String {
@@ -3409,6 +3407,19 @@ mod tests {
         assert_eq!(
             unix_seconds_to_iso8601(1_709_251_199),
             "2024-02-29T23:59:59Z"
+        );
+    }
+
+    #[test]
+    fn codex_run_id_carries_an_incarnation_token() {
+        let run_id = codex_run_id();
+        let token = run_id
+            .strip_prefix("codex-")
+            .expect("codex run id should retain its public prefix");
+
+        assert!(
+            token.parse::<ulid::Ulid>().is_ok(),
+            "codex run id must contain a process-independent incarnation token: {run_id}"
         );
     }
 
