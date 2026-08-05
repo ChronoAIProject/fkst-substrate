@@ -1858,6 +1858,7 @@ fn rebuild_terminal_dead_tables(write: &redb::WriteTransaction) -> Result<()> {
         }
         rows
     };
+    let delivery = write.open_table(DELIVERY_BY_ID)?;
     let mut terminal_index = write.open_table(TERMINAL_DEAD_BY_TIME)?;
     for (delivery_id, bytes) in dead_rows {
         let Some(record) = decode_dead_record(&delivery_id, &bytes) else {
@@ -1868,7 +1869,11 @@ fn rebuild_terminal_dead_tables(write: &redb::WriteTransaction) -> Result<()> {
                 make_dead_due_index_key(&record.dept, record.dead_at_ms, &delivery_id).as_str(),
                 &(),
             )?;
-            suppress_terminal_delivery(write, delivery_id.as_str())?;
+            let live_keyed_follow_up = read_delivery_table(&delivery, delivery_id.as_str())?
+                .is_some_and(|current| current.collapse_by_dedup_id);
+            if !live_keyed_follow_up {
+                suppress_terminal_delivery(write, delivery_id.as_str())?;
+            }
         }
     }
     Ok(())
@@ -4987,6 +4992,69 @@ mod tests {
         assert!(!follow_up.pending_dirty);
         assert_eq!(follow_up.lease_until_ms, None);
         assert_eq!(store.ready_index_len().unwrap(), 1);
+    }
+
+    #[test]
+    fn schema_rebuild_preserves_promoted_keyed_follow_up() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("delivery.redb");
+        let mut original = record("one", 100);
+        original.collapse_by_dedup_id = true;
+        {
+            let store = DeliveryStore::open(&path).unwrap();
+            store.enqueue(&original).unwrap();
+            let leased = store
+                .lease(100, 1, Duration::from_millis(50))
+                .unwrap()
+                .remove(0);
+            store.enqueue(&original).unwrap();
+            assert_eq!(
+                store
+                    .retry(
+                        &leased.delivery_id,
+                        leased.lease_generation,
+                        &failure("permanent", false),
+                        &policy(1),
+                        120,
+                    )
+                    .unwrap(),
+                RetryOutcome::PermanentDead
+            );
+            assert!(store.get("one").unwrap().is_some());
+            assert!(store.get_dead("one").unwrap().unwrap().permanent);
+            assert!(!store.terminal_suppresses("one").unwrap());
+        }
+        {
+            let db = Database::open(&path).unwrap();
+            let write = db.begin_write().unwrap();
+            {
+                let mut meta = write.open_table(META).unwrap();
+                meta.insert("schema_version", "10").unwrap();
+            }
+            write.commit().unwrap();
+        }
+
+        let store = DeliveryStore::open(&path).unwrap();
+
+        assert!(!store.terminal_suppresses("one").unwrap());
+        let follow_up = store
+            .lease(120, 1, Duration::from_millis(50))
+            .unwrap()
+            .remove(0);
+        assert!(store
+            .ack(&follow_up.delivery_id, follow_up.lease_generation)
+            .unwrap());
+        let mut subsequent = original;
+        subsequent.observed_at_ms = 121;
+        subsequent.not_before_ms = 121;
+        store.enqueue(&subsequent).unwrap();
+        assert_eq!(
+            store
+                .lease(121, 1, Duration::from_millis(50))
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     #[test]
