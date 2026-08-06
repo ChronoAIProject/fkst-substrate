@@ -25,7 +25,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::time::Duration;
 
-const SCHEMA_VERSION: &str = "11";
+const SCHEMA_VERSION: &str = "12";
 const TERMINAL_DEAD_RETENTION_MS: u64 = 24 * 60 * 60 * 1_000;
 const TERMINAL_DEAD_COMPACTION_LIMIT: usize = 1_024;
 const TERMINAL_SUPPRESSION_SLOTS: u64 = 16_777_216;
@@ -127,15 +127,28 @@ impl DeliveryStore {
         let db = Database::create(path)?;
         let write = db.begin_write()?;
         {
-            write.open_table(DELIVERY_BY_ID)?;
-            write.open_table(READY_BY_DEPT_DUE)?;
-            write.open_table(LEASED_BY_DEPT_UNTIL)?;
-            write.open_table(DEAD_BY_DEPT_DUE)?;
             let meta = write.open_table(META)?;
             let current_version = meta
                 .get("schema_version")?
                 .map(|value| value.value().to_string());
             drop(meta);
+            let current_schema_version = current_version
+                .as_deref()
+                .and_then(|version| version.parse::<u32>().ok());
+            let supported_schema_version = SCHEMA_VERSION
+                .parse::<u32>()
+                .expect("durable delivery schema version must be numeric");
+            if current_schema_version.is_some_and(|version| version > supported_schema_version) {
+                bail!(
+                    "durable delivery schema newer than supported: found {}, supported {}",
+                    current_version.as_deref().unwrap_or("unknown"),
+                    SCHEMA_VERSION
+                );
+            }
+            write.open_table(DELIVERY_BY_ID)?;
+            write.open_table(READY_BY_DEPT_DUE)?;
+            write.open_table(LEASED_BY_DEPT_UNTIL)?;
+            write.open_table(DEAD_BY_DEPT_DUE)?;
             if current_version.as_deref() == Some("1") {
                 write.delete_table(DEAD_BY_ID)?;
             }
@@ -147,16 +160,12 @@ impl DeliveryStore {
             if current_version.as_deref() != Some(SCHEMA_VERSION) {
                 delete_old_global_indexes(&write)?;
                 rebuild_due_indexes(&write, DELIVERY_BY_ID)?;
-                if current_version
-                    .as_deref()
-                    .and_then(|version| version.parse::<u32>().ok())
-                    .map_or(true, |version| version < 3)
-                {
+                if current_schema_version.map_or(true, |version| version < 3) {
                     mark_existing_dead_records_permanent(&write)?;
                 }
                 rebuild_dead_due_index(&write)?;
                 rebuild_dead_time_index(&write)?;
-                rebuild_terminal_dead_tables(&write)?;
+                rebuild_terminal_dead_tables(&write, current_schema_version)?;
                 import_legacy_terminal_suppressed_ids(&write)?;
                 drop_legacy_terminal_suppressed_table(&write)?;
                 drop_legacy_terminal_suppression_filter(&write)?;
@@ -1853,7 +1862,10 @@ fn rebuild_dead_time_index(write: &redb::WriteTransaction) -> Result<()> {
     Ok(())
 }
 
-fn rebuild_terminal_dead_tables(write: &redb::WriteTransaction) -> Result<()> {
+fn rebuild_terminal_dead_tables(
+    write: &redb::WriteTransaction,
+    previous_schema_version: Option<u32>,
+) -> Result<()> {
     write.delete_table(TERMINAL_DEAD_BY_TIME)?;
     let dead_rows = {
         let dead = write.open_table(DEAD_BY_ID)?;
@@ -1877,7 +1889,9 @@ fn rebuild_terminal_dead_tables(write: &redb::WriteTransaction) -> Result<()> {
             )?;
             let live_keyed_follow_up = read_delivery_table(&delivery, delivery_id.as_str())?
                 .is_some_and(|current| current.collapse_by_dedup_id);
-            if live_keyed_follow_up && !record.allows_keyed_reuse {
+            let schema_v11_keyed_reuse = previous_schema_version == Some(11)
+                && !terminal_delivery_is_suppressed(write, delivery_id.as_str())?;
+            if (live_keyed_follow_up || schema_v11_keyed_reuse) && !record.allows_keyed_reuse {
                 record.allows_keyed_reuse = true;
                 let mut dead = write.open_table(DEAD_BY_ID)?;
                 let bytes = serde_json::to_vec(&record)?;
@@ -5045,8 +5059,17 @@ mod tests {
             let db = Database::open(&path).unwrap();
             let write = db.begin_write().unwrap();
             {
+                let mut dead = write.open_table(DEAD_BY_ID).unwrap();
+                let bytes = dead.get("one").unwrap().unwrap().value().to_vec();
+                let mut encoded: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                encoded
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("allows_keyed_reuse");
+                let bytes = serde_json::to_vec(&encoded).unwrap();
+                dead.insert("one", bytes.as_slice()).unwrap();
                 let mut meta = write.open_table(META).unwrap();
-                meta.insert("schema_version", "10").unwrap();
+                meta.insert("schema_version", "11").unwrap();
             }
             write.commit().unwrap();
         }
@@ -5115,8 +5138,17 @@ mod tests {
             let db = Database::open(&path).unwrap();
             let write = db.begin_write().unwrap();
             {
+                let mut dead = write.open_table(DEAD_BY_ID).unwrap();
+                let bytes = dead.get("one").unwrap().unwrap().value().to_vec();
+                let mut encoded: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                encoded
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("allows_keyed_reuse");
+                let bytes = serde_json::to_vec(&encoded).unwrap();
+                dead.insert("one", bytes.as_slice()).unwrap();
                 let mut meta = write.open_table(META).unwrap();
-                meta.insert("schema_version", "10").unwrap();
+                meta.insert("schema_version", "11").unwrap();
             }
             write.commit().unwrap();
         }
@@ -5192,6 +5224,62 @@ mod tests {
         original.not_before_ms = compact_at_ms;
         store.enqueue(&original).unwrap();
         assert!(store.get("one").unwrap().is_some());
+    }
+
+    #[test]
+    fn newer_schema_version_fails_closed() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("delivery.redb");
+        {
+            let _store = DeliveryStore::open(&path).unwrap();
+        }
+        {
+            let db = Database::open(&path).unwrap();
+            let write = db.begin_write().unwrap();
+            {
+                let mut meta = write.open_table(META).unwrap();
+                let newer = SCHEMA_VERSION.parse::<u32>().unwrap().saturating_add(1);
+                meta.insert("schema_version", newer.to_string().as_str())
+                    .unwrap();
+            }
+            write.commit().unwrap();
+        }
+
+        let error = match DeliveryStore::open(&path) {
+            Ok(_) => panic!("newer durable delivery schema must fail closed"),
+            Err(error) => error,
+        };
+
+        assert!(error
+            .to_string()
+            .contains("durable delivery schema newer than supported"));
+    }
+
+    #[test]
+    fn dead_record_keyed_reuse_marker_is_backward_compatible() {
+        let clean = DeadRecord {
+            delivery_id: "one".to_string(),
+            queue: "input".to_string(),
+            dept: "worker".to_string(),
+            source: None,
+            observed_at_ms: 10,
+            not_before_ms: 100,
+            dead_at_ms: 120,
+            attempts: 1,
+            redrive_count: 0,
+            replayable: false,
+            permanent: true,
+            allows_keyed_reuse: false,
+            error_excerpt: Some("final".to_string()),
+            record: None,
+        };
+        let encoded = serde_json::to_value(&clean).unwrap();
+        assert!(encoded.get("allows_keyed_reuse").is_none());
+
+        let decoded: DeadRecord = serde_json::from_value(encoded).unwrap();
+
+        assert!(!decoded.allows_keyed_reuse);
+        assert_eq!(decoded, clean);
     }
 
     #[test]
@@ -5487,6 +5575,8 @@ mod tests {
             lineage.terminal_dead_letter.unwrap().delivery_id,
             "latest-b"
         );
+        assert!(!store.get_dead("older").unwrap().unwrap().allows_keyed_reuse);
+        assert!(store.terminal_suppresses("older").unwrap());
     }
 
     #[test]
