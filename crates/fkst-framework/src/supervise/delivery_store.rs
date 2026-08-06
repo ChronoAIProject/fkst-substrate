@@ -1310,12 +1310,9 @@ impl DeliveryStore {
         mut visit_queue_delivery: impl FnMut(DeliveryRecord) -> Result<()>,
     ) -> Result<DeliveryObservationRecords> {
         let read = self.db.begin_read()?;
-        let delivery = read.open_table(DELIVERY_BY_ID)?;
-        let delivery_order = read.open_table(DELIVERY_BY_OBSERVE_ORDER)?;
-        let dead = read.open_table(DEAD_BY_ID)?;
-        let dead_by_time = read.open_table(DEAD_BY_TIME)?;
 
         if projection.queue_aggregates {
+            let delivery = read.open_table(DELIVERY_BY_ID)?;
             for entry in delivery.iter()? {
                 let (delivery_id, bytes) = entry?;
                 count_observation_queue_record_read();
@@ -1337,6 +1334,8 @@ impl DeliveryStore {
         let record_limit = limit.saturating_add(1);
         let mut deliveries = Vec::new();
         if projection.deliveries {
+            let delivery = read.open_table(DELIVERY_BY_ID)?;
+            let delivery_order = read.open_table(DELIVERY_BY_OBSERVE_ORDER)?;
             let start = since
                 .map(|delivery_id| read_delivery_read_only(&delivery, delivery_id))
                 .transpose()?
@@ -1376,6 +1375,8 @@ impl DeliveryStore {
 
         let mut dead_letters = Vec::new();
         if projection.dead_letters {
+            let dead = read.open_table(DEAD_BY_ID)?;
+            let dead_by_time = read.open_table(DEAD_BY_TIME)?;
             let start = match dead_after {
                 Some((dead_at_ms, delivery_id)) => {
                     Some(make_dead_time_index_key(dead_at_ms, delivery_id))

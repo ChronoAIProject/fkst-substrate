@@ -579,7 +579,8 @@ mod tests {
     fn offline_snapshot_pushes_error_projection_into_bounded_store_read() {
         let temp = TempDir::new().unwrap();
         let layout = DurableLayout::new(temp.path()).unwrap();
-        let store = DeliveryStore::open(layout.delivery_db_path()).unwrap();
+        let database_path = layout.delivery_db_path();
+        let store = DeliveryStore::open(&database_path).unwrap();
         let record = |delivery_id: &str| DeliveryRecord {
             delivery_id: delivery_id.to_string(),
             queue: "jobs".to_string(),
@@ -626,6 +627,15 @@ mod tests {
                 .unwrap();
         }
         drop(store);
+        let database = redb::Database::open(&database_path).unwrap();
+        let write = database.begin_write().unwrap();
+        write
+            .delete_table(redb::TableDefinition::<&str, &str>::new(
+                "delivery_by_observe_order",
+            ))
+            .unwrap();
+        write.commit().unwrap();
+        drop(database);
 
         DeliveryStore::reset_observation_record_read_counts();
         let snapshot = snapshot_for_durable_root(
