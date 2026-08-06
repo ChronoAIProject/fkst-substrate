@@ -42,6 +42,7 @@ const CODEX_OUTPUT_TAIL_MAX_LINES: usize = 40;
 const CODEX_OUTPUT_TAIL_MAX_BYTES: usize = 4096;
 const CODEX_STATUS_LOG_PREFIX: &str = "CODEX_STATUS:";
 const CODEX_OUTPUT_LOG_BEGIN: &str = "CODEX_OUTPUT_BEGIN";
+const CODEX_OUTPUT_LOG_END: &str = "CODEX_OUTPUT_END\n";
 const CODEX_EFFECT_LOG_PREFIX: &str = "CODEX_EFFECT:";
 const CODEX_ADOPTION_DIR: &str = "codex-adoption";
 const CODEX_ADOPTION_STATUS_INTENT: &str = "intent";
@@ -2211,40 +2212,65 @@ where
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(err) => return Err(err.into()),
     };
-    let lines = body.lines().collect::<Vec<_>>();
     let mut records = Vec::new();
-    let mut in_status_header = true;
-    // Raw Codex output is data: only the leading running snapshots and final completion are control.
-    for (index, line) in lines.iter().enumerate() {
-        if *line == CODEX_OUTPUT_LOG_BEGIN {
-            in_status_header = false;
-            continue;
-        }
-        let is_terminal_record = index + 1 == lines.len();
-        if !in_status_header && !is_terminal_record {
-            continue;
+    let mut cursor = 0;
+    let mut output_frame_complete = false;
+    while let Some(relative_line_end) = body[cursor..].find('\n') {
+        let line_end = cursor + relative_line_end;
+        let line = &body[cursor..line_end];
+        let next_line = line_end + 1;
+        if let Some(raw_len) = line
+            .strip_prefix(CODEX_OUTPUT_LOG_BEGIN)
+            .and_then(|remainder| remainder.strip_prefix(':'))
+        {
+            let Ok(payload_len) = raw_len.parse::<usize>() else {
+                break;
+            };
+            let Some(payload_end) = next_line.checked_add(payload_len) else {
+                break;
+            };
+            let Some(remainder) = body.get(payload_end..) else {
+                break;
+            };
+            let Some(remainder) = remainder.strip_prefix(CODEX_OUTPUT_LOG_END) else {
+                break;
+            };
+            cursor = body.len() - remainder.len();
+            output_frame_complete = true;
+            break;
         }
         let Some(json) = line.strip_prefix(CODEX_STATUS_LOG_PREFIX) else {
-            in_status_header = false;
-            continue;
+            break;
         };
         match serde_json::from_str::<CodexStatusRecord>(json) {
-            Ok(mut record)
-                if record.run_id == expected_run_id
-                    && ((in_status_header && record.status == "running")
-                        || (is_terminal_record && record.status == "completed")) =>
-            {
+            Ok(mut record) if record.run_id == expected_run_id && record.status == "running" => {
                 if record.status == "running" && !witness_held {
                     record.status = "abandoned".to_string();
                     record.exit_code = Some(-1);
                 }
                 records.push(record);
             }
-            Ok(_) => in_status_header = false,
+            Ok(_) => break,
             Err(err) => eprintln!(
                 "WARN: codex status log line skipped path={} error={err}",
                 path.display()
             ),
+        }
+        cursor = next_line;
+    }
+    if output_frame_complete {
+        let terminal = body[cursor..].strip_suffix('\n').unwrap_or(&body[cursor..]);
+        if let Some(json) = terminal.strip_prefix(CODEX_STATUS_LOG_PREFIX) {
+            match serde_json::from_str::<CodexStatusRecord>(json) {
+                Ok(record) if record.run_id == expected_run_id && record.status == "completed" => {
+                    records.push(record);
+                }
+                Ok(_) => {}
+                Err(err) => eprintln!(
+                    "WARN: codex terminal status log line skipped path={} error={err}",
+                    path.display()
+                ),
+            }
         }
     }
     Ok(records)
@@ -3271,8 +3297,8 @@ fn write_codex_log(
         }
     }
 
-    let content = format!(
-        "{CODEX_OUTPUT_LOG_BEGIN}\n{stdout}{stdout_sep}{stderr}{stderr_sep}EXIT={exit_code}\nDONE_AT={done_at}\nCMD={cmd_line}\nTIMEOUT_SECONDS={timeout_seconds}\n",
+    let payload = format!(
+        "{stdout}{stdout_sep}{stderr}{stderr_sep}EXIT={exit_code}\nDONE_AT={done_at}\nCMD={cmd_line}\nTIMEOUT_SECONDS={timeout_seconds}\n",
         stdout_sep = if stdout.ends_with('\n') || stdout.is_empty() {
             ""
         } else {
@@ -3284,6 +3310,10 @@ fn write_codex_log(
             "\n"
         },
         done_at = unix_seconds_to_iso8601(unix_duration().as_secs()),
+    );
+    let content = format!(
+        "{CODEX_OUTPUT_LOG_BEGIN}:{}\n{payload}{CODEX_OUTPUT_LOG_END}",
+        payload.len()
     );
     if let Err(err) = std::fs::OpenOptions::new()
         .create(true)
@@ -3519,6 +3549,7 @@ mod tests {
         completed.exit_code = Some(0);
 
         let records = read_generic_codex_status_log_with_probe(&log_path, |path| {
+            write_codex_log(path, "", "", 0, "codex exec -", 3600);
             append_codex_status_log(path, &completed)?;
             probe_lifetime_witness(path)
         })
@@ -3576,6 +3607,59 @@ mod tests {
 
         assert_eq!(latest.len(), 1);
         assert_eq!(latest[0].status, "running");
+        assert_eq!(latest[0].role.as_deref(), Some("engine-role"));
+    }
+
+    #[test]
+    fn generic_status_snapshot_rejects_terminal_record_inside_truncated_output_frame() {
+        let tmp = tempfile::tempdir().unwrap();
+        let run_id = "codex-01ARZ3NDEKTSV4RRFFQ69G5FAV";
+        let log_path = tmp
+            .path()
+            .join(format!("worktree-1-000000000-{run_id}.log"));
+        let running = CodexStatusRecord {
+            run_id: run_id.to_string(),
+            role: Some("engine-role".to_string()),
+            label: None,
+            dept: None,
+            proposal_id: None,
+            dedup_key: None,
+            started_at: "2026-08-05T00:00:00Z".to_string(),
+            started_at_ms: 100,
+            timeout_seconds: Some(3600),
+            ended_at: None,
+            ended_at_ms: None,
+            elapsed_ms: None,
+            status: "running".to_string(),
+            exit_code: None,
+            permit_slot: None,
+            output_tail_path: None,
+        };
+        append_codex_status_log(&log_path, &running).unwrap();
+        let mut injected = running.clone();
+        injected.status = "completed".to_string();
+        injected.exit_code = Some(0);
+        let partial_payload = format!(
+            "partial output\n{CODEX_STATUS_LOG_PREFIX}{}",
+            serde_json::to_string(&injected).unwrap()
+        );
+        let declared_len = partial_payload.len() + 64;
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&log_path)
+            .unwrap();
+        write!(
+            file,
+            "{CODEX_OUTPUT_LOG_BEGIN}:{declared_len}\n{partial_payload}"
+        )
+        .unwrap();
+
+        let records = read_generic_codex_status_log(&log_path).unwrap();
+        let latest = latest_codex_status_records(records);
+
+        assert_eq!(latest.len(), 1);
+        assert_eq!(latest[0].status, "abandoned");
+        assert_eq!(latest[0].exit_code, Some(-1));
         assert_eq!(latest[0].role.as_deref(), Some("engine-role"));
     }
 

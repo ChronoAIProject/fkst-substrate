@@ -407,9 +407,13 @@ fn codex_runs_uses_log_order_when_wall_clock_moves_backwards() {
         "exit_code": 0,
         "permit_slot": null
     });
+    let output = "EXIT=0\n";
     std::fs::write(
         &log_path,
-        format!("CODEX_STATUS:{running}\nCODEX_STATUS:{completed}\n"),
+        format!(
+            "CODEX_STATUS:{running}\nCODEX_OUTPUT_BEGIN:{}\n{output}CODEX_OUTPUT_END\nCODEX_STATUS:{completed}\n",
+            output.len()
+        ),
     )
     .unwrap();
 
