@@ -196,14 +196,40 @@ impl DeliveryStore {
             if let Some(mut current) = read_delivery_table(&delivery, record.delivery_id.as_str())?
             {
                 if current.collapse_by_dedup_id || record.collapse_by_dedup_id {
-                    if current.collapse_by_dedup_id
-                        && record.collapse_by_dedup_id
-                        && current
-                            .lease_until_ms
-                            .is_some_and(|lease_until_ms| lease_until_ms > record.not_before_ms)
-                        && !current.pending_dirty
-                    {
-                        current.pending_dirty = true;
+                    let mut changed = false;
+                    if current.collapse_by_dedup_id && record.collapse_by_dedup_id {
+                        if let Some(lease_until_ms) = current.lease_until_ms {
+                            if lease_until_ms > record.not_before_ms {
+                                if !current.pending_dirty {
+                                    current.pending_dirty = true;
+                                    changed = true;
+                                }
+                            } else {
+                                let mut lease_index = write.open_table(LEASED_BY_DEPT_UNTIL)?;
+                                lease_index.remove(
+                                    make_index_key(
+                                        &current.dept,
+                                        lease_until_ms,
+                                        record.delivery_id.as_str(),
+                                    )
+                                    .as_str(),
+                                )?;
+                                current.lease_until_ms = None;
+                                let mut ready = write.open_table(READY_BY_DEPT_DUE)?;
+                                ready.insert(
+                                    make_index_key(
+                                        &current.dept,
+                                        current.not_before_ms,
+                                        record.delivery_id.as_str(),
+                                    )
+                                    .as_str(),
+                                    &(),
+                                )?;
+                                changed = true;
+                            }
+                        }
+                    }
+                    if changed {
                         let bytes = serde_json::to_vec(&current)?;
                         delivery.insert(record.delivery_id.as_str(), bytes.as_slice())?;
                     }
@@ -2858,6 +2884,42 @@ mod tests {
             .lease(first.lease_until_ms.unwrap(), 1, Duration::from_millis(50))
             .unwrap()
             .remove(0);
+        assert!(store
+            .ack(&redelivered.delivery_id, redelivered.lease_generation)
+            .unwrap());
+        assert!(store.get("one").unwrap().is_none());
+        assert_eq!(store.ready_index_len().unwrap(), 0);
+    }
+
+    #[test]
+    fn expired_keyed_duplicate_invalidates_late_ack_without_dirty_follow_up() {
+        let temp = TempDir::new().unwrap();
+        let store = store(&temp);
+        let mut original = record("one", 100);
+        original.collapse_by_dedup_id = true;
+        store.enqueue(&original).unwrap();
+        let first = store
+            .lease(100, 1, Duration::from_millis(50))
+            .unwrap()
+            .remove(0);
+        let lease_until_ms = first.lease_until_ms.unwrap();
+        let mut duplicate = original;
+        duplicate.observed_at_ms = lease_until_ms;
+        duplicate.not_before_ms = lease_until_ms;
+
+        store.enqueue(&duplicate).unwrap();
+
+        assert!(!store.get("one").unwrap().unwrap().pending_dirty);
+        assert_eq!(store.ready_index_len().unwrap(), 1);
+        assert_eq!(store.leased_index_len().unwrap(), 0);
+        assert!(!store
+            .ack(&first.delivery_id, first.lease_generation)
+            .unwrap());
+        let redelivered = store
+            .lease(lease_until_ms, 1, Duration::from_millis(50))
+            .unwrap()
+            .remove(0);
+        assert!(!redelivered.pending_dirty);
         assert!(store
             .ack(&redelivered.delivery_id, redelivered.lease_generation)
             .unwrap());
