@@ -19,18 +19,21 @@ use super::delivery_watch::StoreOpWatch;
 use anyhow::{bail, Context, Result};
 use base64::Engine;
 use redb::{Database, ReadableTable, TableDefinition};
+use serde::{Deserialize, Serialize};
 #[cfg(test)]
 use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::time::Duration;
 
-const SCHEMA_VERSION: &str = "11";
+const SCHEMA_VERSION: &str = "12";
 const TERMINAL_DEAD_RETENTION_MS: u64 = 24 * 60 * 60 * 1_000;
 const TERMINAL_DEAD_COMPACTION_LIMIT: usize = 1_024;
 const TERMINAL_SUPPRESSION_SLOTS: u64 = 16_777_216;
 
 const DELIVERY_BY_ID: TableDefinition<&str, &[u8]> = TableDefinition::new("delivery_by_id");
+const DELIVERY_BY_OBSERVE_ORDER: TableDefinition<&str, &str> =
+    TableDefinition::new("delivery_by_observe_order");
 const DEAD_BY_ID: TableDefinition<&str, &[u8]> = TableDefinition::new("dead_by_id");
 const DEAD_BY_TIME: TableDefinition<&str, ()> = TableDefinition::new("dead_by_time");
 const TERMINAL_DEAD_BY_TIME: TableDefinition<&str, ()> =
@@ -50,6 +53,9 @@ thread_local! {
     static WRITE_TXN_COUNT: Cell<usize> = const { Cell::new(0) };
     static WRITE_COMMIT_COUNT: Cell<usize> = const { Cell::new(0) };
     static LINEAGE_INDEX_READ_COUNT: Cell<usize> = const { Cell::new(0) };
+    static OBSERVATION_QUEUE_RECORD_READ_COUNT: Cell<usize> = const { Cell::new(0) };
+    static OBSERVATION_DELIVERY_RECORD_READ_COUNT: Cell<usize> = const { Cell::new(0) };
+    static OBSERVATION_DEAD_RECORD_READ_COUNT: Cell<usize> = const { Cell::new(0) };
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -114,9 +120,32 @@ pub(crate) struct LineageLookup {
     pub(crate) terminal_dead_letter: Option<DeadRecord>,
 }
 
-pub(crate) enum DeliveryScanRecord {
-    Delivery(DeliveryRecord),
-    Dead(DeadRecord),
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub(crate) struct DeliveryObservationProjection {
+    pub(crate) queue_aggregates: bool,
+    pub(crate) deliveries: bool,
+    pub(crate) dead_letters: bool,
+}
+
+impl Default for DeliveryObservationProjection {
+    fn default() -> Self {
+        Self {
+            queue_aggregates: true,
+            deliveries: true,
+            dead_letters: true,
+        }
+    }
+}
+
+impl DeliveryObservationProjection {
+    pub(crate) fn is_all(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+pub(crate) struct DeliveryObservationRecords {
+    pub(crate) deliveries: Vec<DeliveryRecord>,
+    pub(crate) dead_letters: Vec<DeadRecord>,
 }
 
 impl DeliveryStore {
@@ -128,6 +157,7 @@ impl DeliveryStore {
         let write = db.begin_write()?;
         {
             write.open_table(DELIVERY_BY_ID)?;
+            write.open_table(DELIVERY_BY_OBSERVE_ORDER)?;
             write.open_table(READY_BY_DEPT_DUE)?;
             write.open_table(LEASED_BY_DEPT_UNTIL)?;
             write.open_table(DEAD_BY_DEPT_DUE)?;
@@ -147,6 +177,7 @@ impl DeliveryStore {
             if current_version.as_deref() != Some(SCHEMA_VERSION) {
                 delete_old_global_indexes(&write)?;
                 rebuild_due_indexes(&write, DELIVERY_BY_ID)?;
+                rebuild_delivery_observation_index(&write)?;
                 if current_version
                     .as_deref()
                     .and_then(|version| version.parse::<u32>().ok())
@@ -207,6 +238,7 @@ impl DeliveryStore {
             }
             let bytes = serde_json::to_vec(record)?;
             delivery.insert(record.delivery_id.as_str(), bytes.as_slice())?;
+            insert_delivery_observation_index(&write, record)?;
             insert_delivery_lineage_index(&write, record)?;
             let mut ready = write.open_table(READY_BY_DEPT_DUE)?;
             ready.insert(
@@ -314,6 +346,7 @@ impl DeliveryStore {
             for (delivery_id, mut record, new_dept) in candidates {
                 let old_dept = record.dept.clone();
                 let leased = record.lease_until_ms.is_some();
+                remove_delivery_observation_index(&write, &record)?;
                 remove_delivery_lineage_index(&write, &record)?;
                 if let Some(lease_until) = record.lease_until_ms {
                     lease_index.remove(
@@ -329,6 +362,7 @@ impl DeliveryStore {
                 record.dept = new_dept.clone();
                 let bytes = serde_json::to_vec(&record)?;
                 delivery.insert(delivery_id.as_str(), bytes.as_slice())?;
+                insert_delivery_observation_index(&write, &record)?;
                 insert_delivery_lineage_index(&write, &record)?;
                 if let Some(lease_until) = record.lease_until_ms {
                     lease_index.insert(
@@ -430,6 +464,7 @@ impl DeliveryStore {
                             .as_str(),
                     )?;
                 }
+                remove_delivery_observation_index(&write, &record)?;
                 remove_delivery_lineage_index(&write, &record)?;
                 record.lease_until_ms = None;
                 record.not_before_ms = now_ms;
@@ -775,6 +810,7 @@ impl DeliveryStore {
                     } else {
                         return Ok(false);
                     }
+                    remove_delivery_observation_index(&write, &current)?;
                     remove_delivery_lineage_index(&write, &current)?;
                     delivery.remove(delivery_id)?;
                     true
@@ -810,6 +846,7 @@ impl DeliveryStore {
                             lease_index.remove(
                                 make_index_key(&current.dept, lease_until, delivery_id).as_str(),
                             )?;
+                            remove_delivery_observation_index(&write, &current)?;
                             remove_delivery_lineage_index(&write, &current)?;
 
                             let defer_ordinal = current.lease_generation.max(1);
@@ -823,6 +860,7 @@ impl DeliveryStore {
                                 Some(error_excerpt(&format!("lock busy lock={lock}")));
                             let bytes = serde_json::to_vec(&current)?;
                             delivery.insert(delivery_id, bytes.as_slice())?;
+                            insert_delivery_observation_index(&write, &current)?;
                             insert_delivery_lineage_index(&write, &current)?;
                             let mut ready = write.open_table(READY_BY_DEPT_DUE)?;
                             ready.insert(
@@ -926,6 +964,7 @@ impl DeliveryStore {
                             )?;
                             suppress_terminal_delivery(&write, delivery_id)?;
                         }
+                        remove_delivery_observation_index(&write, &current)?;
                         remove_delivery_lineage_index(&write, &current)?;
                         delivery.remove(delivery_id)?;
                         if failure.replayable {
@@ -934,6 +973,7 @@ impl DeliveryStore {
                             RetryOutcome::PermanentDead
                         }
                     } else {
+                        remove_delivery_observation_index(&write, &current)?;
                         remove_delivery_lineage_index(&write, &current)?;
                         let delay = backoff_delay(policy.base, policy.cap, attempt);
                         let jitter = bounded_jitter(delivery_id, attempt, policy.base);
@@ -942,6 +982,7 @@ impl DeliveryStore {
                             .saturating_add(duration_millis(jitter));
                         let bytes = serde_json::to_vec(&current)?;
                         delivery.insert(delivery_id, bytes.as_slice())?;
+                        insert_delivery_observation_index(&write, &current)?;
                         insert_delivery_lineage_index(&write, &current)?;
                         let mut ready = write.open_table(READY_BY_DEPT_DUE)?;
                         ready.insert(
@@ -1121,6 +1162,7 @@ impl DeliveryStore {
                 record.subscriber_absent_since_ms = None;
                 let bytes = serde_json::to_vec(&record)?;
                 delivery.insert(delivery_id.as_str(), bytes.as_slice())?;
+                insert_delivery_observation_index(&write, &record)?;
                 remove_dead_lineage_index(&write, &dead)?;
                 insert_delivery_lineage_index(&write, &record)?;
                 ready.insert(
@@ -1259,94 +1301,117 @@ impl DeliveryStore {
         }
     }
 
-    pub(crate) fn scan_records(
+    pub(crate) fn observe_records(
         &self,
-        mut visit: impl FnMut(DeliveryScanRecord) -> Result<()>,
-    ) -> Result<()> {
-        let read = self.db.begin_read()?;
-        let delivery = read.open_table(DELIVERY_BY_ID)?;
-        let dead = read.open_table(DEAD_BY_ID)?;
-
-        for entry in delivery.iter()? {
-            let (delivery_id, bytes) = entry?;
-            let delivery_id = delivery_id.value().to_string();
-            let record = match serde_json::from_slice::<DeliveryRecord>(bytes.value()) {
-                Ok(record) => record,
-                Err(err) => {
-                    tracing::warn!(
-                        delivery_id = %delivery_id,
-                        error = %err,
-                        "skipping undecodable delivery record"
-                    );
-                    continue;
-                }
-            };
-            visit(DeliveryScanRecord::Delivery(record))?;
-        }
-
-        for entry in dead.iter()? {
-            let (delivery_id, bytes) = entry?;
-            let delivery_id = delivery_id.value().to_string();
-            let Some(record) = decode_dead_record(&delivery_id, bytes.value()) else {
-                continue;
-            };
-            visit(DeliveryScanRecord::Dead(record))?;
-        }
-
-        Ok(())
-    }
-
-    pub(crate) fn scan_records_for_dead_letter_page(
-        &self,
-        after: Option<(u64, &str)>,
+        projection: DeliveryObservationProjection,
+        since: Option<&str>,
+        dead_after: Option<(u64, &str)>,
         limit: usize,
-        mut visit_delivery: impl FnMut(DeliveryRecord) -> Result<()>,
-    ) -> Result<Vec<DeadRecord>> {
+        mut visit_queue_delivery: impl FnMut(DeliveryRecord) -> Result<()>,
+    ) -> Result<DeliveryObservationRecords> {
         let read = self.db.begin_read()?;
         let delivery = read.open_table(DELIVERY_BY_ID)?;
+        let delivery_order = read.open_table(DELIVERY_BY_OBSERVE_ORDER)?;
         let dead = read.open_table(DEAD_BY_ID)?;
         let dead_by_time = read.open_table(DEAD_BY_TIME)?;
 
-        for entry in delivery.iter()? {
-            let (delivery_id, bytes) = entry?;
-            let delivery_id = delivery_id.value().to_string();
-            let record = match serde_json::from_slice::<DeliveryRecord>(bytes.value()) {
-                Ok(record) => record,
-                Err(err) => {
-                    tracing::warn!(
-                        delivery_id = %delivery_id,
-                        error = %err,
-                        "skipping undecodable delivery record"
-                    );
-                    continue;
-                }
-            };
-            visit_delivery(record)?;
+        if projection.queue_aggregates {
+            for entry in delivery.iter()? {
+                let (delivery_id, bytes) = entry?;
+                count_observation_queue_record_read();
+                let record = match serde_json::from_slice::<DeliveryRecord>(bytes.value()) {
+                    Ok(record) => record,
+                    Err(err) => {
+                        tracing::warn!(
+                            delivery_id = %delivery_id.value(),
+                            error = %err,
+                            "skipping undecodable delivery record during queue observation"
+                        );
+                        continue;
+                    }
+                };
+                visit_queue_delivery(record)?;
+            }
         }
 
-        let mut records = Vec::new();
-        if let Some((dead_at_ms, delivery_id)) = after {
-            let start = make_dead_time_index_key(dead_at_ms, delivery_id);
-            for entry in dead_by_time.range::<&str>((
-                std::ops::Bound::Excluded(start.as_str()),
-                std::ops::Bound::Unbounded,
-            ))? {
-                let (key, _) = entry?;
-                collect_dead_letter_page_record(&dead, key.value(), &mut records)?;
-                if records.len() >= limit {
-                    break;
+        let record_limit = limit.saturating_add(1);
+        let mut deliveries = Vec::new();
+        if projection.deliveries {
+            let start = since
+                .map(|delivery_id| read_delivery_read_only(&delivery, delivery_id))
+                .transpose()?
+                .flatten()
+                .map(|record| delivery_observation_index_key(&record));
+            if let Some(start) = start {
+                for entry in delivery_order.range::<&str>((
+                    std::ops::Bound::Excluded(start.as_str()),
+                    std::ops::Bound::Unbounded,
+                ))? {
+                    let (key, delivery_id) = entry?;
+                    collect_delivery_observation_record(
+                        &delivery,
+                        key.value(),
+                        delivery_id.value(),
+                        &mut deliveries,
+                    )?;
+                    if deliveries.len() >= record_limit {
+                        break;
+                    }
                 }
-            }
-        } else {
-            for entry in dead_by_time.iter()? {
-                let (key, _) = entry?;
-                collect_dead_letter_page_record(&dead, key.value(), &mut records)?;
-                if records.len() >= limit {
-                    break;
+            } else {
+                for entry in delivery_order.iter()? {
+                    let (key, delivery_id) = entry?;
+                    collect_delivery_observation_record(
+                        &delivery,
+                        key.value(),
+                        delivery_id.value(),
+                        &mut deliveries,
+                    )?;
+                    if deliveries.len() >= record_limit {
+                        break;
+                    }
                 }
             }
         }
-        Ok(records)
+
+        let mut dead_letters = Vec::new();
+        if projection.dead_letters {
+            let start = match dead_after {
+                Some((dead_at_ms, delivery_id)) => {
+                    Some(make_dead_time_index_key(dead_at_ms, delivery_id))
+                }
+                None => since
+                    .map(|delivery_id| read_dead_table_read_only(&dead, delivery_id))
+                    .transpose()?
+                    .flatten()
+                    .map(|record| make_dead_time_index_key(record.dead_at_ms, &record.delivery_id)),
+            };
+            if let Some(start) = start {
+                for entry in dead_by_time.range::<&str>((
+                    std::ops::Bound::Excluded(start.as_str()),
+                    std::ops::Bound::Unbounded,
+                ))? {
+                    let (key, _) = entry?;
+                    collect_dead_observation_record(&dead, key.value(), &mut dead_letters)?;
+                    if dead_letters.len() >= record_limit {
+                        break;
+                    }
+                }
+            } else {
+                for entry in dead_by_time.iter()? {
+                    let (key, _) = entry?;
+                    collect_dead_observation_record(&dead, key.value(), &mut dead_letters)?;
+                    if dead_letters.len() >= record_limit {
+                        break;
+                    }
+                }
+            }
+        }
+
+        Ok(DeliveryObservationRecords {
+            deliveries,
+            dead_letters,
+        })
     }
 
     #[cfg(test)]
@@ -1419,6 +1484,22 @@ impl DeliveryStore {
         LINEAGE_INDEX_READ_COUNT.get()
     }
 
+    #[cfg(test)]
+    pub(crate) fn reset_observation_record_read_counts() {
+        OBSERVATION_QUEUE_RECORD_READ_COUNT.set(0);
+        OBSERVATION_DELIVERY_RECORD_READ_COUNT.set(0);
+        OBSERVATION_DEAD_RECORD_READ_COUNT.set(0);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn observation_record_read_counts() -> (usize, usize, usize) {
+        (
+            OBSERVATION_QUEUE_RECORD_READ_COUNT.get(),
+            OBSERVATION_DELIVERY_RECORD_READ_COUNT.get(),
+            OBSERVATION_DEAD_RECORD_READ_COUNT.get(),
+        )
+    }
+
     fn begin_write(&self) -> Result<redb::WriteTransaction> {
         begin_write(&self.db)
     }
@@ -1461,6 +1542,63 @@ fn same_delivery_content(left: &DeliveryRecord, right: &DeliveryRecord) -> bool 
         && left.payload == right.payload
         && left.source == right.source
         && left.cron_payload == right.cron_payload
+}
+
+fn rebuild_delivery_observation_index(write: &redb::WriteTransaction) -> Result<()> {
+    write.delete_table(DELIVERY_BY_OBSERVE_ORDER)?;
+    write.open_table(DELIVERY_BY_OBSERVE_ORDER)?;
+    let records = {
+        let delivery = write.open_table(DELIVERY_BY_ID)?;
+        let mut records = Vec::new();
+        for entry in delivery.iter()? {
+            let (delivery_id, bytes) = entry?;
+            let record = match serde_json::from_slice::<DeliveryRecord>(bytes.value()) {
+                Ok(record) => record,
+                Err(err) => {
+                    tracing::warn!(
+                        delivery_id = %delivery_id.value(),
+                        error = %err,
+                        "skipping undecodable delivery record during observation index rebuild"
+                    );
+                    continue;
+                }
+            };
+            records.push(record);
+        }
+        records
+    };
+    for record in &records {
+        insert_delivery_observation_index(write, record)?;
+    }
+    Ok(())
+}
+
+fn insert_delivery_observation_index(
+    write: &redb::WriteTransaction,
+    record: &DeliveryRecord,
+) -> Result<()> {
+    let mut index = write.open_table(DELIVERY_BY_OBSERVE_ORDER)?;
+    index.insert(
+        delivery_observation_index_key(record).as_str(),
+        record.delivery_id.as_str(),
+    )?;
+    Ok(())
+}
+
+fn remove_delivery_observation_index(
+    write: &redb::WriteTransaction,
+    record: &DeliveryRecord,
+) -> Result<()> {
+    let mut index = write.open_table(DELIVERY_BY_OBSERVE_ORDER)?;
+    index.remove(delivery_observation_index_key(record).as_str())?;
+    Ok(())
+}
+
+fn delivery_observation_index_key(record: &DeliveryRecord) -> String {
+    format!(
+        "{}\0{}\0{:020}\0{}",
+        record.queue, record.dept, record.not_before_ms, record.delivery_id
+    )
 }
 
 fn rebuild_lineage_index(write: &redb::WriteTransaction) -> Result<()> {
@@ -1655,6 +1793,30 @@ fn count_lineage_index_read() {
 
 #[cfg(not(test))]
 fn count_lineage_index_read() {}
+
+#[cfg(test)]
+fn count_observation_queue_record_read() {
+    OBSERVATION_QUEUE_RECORD_READ_COUNT.set(OBSERVATION_QUEUE_RECORD_READ_COUNT.get() + 1);
+}
+
+#[cfg(not(test))]
+fn count_observation_queue_record_read() {}
+
+#[cfg(test)]
+fn count_observation_delivery_record_read() {
+    OBSERVATION_DELIVERY_RECORD_READ_COUNT.set(OBSERVATION_DELIVERY_RECORD_READ_COUNT.get() + 1);
+}
+
+#[cfg(not(test))]
+fn count_observation_delivery_record_read() {}
+
+#[cfg(test)]
+fn count_observation_dead_record_read() {
+    OBSERVATION_DEAD_RECORD_READ_COUNT.set(OBSERVATION_DEAD_RECORD_READ_COUNT.get() + 1);
+}
+
+#[cfg(not(test))]
+fn count_observation_dead_record_read() {}
 
 fn expired_lease_quota(batch_limit: usize) -> usize {
     if batch_limit == 0 {
@@ -1962,6 +2124,34 @@ fn compact_terminal_dead_records(write: &redb::WriteTransaction, now_ms: u64) ->
         compacted += 1;
     }
     Ok(compacted)
+}
+
+fn collect_delivery_observation_record(
+    delivery: &redb::ReadOnlyTable<&str, &[u8]>,
+    index_key: &str,
+    delivery_id: &str,
+    records: &mut Vec<DeliveryRecord>,
+) -> Result<()> {
+    count_observation_delivery_record_read();
+    let record = read_delivery_read_only(delivery, delivery_id)?.ok_or_else(|| {
+        anyhow::anyhow!("delivery-observation-index-missing-record: delivery_id={delivery_id}")
+    })?;
+    if record.delivery_id != delivery_id || delivery_observation_index_key(&record) != index_key {
+        anyhow::bail!(
+            "delivery-observation-index-mismatch: delivery_id={delivery_id} index_key={index_key:?}"
+        );
+    }
+    records.push(record);
+    Ok(())
+}
+
+fn collect_dead_observation_record(
+    dead: &redb::ReadOnlyTable<&str, &[u8]>,
+    index_key: &str,
+    records: &mut Vec<DeadRecord>,
+) -> Result<()> {
+    count_observation_dead_record_read();
+    collect_dead_letter_page_record(dead, index_key, records)
 }
 
 fn collect_dead_letter_page_record(
@@ -2359,6 +2549,106 @@ mod tests {
             Some("terminal-0019")
         );
         assert_eq!(after_same_lineage_reads, before_reads);
+    }
+
+    #[test]
+    fn observation_listings_follow_public_order_with_bounded_record_reads() {
+        let temp = TempDir::new().unwrap();
+        let store = store(&temp);
+        for (delivery_id, queue, dept, not_before_ms) in [
+            ("id-a", "zeta", "worker", 100),
+            ("id-b", "alpha", "worker", 300),
+            ("id-c", "alpha", "worker", 100),
+            ("id-d", "alpha", "builder", 200),
+            ("id-e", "middle", "worker", 100),
+        ] {
+            let mut delivery = record(delivery_id, not_before_ms);
+            delivery.queue = queue.to_string();
+            delivery.dept = dept.to_string();
+            store.enqueue(&delivery).unwrap();
+        }
+        for (delivery_id, dead_at_ms) in [
+            ("dead-z", 300),
+            ("dead-a", 100),
+            ("dead-c", 200),
+            ("dead-b", 100),
+        ] {
+            insert_permanent_dead(&store, delivery_id, dead_at_ms);
+        }
+
+        DeliveryStore::reset_observation_record_read_counts();
+        let mut aggregate_visits = 0;
+        let records = store
+            .observe_records(
+                DeliveryObservationProjection {
+                    queue_aggregates: false,
+                    deliveries: true,
+                    dead_letters: true,
+                },
+                None,
+                None,
+                2,
+                |_| {
+                    aggregate_visits += 1;
+                    Ok(())
+                },
+            )
+            .unwrap();
+
+        assert_eq!(
+            records
+                .deliveries
+                .iter()
+                .map(|record| record.delivery_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["id-d", "id-c", "id-b"]
+        );
+        assert_eq!(
+            records
+                .dead_letters
+                .iter()
+                .map(|record| record.delivery_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["dead-a", "dead-b", "dead-c"]
+        );
+        assert_eq!(aggregate_visits, 0);
+        assert_eq!(DeliveryStore::observation_record_read_counts(), (0, 3, 3));
+    }
+
+    #[test]
+    fn observation_queue_aggregates_are_exact_and_separate_from_listings() {
+        let temp = TempDir::new().unwrap();
+        let store = store(&temp);
+        for index in 0..32 {
+            store
+                .enqueue(&record(&format!("delivery-{index:02}"), 100))
+                .unwrap();
+        }
+        insert_permanent_dead(&store, "dead", 200);
+
+        DeliveryStore::reset_observation_record_read_counts();
+        let mut aggregate_visits = 0;
+        let records = store
+            .observe_records(
+                DeliveryObservationProjection {
+                    queue_aggregates: true,
+                    deliveries: false,
+                    dead_letters: false,
+                },
+                None,
+                None,
+                1,
+                |_| {
+                    aggregate_visits += 1;
+                    Ok(())
+                },
+            )
+            .unwrap();
+
+        assert_eq!(aggregate_visits, 32);
+        assert!(records.deliveries.is_empty());
+        assert!(records.dead_letters.is_empty());
+        assert_eq!(DeliveryStore::observation_record_read_counts(), (32, 0, 0));
     }
 
     #[test]
@@ -3212,8 +3502,19 @@ mod tests {
             .unwrap();
 
         let page = store
-            .scan_records_for_dead_letter_page(None, 2, |_| Ok(()))
-            .unwrap();
+            .observe_records(
+                DeliveryObservationProjection {
+                    queue_aggregates: false,
+                    deliveries: false,
+                    dead_letters: true,
+                },
+                None,
+                None,
+                2,
+                |_| Ok(()),
+            )
+            .unwrap()
+            .dead_letters;
 
         assert_eq!(page.len(), 1);
         assert_eq!(page[0].delivery_id, "one");
@@ -4205,8 +4506,19 @@ mod tests {
         assert_eq!(store.dead_due_index_len().unwrap(), 1);
         assert_eq!(store.dead_time_index_len().unwrap(), 3);
         let dead_page = store
-            .scan_records_for_dead_letter_page(None, 4, |_| Ok(()))
-            .unwrap();
+            .observe_records(
+                DeliveryObservationProjection {
+                    queue_aggregates: false,
+                    deliveries: false,
+                    dead_letters: true,
+                },
+                None,
+                None,
+                4,
+                |_| Ok(()),
+            )
+            .unwrap()
+            .dead_letters;
         assert_eq!(
             dead_page
                 .iter()
@@ -4296,7 +4608,7 @@ mod tests {
     }
 
     #[test]
-    fn schema_v10_open_backfills_lineage_index_with_exact_terminal_predicate() {
+    fn schema_v10_open_backfills_observation_and_lineage_indexes() {
         let temp = TempDir::new().unwrap();
         let path = temp.path().join("delivery.redb");
         let source = lineage_source("owner/repo#issue/42");
@@ -4347,8 +4659,22 @@ mod tests {
         }
 
         let store = DeliveryStore::open(&path).unwrap();
+        let observed = store
+            .observe_records(
+                DeliveryObservationProjection {
+                    queue_aggregates: false,
+                    deliveries: true,
+                    dead_letters: false,
+                },
+                None,
+                None,
+                1,
+                |_| Ok(()),
+            )
+            .unwrap();
         let lineage = store.lookup_lineage("input", "worker", &source).unwrap();
 
+        assert_eq!(observed.deliveries[0].delivery_id, "live");
         assert_eq!(lineage.live_delivery.unwrap().delivery_id, "live");
         assert_eq!(
             lineage.terminal_dead_letter.unwrap().delivery_id,

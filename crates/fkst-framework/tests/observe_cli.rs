@@ -14,9 +14,15 @@ mod support;
 use support::manifest_fixture::{unit_name, write_single_package_workspace};
 
 const DELIVERY_BY_ID: TableDefinition<&str, &[u8]> = TableDefinition::new("delivery_by_id");
+const DELIVERY_BY_OBSERVE_ORDER: TableDefinition<&str, &str> =
+    TableDefinition::new("delivery_by_observe_order");
 const DEAD_BY_ID: TableDefinition<&str, &[u8]> = TableDefinition::new("dead_by_id");
 const DEAD_BY_TIME: TableDefinition<&str, ()> = TableDefinition::new("dead_by_time");
 const MAX_OBSERVE_LIMIT: usize = 10_000;
+
+fn delivery_observe_key(queue: &str, dept: &str, not_before_ms: u64, delivery_id: &str) -> String {
+    format!("{queue}\0{dept}\0{not_before_ms:020}\0{delivery_id}")
+}
 
 fn framework_bin() -> &'static str {
     env!("CARGO_BIN_EXE_fkst-framework")
@@ -73,7 +79,9 @@ fn write_observe_fixture(durable_root: &Path) {
     let write = db.begin_write().unwrap();
     {
         let mut deliveries = write.open_table(DELIVERY_BY_ID).unwrap();
+        let mut delivery_order = write.open_table(DELIVERY_BY_OBSERVE_ORDER).unwrap();
         let mut dead = write.open_table(DEAD_BY_ID).unwrap();
+        let mut dead_by_time = write.open_table(DEAD_BY_TIME).unwrap();
         let delivery = json!({
             "delivery_id": "delivery-one",
             "queue": "input",
@@ -100,6 +108,12 @@ fn write_observe_fixture(durable_root: &Path) {
                 serde_json::to_vec(&delivery).unwrap().as_slice(),
             )
             .unwrap();
+        delivery_order
+            .insert(
+                delivery_observe_key("input", "worker", 1000, "delivery-one").as_str(),
+                "delivery-one",
+            )
+            .unwrap();
         let dead_record = json!({
             "delivery_id": "dead-one",
             "queue": "input",
@@ -120,6 +134,9 @@ fn write_observe_fixture(durable_root: &Path) {
             serde_json::to_vec(&dead_record).unwrap().as_slice(),
         )
         .unwrap();
+        dead_by_time
+            .insert(format!("{:020}/{}", 1200, "dead-one").as_str(), &())
+            .unwrap();
     }
     write.commit().unwrap();
     drop(db);
@@ -130,6 +147,7 @@ fn write_dead_letter_page_fixture(durable_root: &Path) {
     let write = db.begin_write().unwrap();
     {
         write.open_table(DELIVERY_BY_ID).unwrap();
+        write.open_table(DELIVERY_BY_OBSERVE_ORDER).unwrap();
         let mut dead = write.open_table(DEAD_BY_ID).unwrap();
         let mut dead_by_time = write.open_table(DEAD_BY_TIME).unwrap();
         for (delivery_id, dept, dead_at_ms) in [
@@ -168,6 +186,7 @@ fn write_large_dead_letter_page_fixture(durable_root: &Path) {
     let write = db.begin_write().unwrap();
     {
         write.open_table(DELIVERY_BY_ID).unwrap();
+        write.open_table(DELIVERY_BY_OBSERVE_ORDER).unwrap();
         let mut dead = write.open_table(DEAD_BY_ID).unwrap();
         let mut dead_by_time = write.open_table(DEAD_BY_TIME).unwrap();
         for index in 0..=MAX_OBSERVE_LIMIT {
@@ -211,7 +230,9 @@ fn write_subscriber_absence_fixture(durable_root: &Path) {
     let write = db.begin_write().unwrap();
     {
         let mut deliveries = write.open_table(DELIVERY_BY_ID).unwrap();
+        let mut delivery_order = write.open_table(DELIVERY_BY_OBSERVE_ORDER).unwrap();
         let mut dead = write.open_table(DEAD_BY_ID).unwrap();
+        let mut dead_by_time = write.open_table(DEAD_BY_TIME).unwrap();
         let pending = json!({
             "delivery_id": "pending-absent",
             "queue": "orphan",
@@ -235,6 +256,13 @@ fn write_subscriber_absence_fixture(durable_root: &Path) {
             .insert(
                 "pending-absent",
                 serde_json::to_vec(&pending).unwrap().as_slice(),
+            )
+            .unwrap();
+        delivery_order
+            .insert(
+                delivery_observe_key("orphan", "old_worker", 4000000000000_u64, "pending-absent")
+                    .as_str(),
+                "pending-absent",
             )
             .unwrap();
         let original = json!({
@@ -276,6 +304,9 @@ fn write_subscriber_absence_fixture(durable_root: &Path) {
             serde_json::to_vec(&dead_record).unwrap().as_slice(),
         )
         .unwrap();
+        dead_by_time
+            .insert(format!("{:020}/{}", 1600, "dead-absent").as_str(), &())
+            .unwrap();
     }
     write.commit().unwrap();
     drop(db);
@@ -286,7 +317,9 @@ fn write_pending_delivery_fixture(durable_root: &Path, rows: &[(&str, &str, &str
     let write = db.begin_write().unwrap();
     {
         let mut deliveries = write.open_table(DELIVERY_BY_ID).unwrap();
+        let mut delivery_order = write.open_table(DELIVERY_BY_OBSERVE_ORDER).unwrap();
         write.open_table(DEAD_BY_ID).unwrap();
+        write.open_table(DEAD_BY_TIME).unwrap();
         for (delivery_id, queue, dept) in rows {
             let delivery = json!({
                 "delivery_id": delivery_id,
@@ -311,6 +344,12 @@ fn write_pending_delivery_fixture(durable_root: &Path, rows: &[(&str, &str, &str
                 .insert(
                     *delivery_id,
                     serde_json::to_vec(&delivery).unwrap().as_slice(),
+                )
+                .unwrap();
+            delivery_order
+                .insert(
+                    delivery_observe_key(queue, dept, 4000000000000_u64, delivery_id).as_str(),
+                    *delivery_id,
                 )
                 .unwrap();
         }

@@ -415,6 +415,7 @@ fn final_state(store: &DeliveryStore) -> mlua::Result<FinalState> {
             since: None,
             dead_letter_page: None,
             current_subscriber_queues: None,
+            projection: Default::default(),
         },
     )
     .map_err(mlua::Error::external)?;

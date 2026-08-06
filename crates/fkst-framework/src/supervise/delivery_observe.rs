@@ -1,4 +1,4 @@
-use super::delivery_store::{DeliveryScanRecord, DeliveryStore};
+use super::delivery_store::{DeliveryObservationProjection, DeliveryStore};
 use super::delivery_types::{DeadRecord, DeliveryRecord, SourceRef};
 use crate::manifest_hash::sha256_hex;
 use crate::observe::{DeadLetterPageCursor, DeadLetterPageOptions};
@@ -15,6 +15,7 @@ pub(crate) struct DeliveryObserveOptions {
     pub(crate) since: Option<String>,
     pub(crate) dead_letter_page: Option<DeadLetterPageOptions>,
     pub(crate) current_subscriber_queues: Option<BTreeSet<String>>,
+    pub(crate) projection: DeliveryObservationProjection,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -161,61 +162,31 @@ pub(crate) fn observe_snapshot(
     if options.dead_letter_page.is_some() && options.since.is_some() {
         anyhow::bail!("fkst.observe page cannot be combined with since");
     }
-    let mut delivery_records = Vec::new();
-    let mut dead_records = Vec::new();
     let mut queues = BTreeMap::<String, QueueAccumulator>::new();
-
-    if let Some(page) = &options.dead_letter_page {
-        let after = page
-            .after
-            .as_ref()
-            .map(|cursor| (cursor.dead_at_ms, cursor.delivery_id.as_str()));
-        dead_records = store.scan_records_for_dead_letter_page(
-            after,
-            options.limit.saturating_add(1),
-            |record| {
-                queues
-                    .entry(record.queue.clone())
-                    .or_default()
-                    .observe_delivery(&record, options.now_ms);
-                delivery_records.push(record);
-                Ok(())
-            },
-        )?;
-    } else {
-        store.scan_records(|record| {
-            match record {
-                DeliveryScanRecord::Delivery(record) => {
-                    queues
-                        .entry(record.queue.clone())
-                        .or_default()
-                        .observe_delivery(&record, options.now_ms);
-                    delivery_records.push(record);
-                }
-                DeliveryScanRecord::Dead(record) => {
-                    dead_records.push(record);
-                }
-            }
+    let mut projection = options.projection;
+    if options.dead_letter_page.is_some() {
+        projection.dead_letters = true;
+    }
+    let dead_after = options
+        .dead_letter_page
+        .as_ref()
+        .and_then(|page| page.after.as_ref())
+        .map(|cursor| (cursor.dead_at_ms, cursor.delivery_id.as_str()));
+    let records = store.observe_records(
+        projection,
+        options.since.as_deref(),
+        dead_after,
+        options.limit,
+        |record| {
+            queues
+                .entry(record.queue.clone())
+                .or_default()
+                .observe_delivery(&record, options.now_ms);
             Ok(())
-        })?;
-    }
-
-    delivery_records.sort_by(|left, right| {
-        left.queue
-            .cmp(&right.queue)
-            .then_with(|| left.dept.cmp(&right.dept))
-            .then_with(|| left.not_before_ms.cmp(&right.not_before_ms))
-            .then_with(|| left.delivery_id.cmp(&right.delivery_id))
-    });
-    dead_records.sort_by(|left, right| {
-        left.dead_at_ms
-            .cmp(&right.dead_at_ms)
-            .then_with(|| left.delivery_id.cmp(&right.delivery_id))
-    });
-    if let Some(since) = options.since.as_deref() {
-        trim_deliveries_after_cursor(&mut delivery_records, since);
-        trim_dead_letters_after_cursor(&mut dead_records, since);
-    }
+        },
+    )?;
+    let mut delivery_records = records.deliveries;
+    let mut dead_records = records.dead_letters;
     let truncated = DeliveryObserveTruncated {
         deliveries: apply_limit(&mut delivery_records, options.limit),
         dead_letters: apply_limit(&mut dead_records, options.limit),
@@ -304,26 +275,6 @@ pub(crate) fn observe_lineage(
             .map(dead_letter_observe_entry)
             .transpose()?,
     })
-}
-
-fn trim_deliveries_after_cursor(entries: &mut Vec<DeliveryRecord>, since: &str) {
-    let Some(cursor) = entries
-        .iter()
-        .position(|entry| entry.delivery_id.as_str() == since)
-    else {
-        return;
-    };
-    entries.drain(0..=cursor);
-}
-
-fn trim_dead_letters_after_cursor(entries: &mut Vec<DeadRecord>, since: &str) {
-    let Some(cursor) = entries
-        .iter()
-        .position(|entry| entry.delivery_id.as_str() == since)
-    else {
-        return;
-    };
-    entries.drain(0..=cursor);
 }
 
 fn apply_limit<T>(entries: &mut Vec<T>, limit: usize) -> bool {
@@ -586,6 +537,7 @@ mod tests {
                 since: None,
                 dead_letter_page: None,
                 current_subscriber_queues: None,
+                projection: DeliveryObservationProjection::default(),
             },
         )
         .unwrap();
@@ -652,6 +604,7 @@ mod tests {
                 since: None,
                 dead_letter_page: None,
                 current_subscriber_queues: None,
+                projection: DeliveryObservationProjection::default(),
             },
         )
         .unwrap();
@@ -684,12 +637,66 @@ mod tests {
                 since: None,
                 dead_letter_page: None,
                 current_subscriber_queues: None,
+                projection: DeliveryObservationProjection::default(),
             },
         )
         .unwrap();
 
         assert_eq!(snapshot.deliveries.len(), 1);
         assert!(snapshot.truncated.deliveries);
+    }
+
+    #[test]
+    fn observe_snapshot_pushes_error_only_projection_into_storage() {
+        let temp = TempDir::new().unwrap();
+        let store = store(&temp);
+        for (delivery_id, dead_at_ms) in [("dead-b", 200), ("dead-a", 100)] {
+            store.enqueue(&record(delivery_id, 100)).unwrap();
+            let leased = store
+                .lease(100, 1, Duration::from_millis(50))
+                .unwrap()
+                .remove(0);
+            store
+                .retry(
+                    &leased.delivery_id,
+                    leased.lease_generation,
+                    &failure("final", false),
+                    &policy(1),
+                    dead_at_ms,
+                )
+                .unwrap();
+        }
+        for index in 0..32 {
+            store
+                .enqueue(&record(&format!("delivery-{index:02}"), 100))
+                .unwrap();
+        }
+
+        DeliveryStore::reset_observation_record_read_counts();
+        let snapshot = observe_snapshot(
+            &store,
+            temp.path(),
+            &temp.path().join("delivery.redb"),
+            &DeliveryObserveOptions {
+                now_ms: 300,
+                limit: 1,
+                since: None,
+                dead_letter_page: None,
+                current_subscriber_queues: None,
+                projection: DeliveryObservationProjection {
+                    queue_aggregates: false,
+                    deliveries: false,
+                    dead_letters: true,
+                },
+            },
+        )
+        .unwrap();
+
+        assert!(snapshot.queues.is_empty());
+        assert!(snapshot.deliveries.is_empty());
+        assert_eq!(snapshot.dead_letters[0].delivery_id, "dead-a");
+        assert!(snapshot.truncated.dead_letters);
+        assert_eq!(DeliveryStore::observation_record_read_counts(), (0, 0, 2));
     }
 
     #[test]
@@ -710,6 +717,7 @@ mod tests {
                 since: Some("delivery-001".to_string()),
                 dead_letter_page: None,
                 current_subscriber_queues: None,
+                projection: DeliveryObservationProjection::default(),
             },
         )
         .unwrap();
@@ -739,6 +747,7 @@ mod tests {
                 since: None,
                 dead_letter_page: None,
                 current_subscriber_queues: Some(BTreeSet::from(["input".to_string()])),
+                projection: DeliveryObservationProjection::default(),
             },
         )
         .unwrap();

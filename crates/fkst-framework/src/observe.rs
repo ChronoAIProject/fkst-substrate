@@ -28,6 +28,7 @@ pub(crate) struct ObserveSnapshotOptions {
     pub(crate) limit: usize,
     pub(crate) since: Option<String>,
     pub(crate) page: Option<DeadLetterPageRequest>,
+    pub(crate) projection: crate::supervise::delivery_store::DeliveryObservationProjection,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -100,6 +101,7 @@ pub(crate) fn run(options: ObserveOptions) -> Result<i32> {
             limit: options.limit,
             since: None,
             page: None,
+            projection: Default::default(),
         },
     )?;
     if options.json {
@@ -127,6 +129,7 @@ pub(crate) fn snapshot_for_durable_root(
             limit,
             since: options.since.clone(),
             page: options.page.clone(),
+            projection: options.projection,
         },
     )? {
         Some(snapshot) => Ok(snapshot),
@@ -142,6 +145,7 @@ pub(crate) fn snapshot_for_durable_root(
                     since: options.since.clone(),
                     dead_letter_page,
                     current_subscriber_queues: None,
+                    projection: options.projection,
                 },
             )
         }
@@ -206,6 +210,7 @@ pub(crate) fn request_live_snapshot(
         since: options.since.clone(),
         page: options.page.clone(),
         lineage: None,
+        projection: options.projection,
         now_ms: now_ms(),
     };
     let Some(response) = request_live_observe(layout, &request)? else {
@@ -231,6 +236,7 @@ pub(crate) fn request_live_lineage(
         since: None,
         page: None,
         lineage: Some(lineage.clone()),
+        projection: Default::default(),
         now_ms: now_ms(),
     };
     let Some(response) = request_live_observe(layout, &request)? else {
@@ -290,6 +296,11 @@ pub(crate) struct ObserveSocketRequest {
     pub(crate) page: Option<DeadLetterPageRequest>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) lineage: Option<LineageObserveRequest>,
+    #[serde(
+        default,
+        skip_serializing_if = "crate::supervise::delivery_store::DeliveryObservationProjection::is_all"
+    )]
+    pub(crate) projection: crate::supervise::delivery_store::DeliveryObservationProjection,
     pub(crate) now_ms: u64,
 }
 
@@ -512,6 +523,7 @@ mod tests {
                 limit: DEFAULT_LIMIT,
                 since: Some(String::new()),
                 page: None,
+                projection: Default::default(),
             },
         )
         .unwrap_err();
@@ -553,6 +565,7 @@ mod tests {
             since: None,
             page: None,
             lineage: None,
+            projection: Default::default(),
             now_ms: 1,
         };
 
@@ -560,6 +573,78 @@ mod tests {
             serde_json::to_string(&request).unwrap(),
             r#"{"limit":500,"since":null,"now_ms":1}"#
         );
+    }
+
+    #[test]
+    fn offline_snapshot_pushes_error_projection_into_bounded_store_read() {
+        let temp = TempDir::new().unwrap();
+        let layout = DurableLayout::new(temp.path()).unwrap();
+        let store = DeliveryStore::open(layout.delivery_db_path()).unwrap();
+        let record = |delivery_id: &str| DeliveryRecord {
+            delivery_id: delivery_id.to_string(),
+            queue: "jobs".to_string(),
+            dept: "worker".to_string(),
+            payload: serde_json::json!({"delivery_id": delivery_id}),
+            source: None,
+            cron_payload: None,
+            observed_at_ms: 10,
+            attempt: 0,
+            redrive_count: 0,
+            collapse_by_dedup_id: false,
+            subscriber_absent_since_ms: None,
+            lease_generation: 0,
+            lease_until_ms: None,
+            not_before_ms: 100,
+            last_error_excerpt: None,
+        };
+        for (delivery_id, dead_at_ms) in [("dead-b", 200), ("dead-a", 100)] {
+            store.enqueue(&record(delivery_id)).unwrap();
+            let leased = store
+                .lease(100, 1, Duration::from_millis(50))
+                .unwrap()
+                .remove(0);
+            store
+                .retry(
+                    &leased.delivery_id,
+                    leased.lease_generation,
+                    &RetryFailure {
+                        message: "final".to_string(),
+                        replayable: false,
+                    },
+                    &RetryPolicy {
+                        max_attempts: 1,
+                        base: Duration::from_millis(1),
+                        cap: Duration::from_millis(1),
+                    },
+                    dead_at_ms,
+                )
+                .unwrap();
+        }
+        for index in 0..32 {
+            store
+                .enqueue(&record(&format!("delivery-{index:02}")))
+                .unwrap();
+        }
+        drop(store);
+
+        DeliveryStore::reset_observation_record_read_counts();
+        let snapshot = snapshot_for_durable_root(
+            temp.path(),
+            &ObserveSnapshotOptions {
+                limit: 1,
+                since: None,
+                page: None,
+                projection: crate::supervise::delivery_store::DeliveryObservationProjection {
+                    queue_aggregates: false,
+                    deliveries: false,
+                    dead_letters: true,
+                },
+            },
+        )
+        .unwrap();
+
+        assert_eq!(snapshot.dead_letters[0].delivery_id, "dead-a");
+        assert_eq!(DeliveryStore::observation_record_read_counts(), (0, 0, 2));
     }
 
     #[test]

@@ -170,6 +170,14 @@ impl ObserveSdkOptions {
             limit: self.limit,
             since: self.since.clone(),
             page: self.page.clone(),
+            projection: match &self.include {
+                Some(include) => crate::supervise::delivery_store::DeliveryObservationProjection {
+                    queue_aggregates: include.contains("queues"),
+                    deliveries: include.contains("events") || include.contains("entities"),
+                    dead_letters: include.contains("errors") || include.contains("entities"),
+                },
+                None => Default::default(),
+            },
         }
     }
 
@@ -780,6 +788,46 @@ return fkst.observe({
         assert!(err
             .to_string()
             .contains("unsupported fkst.observe include section"));
+    }
+
+    #[test]
+    fn observe_include_maps_to_storage_projection_before_read() {
+        let lua = Lua::new();
+        let opts = ObserveSdkOptions::from_lua(Some(
+            lua.load("return { include = { 'queues', 'errors' } }")
+                .eval()
+                .unwrap(),
+        ))
+        .unwrap();
+
+        assert_eq!(
+            opts.snapshot_options().projection,
+            crate::supervise::delivery_store::DeliveryObservationProjection {
+                queue_aggregates: true,
+                deliveries: false,
+                dead_letters: true,
+            }
+        );
+    }
+
+    #[test]
+    fn observe_entities_include_reads_bounded_lookahead_for_truncation() {
+        let lua = Lua::new();
+        let opts = ObserveSdkOptions::from_lua(Some(
+            lua.load("return { include = { 'entities' } }")
+                .eval()
+                .unwrap(),
+        ))
+        .unwrap();
+
+        assert_eq!(
+            opts.snapshot_options().projection,
+            crate::supervise::delivery_store::DeliveryObservationProjection {
+                queue_aggregates: false,
+                deliveries: true,
+                dead_letters: true,
+            }
+        );
     }
 
     #[test]

@@ -144,6 +144,7 @@ async fn serve_connection(
                             since: request.since,
                             dead_letter_page,
                             current_subscriber_queues: Some(current_subscriber_queues),
+                            projection: request.projection,
                         },
                     ) {
                         Ok(snapshot) => ObserveSocketResponse::Ok { snapshot },
@@ -248,6 +249,7 @@ mod tests {
                 dept: "worker".to_string(),
                 source_ref,
             }),
+            projection: Default::default(),
             now_ms: 100,
         };
         let mut body = serde_json::to_vec(&request).unwrap();
@@ -268,6 +270,60 @@ mod tests {
         };
         assert_eq!(lineage.live_delivery.unwrap().delivery_id, "one");
         assert!(lineage.terminal_dead_letter.is_none());
+    }
+
+    #[tokio::test]
+    async fn connection_pushes_event_projection_into_bounded_store_read() {
+        let temp = TempDir::new().unwrap();
+        let layout = DurableLayout::new(temp.path()).unwrap();
+        let database = layout.delivery_db_path();
+        let store = Arc::new(DeliveryStore::open(&database).unwrap());
+        for index in 0..32 {
+            store
+                .enqueue(&record(&format!("delivery-{index:02}")))
+                .unwrap();
+        }
+        let endpoint = endpoint_for_layout(&layout);
+        let (server, mut client) = UnixStream::pair().unwrap();
+        DeliveryStore::reset_observation_record_read_counts();
+        let server_task = tokio::spawn(serve_connection(
+            server,
+            store,
+            endpoint,
+            BTreeSet::from(["jobs".to_string()]),
+        ));
+        let request = crate::observe::ObserveSocketRequest {
+            limit: 1,
+            since: None,
+            page: None,
+            lineage: None,
+            projection: crate::supervise::delivery_store::DeliveryObservationProjection {
+                queue_aggregates: false,
+                deliveries: true,
+                dead_letters: false,
+            },
+            now_ms: 100,
+        };
+        let mut body = serde_json::to_vec(&request).unwrap();
+        body.push(b'\n');
+        client.write_all(&body).await.unwrap();
+
+        let mut response_line = String::new();
+        BufReader::new(&mut client)
+            .read_line(&mut response_line)
+            .await
+            .unwrap();
+        server_task.await.unwrap().unwrap();
+        let response: crate::observe::ObserveSocketResponse =
+            serde_json::from_str(&response_line).unwrap();
+        let crate::observe::ObserveSocketResponse::Ok { snapshot } = response else {
+            panic!("snapshot request must return ok");
+        };
+
+        assert!(snapshot.queues.is_empty());
+        assert_eq!(snapshot.deliveries.len(), 1);
+        assert!(snapshot.dead_letters.is_empty());
+        assert_eq!(DeliveryStore::observation_record_read_counts(), (0, 2, 0));
     }
 
     #[tokio::test]
@@ -328,6 +384,7 @@ mod tests {
                     limit: 10,
                     since: None,
                     page: None,
+                    projection: Default::default(),
                 },
             )
         })
@@ -346,6 +403,7 @@ mod tests {
                     limit: 10,
                     since: None,
                     page: None,
+                    projection: Default::default(),
                 },
             )
         })
@@ -395,6 +453,7 @@ mod tests {
                     limit: 10,
                     since: None,
                     page: None,
+                    projection: Default::default(),
                 },
             )
         })
@@ -423,6 +482,7 @@ mod tests {
                         section: "dead_letters".to_string(),
                         after: None,
                     }),
+                    projection: Default::default(),
                 },
             )
         })
