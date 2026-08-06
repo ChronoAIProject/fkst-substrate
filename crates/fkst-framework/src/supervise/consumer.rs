@@ -3526,6 +3526,46 @@ return M
     }
 
     #[test]
+    fn exhausted_enoent_spawn_failure_is_permanent() {
+        let temp = TempDir::new().unwrap();
+        let store = Arc::new(DeliveryStore::open(temp.path().join("delivery.redb")).unwrap());
+        store.enqueue(&record("one")).unwrap();
+        let leased = store
+            .lease_for_dept("worker", now_unix_millis(), 8, Duration::from_millis(50))
+            .unwrap()
+            .remove(0);
+        let router = router_with_dead_letter(store.clone());
+        let error = anyhow::Error::new(std::io::Error::from_raw_os_error(Errno::ENOENT as i32))
+            .context("spawn fkst-framework");
+
+        retry_record(
+            &store,
+            &router,
+            Some(&policy(1)),
+            &leased,
+            DeliveryFailure::from_spawn_error(&error),
+            &SupervisorJournal::disabled(),
+        );
+
+        let dead = store.get_dead("one").unwrap().unwrap();
+        assert!(!dead.replayable);
+        assert!(dead.permanent);
+        assert!(dead.record.is_none());
+
+        let result = store
+            .redrive_due(
+                &RedrivePolicy {
+                    max_redrives: 3,
+                    cooldown: Duration::ZERO,
+                },
+                u64::MAX,
+                1,
+            )
+            .unwrap();
+        assert!(result.redriven.is_empty());
+    }
+
+    #[test]
     fn raised_to_reliable_queue_without_source_ref_returns_error() {
         let mut queue = BTreeMap::new();
         queue.insert(
