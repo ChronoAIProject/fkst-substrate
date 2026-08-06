@@ -459,6 +459,7 @@ impl DeliveryStore {
                     redrive_count: record.redrive_count,
                     replayable: true,
                     permanent: false,
+                    allows_keyed_reuse: false,
                     error_excerpt: record.last_error_excerpt.clone(),
                     record: Some(record.clone()),
                 };
@@ -907,7 +908,7 @@ impl DeliveryStore {
                     current.lease_until_ms = None;
 
                     if attempt >= policy.max_attempts {
-                        let dead = DeadRecord {
+                        let mut dead = DeadRecord {
                             delivery_id: current.delivery_id.clone(),
                             queue: current.queue.clone(),
                             dept: current.dept.clone(),
@@ -919,10 +920,10 @@ impl DeliveryStore {
                             redrive_count: current.redrive_count,
                             replayable: failure.replayable,
                             permanent: !failure.replayable,
+                            allows_keyed_reuse: false,
                             error_excerpt: current.last_error_excerpt.clone(),
                             record: failure.replayable.then_some(current.clone()),
                         };
-                        let bytes = serde_json::to_vec(&dead)?;
                         let mut dead_table = write.open_table(DEAD_BY_ID)?;
                         let mut dead_by_time = write.open_table(DEAD_BY_TIME)?;
                         let mut dead_index = write.open_table(DEAD_BY_DEPT_DUE)?;
@@ -949,8 +950,6 @@ impl DeliveryStore {
                                 .as_str(),
                             )?;
                         }
-                        dead_table.insert(delivery_id, bytes.as_slice())?;
-                        insert_dead_lineage_index(&write, &dead)?;
                         dead_by_time.insert(
                             make_dead_time_index_key(dead.dead_at_ms, delivery_id).as_str(),
                             &(),
@@ -958,6 +957,10 @@ impl DeliveryStore {
                         remove_delivery_lineage_index(&write, &current)?;
                         let promoted_dirty_follow_up =
                             !failure.replayable && prepare_dirty_follow_up(&mut current, now_ms);
+                        dead.allows_keyed_reuse = promoted_dirty_follow_up;
+                        let bytes = serde_json::to_vec(&dead)?;
+                        dead_table.insert(delivery_id, bytes.as_slice())?;
+                        insert_dead_lineage_index(&write, &dead)?;
                         if failure.replayable {
                             dead_index.insert(
                                 make_dead_due_index_key(&dead.dept, dead.dead_at_ms, delivery_id)
@@ -1145,6 +1148,8 @@ impl DeliveryStore {
                             .is_some_and(|current| current.collapse_by_dedup_id);
                     let promoted_dirty_follow_up =
                         live.is_none() && prepare_dirty_follow_up(&mut record, now_ms);
+                    dead.allows_keyed_reuse |=
+                        promoted_dirty_follow_up || live_preserves_keyed_delivery;
                     dead.permanent = true;
                     dead.replayable = false;
                     dead.record = None;
@@ -1175,6 +1180,7 @@ impl DeliveryStore {
                 if let Some(live) = read_delivery_table(&delivery, delivery_id.as_str())? {
                     let live_preserves_keyed_delivery =
                         record.collapse_by_dedup_id && live.collapse_by_dedup_id;
+                    dead.allows_keyed_reuse |= live_preserves_keyed_delivery;
                     dead_index.remove(key.key.as_str())?;
                     dead.permanent = true;
                     dead.replayable = false;
@@ -1861,7 +1867,7 @@ fn rebuild_terminal_dead_tables(write: &redb::WriteTransaction) -> Result<()> {
     let delivery = write.open_table(DELIVERY_BY_ID)?;
     let mut terminal_index = write.open_table(TERMINAL_DEAD_BY_TIME)?;
     for (delivery_id, bytes) in dead_rows {
-        let Some(record) = decode_dead_record(&delivery_id, &bytes) else {
+        let Some(mut record) = decode_dead_record(&delivery_id, &bytes) else {
             continue;
         };
         if is_terminal_dead_record(&record) {
@@ -1871,7 +1877,13 @@ fn rebuild_terminal_dead_tables(write: &redb::WriteTransaction) -> Result<()> {
             )?;
             let live_keyed_follow_up = read_delivery_table(&delivery, delivery_id.as_str())?
                 .is_some_and(|current| current.collapse_by_dedup_id);
-            if !live_keyed_follow_up {
+            if live_keyed_follow_up && !record.allows_keyed_reuse {
+                record.allows_keyed_reuse = true;
+                let mut dead = write.open_table(DEAD_BY_ID)?;
+                let bytes = serde_json::to_vec(&record)?;
+                dead.insert(delivery_id.as_str(), bytes.as_slice())?;
+            }
+            if !record.allows_keyed_reuse {
                 suppress_terminal_delivery(write, delivery_id.as_str())?;
             }
         }
@@ -2044,7 +2056,9 @@ fn compact_terminal_dead_records(write: &redb::WriteTransaction, now_ms: u64) ->
                     make_dead_due_index_key(&record.dept, record.dead_at_ms, &delivery_id).as_str(),
                     &(),
                 )?;
-                suppress_terminal_delivery(write, delivery_id.as_str())?;
+                if !record.allows_keyed_reuse {
+                    suppress_terminal_delivery(write, delivery_id.as_str())?;
+                }
             }
             compacted += 1;
             continue;
@@ -2268,6 +2282,7 @@ mod tests {
             redrive_count: 0,
             replayable: true,
             permanent: false,
+            allows_keyed_reuse: false,
             error_excerpt: Some("timeout".to_string()),
             record: Some(delivery),
         };
@@ -2308,6 +2323,7 @@ mod tests {
             redrive_count: 0,
             replayable: false,
             permanent: true,
+            allows_keyed_reuse: false,
             error_excerpt: Some("final".to_string()),
             record: None,
         };
@@ -4031,6 +4047,7 @@ mod tests {
             redrive_count: 0,
             replayable: true,
             permanent: false,
+            allows_keyed_reuse: false,
             error_excerpt: None,
             record: Some(dead_record),
         };
@@ -5058,6 +5075,126 @@ mod tests {
     }
 
     #[test]
+    fn schema_rebuild_preserves_keyed_reuse_after_dirty_follow_up_ack() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("delivery.redb");
+        let mut original = record("one", 100);
+        original.collapse_by_dedup_id = true;
+        {
+            let store = DeliveryStore::open(&path).unwrap();
+            store.enqueue(&original).unwrap();
+            let leased = store
+                .lease(100, 1, Duration::from_millis(50))
+                .unwrap()
+                .remove(0);
+            store.enqueue(&original).unwrap();
+            assert_eq!(
+                store
+                    .retry(
+                        &leased.delivery_id,
+                        leased.lease_generation,
+                        &failure("permanent", false),
+                        &policy(1),
+                        120,
+                    )
+                    .unwrap(),
+                RetryOutcome::PermanentDead
+            );
+            let follow_up = store
+                .lease(120, 1, Duration::from_millis(50))
+                .unwrap()
+                .remove(0);
+            assert!(store
+                .ack(&follow_up.delivery_id, follow_up.lease_generation)
+                .unwrap());
+            assert!(store.get("one").unwrap().is_none());
+            assert!(store.get_dead("one").unwrap().unwrap().permanent);
+            assert!(!store.terminal_suppresses("one").unwrap());
+        }
+        {
+            let db = Database::open(&path).unwrap();
+            let write = db.begin_write().unwrap();
+            {
+                let mut meta = write.open_table(META).unwrap();
+                meta.insert("schema_version", "10").unwrap();
+            }
+            write.commit().unwrap();
+        }
+
+        let store = DeliveryStore::open(&path).unwrap();
+
+        assert!(!store.terminal_suppresses("one").unwrap());
+        assert!(store.get_dead("one").unwrap().unwrap().allows_keyed_reuse);
+        original.observed_at_ms = 121;
+        original.not_before_ms = 121;
+        store.enqueue(&original).unwrap();
+        assert_eq!(
+            store
+                .lease(121, 1, Duration::from_millis(50))
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn terminal_index_repair_preserves_keyed_reuse_after_dirty_follow_up_ack() {
+        let temp = TempDir::new().unwrap();
+        let store = store(&temp);
+        let mut original = record("one", 100);
+        original.collapse_by_dedup_id = true;
+        store.enqueue(&original).unwrap();
+        let leased = store
+            .lease(100, 1, Duration::from_millis(50))
+            .unwrap()
+            .remove(0);
+        store.enqueue(&original).unwrap();
+        assert_eq!(
+            store
+                .retry(
+                    &leased.delivery_id,
+                    leased.lease_generation,
+                    &failure("permanent", false),
+                    &policy(1),
+                    120,
+                )
+                .unwrap(),
+            RetryOutcome::PermanentDead
+        );
+        let follow_up = store
+            .lease(120, 1, Duration::from_millis(50))
+            .unwrap()
+            .remove(0);
+        assert!(store
+            .ack(&follow_up.delivery_id, follow_up.lease_generation)
+            .unwrap());
+        {
+            let write = store.db.begin_write().unwrap();
+            {
+                let mut terminal = write.open_table(TERMINAL_DEAD_BY_TIME).unwrap();
+                terminal
+                    .remove(make_dead_due_index_key("worker", 120, "one").as_str())
+                    .unwrap();
+                terminal
+                    .insert(make_dead_due_index_key("worker", 119, "one").as_str(), &())
+                    .unwrap();
+            }
+            write.commit().unwrap();
+        }
+
+        let compact_at_ms = 120_u64.saturating_add(TERMINAL_DEAD_RETENTION_MS);
+        store
+            .enqueue(&record("fresh", compact_at_ms))
+            .unwrap();
+
+        assert!(!store.terminal_suppresses("one").unwrap());
+        original.observed_at_ms = compact_at_ms;
+        original.not_before_ms = compact_at_ms;
+        store.enqueue(&original).unwrap();
+        assert!(store.get("one").unwrap().is_some());
+    }
+
+    #[test]
     fn delivery_record_without_pending_dirty_defaults_clean() {
         let mut encoded = serde_json::to_value(record("one", 100)).unwrap();
         encoded.as_object_mut().unwrap().remove("pending_dirty");
@@ -5132,6 +5269,7 @@ mod tests {
             redrive_count: 0,
             replayable: true,
             permanent: false,
+            allows_keyed_reuse: false,
             error_excerpt: Some("timeout".to_string()),
             record: Some(record("replayable", 100)),
         };
@@ -5147,6 +5285,7 @@ mod tests {
             redrive_count: 0,
             replayable: true,
             permanent: true,
+            allows_keyed_reuse: false,
             error_excerpt: Some("permanent".to_string()),
             record: Some(record("permanent", 100)),
         };
@@ -5162,6 +5301,7 @@ mod tests {
             redrive_count: 0,
             replayable: true,
             permanent: false,
+            allows_keyed_reuse: false,
             error_excerpt: Some("missing payload".to_string()),
             record: None,
         };
@@ -5245,6 +5385,7 @@ mod tests {
             redrive_count: 0,
             replayable: false,
             permanent: true,
+            allows_keyed_reuse: false,
             error_excerpt: Some("final".to_string()),
             record: None,
         };
@@ -5305,6 +5446,7 @@ mod tests {
             redrive_count: 0,
             replayable: false,
             permanent: true,
+            allows_keyed_reuse: false,
             error_excerpt: Some("final".to_string()),
             record: None,
         };

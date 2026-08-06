@@ -60,6 +60,9 @@ pub(crate) struct DeadRecord {
     pub replayable: bool,
     #[serde(default = "default_dead_permanent")]
     pub permanent: bool,
+    /// A keyed successor made this terminal delivery ID reusable.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub allows_keyed_reuse: bool,
     pub error_excerpt: Option<String>,
     #[serde(default)]
     pub record: Option<DeliveryRecord>,
