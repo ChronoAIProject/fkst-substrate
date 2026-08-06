@@ -3448,6 +3448,14 @@ return M
     }
 
     #[test]
+    fn framework_exit_classifier_keeps_timeout_as_the_only_replayable_exit() {
+        assert!(is_replayable_framework_exit_code(124));
+        for exit_code in [1, 123, 125] {
+            assert!(!is_replayable_framework_exit_code(exit_code));
+        }
+    }
+
+    #[test]
     fn spawn_error_classifier_separates_transient_resource_failures() {
         for errno in [
             Errno::EMFILE,
