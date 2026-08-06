@@ -2185,6 +2185,9 @@ fn read_generic_codex_status_log_with_probe<F>(
 where
     F: FnOnce(&Path) -> anyhow::Result<LifetimeWitnessProbe>,
 {
+    let Some(expected_run_id) = codex_run_id_from_log_path(path) else {
+        return Ok(Vec::new());
+    };
     let witness = match probe(path) {
         Ok(witness) => Some(witness),
         Err(err) => {
@@ -2213,13 +2216,14 @@ where
             continue;
         };
         match serde_json::from_str::<CodexStatusRecord>(json) {
-            Ok(mut record) => {
+            Ok(mut record) if record.run_id == expected_run_id => {
                 if record.status == "running" && !witness_held {
                     record.status = "abandoned".to_string();
                     record.exit_code = Some(-1);
                 }
                 records.push(record);
             }
+            Ok(_) => {}
             Err(err) => eprintln!(
                 "WARN: codex status log line skipped path={} error={err}",
                 path.display()
@@ -2983,6 +2987,14 @@ fn codex_log_path(worktree: Option<&str>, run_id: &str) -> PathBuf {
         .join(format!("{basename}-{timestamp}-{run_id}.log"))
 }
 
+fn codex_run_id_from_log_path(path: &Path) -> Option<&str> {
+    let stem = path.file_stem()?.to_str()?;
+    let start = stem.rfind("-codex-")? + 1;
+    let run_id = &stem[start..];
+    let token = run_id.strip_prefix("codex-")?;
+    token.parse::<ulid::Ulid>().ok().map(|_| run_id)
+}
+
 fn codex_output_tail_path(log_path: &Path) -> PathBuf {
     let stem = log_path
         .file_stem()
@@ -3459,9 +3471,12 @@ mod tests {
     #[test]
     fn generic_status_snapshot_reads_terminal_record_after_unlocked_probe() {
         let tmp = tempfile::tempdir().unwrap();
-        let log_path = tmp.path().join("generic.log");
+        let run_id = "codex-01ARZ3NDEKTSV4RRFFQ69G5FAV";
+        let log_path = tmp
+            .path()
+            .join(format!("worktree-1-000000000-{run_id}.log"));
         let running = CodexStatusRecord {
-            run_id: "codex-snapshot-order".to_string(),
+            run_id: run_id.to_string(),
             role: None,
             label: None,
             dept: None,
