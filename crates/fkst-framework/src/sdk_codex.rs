@@ -2164,35 +2164,7 @@ fn read_codex_status_records(host_root: &Path) -> anyhow::Result<Vec<CodexStatus
                 if path.extension().and_then(OsStr::to_str) != Some("log") {
                     continue;
                 }
-                let body = std::fs::read_to_string(&path)?;
-                let witness_held = match lifetime_witness_held(&path) {
-                    Ok(held) => held,
-                    Err(err) => {
-                        eprintln!(
-                            "WARN: codex lifetime witness probe failed path={} error={err}",
-                            path.display()
-                        );
-                        true
-                    }
-                };
-                for line in body.lines() {
-                    let Some(json) = line.strip_prefix(CODEX_STATUS_LOG_PREFIX) else {
-                        continue;
-                    };
-                    match serde_json::from_str::<CodexStatusRecord>(json) {
-                        Ok(mut record) => {
-                            if record.status == "running" && !witness_held {
-                                record.status = "abandoned".to_string();
-                                record.exit_code = Some(-1);
-                            }
-                            records.push(record);
-                        }
-                        Err(err) => eprintln!(
-                            "WARN: codex status log line skipped path={} error={err}",
-                            path.display()
-                        ),
-                    }
-                }
+                records.extend(read_generic_codex_status_log(&path)?);
             }
         }
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
@@ -2200,6 +2172,61 @@ fn read_codex_status_records(host_root: &Path) -> anyhow::Result<Vec<CodexStatus
     }
     records.extend(read_adoption_status_records(host_root)?);
     Ok(latest_codex_status_records(records))
+}
+
+fn read_generic_codex_status_log(path: &Path) -> anyhow::Result<Vec<CodexStatusRecord>> {
+    read_generic_codex_status_log_with_probe(path, probe_lifetime_witness)
+}
+
+fn read_generic_codex_status_log_with_probe<F>(
+    path: &Path,
+    probe: F,
+) -> anyhow::Result<Vec<CodexStatusRecord>>
+where
+    F: FnOnce(&Path) -> anyhow::Result<LifetimeWitnessProbe>,
+{
+    let witness = match probe(path) {
+        Ok(witness) => Some(witness),
+        Err(err) => {
+            eprintln!(
+                "WARN: codex lifetime witness probe failed path={} error={err}",
+                path.display()
+            );
+            None
+        }
+    };
+    if matches!(&witness, Some(LifetimeWitnessProbe::Missing)) {
+        return Ok(Vec::new());
+    }
+    let witness_held = match &witness {
+        Some(LifetimeWitnessProbe::Missing) | Some(LifetimeWitnessProbe::Unlocked(_)) => false,
+        Some(LifetimeWitnessProbe::Held) | None => true,
+    };
+    let body = match std::fs::read_to_string(path) {
+        Ok(body) => body,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(err) => return Err(err.into()),
+    };
+    let mut records = Vec::new();
+    for line in body.lines() {
+        let Some(json) = line.strip_prefix(CODEX_STATUS_LOG_PREFIX) else {
+            continue;
+        };
+        match serde_json::from_str::<CodexStatusRecord>(json) {
+            Ok(mut record) => {
+                if record.status == "running" && !witness_held {
+                    record.status = "abandoned".to_string();
+                    record.exit_code = Some(-1);
+                }
+                records.push(record);
+            }
+            Err(err) => eprintln!(
+                "WARN: codex status log line skipped path={} error={err}",
+                path.display()
+            ),
+        }
+    }
+    Ok(records)
 }
 
 fn read_adoption_status_records(host_root: &Path) -> anyhow::Result<Vec<CodexStatusRecord>> {
@@ -3427,6 +3454,48 @@ mod tests {
             file_name.contains(&request.run_id),
             "generic lifetime witness path must identify its run incarnation: {file_name}"
         );
+    }
+
+    #[test]
+    fn generic_status_snapshot_reads_terminal_record_after_unlocked_probe() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log_path = tmp.path().join("generic.log");
+        let running = CodexStatusRecord {
+            run_id: "codex-snapshot-order".to_string(),
+            role: None,
+            label: None,
+            dept: None,
+            proposal_id: None,
+            dedup_key: None,
+            started_at: "2026-08-05T00:00:00Z".to_string(),
+            started_at_ms: 100,
+            timeout_seconds: Some(3600),
+            ended_at: None,
+            ended_at_ms: None,
+            elapsed_ms: None,
+            status: "running".to_string(),
+            exit_code: None,
+            permit_slot: None,
+            output_tail_path: None,
+        };
+        append_codex_status_log(&log_path, &running).unwrap();
+        let mut completed = running.clone();
+        completed.status = "completed".to_string();
+        completed.ended_at = Some("2026-08-05T00:00:01Z".to_string());
+        completed.ended_at_ms = Some(101);
+        completed.elapsed_ms = Some(1);
+        completed.exit_code = Some(0);
+
+        let records = read_generic_codex_status_log_with_probe(&log_path, |path| {
+            append_codex_status_log(path, &completed)?;
+            probe_lifetime_witness(path)
+        })
+        .unwrap();
+        let latest = latest_codex_status_records(records);
+
+        assert_eq!(latest.len(), 1);
+        assert_eq!(latest[0].status, "completed");
+        assert_eq!(latest[0].exit_code, Some(0));
     }
 
     #[test]
