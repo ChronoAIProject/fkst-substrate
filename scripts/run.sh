@@ -59,7 +59,7 @@ run_verification() {
   # and test-process evidence. Codes outside the explicit sets remain UNKNOWN.
   case "$status" in
     0)                    emit_local_iteration_result "PASS:NONE" ;;
-    10|11|12|13|14|15|16|21) emit_local_iteration_result "FAIL:SEMANTIC" ;;
+    10|11|12|13|14|15|16) emit_local_iteration_result "FAIL:SEMANTIC" ;;
     17|18)                emit_local_iteration_result "FAIL:INFRASTRUCTURE" ;;
     22)                   emit_local_iteration_result "FAIL:TOOLCHAIN" ;;
     *)                    emit_local_iteration_result "UNKNOWN:UNKNOWN" ;;

@@ -11,6 +11,7 @@ from typing import Any
 SEMANTIC = 20
 INFRASTRUCTURE = 21
 UNKNOWN = 22
+LIBTEST_REJECTION = 101
 
 
 def record_evidence(path: Path, evidence: dict[str, Any]) -> None:
@@ -20,6 +21,19 @@ def record_evidence(path: Path, evidence: dict[str, Any]) -> None:
         os.write(descriptor, encoded)
     finally:
         os.close(descriptor)
+
+
+def test_harness_is_ready(command: list[str]) -> bool:
+    try:
+        completed = subprocess.run(
+            [*command, "--list"],
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except OSError:
+        return False
+    return completed.returncode == 0
 
 
 def run_test_process(evidence_path: Path, command: list[str]) -> int:
@@ -40,9 +54,15 @@ def run_test_process(evidence_path: Path, command: list[str]) -> int:
         )
         return min(128 - completed.returncode, 255)
 
+    kind = (
+        "test-harness-rejected"
+        if completed.returncode == LIBTEST_REJECTION
+        and test_harness_is_ready(command)
+        else "test-exit"
+    )
     record_evidence(
         evidence_path,
-        {"kind": "test-exit", "returncode": completed.returncode},
+        {"kind": kind, "returncode": completed.returncode},
     )
     return min(completed.returncode, 255)
 
@@ -83,7 +103,8 @@ def classify_failure(
     test_evidence: list[dict[str, Any]],
 ) -> int:
     semantic = compiler_rejected or any(
-        item.get("kind") == "test-exit" and item.get("returncode") != 0
+        item.get("kind") == "test-harness-rejected"
+        and item.get("returncode") == LIBTEST_REJECTION
         for item in test_evidence
     )
     infrastructure = any(
