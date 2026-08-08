@@ -576,6 +576,74 @@ mod tests {
     }
 
     #[test]
+    fn offline_snapshot_pushes_queue_projection_into_exact_aggregate_read() {
+        let temp = TempDir::new().unwrap();
+        let layout = DurableLayout::new(temp.path()).unwrap();
+        let database_path = layout.delivery_db_path();
+        let store = DeliveryStore::open(&database_path).unwrap();
+        for index in 0..32 {
+            store
+                .enqueue(&DeliveryRecord {
+                    delivery_id: format!("delivery-{index:02}"),
+                    queue: "jobs".to_string(),
+                    dept: "worker".to_string(),
+                    payload: serde_json::json!({"index": index}),
+                    source: None,
+                    cron_payload: None,
+                    observed_at_ms: 10,
+                    attempt: 0,
+                    redrive_count: 0,
+                    collapse_by_dedup_id: false,
+                    subscriber_absent_since_ms: None,
+                    lease_generation: 0,
+                    lease_until_ms: None,
+                    not_before_ms: 100,
+                    last_error_excerpt: None,
+                })
+                .unwrap();
+        }
+        drop(store);
+        let database = redb::Database::open(&database_path).unwrap();
+        let write = database.begin_write().unwrap();
+        write
+            .delete_table(redb::TableDefinition::<&str, &str>::new(
+                "delivery_by_observe_order",
+            ))
+            .unwrap();
+        write
+            .delete_table(redb::TableDefinition::<&str, &[u8]>::new("dead_by_id"))
+            .unwrap();
+        write
+            .delete_table(redb::TableDefinition::<&str, ()>::new("dead_by_time"))
+            .unwrap();
+        write.commit().unwrap();
+        drop(database);
+
+        DeliveryStore::reset_observation_record_read_counts();
+        let snapshot = snapshot_for_durable_root(
+            temp.path(),
+            &ObserveSnapshotOptions {
+                limit: 1,
+                since: None,
+                page: None,
+                projection: crate::supervise::delivery_store::DeliveryObservationProjection {
+                    queue_aggregates: true,
+                    deliveries: false,
+                    dead_letters: false,
+                },
+            },
+        )
+        .unwrap();
+
+        assert_eq!(snapshot.queues.len(), 1);
+        assert_eq!(snapshot.queues[0].queue, "jobs");
+        assert_eq!(snapshot.queues[0].depth, 32);
+        assert!(snapshot.deliveries.is_empty());
+        assert!(snapshot.dead_letters.is_empty());
+        assert_eq!(DeliveryStore::observation_record_read_counts(), (32, 0, 0));
+    }
+
+    #[test]
     fn offline_snapshot_pushes_error_projection_into_bounded_store_read() {
         let temp = TempDir::new().unwrap();
         let layout = DurableLayout::new(temp.path()).unwrap();
