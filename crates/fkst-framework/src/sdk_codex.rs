@@ -628,7 +628,7 @@ fn run_codex_request(
         return run_adoptable_codex_request(request, paths, host_root, config);
     }
 
-    let lifetime_witness = acquire_log_lifetime_witness(&request);
+    let lifetime_witness = acquire_log_lifetime_witness(&request).map_err(mlua::Error::external)?;
     let mut status = CodexStatusRecord::from_request(&request, None);
     write_codex_status(&request.log_path, &status);
     if let Err(err) = ensure_pool_with_context(host_root, config) {
@@ -681,11 +681,7 @@ fn run_codex_request(
         }
     };
 
-    let result = run_codex_request_with_permit(
-        request,
-        config,
-        lifetime_witness.as_ref().map(AsRawFd::as_raw_fd),
-    );
+    let result = run_codex_request_with_permit(request, config, lifetime_witness.as_raw_fd());
     status.finish(result.exit_code);
     write_codex_status(Path::new(&result.log_path), &status);
     Ok(result)
@@ -763,7 +759,8 @@ fn run_mocked_codex_request(
             return Ok(result);
         }
     };
-    let _lifetime_witness = acquire_log_lifetime_witness(&request);
+    let _lifetime_witness =
+        acquire_log_lifetime_witness(&request).map_err(mlua::Error::external)?;
     let mut status = CodexStatusRecord::from_request(&request, None);
     write_codex_status(&request.log_path, &status);
     write_live_output_tail(
@@ -1083,18 +1080,14 @@ fn read_optional_string(path: &Path) -> anyhow::Result<String> {
     }
 }
 
-fn acquire_log_lifetime_witness(request: &CodexRequest) -> Option<std::fs::File> {
-    match acquire_lifetime_witness_from_disk(&request.log_path) {
-        Ok(file) => Some(file),
-        Err(err) => {
-            eprintln!(
-                "WARN: codex lifetime witness unavailable run_id={} path={} error={err}",
-                request.run_id,
-                request.log_path.display()
-            );
-            None
-        }
-    }
+fn acquire_log_lifetime_witness(request: &CodexRequest) -> anyhow::Result<std::fs::File> {
+    acquire_lifetime_witness_from_disk(&request.log_path).map_err(|err| {
+        anyhow::anyhow!(
+            "codex lifetime witness acquisition failed run_id={} path={} error={err}",
+            request.run_id,
+            request.log_path.display()
+        )
+    })
 }
 
 fn acquire_lifetime_witness_from_disk(path: &Path) -> anyhow::Result<std::fs::File> {
@@ -1695,7 +1688,7 @@ pub(crate) fn run_codex_worker(options: CodexWorkerOptions) -> anyhow::Result<i3
         return Ok(0);
     };
     drop(run_lock);
-    let _status_lifetime_witness = acquire_log_lifetime_witness(&request);
+    let _status_lifetime_witness = acquire_log_lifetime_witness(&request)?;
     let mut status = CodexStatusRecord::from_request(&request, None);
     write_codex_status(&request.log_path, &status);
 
@@ -1706,7 +1699,7 @@ pub(crate) fn run_codex_worker(options: CodexWorkerOptions) -> anyhow::Result<i3
             let result = run_codex_request_with_permit(
                 request,
                 &config,
-                Some(adoption_lifetime_witness.as_raw_fd()),
+                adoption_lifetime_witness.as_raw_fd(),
             );
             drop(permit);
             result
@@ -2384,7 +2377,7 @@ fn lease_expires_at_ms(started_at_ms: u64, timeout_seconds: i64) -> Option<u64> 
 fn run_codex_request_with_permit(
     mut request: CodexRequest,
     config: &ConfigContext,
-    lifetime_witness_fd: Option<RawFd>,
+    lifetime_witness_fd: RawFd,
 ) -> CodexResult {
     let shim_dir = match prepare_rate_shims_for_codex(config) {
         Ok(shim_dir) => shim_dir,
@@ -2890,7 +2883,7 @@ fn logged_failure(
 fn command_for_request(
     request: &CodexRequest,
     program: &Path,
-    lifetime_witness_fd: Option<RawFd>,
+    lifetime_witness_fd: RawFd,
 ) -> (Command, String) {
     let mut cmd = Command::new(program);
     let cmd_args = command_args_for_request(request);
@@ -2898,9 +2891,7 @@ fn command_for_request(
     #[cfg(unix)]
     {
         cmd.process_group(0);
-        if let Some(fd) = lifetime_witness_fd {
-            inherit_fd_on_exec(&mut cmd, fd);
-        }
+        inherit_fd_on_exec(&mut cmd, lifetime_witness_fd);
     }
     cmd.stdin(Stdio::piped());
     cmd.stdout(Stdio::piped());
@@ -3987,7 +3978,8 @@ mod tests {
     #[test]
     fn codex_command_strips_github_token_env() {
         let request = command_test_request();
-        let (cmd, _) = command_for_request(&request, Path::new("codex"), None);
+        let witness = acquire_log_lifetime_witness(&request).unwrap();
+        let (cmd, _) = command_for_request(&request, Path::new("codex"), witness.as_raw_fd());
         let envs = cmd.get_envs().collect::<Vec<_>>();
 
         assert!(envs

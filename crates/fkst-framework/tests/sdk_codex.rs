@@ -2487,16 +2487,18 @@ exit 1
 
 #[cfg(unix)]
 #[test]
-fn spawn_codex_sync_continues_when_log_write_fails() {
+fn spawn_codex_sync_refuses_to_spawn_when_lifetime_witness_acquisition_fails() {
     use std::fs;
 
     let tmp = tempfile::tempdir().unwrap();
     let bin_dir = tmp.path().join("bin");
+    let capture_dir = tmp.path().join("capture");
+    fs::create_dir_all(&capture_dir).unwrap();
     install_codex_script(
         &bin_dir,
         r#"#!/bin/sh
 cat >/dev/null
-printf 'still-ok'
+printf 'spawned' > "$CAPTURE_DIR/spawned"
 "#,
     );
 
@@ -2505,6 +2507,7 @@ printf 'still-ok'
     let mut sandbox = ProcessSandbox::new();
     sandbox.enter_cwd(tmp.path()).runtime_root(".fkst/runtime");
     sandbox.prepend_path(&bin_dir);
+    sandbox.set_env("CAPTURE_DIR", capture_dir.to_string_lossy().into_owned());
     sandbox.runtime_log_dir(&log_root_file);
     let (_lock, _guard) = sandbox.enter();
 
@@ -2514,13 +2517,13 @@ printf 'still-ok'
     let opts = lua.create_table().unwrap();
     opts.set("prompt", "hello").unwrap();
 
-    let result: mlua::Table = spawn.call(opts).unwrap();
-    assert_eq!(result.get::<i64>("exit_code").unwrap(), 0);
-    assert_eq!(result.get::<String>("stdout").unwrap(), "still-ok");
-    assert!(result
-        .get::<String>("log_path")
-        .unwrap()
-        .contains("not-a-dir"));
+    let err = spawn.call::<Table>(opts).unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("codex lifetime witness acquisition failed"),
+        "{err}"
+    );
+    assert!(!capture_dir.join("spawned").exists());
 }
 
 #[cfg(unix)]
