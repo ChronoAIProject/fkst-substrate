@@ -25,9 +25,22 @@ result_file="${FKST_LOCAL_ITERATION_RESULT_FILE:-}"
 # result file, mirroring fkst-packages' local_iteration_result_arm.
 unset FKST_LOCAL_ITERATION_RESULT_FILE
 
+# The result file is an INTERNAL nesting channel: a parent runner sets it so a
+# nested runner's verdict can be merged instead of racing the parent's own. The
+# consumer that actually classifies the attempt is harvest, which reads the
+# marker off the process's stdout/stderr and never opens that file
+# (fkst-packages local_iteration_result.lua:65-66, from_command). harvest
+# invokes this gate WITHOUT setting FKST_LOCAL_ITERATION_RESULT_FILE, so a
+# file-only emitter writes into a channel nobody reads and every verdict stays
+# UNKNOWN. Mirror the reference emitter exactly: file when nesting, else stderr.
 emit_local_iteration_result() {
-  [ -n "$result_file" ] || return 0
-  printf 'FKST_LOCAL_ITERATION_RESULT:v2:%s\n' "$1" > "$result_file"
+  local marker
+  marker="$(printf 'FKST_LOCAL_ITERATION_RESULT:v2:%s' "$1")"
+  if [ -n "$result_file" ]; then
+    printf '%s\n' "$marker" > "$result_file"
+  else
+    printf '%s\n' "$marker" >&2
+  fi
 }
 
 run_verification() {
