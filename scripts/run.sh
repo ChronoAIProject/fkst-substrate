@@ -15,11 +15,10 @@ repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # which the package checkpoints and replays forever, so a strand never
 # terminates even when its work is green (fkst-substrate#317).
 #
-# Only classes this script can establish are emitted. verify.sh currently
-# signals every gate failure with a bare `exit 1`, so a failing verification
-# stays UNKNOWN rather than being guessed at as SEMANTIC — misreporting an
-# infrastructure fault as "your diff is wrong" would be worse than the honest
-# UNKNOWN it replaces. Instrumenting verify.sh per gate is the remaining work.
+# Only classes this script can establish are emitted. verify.sh uses distinct
+# exit codes for semantic Cargo diagnostics, infrastructure execution failures,
+# and ambiguous Cargo failures. Unrecognised results stay UNKNOWN rather than
+# being guessed at from human-formatted output.
 result_file="${FKST_LOCAL_ITERATION_RESULT_FILE:-}"
 # Unset before invoking any child so a nested runner cannot clobber this
 # result file, mirroring fkst-packages' local_iteration_result_arm.
@@ -49,30 +48,21 @@ run_verification() {
     emit_local_iteration_result "FAIL:TOOLCHAIN"
     return 1
   fi
+  if ! command -v python3 >/dev/null 2>&1; then
+    echo "scripts/run.sh: python3 not found on PATH" >&2
+    emit_local_iteration_result "FAIL:TOOLCHAIN"
+    return 1
+  fi
   local status=0
   "$repo/scripts/verify.sh" || status=$?
-  # verify.sh exits with a distinct code per gate so the failure can be typed.
-  # Every one of these gates fails because the tree under test is wrong — a
-  # compile error, a failing test, an oversized supervisor, an unparseable
-  # script, a conformance violation. That is SEMANTIC. An exit code outside the
-  # known set is genuinely unclassifiable and stays UNKNOWN rather than being
-  # guessed at, since misreporting an infrastructure fault as "your diff is
-  # wrong" is worse than admitting ignorance.
-  # Only gates that cannot fail for an environmental reason may accuse the tree.
-  # The audit, shell-syntax, self-test, conformance and lua-test gates each ran
-  # to a verdict about the tree, so their failure is SEMANTIC.
-  #
-  # `cargo build` (12) and `cargo test` (13) are excluded on purpose: each
-  # conflates "ran and rejected the tree" with "could not run" — lock
-  # contention, target-dir/IO failure, a registry fetch. #327 observed exactly
-  # that: #314's base probe reported base_exit=12 -> SEMANTIC for
-  # 171c7395, while CI on that same sha was green three times over. Until the
-  # two are told apart they stay UNKNOWN, because an honest UNKNOWN costs a
-  # redrive while a false SEMANTIC parks a healthy strand on an accusation.
+  # verify.sh assigns build/test codes only from structured Cargo diagnostics
+  # and test-process evidence. Codes outside the explicit sets remain UNKNOWN.
   case "$status" in
-    0)              emit_local_iteration_result "PASS:NONE" ;;
-    10|11|14|15|16) emit_local_iteration_result "FAIL:SEMANTIC" ;;
-    *)              emit_local_iteration_result "UNKNOWN:UNKNOWN" ;;
+    0)                    emit_local_iteration_result "PASS:NONE" ;;
+    10|11|12|13|14|15|16|21) emit_local_iteration_result "FAIL:SEMANTIC" ;;
+    17|18)                emit_local_iteration_result "FAIL:INFRASTRUCTURE" ;;
+    22)                   emit_local_iteration_result "FAIL:TOOLCHAIN" ;;
+    *)                    emit_local_iteration_result "UNKNOWN:UNKNOWN" ;;
   esac
   return "$status"
 }
