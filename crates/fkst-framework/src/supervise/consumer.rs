@@ -2331,20 +2331,7 @@ units = [{units}]
             &complete_tx,
             &mut running,
         );
-        timeout(Duration::from_secs(2), async {
-            loop {
-                if fs::read_to_string(&started)
-                    .map(|text| text.lines().count())
-                    .unwrap_or(0)
-                    == 1
-                {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .expect("first durable child should start");
+        wait_for_started_count(&started, 1).await;
         assert_eq!(running.len(), 1);
 
         dispatch_due(
