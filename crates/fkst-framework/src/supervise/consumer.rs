@@ -1192,6 +1192,19 @@ async fn spawn_and_report_with_stdout_observer(
             ("dept", dept_name.to_string()),
             ("pid", result.pid.to_string()),
             ("exit_code", result.exit_code.to_string()),
+            ("spawn_return_ms", result.spawn_return_ms.to_string()),
+            (
+                "first_pipe_read_ms",
+                result
+                    .first_pipe_read_ms
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "none".to_string()),
+            ),
+            ("wait_complete_ms", result.wait_complete_ms.to_string()),
+            (
+                "capture_complete_ms",
+                result.capture_complete_ms.to_string(),
+            ),
             ("elapsed_ms", result.elapsed_ms.to_string()),
             ("log_path", optional_path(result.log_path.as_deref())),
             ("reason", "natural_exit".to_string()),
@@ -1435,6 +1448,7 @@ mod tests {
             attempt: 0,
             redrive_count: 0,
             collapse_by_dedup_id: false,
+            pending_dirty: false,
             subscriber_absent_since_ms: None,
             lease_generation: 0,
             lease_until_ms: None,
@@ -2317,20 +2331,7 @@ units = [{units}]
             &complete_tx,
             &mut running,
         );
-        timeout(Duration::from_secs(2), async {
-            loop {
-                if fs::read_to_string(&started)
-                    .map(|text| text.lines().count())
-                    .unwrap_or(0)
-                    == 1
-                {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .expect("first durable child should start");
+        wait_for_started_count(&started, 1).await;
         assert_eq!(running.len(), 1);
 
         dispatch_due(
@@ -3427,6 +3428,10 @@ return M
             exit_code: 124,
             stdout: String::new(),
             stderr: "codex timed out".to_string(),
+            spawn_return_ms: 0,
+            first_pipe_read_ms: None,
+            wait_complete_ms: 1_000,
+            capture_complete_ms: 1_000,
             elapsed_ms: 1_000,
             log_path: None,
         });

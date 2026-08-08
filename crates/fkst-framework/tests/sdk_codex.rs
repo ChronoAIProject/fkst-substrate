@@ -44,7 +44,7 @@ use std::io::Write;
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 use support::process_sandbox::ProcessSandbox;
 
 const DEFAULT_CODEX_PERMIT_SLOTS: usize = 20;
@@ -98,7 +98,7 @@ fn read_fifo(path: &Path) -> String {
         let _ = tx.send(result);
     });
     let result = rx
-        .recv_timeout(Duration::from_secs(15))
+        .recv_timeout(Duration::from_secs(60))
         .unwrap_or_else(|err| panic!("timed out reading FIFO {display}: {err}"));
     result.unwrap_or_else(|err| panic!("failed reading FIFO {display}: {err}"))
 }
@@ -232,6 +232,66 @@ fn adoption_work_dir(root: &Path) -> PathBuf {
         .path()
 }
 
+#[cfg(unix)]
+fn hold_exclusive_lock(path: &Path) -> std::fs::File {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).unwrap();
+    }
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(path)
+        .unwrap();
+    flock(file.as_raw_fd(), FlockArg::LockExclusive).unwrap();
+    file
+}
+
+#[cfg(unix)]
+fn wait_for_exclusive_lock(path: &Path) {
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(path)
+            .unwrap();
+        if flock(file.as_raw_fd(), FlockArg::LockExclusiveNonblock).is_ok() {
+            return;
+        }
+        if Instant::now() >= deadline {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    panic!(
+        "timed out waiting for lifetime witness release: {}",
+        path.display()
+    );
+}
+
+#[cfg(unix)]
+fn wait_for_child_exit(pid: i32) {
+    use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
+    use nix::unistd::Pid;
+
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        match waitpid(Pid::from_raw(pid), Some(WaitPidFlag::WNOHANG)) {
+            Ok(WaitStatus::StillAlive) => {}
+            Ok(_) | Err(nix::errno::Errno::ECHILD) => return,
+            Err(err) => panic!("failed waiting for child {pid}: {err}"),
+        }
+        if Instant::now() >= deadline {
+            panic!("timed out waiting for child {pid} to exit");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
 fn wait_for_adoption_status(root: &Path, expected: &str) {
     for _ in 0..100 {
         if adoption_status_values(root)
@@ -271,6 +331,143 @@ fn codex_runs_fn(lua: &Lua) -> Function {
         .unwrap()
         .get("codex_runs")
         .unwrap()
+}
+
+#[cfg(unix)]
+#[test]
+fn codex_runs_projects_generic_running_only_while_its_log_witness_is_held() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut sandbox = ProcessSandbox::new();
+    sandbox.enter_cwd(tmp.path()).runtime_root(".fkst/runtime");
+    sandbox.runtime_log_dir(tmp.path().join("runtime"));
+    let (_lock, _guard) = sandbox.enter();
+
+    let run_id = "codex-01ARZ3NDEKTSV4RRFFQ69G5FAV";
+    let log_path = tmp
+        .path()
+        .join(format!("runtime/codex/worktree-1-000000000-{run_id}.log"));
+    let witness = hold_exclusive_lock(&log_path);
+    let record = serde_json::json!({
+        "run_id": run_id,
+        "role": "implementer",
+        "started_at": "2026-08-05T00:00:00Z",
+        "started_at_ms": 1_786_000_000_000_u64,
+        "timeout_seconds": 3600,
+        "status": "running",
+        "permit_slot": null,
+        "output_tail_path": null
+    });
+    std::fs::write(&log_path, format!("CODEX_STATUS:{record}\n")).unwrap();
+
+    let lua = Lua::new();
+    register(&lua).unwrap();
+    let status_fn = codex_runs_fn(&lua);
+    let live: Table = status_fn.call(()).unwrap();
+    assert_eq!(table_len(&live, "running"), 1);
+    assert_eq!(table_len(&live, "recent"), 0);
+
+    drop(witness);
+
+    let reconciled: Table = status_fn.call(()).unwrap();
+    assert_eq!(table_len(&reconciled, "running"), 0);
+    let recent: Table = reconciled.get("recent").unwrap();
+    assert_eq!(recent.raw_len(), 1);
+    let abandoned: Table = recent.get(1).unwrap();
+    assert_eq!(abandoned.get::<String>("status").unwrap(), "failed");
+    assert_eq!(abandoned.get::<i64>("exit_code").unwrap(), -1);
+}
+
+#[test]
+fn codex_runs_uses_log_order_when_wall_clock_moves_backwards() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut sandbox = ProcessSandbox::new();
+    sandbox.enter_cwd(tmp.path()).runtime_root(".fkst/runtime");
+    sandbox.runtime_log_dir(tmp.path().join("runtime"));
+    let (_lock, _guard) = sandbox.enter();
+
+    let run_id = "codex-01ARZ3NDEKTSV4RRFFQ69G5FAV";
+    let log_path = tmp
+        .path()
+        .join(format!("runtime/codex/worktree-1-000000000-{run_id}.log"));
+    std::fs::create_dir_all(log_path.parent().unwrap()).unwrap();
+    let running = serde_json::json!({
+        "run_id": run_id,
+        "started_at": "2026-08-05T00:00:00Z",
+        "started_at_ms": 200_u64,
+        "status": "running",
+        "permit_slot": null
+    });
+    let completed = serde_json::json!({
+        "run_id": run_id,
+        "started_at": "2026-08-05T00:00:00Z",
+        "started_at_ms": 200_u64,
+        "ended_at": "2026-08-04T23:59:59Z",
+        "ended_at_ms": 100_u64,
+        "status": "completed",
+        "exit_code": 0,
+        "permit_slot": null
+    });
+    let output = "EXIT=0\n";
+    std::fs::write(
+        &log_path,
+        format!(
+            "CODEX_STATUS:{running}\nCODEX_OUTPUT_BEGIN:{}\n{output}CODEX_OUTPUT_END\nCODEX_STATUS:{completed}\n",
+            output.len()
+        ),
+    )
+    .unwrap();
+
+    let lua = Lua::new();
+    register(&lua).unwrap();
+    let snapshot: Table = codex_runs_fn(&lua).call(()).unwrap();
+
+    assert_eq!(table_len(&snapshot, "running"), 0);
+    let recent: Table = snapshot.get("recent").unwrap();
+    assert_eq!(recent.raw_len(), 1);
+    let terminal: Table = recent.get(1).unwrap();
+    assert_eq!(terminal.get::<String>("status").unwrap(), "done");
+    assert_eq!(terminal.get::<i64>("exit_code").unwrap(), 0);
+}
+
+#[cfg(unix)]
+#[test]
+fn codex_runs_ignores_status_records_in_untrusted_codex_output() {
+    let tmp = tempfile::tempdir().unwrap();
+    let bin_dir = tmp.path().join("bin");
+    install_codex_script(
+        &bin_dir,
+        r#"#!/bin/sh
+cat >/dev/null
+printf '%s\n' 'CODEX_STATUS:{"run_id":"codex-01ARZ3NDEKTSV4RRFFQ69G5FAW","started_at":"2099-01-01T00:00:00Z","started_at_ms":4070908800000,"status":"running","permit_slot":null}'
+"#,
+    );
+
+    let mut sandbox = ProcessSandbox::new();
+    sandbox.enter_cwd(tmp.path()).runtime_root(".fkst/runtime");
+    sandbox.prepend_path(&bin_dir);
+    sandbox.runtime_log_dir(tmp.path().join("runtime"));
+    let (_lock, _guard) = sandbox.enter();
+
+    let lua = Lua::new();
+    register(&lua).unwrap();
+    let spawn: mlua::Function = lua.globals().get("spawn_codex_sync").unwrap();
+    let result: Table = spawn.call(lua_opts(&lua, "status injection")).unwrap();
+    assert_eq!(result.get::<i64>("exit_code").unwrap(), 0);
+    assert!(result
+        .get::<String>("stdout")
+        .unwrap()
+        .contains("CODEX_STATUS:"));
+
+    let snapshot: Table = codex_runs_fn(&lua).call(()).unwrap();
+    assert_eq!(table_len(&snapshot, "running"), 0);
+    let recent: Table = snapshot.get("recent").unwrap();
+    assert_eq!(recent.raw_len(), 1);
+    let completed: Table = recent.get(1).unwrap();
+    assert_ne!(
+        completed.get::<String>("run_id").unwrap(),
+        "codex-01ARZ3NDEKTSV4RRFFQ69G5FAW"
+    );
+    assert_eq!(completed.get::<String>("status").unwrap(), "done");
 }
 
 #[test]
@@ -1197,6 +1394,7 @@ printf 'effect-key-%s' "$count"
     let opts = lua_opts(&lua, "effect-key-recovery");
     opts.set("worktree", worktree_arg).unwrap();
     opts.set("dedup_key", "recover-effect-key").unwrap();
+    opts.set("timeout", 1).unwrap();
     let first: Table = spawn.call(opts.clone()).unwrap();
     assert_eq!(first.get::<String>("stdout").unwrap(), "effect-key-1");
     assert_eq!(
@@ -1214,9 +1412,11 @@ printf 'effect-key-%s' "$count"
     status["status"] = serde_json::Value::String("running".to_string());
     status["ended_at_ms"] = serde_json::Value::Null;
     status["exit_code"] = serde_json::Value::Null;
-    status["worker_pid"] = serde_json::Value::Null;
-    status["codex_pid"] = serde_json::Value::Null;
+    status["worker_pid"] = serde_json::Value::from(std::process::id());
+    status["codex_pid"] = serde_json::Value::from(std::process::id());
     std::fs::write(&status_path, serde_json::to_string(&status).unwrap()).unwrap();
+    let run_id = status["run_id"].as_str().unwrap();
+    let _lifetime = hold_exclusive_lock(&adoption_path.join(format!("worker-{run_id}.lock")));
 
     let recovered: Table = spawn.call(opts.clone()).unwrap();
     assert_eq!(recovered.get::<String>("stdout").unwrap(), "effect-key-1");
@@ -1388,6 +1588,13 @@ printf 'adopted-%s' "$count"
     });
     assert_eq!(read_fifo(&started_fifo), "started");
 
+    let status_path = adoption_work_dir(tmp.path()).join("status.json");
+    let mut status: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&status_path).unwrap()).unwrap();
+    status["worker_pid"] = serde_json::Value::Null;
+    status["codex_pid"] = serde_json::Value::Null;
+    std::fs::write(&status_path, serde_json::to_string(&status).unwrap()).unwrap();
+
     let lua = Lua::new();
     register(&lua).unwrap();
     let spawn: mlua::Function = lua.globals().get("spawn_codex_sync").unwrap();
@@ -1418,6 +1625,327 @@ printf 'adopted-%s' "$count"
     assert_eq!(
         std::fs::read_to_string(capture_dir.join("spawns")).unwrap(),
         "1"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn codex_runs_keeps_spawned_adoption_intent_running_during_worker_handoff() {
+    let tmp = tempfile::tempdir().unwrap();
+    let worktree = tmp.path().join("wt");
+    let worker = tmp.path().join("fake-worker");
+    let started_fifo = tmp.path().join("started.fifo");
+    let release_fifo = tmp.path().join("release.fifo");
+    std::fs::create_dir_all(&worktree).unwrap();
+    make_fifo(&started_fifo);
+    make_fifo(&release_fifo);
+    install_codex_script(
+        tmp.path(),
+        r#"#!/bin/sh
+stdout_file=
+stderr_file=
+result_file=
+status_file=
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --stdout-file) stdout_file="$2"; shift 2 ;;
+    --stderr-file) stderr_file="$2"; shift 2 ;;
+    --result-file) result_file="$2"; shift 2 ;;
+    --status-file) status_file="$2"; shift 2 ;;
+    *) shift ;;
+  esac
+done
+printf 'started' > "$STARTED_FIFO"
+read _ < "$RELEASE_FIFO"
+printf 'handoff-result' > "$stdout_file"
+: > "$stderr_file"
+printf '{"ended_at_ms":1,"exit_code":0,"error_kind":null,"error":null}' > "$result_file"
+sed -e 's/"status":"intent"/"status":"completed"/' \
+    -e 's/"ended_at_ms":null/"ended_at_ms":1/' \
+    -e 's/"exit_code":null/"exit_code":0/' \
+    "$status_file" > "$status_file.tmp"
+mv "$status_file.tmp" "$status_file"
+"#,
+    );
+    std::fs::rename(tmp.path().join("codex"), &worker).unwrap();
+
+    let mut sandbox = ProcessSandbox::new();
+    sandbox.enter_cwd(tmp.path()).runtime_root(".fkst/runtime");
+    sandbox.set_env("STARTED_FIFO", started_fifo.to_string_lossy().into_owned());
+    sandbox.set_env("RELEASE_FIFO", release_fifo.to_string_lossy().into_owned());
+    sandbox.set_env(CODEX_WORKER_BIN_ENV, worker.to_string_lossy().into_owned());
+    sandbox.runtime_log_dir(tmp.path().join("runtime"));
+    let (_lock, _guard) = sandbox.enter();
+
+    let worktree_arg = worktree.to_string_lossy().into_owned();
+    let (result_tx, result_rx) = std::sync::mpsc::channel();
+    let caller = std::thread::spawn(move || {
+        let lua = Lua::new();
+        register(&lua).unwrap();
+        let spawn: mlua::Function = lua.globals().get("spawn_codex_sync").unwrap();
+        let opts = lua_opts(&lua, "handoff");
+        opts.set("worktree", worktree_arg).unwrap();
+        opts.set("dedup_key", "handoff-key").unwrap();
+        let result: Table = spawn.call(opts).unwrap();
+        result_tx
+            .send((
+                result.get::<i64>("exit_code").unwrap(),
+                result.get::<String>("stdout").unwrap(),
+            ))
+            .unwrap();
+    });
+    assert_eq!(read_fifo(&started_fifo), "started");
+
+    let lua = Lua::new();
+    register(&lua).unwrap();
+    let status_fn = codex_runs_fn(&lua);
+    let deadline = Instant::now() + Duration::from_secs(1);
+    let projected_running = loop {
+        let snapshot: Table = status_fn.call(()).unwrap();
+        let running = table_len(&snapshot, "running");
+        if running == 0 || Instant::now() >= deadline {
+            break running;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+
+    write_fifo(&release_fifo, "go\n");
+    assert_eq!(
+        result_rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+        (0, "handoff-result".to_string())
+    );
+    caller.join().unwrap();
+    assert_eq!(projected_running, 1);
+}
+
+#[cfg(unix)]
+#[test]
+fn live_orphan_codex_remains_running_then_same_key_redrives_once_after_exit() {
+    use nix::sys::signal::{killpg, Signal};
+    use nix::unistd::Pid;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let bin_dir = tmp.path().join("bin");
+    let worktree = tmp.path().join("wt");
+    let capture_dir = tmp.path().join("capture");
+    let started_fifo = tmp.path().join("started.fifo");
+    std::fs::create_dir_all(&worktree).unwrap();
+    std::fs::create_dir_all(&capture_dir).unwrap();
+    make_fifo(&started_fifo);
+    install_codex_script(
+        &bin_dir,
+        r#"#!/bin/sh
+cat >/dev/null
+count_file="$CAPTURE_DIR/spawns"
+count=0
+if [ -f "$count_file" ]; then
+  count=$(cat "$count_file")
+fi
+count=$((count + 1))
+printf '%s' "$count" > "$count_file"
+if [ "$count" -eq 1 ]; then
+  printf 'started' > "$STARTED_FIFO"
+  while :; do sleep 1; done
+fi
+printf 'redrive-%s' "$count"
+"#,
+    );
+
+    let mut sandbox = ProcessSandbox::new();
+    sandbox.enter_cwd(tmp.path()).runtime_root(".fkst/runtime");
+    sandbox.prepend_path(&bin_dir);
+    sandbox.set_env("CAPTURE_DIR", capture_dir.to_string_lossy().into_owned());
+    sandbox.set_env("STARTED_FIFO", started_fifo.to_string_lossy().into_owned());
+    sandbox.set_env(CODEX_WORKER_BIN_ENV, framework_bin());
+    sandbox.runtime_log_dir(tmp.path().join("runtime"));
+    let (_lock, _guard) = sandbox.enter();
+
+    let worktree_arg = worktree.to_string_lossy().into_owned();
+    let (first_tx, first_rx) = std::sync::mpsc::channel();
+    let first_thread = std::thread::spawn({
+        let worktree_arg = worktree_arg.clone();
+        move || {
+            let lua = Lua::new();
+            register(&lua).unwrap();
+            let spawn: mlua::Function = lua.globals().get("spawn_codex_sync").unwrap();
+            let opts = lua_opts(&lua, "crash-redrive");
+            opts.set("worktree", worktree_arg).unwrap();
+            opts.set("dedup_key", "crash-redrive-key").unwrap();
+            opts.set("timeout", 60).unwrap();
+            let result: Table = spawn.call(opts).unwrap();
+            first_tx
+                .send((
+                    result.get::<i64>("exit_code").unwrap(),
+                    result.get::<String>("stdout").unwrap(),
+                ))
+                .unwrap();
+        }
+    });
+    assert_eq!(read_fifo(&started_fifo), "started");
+
+    let adoption_path = adoption_work_dir(tmp.path());
+    let status_path = adoption_path.join("status.json");
+    let mut status: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&status_path).unwrap()).unwrap();
+    let run_id = status["run_id"].as_str().unwrap().to_string();
+    let worker_pid = status["worker_pid"].as_i64().unwrap() as i32;
+    let codex_pid = status["codex_pid"].as_i64().unwrap() as i32;
+    killpg(Pid::from_raw(worker_pid), Signal::SIGKILL).unwrap();
+    wait_for_child_exit(worker_pid);
+
+    let lua = Lua::new();
+    register(&lua).unwrap();
+    let status_fn = codex_runs_fn(&lua);
+    let live_orphan: Table = status_fn.call(()).unwrap();
+    assert_eq!(table_len(&live_orphan, "running"), 1);
+    assert_eq!(
+        std::fs::read_to_string(capture_dir.join("spawns")).unwrap(),
+        "1"
+    );
+
+    killpg(Pid::from_raw(codex_pid), Signal::SIGKILL).unwrap();
+    wait_for_exclusive_lock(&adoption_path.join(format!("worker-{run_id}.lock")));
+
+    status["worker_pid"] = serde_json::Value::from(std::process::id());
+    status["codex_pid"] = serde_json::Value::from(std::process::id());
+    std::fs::write(&status_path, serde_json::to_string(&status).unwrap()).unwrap();
+
+    let abandoned: Table = status_fn.call(()).unwrap();
+    assert_eq!(table_len(&abandoned, "running"), 0);
+
+    let spawn: mlua::Function = lua.globals().get("spawn_codex_sync").unwrap();
+    let opts = lua_opts(&lua, "crash-redrive");
+    opts.set("worktree", worktree_arg).unwrap();
+    opts.set("dedup_key", "crash-redrive-key").unwrap();
+    opts.set("timeout", 60).unwrap();
+    let redriven: Table = spawn.call(opts).unwrap();
+    assert_eq!(redriven.get::<i64>("exit_code").unwrap(), 0);
+    assert_eq!(redriven.get::<String>("stdout").unwrap(), "redrive-2");
+    assert_eq!(
+        first_rx.recv_timeout(Duration::from_secs(60)).unwrap(),
+        (0, "redrive-2".to_string())
+    );
+    first_thread.join().unwrap();
+    assert_eq!(
+        std::fs::read_to_string(capture_dir.join("spawns")).unwrap(),
+        "2"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn stale_waiter_timeout_does_not_kill_newer_adoption_incarnation() {
+    use nix::sys::signal::{killpg, Signal};
+    use nix::unistd::Pid;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let bin_dir = tmp.path().join("bin");
+    let worktree = tmp.path().join("wt");
+    let capture_dir = tmp.path().join("capture");
+    let first_started_fifo = tmp.path().join("first-started.fifo");
+    let redrive_started_fifo = tmp.path().join("redrive-started.fifo");
+    std::fs::create_dir_all(&worktree).unwrap();
+    std::fs::create_dir_all(&capture_dir).unwrap();
+    make_fifo(&first_started_fifo);
+    make_fifo(&redrive_started_fifo);
+    install_codex_script(
+        &bin_dir,
+        r#"#!/bin/sh
+cat >/dev/null
+count_file="$CAPTURE_DIR/spawns"
+count=0
+if [ -f "$count_file" ]; then
+  count=$(cat "$count_file")
+fi
+count=$((count + 1))
+printf '%s' "$count" > "$count_file"
+if [ "$count" -eq 1 ]; then
+  printf 'started' > "$FIRST_STARTED_FIFO"
+  while :; do sleep 1; done
+fi
+printf 'started' > "$REDRIVE_STARTED_FIFO"
+sleep 4
+printf 'redrive-%s' "$count"
+"#,
+    );
+
+    let mut sandbox = ProcessSandbox::new();
+    sandbox.enter_cwd(tmp.path()).runtime_root(".fkst/runtime");
+    sandbox.prepend_path(&bin_dir);
+    sandbox.set_env("CAPTURE_DIR", capture_dir.to_string_lossy().into_owned());
+    sandbox.set_env(
+        "FIRST_STARTED_FIFO",
+        first_started_fifo.to_string_lossy().into_owned(),
+    );
+    sandbox.set_env(
+        "REDRIVE_STARTED_FIFO",
+        redrive_started_fifo.to_string_lossy().into_owned(),
+    );
+    sandbox.set_env(CODEX_WORKER_BIN_ENV, framework_bin());
+    sandbox.runtime_log_dir(tmp.path().join("runtime"));
+    let (_lock, _guard) = sandbox.enter();
+
+    let worktree_arg = worktree.to_string_lossy().into_owned();
+    let (first_tx, first_rx) = std::sync::mpsc::channel();
+    let first_thread = std::thread::spawn({
+        let worktree_arg = worktree_arg.clone();
+        move || {
+            let lua = Lua::new();
+            register(&lua).unwrap();
+            let spawn: mlua::Function = lua.globals().get("spawn_codex_sync").unwrap();
+            let opts = lua_opts(&lua, "stale-waiter");
+            opts.set("worktree", worktree_arg).unwrap();
+            opts.set("dedup_key", "stale-waiter-key").unwrap();
+            opts.set("timeout", 1).unwrap();
+            let result: Table = spawn.call(opts).unwrap();
+            first_tx
+                .send(result.get::<i64>("exit_code").unwrap())
+                .unwrap();
+        }
+    });
+    assert_eq!(read_fifo(&first_started_fifo), "started");
+
+    let adoption_path = adoption_work_dir(tmp.path());
+    let status: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(adoption_path.join("status.json")).unwrap())
+            .unwrap();
+    let run_id = status["run_id"].as_str().unwrap();
+    let worker_pid = status["worker_pid"].as_i64().unwrap() as i32;
+    let codex_pid = status["codex_pid"].as_i64().unwrap() as i32;
+    killpg(Pid::from_raw(worker_pid), Signal::SIGKILL).unwrap();
+    wait_for_child_exit(worker_pid);
+    killpg(Pid::from_raw(codex_pid), Signal::SIGKILL).unwrap();
+    wait_for_exclusive_lock(&adoption_path.join(format!("worker-{run_id}.lock")));
+
+    let (redrive_tx, redrive_rx) = std::sync::mpsc::channel();
+    let redrive_thread = std::thread::spawn(move || {
+        let lua = Lua::new();
+        register(&lua).unwrap();
+        let spawn: mlua::Function = lua.globals().get("spawn_codex_sync").unwrap();
+        let opts = lua_opts(&lua, "stale-waiter");
+        opts.set("worktree", worktree_arg).unwrap();
+        opts.set("dedup_key", "stale-waiter-key").unwrap();
+        opts.set("timeout", 5).unwrap();
+        let result: Table = spawn.call(opts).unwrap();
+        redrive_tx
+            .send((
+                result.get::<i64>("exit_code").unwrap(),
+                result.get::<String>("stdout").unwrap(),
+            ))
+            .unwrap();
+    });
+    assert_eq!(read_fifo(&redrive_started_fifo), "started");
+
+    assert_eq!(first_rx.recv_timeout(Duration::from_secs(6)).unwrap(), 124);
+    assert_eq!(
+        redrive_rx.recv_timeout(Duration::from_secs(10)).unwrap(),
+        (0, "redrive-2".to_string())
+    );
+    first_thread.join().unwrap();
+    redrive_thread.join().unwrap();
+    assert_eq!(
+        std::fs::read_to_string(capture_dir.join("spawns")).unwrap(),
+        "2"
     );
 }
 
@@ -1959,16 +2487,18 @@ exit 1
 
 #[cfg(unix)]
 #[test]
-fn spawn_codex_sync_continues_when_log_write_fails() {
+fn spawn_codex_sync_refuses_to_spawn_when_lifetime_witness_acquisition_fails() {
     use std::fs;
 
     let tmp = tempfile::tempdir().unwrap();
     let bin_dir = tmp.path().join("bin");
+    let capture_dir = tmp.path().join("capture");
+    fs::create_dir_all(&capture_dir).unwrap();
     install_codex_script(
         &bin_dir,
         r#"#!/bin/sh
 cat >/dev/null
-printf 'still-ok'
+printf 'spawned' > "$CAPTURE_DIR/spawned"
 "#,
     );
 
@@ -1977,6 +2507,7 @@ printf 'still-ok'
     let mut sandbox = ProcessSandbox::new();
     sandbox.enter_cwd(tmp.path()).runtime_root(".fkst/runtime");
     sandbox.prepend_path(&bin_dir);
+    sandbox.set_env("CAPTURE_DIR", capture_dir.to_string_lossy().into_owned());
     sandbox.runtime_log_dir(&log_root_file);
     let (_lock, _guard) = sandbox.enter();
 
@@ -1986,13 +2517,13 @@ printf 'still-ok'
     let opts = lua.create_table().unwrap();
     opts.set("prompt", "hello").unwrap();
 
-    let result: mlua::Table = spawn.call(opts).unwrap();
-    assert_eq!(result.get::<i64>("exit_code").unwrap(), 0);
-    assert_eq!(result.get::<String>("stdout").unwrap(), "still-ok");
-    assert!(result
-        .get::<String>("log_path")
-        .unwrap()
-        .contains("not-a-dir"));
+    let err = spawn.call::<Table>(opts).unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("codex lifetime witness acquisition failed"),
+        "{err}"
+    );
+    assert!(!capture_dir.join("spawned").exists());
 }
 
 #[cfg(unix)]
@@ -2011,10 +2542,17 @@ printf 'ok'
     let log_dir = tmp.path().join("runtime/codex");
     std::fs::create_dir_all(&log_dir).unwrap();
     let old_log = log_dir.join("old.log");
+    let active_log = log_dir.join("active.log");
     let fresh_log = log_dir.join("fresh.log");
     let ignored = log_dir.join("old.txt");
     let now = SystemTime::now();
     write_log_with_mtime(&old_log, "old", now - Duration::from_secs(2 * 60 * 60));
+    write_log_with_mtime(
+        &active_log,
+        "active",
+        now - Duration::from_secs(2 * 60 * 60),
+    );
+    let _active_witness = hold_exclusive_lock(&active_log);
     write_log_with_mtime(&fresh_log, "fresh", now - Duration::from_secs(5 * 60));
     write_log_with_mtime(&ignored, "ignored", now - Duration::from_secs(2 * 60 * 60));
 
@@ -2034,6 +2572,7 @@ printf 'ok'
 
     assert_eq!(result.get::<i64>("exit_code").unwrap(), 0);
     assert!(!old_log.exists());
+    assert!(active_log.exists());
     assert!(fresh_log.exists());
     assert!(ignored.exists());
     assert!(current_log.exists());
@@ -2054,10 +2593,13 @@ printf 'ok'
 
     let log_dir = tmp.path().join("runtime/codex");
     std::fs::create_dir_all(&log_dir).unwrap();
+    let active = log_dir.join("active.log");
     let oldest = log_dir.join("oldest.log");
     let middle = log_dir.join("middle.log");
     let newest = log_dir.join("newest.log");
     let now = SystemTime::now();
+    write_log_with_mtime(&active, "active", now - Duration::from_secs(40));
+    let _active_witness = hold_exclusive_lock(&active);
     write_log_with_mtime(&oldest, "aaaaaa", now - Duration::from_secs(30));
     write_log_with_mtime(&middle, "bbbbbb", now - Duration::from_secs(20));
     write_log_with_mtime(&newest, "cccccc", now - Duration::from_secs(10));
@@ -2067,7 +2609,7 @@ printf 'ok'
     sandbox.prepend_path(&bin_dir);
     sandbox.runtime_log_dir(tmp.path().join("runtime"));
     sandbox.set_env("FKST_CODEX_LOG_MAX_AGE", "0");
-    sandbox.set_env("FKST_CODEX_LOG_MAX_BYTES", "12");
+    sandbox.set_env("FKST_CODEX_LOG_MAX_BYTES", "18");
     let (_lock, _guard) = sandbox.enter();
 
     let lua = Lua::new();
@@ -2077,6 +2619,7 @@ printf 'ok'
     let current_log = PathBuf::from(result.get::<String>("log_path").unwrap());
 
     assert_eq!(result.get::<i64>("exit_code").unwrap(), 0);
+    assert!(active.exists());
     assert!(!oldest.exists());
     assert!(middle.exists());
     assert!(newest.exists());

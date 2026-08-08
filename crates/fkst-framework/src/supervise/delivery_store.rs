@@ -25,7 +25,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::time::Duration;
 
-const SCHEMA_VERSION: &str = "11";
+const SCHEMA_VERSION: &str = "12";
 const TERMINAL_DEAD_RETENTION_MS: u64 = 24 * 60 * 60 * 1_000;
 const TERMINAL_DEAD_COMPACTION_LIMIT: usize = 1_024;
 const TERMINAL_SUPPRESSION_SLOTS: u64 = 16_777_216;
@@ -127,15 +127,28 @@ impl DeliveryStore {
         let db = Database::create(path)?;
         let write = db.begin_write()?;
         {
-            write.open_table(DELIVERY_BY_ID)?;
-            write.open_table(READY_BY_DEPT_DUE)?;
-            write.open_table(LEASED_BY_DEPT_UNTIL)?;
-            write.open_table(DEAD_BY_DEPT_DUE)?;
             let meta = write.open_table(META)?;
             let current_version = meta
                 .get("schema_version")?
                 .map(|value| value.value().to_string());
             drop(meta);
+            let current_schema_version = current_version
+                .as_deref()
+                .and_then(|version| version.parse::<u32>().ok());
+            let supported_schema_version = SCHEMA_VERSION
+                .parse::<u32>()
+                .expect("durable delivery schema version must be numeric");
+            if current_schema_version.is_some_and(|version| version > supported_schema_version) {
+                bail!(
+                    "durable delivery schema newer than supported: found {}, supported {}",
+                    current_version.as_deref().unwrap_or("unknown"),
+                    SCHEMA_VERSION
+                );
+            }
+            write.open_table(DELIVERY_BY_ID)?;
+            write.open_table(READY_BY_DEPT_DUE)?;
+            write.open_table(LEASED_BY_DEPT_UNTIL)?;
+            write.open_table(DEAD_BY_DEPT_DUE)?;
             if current_version.as_deref() == Some("1") {
                 write.delete_table(DEAD_BY_ID)?;
             }
@@ -147,16 +160,12 @@ impl DeliveryStore {
             if current_version.as_deref() != Some(SCHEMA_VERSION) {
                 delete_old_global_indexes(&write)?;
                 rebuild_due_indexes(&write, DELIVERY_BY_ID)?;
-                if current_version
-                    .as_deref()
-                    .and_then(|version| version.parse::<u32>().ok())
-                    .map_or(true, |version| version < 3)
-                {
+                if current_schema_version.map_or(true, |version| version < 3) {
                     mark_existing_dead_records_permanent(&write)?;
                 }
                 rebuild_dead_due_index(&write)?;
                 rebuild_dead_time_index(&write)?;
-                rebuild_terminal_dead_tables(&write)?;
+                rebuild_terminal_dead_tables(&write, current_schema_version)?;
                 import_legacy_terminal_suppressed_ids(&write)?;
                 drop_legacy_terminal_suppressed_table(&write)?;
                 drop_legacy_terminal_suppression_filter(&write)?;
@@ -183,9 +192,47 @@ impl DeliveryStore {
         let _op = StoreOpWatch::new("enqueue", &record.dept);
         let write = self.begin_write()?;
         {
-            let delivery = write.open_table(DELIVERY_BY_ID)?;
-            if let Some(current) = read_delivery_table(&delivery, record.delivery_id.as_str())? {
+            let mut delivery = write.open_table(DELIVERY_BY_ID)?;
+            if let Some(mut current) = read_delivery_table(&delivery, record.delivery_id.as_str())?
+            {
                 if current.collapse_by_dedup_id || record.collapse_by_dedup_id {
+                    let mut changed = false;
+                    if current.collapse_by_dedup_id && record.collapse_by_dedup_id {
+                        if let Some(lease_until_ms) = current.lease_until_ms {
+                            if lease_until_ms > record.not_before_ms {
+                                if !current.pending_dirty {
+                                    current.pending_dirty = true;
+                                    changed = true;
+                                }
+                            } else {
+                                let mut lease_index = write.open_table(LEASED_BY_DEPT_UNTIL)?;
+                                lease_index.remove(
+                                    make_index_key(
+                                        &current.dept,
+                                        lease_until_ms,
+                                        record.delivery_id.as_str(),
+                                    )
+                                    .as_str(),
+                                )?;
+                                current.lease_until_ms = None;
+                                let mut ready = write.open_table(READY_BY_DEPT_DUE)?;
+                                ready.insert(
+                                    make_index_key(
+                                        &current.dept,
+                                        current.not_before_ms,
+                                        record.delivery_id.as_str(),
+                                    )
+                                    .as_str(),
+                                    &(),
+                                )?;
+                                changed = true;
+                            }
+                        }
+                    }
+                    if changed {
+                        let bytes = serde_json::to_vec(&current)?;
+                        delivery.insert(record.delivery_id.as_str(), bytes.as_slice())?;
+                    }
                     drop(delivery);
                     commit_write(write)?;
                     return Ok(());
@@ -382,6 +429,7 @@ impl DeliveryStore {
             let mut dead_table = write.open_table(DEAD_BY_ID)?;
             let mut dead_index = write.open_table(DEAD_BY_DEPT_DUE)?;
             let mut dead_by_time = write.open_table(DEAD_BY_TIME)?;
+            let mut terminal_index = write.open_table(TERMINAL_DEAD_BY_TIME)?;
             for delivery_id in candidates {
                 let Some(mut record) = read_delivery_table(&delivery, &delivery_id)? else {
                     continue;
@@ -446,6 +494,7 @@ impl DeliveryStore {
                     redrive_count: record.redrive_count,
                     replayable: true,
                     permanent: false,
+                    allows_keyed_reuse: false,
                     error_excerpt: record.last_error_excerpt.clone(),
                     record: Some(record.clone()),
                 };
@@ -460,6 +509,14 @@ impl DeliveryStore {
                         .as_str(),
                     )?;
                     dead_index.remove(
+                        make_dead_due_index_key(
+                            &previous.dept,
+                            previous.dead_at_ms,
+                            previous.delivery_id.as_str(),
+                        )
+                        .as_str(),
+                    )?;
+                    terminal_index.remove(
                         make_dead_due_index_key(
                             &previous.dept,
                             previous.dead_at_ms,
@@ -488,6 +545,7 @@ impl DeliveryStore {
             drop(dead_table);
             drop(dead_index);
             drop(dead_by_time);
+            drop(terminal_index);
             compact_terminal_dead_records(&write, now_ms)?;
         }
         if sweep.is_empty() {
@@ -764,7 +822,7 @@ impl DeliveryStore {
         let write = self.begin_write()?;
         let applied = {
             let mut delivery = write.open_table(DELIVERY_BY_ID)?;
-            if let Some(current) = read_delivery_table(&delivery, delivery_id)? {
+            if let Some(mut current) = read_delivery_table(&delivery, delivery_id)? {
                 op.set_dept(&current.dept);
                 if current.lease_generation == lease_generation {
                     if let Some(lease_until) = current.lease_until_ms {
@@ -776,7 +834,20 @@ impl DeliveryStore {
                         return Ok(false);
                     }
                     remove_delivery_lineage_index(&write, &current)?;
-                    delivery.remove(delivery_id)?;
+                    let follow_up_due = current.not_before_ms;
+                    if prepare_dirty_follow_up(&mut current, follow_up_due) {
+                        let bytes = serde_json::to_vec(&current)?;
+                        delivery.insert(delivery_id, bytes.as_slice())?;
+                        insert_delivery_lineage_index(&write, &current)?;
+                        let mut ready = write.open_table(READY_BY_DEPT_DUE)?;
+                        ready.insert(
+                            make_index_key(&current.dept, current.not_before_ms, delivery_id)
+                                .as_str(),
+                            &(),
+                        )?;
+                    } else {
+                        delivery.remove(delivery_id)?;
+                    }
                     true
                 } else {
                     false
@@ -872,7 +943,7 @@ impl DeliveryStore {
                     current.lease_until_ms = None;
 
                     if attempt >= policy.max_attempts {
-                        let dead = DeadRecord {
+                        let mut dead = DeadRecord {
                             delivery_id: current.delivery_id.clone(),
                             queue: current.queue.clone(),
                             dept: current.dept.clone(),
@@ -884,13 +955,14 @@ impl DeliveryStore {
                             redrive_count: current.redrive_count,
                             replayable: failure.replayable,
                             permanent: !failure.replayable,
+                            allows_keyed_reuse: false,
                             error_excerpt: current.last_error_excerpt.clone(),
                             record: failure.replayable.then_some(current.clone()),
                         };
-                        let bytes = serde_json::to_vec(&dead)?;
                         let mut dead_table = write.open_table(DEAD_BY_ID)?;
                         let mut dead_by_time = write.open_table(DEAD_BY_TIME)?;
                         let mut dead_index = write.open_table(DEAD_BY_DEPT_DUE)?;
+                        let mut terminal_index = write.open_table(TERMINAL_DEAD_BY_TIME)?;
                         if let Some(previous) = read_dead_table(&dead_table, delivery_id)? {
                             remove_dead_lineage_index(&write, &previous)?;
                             dead_by_time.remove(
@@ -904,13 +976,26 @@ impl DeliveryStore {
                                 )
                                 .as_str(),
                             )?;
+                            terminal_index.remove(
+                                make_dead_due_index_key(
+                                    &previous.dept,
+                                    previous.dead_at_ms,
+                                    delivery_id,
+                                )
+                                .as_str(),
+                            )?;
                         }
-                        dead_table.insert(delivery_id, bytes.as_slice())?;
-                        insert_dead_lineage_index(&write, &dead)?;
                         dead_by_time.insert(
                             make_dead_time_index_key(dead.dead_at_ms, delivery_id).as_str(),
                             &(),
                         )?;
+                        remove_delivery_lineage_index(&write, &current)?;
+                        let promoted_dirty_follow_up =
+                            !failure.replayable && prepare_dirty_follow_up(&mut current, now_ms);
+                        dead.allows_keyed_reuse = promoted_dirty_follow_up;
+                        let bytes = serde_json::to_vec(&dead)?;
+                        dead_table.insert(delivery_id, bytes.as_slice())?;
+                        insert_dead_lineage_index(&write, &dead)?;
                         if failure.replayable {
                             dead_index.insert(
                                 make_dead_due_index_key(&dead.dept, dead.dead_at_ms, delivery_id)
@@ -918,16 +1003,32 @@ impl DeliveryStore {
                                 &(),
                             )?;
                         } else {
-                            let mut terminal_index = write.open_table(TERMINAL_DEAD_BY_TIME)?;
                             terminal_index.insert(
                                 make_dead_due_index_key(&dead.dept, dead.dead_at_ms, delivery_id)
                                     .as_str(),
                                 &(),
                             )?;
-                            suppress_terminal_delivery(&write, delivery_id)?;
+                            if promoted_dirty_follow_up {
+                                let bytes = serde_json::to_vec(&current)?;
+                                delivery.insert(delivery_id, bytes.as_slice())?;
+                                insert_delivery_lineage_index(&write, &current)?;
+                                let mut ready = write.open_table(READY_BY_DEPT_DUE)?;
+                                ready.insert(
+                                    make_index_key(
+                                        &current.dept,
+                                        current.not_before_ms,
+                                        delivery_id,
+                                    )
+                                    .as_str(),
+                                    &(),
+                                )?;
+                            } else {
+                                suppress_terminal_delivery(&write, delivery_id)?;
+                            }
                         }
-                        remove_delivery_lineage_index(&write, &current)?;
-                        delivery.remove(delivery_id)?;
+                        if !promoted_dirty_follow_up {
+                            delivery.remove(delivery_id)?;
+                        }
                         if failure.replayable {
                             RetryOutcome::DeadPendingRedrive
                         } else {
@@ -1064,8 +1165,26 @@ impl DeliveryStore {
                     mutated = true;
                     continue;
                 };
+                if is_subscriber_absent_dead_record(&dead) {
+                    let Some(current_dept_by_queue) = current_dept_by_queue else {
+                        continue;
+                    };
+                    let Some(current_dept) = current_dept_by_queue.get(&record.queue) else {
+                        continue;
+                    };
+                    record.dept.clone_from(current_dept);
+                }
                 if dead.redrive_count >= policy.max_redrives {
                     dead_index.remove(key.key.as_str())?;
+                    let live = read_delivery_table(&delivery, delivery_id.as_str())?;
+                    let live_preserves_keyed_delivery = record.collapse_by_dedup_id
+                        && live
+                            .as_ref()
+                            .is_some_and(|current| current.collapse_by_dedup_id);
+                    let promoted_dirty_follow_up =
+                        live.is_none() && prepare_dirty_follow_up(&mut record, now_ms);
+                    dead.allows_keyed_reuse |=
+                        promoted_dirty_follow_up || live_preserves_keyed_delivery;
                     dead.permanent = true;
                     dead.replayable = false;
                     dead.record = None;
@@ -1077,21 +1196,26 @@ impl DeliveryStore {
                             .as_str(),
                         &(),
                     )?;
-                    suppress_terminal_delivery(&write, delivery_id.as_str())?;
+                    if promoted_dirty_follow_up {
+                        let bytes = serde_json::to_vec(&record)?;
+                        delivery.insert(delivery_id.as_str(), bytes.as_slice())?;
+                        insert_delivery_lineage_index(&write, &record)?;
+                        ready.insert(
+                            make_index_key(&record.dept, record.not_before_ms, &delivery_id)
+                                .as_str(),
+                            &(),
+                        )?;
+                    } else if !live_preserves_keyed_delivery {
+                        suppress_terminal_delivery(&write, delivery_id.as_str())?;
+                    }
                     result.permanent.push(dead);
                     mutated = true;
                     continue;
                 }
-                if is_subscriber_absent_dead_record(&dead) {
-                    let Some(current_dept_by_queue) = current_dept_by_queue else {
-                        continue;
-                    };
-                    let Some(current_dept) = current_dept_by_queue.get(&record.queue) else {
-                        continue;
-                    };
-                    record.dept.clone_from(current_dept);
-                }
-                if delivery.get(delivery_id.as_str())?.is_some() {
+                if let Some(live) = read_delivery_table(&delivery, delivery_id.as_str())? {
+                    let live_preserves_keyed_delivery =
+                        record.collapse_by_dedup_id && live.collapse_by_dedup_id;
+                    dead.allows_keyed_reuse |= live_preserves_keyed_delivery;
                     dead_index.remove(key.key.as_str())?;
                     dead.permanent = true;
                     dead.replayable = false;
@@ -1106,7 +1230,9 @@ impl DeliveryStore {
                             .as_str(),
                         &(),
                     )?;
-                    suppress_terminal_delivery(&write, delivery_id.as_str())?;
+                    if !live_preserves_keyed_delivery {
+                        suppress_terminal_delivery(&write, delivery_id.as_str())?;
+                    }
                     result.permanent.push(dead);
                     mutated = true;
                     continue;
@@ -1463,6 +1589,20 @@ fn same_delivery_content(left: &DeliveryRecord, right: &DeliveryRecord) -> bool 
         && left.cron_payload == right.cron_payload
 }
 
+fn prepare_dirty_follow_up(record: &mut DeliveryRecord, not_before_ms: u64) -> bool {
+    if !record.collapse_by_dedup_id || !record.pending_dirty {
+        return false;
+    }
+    record.pending_dirty = false;
+    record.attempt = 0;
+    record.redrive_count = 0;
+    record.subscriber_absent_since_ms = None;
+    record.lease_until_ms = None;
+    record.not_before_ms = not_before_ms;
+    record.last_error_excerpt = None;
+    true
+}
+
 fn rebuild_lineage_index(write: &redb::WriteTransaction) -> Result<()> {
     write.delete_table(LINEAGE_BY_SOURCE)?;
     let deliveries = {
@@ -1748,7 +1888,10 @@ fn rebuild_dead_time_index(write: &redb::WriteTransaction) -> Result<()> {
     Ok(())
 }
 
-fn rebuild_terminal_dead_tables(write: &redb::WriteTransaction) -> Result<()> {
+fn rebuild_terminal_dead_tables(
+    write: &redb::WriteTransaction,
+    previous_schema_version: Option<u32>,
+) -> Result<()> {
     write.delete_table(TERMINAL_DEAD_BY_TIME)?;
     let dead_rows = {
         let dead = write.open_table(DEAD_BY_ID)?;
@@ -1759,9 +1902,10 @@ fn rebuild_terminal_dead_tables(write: &redb::WriteTransaction) -> Result<()> {
         }
         rows
     };
+    let delivery = write.open_table(DELIVERY_BY_ID)?;
     let mut terminal_index = write.open_table(TERMINAL_DEAD_BY_TIME)?;
     for (delivery_id, bytes) in dead_rows {
-        let Some(record) = decode_dead_record(&delivery_id, &bytes) else {
+        let Some(mut record) = decode_dead_record(&delivery_id, &bytes) else {
             continue;
         };
         if is_terminal_dead_record(&record) {
@@ -1769,7 +1913,19 @@ fn rebuild_terminal_dead_tables(write: &redb::WriteTransaction) -> Result<()> {
                 make_dead_due_index_key(&record.dept, record.dead_at_ms, &delivery_id).as_str(),
                 &(),
             )?;
-            suppress_terminal_delivery(write, delivery_id.as_str())?;
+            let live_keyed_follow_up = read_delivery_table(&delivery, delivery_id.as_str())?
+                .is_some_and(|current| current.collapse_by_dedup_id);
+            let schema_v11_keyed_reuse = previous_schema_version == Some(11)
+                && !terminal_delivery_is_suppressed(write, delivery_id.as_str())?;
+            if (live_keyed_follow_up || schema_v11_keyed_reuse) && !record.allows_keyed_reuse {
+                record.allows_keyed_reuse = true;
+                let mut dead = write.open_table(DEAD_BY_ID)?;
+                let bytes = serde_json::to_vec(&record)?;
+                dead.insert(delivery_id.as_str(), bytes.as_slice())?;
+            }
+            if !record.allows_keyed_reuse {
+                suppress_terminal_delivery(write, delivery_id.as_str())?;
+            }
         }
     }
     Ok(())
@@ -1940,7 +2096,9 @@ fn compact_terminal_dead_records(write: &redb::WriteTransaction, now_ms: u64) ->
                     make_dead_due_index_key(&record.dept, record.dead_at_ms, &delivery_id).as_str(),
                     &(),
                 )?;
-                suppress_terminal_delivery(write, delivery_id.as_str())?;
+                if !record.allows_keyed_reuse {
+                    suppress_terminal_delivery(write, delivery_id.as_str())?;
+                }
             }
             compacted += 1;
             continue;
@@ -2118,6 +2276,7 @@ mod tests {
             attempt: 0,
             redrive_count: 0,
             collapse_by_dedup_id: false,
+            pending_dirty: false,
             subscriber_absent_since_ms: None,
             lease_generation: 0,
             lease_until_ms: None,
@@ -2163,6 +2322,7 @@ mod tests {
             redrive_count: 0,
             replayable: true,
             permanent: false,
+            allows_keyed_reuse: false,
             error_excerpt: Some("timeout".to_string()),
             record: Some(delivery),
         };
@@ -2203,6 +2363,7 @@ mod tests {
             redrive_count: 0,
             replayable: false,
             permanent: true,
+            allows_keyed_reuse: false,
             error_excerpt: Some("final".to_string()),
             record: None,
         };
@@ -2616,6 +2777,379 @@ mod tests {
         assert_eq!(current.source, original.source);
         assert_eq!(current.not_before_ms, 100);
         assert_eq!(store.ready_index_len().unwrap(), 1);
+    }
+
+    #[test]
+    fn leased_keyed_duplicates_coalesce_into_one_follow_up_after_ack() {
+        let temp = TempDir::new().unwrap();
+        let store = store(&temp);
+        let source = lineage_source("owner/repo#issue/dirty-ack");
+        let mut original = record("one", 100);
+        original.collapse_by_dedup_id = true;
+        original.source = Some(source.clone());
+        store.enqueue(&original).unwrap();
+        let leased = store
+            .lease(100, 1, Duration::from_millis(50))
+            .unwrap()
+            .remove(0);
+
+        for observation in 2..=5 {
+            let mut duplicate = original.clone();
+            duplicate.payload = serde_json::json!({"n": observation});
+            store.enqueue(&duplicate).unwrap();
+        }
+
+        let dirty = store.get("one").unwrap().unwrap();
+        assert!(dirty.pending_dirty);
+        assert_eq!(store.ready_index_len().unwrap(), 0);
+        assert_eq!(store.leased_index_len().unwrap(), 1);
+        assert!(store
+            .ack(&leased.delivery_id, leased.lease_generation)
+            .unwrap());
+
+        let follow_up = store.get("one").unwrap().unwrap();
+        assert!(!follow_up.pending_dirty);
+        assert_eq!(follow_up.lease_until_ms, None);
+        assert_eq!(store.ready_index_len().unwrap(), 1);
+        assert_eq!(store.leased_index_len().unwrap(), 0);
+        assert_eq!(
+            store
+                .lookup_lineage("input", "worker", &source)
+                .unwrap()
+                .live_delivery
+                .unwrap()
+                .delivery_id,
+            "one"
+        );
+        let leased_follow_up = store.lease(100, 10, Duration::from_millis(50)).unwrap();
+        assert_eq!(leased_follow_up.len(), 1);
+        assert!(store
+            .ack(
+                &leased_follow_up[0].delivery_id,
+                leased_follow_up[0].lease_generation,
+            )
+            .unwrap());
+        assert!(store.get("one").unwrap().is_none());
+        assert!(store
+            .lookup_lineage("input", "worker", &source)
+            .unwrap()
+            .live_delivery
+            .is_none());
+    }
+
+    #[test]
+    fn ready_keyed_duplicates_remain_collapsed_without_follow_up() {
+        let temp = TempDir::new().unwrap();
+        let store = store(&temp);
+        let mut original = record("one", 100);
+        original.collapse_by_dedup_id = true;
+        store.enqueue(&original).unwrap();
+
+        for _ in 0..4 {
+            store.enqueue(&original).unwrap();
+        }
+
+        let current = store.get("one").unwrap().unwrap();
+        assert!(!current.pending_dirty);
+        let leased = store
+            .lease(100, 1, Duration::from_millis(50))
+            .unwrap()
+            .remove(0);
+        assert!(store
+            .ack(&leased.delivery_id, leased.lease_generation)
+            .unwrap());
+        assert!(store.get("one").unwrap().is_none());
+        assert_eq!(store.ready_index_len().unwrap(), 0);
+    }
+
+    #[test]
+    fn expired_keyed_duplicate_remains_collapsed_without_follow_up() {
+        let temp = TempDir::new().unwrap();
+        let store = store(&temp);
+        let mut original = record("one", 100);
+        original.collapse_by_dedup_id = true;
+        store.enqueue(&original).unwrap();
+        let first = store
+            .lease(100, 1, Duration::from_millis(50))
+            .unwrap()
+            .remove(0);
+        let mut duplicate = original;
+        duplicate.observed_at_ms = first.lease_until_ms.unwrap();
+        duplicate.not_before_ms = first.lease_until_ms.unwrap();
+
+        store.enqueue(&duplicate).unwrap();
+
+        assert!(!store.get("one").unwrap().unwrap().pending_dirty);
+        let redelivered = store
+            .lease(first.lease_until_ms.unwrap(), 1, Duration::from_millis(50))
+            .unwrap()
+            .remove(0);
+        assert!(store
+            .ack(&redelivered.delivery_id, redelivered.lease_generation)
+            .unwrap());
+        assert!(store.get("one").unwrap().is_none());
+        assert_eq!(store.ready_index_len().unwrap(), 0);
+    }
+
+    #[test]
+    fn expired_keyed_duplicate_invalidates_late_ack_without_dirty_follow_up() {
+        let temp = TempDir::new().unwrap();
+        let store = store(&temp);
+        let mut original = record("one", 100);
+        original.collapse_by_dedup_id = true;
+        store.enqueue(&original).unwrap();
+        let first = store
+            .lease(100, 1, Duration::from_millis(50))
+            .unwrap()
+            .remove(0);
+        let lease_until_ms = first.lease_until_ms.unwrap();
+        let mut duplicate = original;
+        duplicate.observed_at_ms = lease_until_ms;
+        duplicate.not_before_ms = lease_until_ms;
+
+        store.enqueue(&duplicate).unwrap();
+
+        assert!(!store.get("one").unwrap().unwrap().pending_dirty);
+        assert_eq!(store.ready_index_len().unwrap(), 1);
+        assert_eq!(store.leased_index_len().unwrap(), 0);
+        assert!(!store
+            .ack(&first.delivery_id, first.lease_generation)
+            .unwrap());
+        let redelivered = store
+            .lease(lease_until_ms, 1, Duration::from_millis(50))
+            .unwrap()
+            .remove(0);
+        assert!(!redelivered.pending_dirty);
+        assert!(store
+            .ack(&redelivered.delivery_id, redelivered.lease_generation)
+            .unwrap());
+        assert!(store.get("one").unwrap().is_none());
+        assert_eq!(store.ready_index_len().unwrap(), 0);
+    }
+
+    #[test]
+    fn leased_non_keyed_duplicate_does_not_arm_follow_up() {
+        let temp = TempDir::new().unwrap();
+        let store = store(&temp);
+        let original = record("one", 100);
+        store.enqueue(&original).unwrap();
+        let leased = store
+            .lease(100, 1, Duration::from_millis(50))
+            .unwrap()
+            .remove(0);
+
+        store.enqueue(&original).unwrap();
+
+        assert!(!store.get("one").unwrap().unwrap().pending_dirty);
+        assert!(store
+            .ack(&leased.delivery_id, leased.lease_generation)
+            .unwrap());
+        assert!(store.get("one").unwrap().is_none());
+        assert_eq!(store.ready_index_len().unwrap(), 0);
+    }
+
+    #[test]
+    fn keyed_dirty_follow_up_survives_retry_and_lease_expiry() {
+        let temp = TempDir::new().unwrap();
+        let store = store(&temp);
+        let mut original = record("one", 100);
+        original.collapse_by_dedup_id = true;
+        store.enqueue(&original).unwrap();
+        let first = store
+            .lease(100, 1, Duration::from_millis(50))
+            .unwrap()
+            .remove(0);
+        store.enqueue(&original).unwrap();
+
+        assert_eq!(
+            store
+                .retry(
+                    &first.delivery_id,
+                    first.lease_generation,
+                    &failure("temporary", false),
+                    &policy(3),
+                    120,
+                )
+                .unwrap(),
+            RetryOutcome::Scheduled
+        );
+        let retry_due = store.get("one").unwrap().unwrap().not_before_ms;
+        assert!(store.get("one").unwrap().unwrap().pending_dirty);
+        let retried = store
+            .lease(retry_due, 1, Duration::from_millis(50))
+            .unwrap()
+            .remove(0);
+        let after_expiry = store
+            .lease(
+                retried.lease_until_ms.unwrap(),
+                1,
+                Duration::from_millis(50),
+            )
+            .unwrap()
+            .remove(0);
+        assert!(after_expiry.pending_dirty);
+
+        assert!(store
+            .ack(&after_expiry.delivery_id, after_expiry.lease_generation)
+            .unwrap());
+        let follow_up = store.get("one").unwrap().unwrap();
+        assert!(!follow_up.pending_dirty);
+        assert_eq!(follow_up.attempt, 0);
+        assert_eq!(follow_up.lease_until_ms, None);
+        assert_eq!(store.ready_index_len().unwrap(), 1);
+    }
+
+    #[test]
+    fn leased_keyed_duplicates_remain_independent_across_keys() {
+        let temp = TempDir::new().unwrap();
+        let store = store(&temp);
+        for key in ["one", "two", "three"] {
+            let mut original = record(key, 100);
+            original.collapse_by_dedup_id = true;
+            store.enqueue(&original).unwrap();
+        }
+        let leased = store.lease(100, 3, Duration::from_millis(50)).unwrap();
+        assert_eq!(leased.len(), 3);
+
+        for _ in 0..5 {
+            for key in ["one", "two", "three"] {
+                let mut duplicate = record(key, 100);
+                duplicate.collapse_by_dedup_id = true;
+                store.enqueue(&duplicate).unwrap();
+            }
+        }
+
+        for active in leased {
+            assert!(store
+                .ack(&active.delivery_id, active.lease_generation)
+                .unwrap());
+        }
+        assert_eq!(store.ready_index_len().unwrap(), 3);
+        let follow_ups = store.lease(100, 10, Duration::from_millis(50)).unwrap();
+        assert_eq!(follow_ups.len(), 3);
+        assert_eq!(
+            follow_ups
+                .iter()
+                .map(|record| record.delivery_id.as_str())
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from(["one", "two", "three"])
+        );
+    }
+
+    #[test]
+    fn permanent_dead_keyed_delivery_promotes_one_dirty_follow_up() {
+        let temp = TempDir::new().unwrap();
+        let store = store(&temp);
+        let source = lineage_source("owner/repo#issue/dirty-terminal");
+        let mut original = record("one", 100);
+        original.collapse_by_dedup_id = true;
+        original.source = Some(source.clone());
+        store.enqueue(&original).unwrap();
+        let leased = store
+            .lease(100, 1, Duration::from_millis(50))
+            .unwrap()
+            .remove(0);
+        store.enqueue(&original).unwrap();
+
+        let outcome = store
+            .retry(
+                &leased.delivery_id,
+                leased.lease_generation,
+                &failure("permanent", false),
+                &policy(1),
+                120,
+            )
+            .unwrap();
+
+        assert_eq!(outcome, RetryOutcome::PermanentDead);
+        assert!(store.get_dead("one").unwrap().unwrap().permanent);
+        let follow_up = store.get("one").unwrap().unwrap();
+        assert!(!follow_up.pending_dirty);
+        assert_eq!(follow_up.attempt, 0);
+        assert_eq!(follow_up.lease_until_ms, None);
+        assert_eq!(follow_up.not_before_ms, 120);
+        assert_eq!(store.ready_index_len().unwrap(), 1);
+        assert_eq!(store.leased_index_len().unwrap(), 0);
+        assert!(!store.terminal_suppresses("one").unwrap());
+        let lineage = store.lookup_lineage("input", "worker", &source).unwrap();
+        assert_eq!(lineage.live_delivery.unwrap().delivery_id, "one");
+        assert_eq!(lineage.terminal_dead_letter.unwrap().delivery_id, "one");
+        assert_eq!(
+            store
+                .lease(120, 10, Duration::from_millis(50))
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn repeated_dirty_terminalization_does_not_suppress_promoted_follow_up() {
+        let temp = TempDir::new().unwrap();
+        let store = store(&temp);
+        let mut original = record("one", 100);
+        original.collapse_by_dedup_id = true;
+        store.enqueue(&original).unwrap();
+        let first = store
+            .lease(100, 1, Duration::from_millis(50))
+            .unwrap()
+            .remove(0);
+        store.enqueue(&original).unwrap();
+        let first_dead_at = 120;
+        assert_eq!(
+            store
+                .retry(
+                    &first.delivery_id,
+                    first.lease_generation,
+                    &failure("first permanent", false),
+                    &policy(1),
+                    first_dead_at,
+                )
+                .unwrap(),
+            RetryOutcome::PermanentDead
+        );
+
+        let second = store
+            .lease(first_dead_at, 1, Duration::from_millis(50))
+            .unwrap()
+            .remove(0);
+        store.enqueue(&original).unwrap();
+        let second_dead_at = first_dead_at
+            .saturating_add(TERMINAL_DEAD_RETENTION_MS)
+            .saturating_add(1);
+        assert_eq!(
+            store
+                .retry(
+                    &second.delivery_id,
+                    second.lease_generation,
+                    &failure("second permanent", false),
+                    &policy(1),
+                    second_dead_at,
+                )
+                .unwrap(),
+            RetryOutcome::PermanentDead
+        );
+
+        assert_eq!(store.terminal_dead_index_len().unwrap(), 1);
+        assert!(!store.terminal_suppresses("one").unwrap());
+        let follow_up = store
+            .lease(second_dead_at, 1, Duration::from_millis(50))
+            .unwrap()
+            .remove(0);
+        assert!(store
+            .ack(&follow_up.delivery_id, follow_up.lease_generation)
+            .unwrap());
+        let mut next = original;
+        next.observed_at_ms = second_dead_at.saturating_add(1);
+        next.not_before_ms = second_dead_at.saturating_add(1);
+        store.enqueue(&next).unwrap();
+        assert_eq!(
+            store
+                .lease(next.not_before_ms, 1, Duration::from_millis(50))
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     #[test]
@@ -3197,6 +3731,45 @@ mod tests {
     }
 
     #[test]
+    fn subscriber_absence_replacement_removes_previous_terminal_index() {
+        let temp = TempDir::new().unwrap();
+        let store = store(&temp);
+        let mut original = record("one", 100);
+        original.collapse_by_dedup_id = true;
+        store.enqueue(&original).unwrap();
+        let leased = store
+            .lease(100, 1, Duration::from_millis(50))
+            .unwrap()
+            .remove(0);
+        store.enqueue(&original).unwrap();
+        assert_eq!(
+            store
+                .retry(
+                    &leased.delivery_id,
+                    leased.lease_generation,
+                    &failure("permanent", false),
+                    &policy(1),
+                    120,
+                )
+                .unwrap(),
+            RetryOutcome::PermanentDead
+        );
+        assert_eq!(store.terminal_dead_index_len().unwrap(), 1);
+
+        let current_subscribers = BTreeSet::new();
+        store
+            .sweep_subscriber_absence(&current_subscribers, 130, Duration::ZERO, 10)
+            .unwrap();
+        let sweep = store
+            .sweep_subscriber_absence(&current_subscribers, 131, Duration::ZERO, 10)
+            .unwrap();
+
+        assert_eq!(sweep.dead_lettered.len(), 1);
+        assert!(sweep.dead_lettered[0].replayable);
+        assert_eq!(store.terminal_dead_index_len().unwrap(), 0);
+    }
+
+    #[test]
     fn repeated_dead_letter_replaces_page_index_tuple() {
         let temp = TempDir::new().unwrap();
         let store = store(&temp);
@@ -3550,6 +4123,7 @@ mod tests {
             redrive_count: 0,
             replayable: true,
             permanent: false,
+            allows_keyed_reuse: false,
             error_excerpt: None,
             record: Some(dead_record),
         };
@@ -3583,6 +4157,140 @@ mod tests {
         assert_eq!(result.permanent.len(), 1);
         assert!(store.get_dead("one").unwrap().unwrap().permanent);
         assert_eq!(store.dead_due_index_len().unwrap(), 0);
+    }
+
+    #[test]
+    fn redrive_collision_preserves_reusable_live_keyed_delivery() {
+        let temp = TempDir::new().unwrap();
+        let store = store(&temp);
+        let mut original = record("one", 100);
+        original.collapse_by_dedup_id = true;
+        store.enqueue(&original).unwrap();
+        let leased = store
+            .lease(100, 1, Duration::from_millis(50))
+            .unwrap()
+            .remove(0);
+        store.enqueue(&original).unwrap();
+        assert_eq!(
+            store
+                .retry(
+                    &leased.delivery_id,
+                    leased.lease_generation,
+                    &failure("transient", true),
+                    &policy(1),
+                    120,
+                )
+                .unwrap(),
+            RetryOutcome::DeadPendingRedrive
+        );
+
+        let mut newer = original.clone();
+        newer.payload = serde_json::json!({"version": "newer"});
+        newer.observed_at_ms = 121;
+        newer.not_before_ms = 121;
+        store.enqueue(&newer).unwrap();
+        let collision = store
+            .redrive_due(
+                &RedrivePolicy {
+                    max_redrives: 3,
+                    cooldown: Duration::ZERO,
+                },
+                122,
+                10,
+            )
+            .unwrap();
+
+        assert_eq!(collision.permanent.len(), 1);
+        assert!(!store.terminal_suppresses("one").unwrap());
+        let live = store
+            .lease(122, 1, Duration::from_millis(50))
+            .unwrap()
+            .remove(0);
+        assert_eq!(live.payload, serde_json::json!({"version": "newer"}));
+        assert!(store.ack(&live.delivery_id, live.lease_generation).unwrap());
+
+        let mut subsequent = original;
+        subsequent.observed_at_ms = 123;
+        subsequent.not_before_ms = 123;
+        store.enqueue(&subsequent).unwrap();
+        assert_eq!(
+            store
+                .lease(123, 1, Duration::from_millis(50))
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn redrive_collision_preserves_reusable_live_clean_keyed_delivery() {
+        let temp = TempDir::new().unwrap();
+        let store = store(&temp);
+        let mut original = record("one", 100);
+        original.collapse_by_dedup_id = true;
+        store.enqueue(&original).unwrap();
+        let leased = store
+            .lease(100, 1, Duration::from_millis(50))
+            .unwrap()
+            .remove(0);
+        assert_eq!(
+            store
+                .retry(
+                    &leased.delivery_id,
+                    leased.lease_generation,
+                    &failure("transient", true),
+                    &policy(1),
+                    120,
+                )
+                .unwrap(),
+            RetryOutcome::DeadPendingRedrive
+        );
+        assert!(
+            !store
+                .get_dead("one")
+                .unwrap()
+                .unwrap()
+                .record
+                .unwrap()
+                .pending_dirty
+        );
+
+        let mut newer = original.clone();
+        newer.payload = serde_json::json!({"version": "newer"});
+        newer.observed_at_ms = 121;
+        newer.not_before_ms = 121;
+        store.enqueue(&newer).unwrap();
+        let collision = store
+            .redrive_due(
+                &RedrivePolicy {
+                    max_redrives: 3,
+                    cooldown: Duration::ZERO,
+                },
+                122,
+                10,
+            )
+            .unwrap();
+
+        assert_eq!(collision.permanent.len(), 1);
+        assert!(!store.terminal_suppresses("one").unwrap());
+        let live = store
+            .lease(122, 1, Duration::from_millis(50))
+            .unwrap()
+            .remove(0);
+        assert_eq!(live.payload, serde_json::json!({"version": "newer"}));
+        assert!(store.ack(&live.delivery_id, live.lease_generation).unwrap());
+
+        let mut subsequent = original;
+        subsequent.observed_at_ms = 123;
+        subsequent.not_before_ms = 123;
+        store.enqueue(&subsequent).unwrap();
+        assert_eq!(
+            store
+                .lease(123, 1, Duration::from_millis(50))
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     #[test]
@@ -3656,6 +4364,274 @@ mod tests {
         assert_eq!(dead.redrive_count, 1);
         assert!(dead.record.is_none());
         assert_eq!(store.dead_due_index_len().unwrap(), 0);
+    }
+
+    #[test]
+    fn terminal_redrive_cap_promotes_one_keyed_dirty_follow_up() {
+        let temp = TempDir::new().unwrap();
+        let store = store(&temp);
+        let mut original = record("one", 100);
+        original.collapse_by_dedup_id = true;
+        store.enqueue(&original).unwrap();
+        let leased = store
+            .lease(100, 1, Duration::from_millis(50))
+            .unwrap()
+            .remove(0);
+        store.enqueue(&original).unwrap();
+        assert_eq!(
+            store
+                .retry(
+                    &leased.delivery_id,
+                    leased.lease_generation,
+                    &failure("transient", true),
+                    &policy(1),
+                    120,
+                )
+                .unwrap(),
+            RetryOutcome::DeadPendingRedrive
+        );
+        assert!(
+            store
+                .get_dead("one")
+                .unwrap()
+                .unwrap()
+                .record
+                .unwrap()
+                .pending_dirty
+        );
+
+        let capped = store
+            .redrive_due(
+                &RedrivePolicy {
+                    max_redrives: 0,
+                    cooldown: Duration::ZERO,
+                },
+                121,
+                10,
+            )
+            .unwrap();
+
+        assert!(capped.redriven.is_empty());
+        assert_eq!(capped.permanent.len(), 1);
+        assert!(store.get_dead("one").unwrap().unwrap().permanent);
+        let follow_up = store.get("one").unwrap().unwrap();
+        assert!(!follow_up.pending_dirty);
+        assert_eq!(follow_up.attempt, 0);
+        assert_eq!(follow_up.redrive_count, 0);
+        assert_eq!(follow_up.lease_until_ms, None);
+        assert_eq!(follow_up.not_before_ms, 121);
+        assert_eq!(store.ready_index_len().unwrap(), 1);
+        assert!(!store.terminal_suppresses("one").unwrap());
+    }
+
+    #[test]
+    fn terminal_redrive_cap_preserves_reusable_live_clean_keyed_delivery() {
+        let temp = TempDir::new().unwrap();
+        let store = store(&temp);
+        let mut original = record("one", 100);
+        original.collapse_by_dedup_id = true;
+        store.enqueue(&original).unwrap();
+        let leased = store
+            .lease(100, 1, Duration::from_millis(50))
+            .unwrap()
+            .remove(0);
+        assert_eq!(
+            store
+                .retry(
+                    &leased.delivery_id,
+                    leased.lease_generation,
+                    &failure("transient", true),
+                    &policy(1),
+                    120,
+                )
+                .unwrap(),
+            RetryOutcome::DeadPendingRedrive
+        );
+
+        let mut newer = original.clone();
+        newer.payload = serde_json::json!({"version": "newer"});
+        newer.observed_at_ms = 121;
+        newer.not_before_ms = 121;
+        store.enqueue(&newer).unwrap();
+        let capped = store
+            .redrive_due(
+                &RedrivePolicy {
+                    max_redrives: 0,
+                    cooldown: Duration::ZERO,
+                },
+                122,
+                10,
+            )
+            .unwrap();
+
+        assert_eq!(capped.permanent.len(), 1);
+        assert!(!store.terminal_suppresses("one").unwrap());
+        let live = store
+            .lease(122, 1, Duration::from_millis(50))
+            .unwrap()
+            .remove(0);
+        assert_eq!(live.payload, serde_json::json!({"version": "newer"}));
+        assert!(store.ack(&live.delivery_id, live.lease_generation).unwrap());
+
+        let mut subsequent = original;
+        subsequent.observed_at_ms = 123;
+        subsequent.not_before_ms = 123;
+        store.enqueue(&subsequent).unwrap();
+        assert_eq!(
+            store
+                .lease(123, 1, Duration::from_millis(50))
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn terminal_redrive_cap_preserves_newer_ready_keyed_delivery() {
+        let temp = TempDir::new().unwrap();
+        let store = store(&temp);
+        let mut original = record("one", 100);
+        original.collapse_by_dedup_id = true;
+        original.payload = serde_json::json!({"version": "original"});
+        store.enqueue(&original).unwrap();
+        let leased = store
+            .lease(100, 1, Duration::from_millis(50))
+            .unwrap()
+            .remove(0);
+        store.enqueue(&original).unwrap();
+        assert_eq!(
+            store
+                .retry(
+                    &leased.delivery_id,
+                    leased.lease_generation,
+                    &failure("transient", true),
+                    &policy(1),
+                    120,
+                )
+                .unwrap(),
+            RetryOutcome::DeadPendingRedrive
+        );
+        let mut newer = original;
+        newer.payload = serde_json::json!({"version": "newer"});
+        newer.observed_at_ms = 121;
+        newer.not_before_ms = 121;
+        store.enqueue(&newer).unwrap();
+
+        let capped = store
+            .redrive_due(
+                &RedrivePolicy {
+                    max_redrives: 0,
+                    cooldown: Duration::ZERO,
+                },
+                122,
+                10,
+            )
+            .unwrap();
+
+        assert_eq!(capped.permanent.len(), 1);
+        assert_eq!(store.get("one").unwrap().unwrap(), newer);
+        assert_eq!(store.ready_index_len().unwrap(), 1);
+        assert_eq!(store.leased_index_len().unwrap(), 0);
+        assert!(!store.terminal_suppresses("one").unwrap());
+    }
+
+    #[test]
+    fn terminal_redrive_cap_preserves_newer_leased_keyed_delivery() {
+        let temp = TempDir::new().unwrap();
+        let store = store(&temp);
+        let mut original = record("one", 100);
+        original.collapse_by_dedup_id = true;
+        original.payload = serde_json::json!({"version": "original"});
+        store.enqueue(&original).unwrap();
+        let leased = store
+            .lease(100, 1, Duration::from_millis(50))
+            .unwrap()
+            .remove(0);
+        store.enqueue(&original).unwrap();
+        assert_eq!(
+            store
+                .retry(
+                    &leased.delivery_id,
+                    leased.lease_generation,
+                    &failure("transient", true),
+                    &policy(1),
+                    120,
+                )
+                .unwrap(),
+            RetryOutcome::DeadPendingRedrive
+        );
+        let mut newer = original;
+        newer.payload = serde_json::json!({"version": "newer"});
+        newer.observed_at_ms = 121;
+        newer.not_before_ms = 121;
+        store.enqueue(&newer).unwrap();
+        let newer_lease = store
+            .lease(121, 1, Duration::from_millis(50))
+            .unwrap()
+            .remove(0);
+
+        let capped = store
+            .redrive_due(
+                &RedrivePolicy {
+                    max_redrives: 0,
+                    cooldown: Duration::ZERO,
+                },
+                122,
+                10,
+            )
+            .unwrap();
+
+        assert_eq!(capped.permanent.len(), 1);
+        assert_eq!(store.get("one").unwrap().unwrap(), newer_lease);
+        assert_eq!(store.ready_index_len().unwrap(), 0);
+        assert_eq!(store.leased_index_len().unwrap(), 1);
+        assert!(!store.terminal_suppresses("one").unwrap());
+    }
+
+    #[test]
+    fn terminal_redrive_cap_rebinds_subscriber_absence_dirty_follow_up() {
+        let temp = TempDir::new().unwrap();
+        let store = store(&temp);
+        let mut original = record("one", 100);
+        original.queue = "jobs".to_string();
+        original.dept = "old_worker".to_string();
+        original.collapse_by_dedup_id = true;
+        store.enqueue(&original).unwrap();
+        store
+            .lease_for_dept("old_worker", 100, 1, Duration::from_millis(50))
+            .unwrap();
+        store.enqueue(&original).unwrap();
+        store
+            .sweep_subscriber_absence(&BTreeSet::new(), 110, Duration::ZERO, 10)
+            .unwrap();
+        store
+            .sweep_subscriber_absence(&BTreeSet::new(), 111, Duration::ZERO, 10)
+            .unwrap();
+
+        let capped = store
+            .redrive_due_with_current_subscribers(
+                &RedrivePolicy {
+                    max_redrives: 0,
+                    cooldown: Duration::ZERO,
+                },
+                &BTreeMap::from([("jobs".to_string(), "new_worker".to_string())]),
+                112,
+                10,
+            )
+            .unwrap();
+
+        assert_eq!(capped.permanent.len(), 1);
+        let follow_up = store.get("one").unwrap().unwrap();
+        assert_eq!(follow_up.dept, "new_worker");
+        assert_eq!(follow_up.subscriber_absent_since_ms, None);
+        assert_eq!(store.ready_index_len().unwrap(), 1);
+        assert_eq!(
+            store
+                .lease_for_dept("new_worker", 112, 1, Duration::from_millis(50))
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     #[test]
@@ -4084,6 +5060,308 @@ mod tests {
     }
 
     #[test]
+    fn reopen_preserves_keyed_dirty_follow_up() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("delivery.redb");
+        let leased = {
+            let store = DeliveryStore::open(&path).unwrap();
+            let mut original = record("one", 100);
+            original.collapse_by_dedup_id = true;
+            store.enqueue(&original).unwrap();
+            let leased = store
+                .lease(100, 1, Duration::from_millis(50))
+                .unwrap()
+                .remove(0);
+            store.enqueue(&original).unwrap();
+            leased
+        };
+        let store = DeliveryStore::open(&path).unwrap();
+
+        assert!(store.get("one").unwrap().unwrap().pending_dirty);
+        assert!(store
+            .ack(&leased.delivery_id, leased.lease_generation)
+            .unwrap());
+        let follow_up = store.get("one").unwrap().unwrap();
+        assert!(!follow_up.pending_dirty);
+        assert_eq!(follow_up.lease_until_ms, None);
+        assert_eq!(store.ready_index_len().unwrap(), 1);
+    }
+
+    #[test]
+    fn schema_rebuild_preserves_promoted_keyed_follow_up() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("delivery.redb");
+        let mut original = record("one", 100);
+        original.collapse_by_dedup_id = true;
+        {
+            let store = DeliveryStore::open(&path).unwrap();
+            store.enqueue(&original).unwrap();
+            let leased = store
+                .lease(100, 1, Duration::from_millis(50))
+                .unwrap()
+                .remove(0);
+            store.enqueue(&original).unwrap();
+            assert_eq!(
+                store
+                    .retry(
+                        &leased.delivery_id,
+                        leased.lease_generation,
+                        &failure("permanent", false),
+                        &policy(1),
+                        120,
+                    )
+                    .unwrap(),
+                RetryOutcome::PermanentDead
+            );
+            assert!(store.get("one").unwrap().is_some());
+            assert!(store.get_dead("one").unwrap().unwrap().permanent);
+            assert!(!store.terminal_suppresses("one").unwrap());
+        }
+        {
+            let db = Database::open(&path).unwrap();
+            let write = db.begin_write().unwrap();
+            {
+                let mut dead = write.open_table(DEAD_BY_ID).unwrap();
+                let bytes = dead.get("one").unwrap().unwrap().value().to_vec();
+                let mut encoded: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                encoded
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("allows_keyed_reuse");
+                let bytes = serde_json::to_vec(&encoded).unwrap();
+                dead.insert("one", bytes.as_slice()).unwrap();
+                let mut meta = write.open_table(META).unwrap();
+                meta.insert("schema_version", "11").unwrap();
+            }
+            write.commit().unwrap();
+        }
+
+        let store = DeliveryStore::open(&path).unwrap();
+
+        assert!(!store.terminal_suppresses("one").unwrap());
+        let follow_up = store
+            .lease(120, 1, Duration::from_millis(50))
+            .unwrap()
+            .remove(0);
+        assert!(store
+            .ack(&follow_up.delivery_id, follow_up.lease_generation)
+            .unwrap());
+        let mut subsequent = original;
+        subsequent.observed_at_ms = 121;
+        subsequent.not_before_ms = 121;
+        store.enqueue(&subsequent).unwrap();
+        assert_eq!(
+            store
+                .lease(121, 1, Duration::from_millis(50))
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn schema_rebuild_preserves_keyed_reuse_after_dirty_follow_up_ack() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("delivery.redb");
+        let mut original = record("one", 100);
+        original.collapse_by_dedup_id = true;
+        {
+            let store = DeliveryStore::open(&path).unwrap();
+            store.enqueue(&original).unwrap();
+            let leased = store
+                .lease(100, 1, Duration::from_millis(50))
+                .unwrap()
+                .remove(0);
+            store.enqueue(&original).unwrap();
+            assert_eq!(
+                store
+                    .retry(
+                        &leased.delivery_id,
+                        leased.lease_generation,
+                        &failure("permanent", false),
+                        &policy(1),
+                        120,
+                    )
+                    .unwrap(),
+                RetryOutcome::PermanentDead
+            );
+            let follow_up = store
+                .lease(120, 1, Duration::from_millis(50))
+                .unwrap()
+                .remove(0);
+            assert!(store
+                .ack(&follow_up.delivery_id, follow_up.lease_generation)
+                .unwrap());
+            assert!(store.get("one").unwrap().is_none());
+            assert!(store.get_dead("one").unwrap().unwrap().permanent);
+            assert!(!store.terminal_suppresses("one").unwrap());
+        }
+        {
+            let db = Database::open(&path).unwrap();
+            let write = db.begin_write().unwrap();
+            {
+                let mut dead = write.open_table(DEAD_BY_ID).unwrap();
+                let bytes = dead.get("one").unwrap().unwrap().value().to_vec();
+                let mut encoded: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                encoded
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("allows_keyed_reuse");
+                let bytes = serde_json::to_vec(&encoded).unwrap();
+                dead.insert("one", bytes.as_slice()).unwrap();
+                let mut meta = write.open_table(META).unwrap();
+                meta.insert("schema_version", "11").unwrap();
+            }
+            write.commit().unwrap();
+        }
+
+        let store = DeliveryStore::open(&path).unwrap();
+
+        assert!(!store.terminal_suppresses("one").unwrap());
+        assert!(store.get_dead("one").unwrap().unwrap().allows_keyed_reuse);
+        original.observed_at_ms = 121;
+        original.not_before_ms = 121;
+        store.enqueue(&original).unwrap();
+        assert_eq!(
+            store
+                .lease(121, 1, Duration::from_millis(50))
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn terminal_index_repair_preserves_keyed_reuse_after_dirty_follow_up_ack() {
+        let temp = TempDir::new().unwrap();
+        let store = store(&temp);
+        let mut original = record("one", 100);
+        original.collapse_by_dedup_id = true;
+        store.enqueue(&original).unwrap();
+        let leased = store
+            .lease(100, 1, Duration::from_millis(50))
+            .unwrap()
+            .remove(0);
+        store.enqueue(&original).unwrap();
+        assert_eq!(
+            store
+                .retry(
+                    &leased.delivery_id,
+                    leased.lease_generation,
+                    &failure("permanent", false),
+                    &policy(1),
+                    120,
+                )
+                .unwrap(),
+            RetryOutcome::PermanentDead
+        );
+        let follow_up = store
+            .lease(120, 1, Duration::from_millis(50))
+            .unwrap()
+            .remove(0);
+        assert!(store
+            .ack(&follow_up.delivery_id, follow_up.lease_generation)
+            .unwrap());
+        {
+            let write = store.db.begin_write().unwrap();
+            {
+                let mut terminal = write.open_table(TERMINAL_DEAD_BY_TIME).unwrap();
+                terminal
+                    .remove(make_dead_due_index_key("worker", 120, "one").as_str())
+                    .unwrap();
+                terminal
+                    .insert(make_dead_due_index_key("worker", 119, "one").as_str(), &())
+                    .unwrap();
+            }
+            write.commit().unwrap();
+        }
+
+        let compact_at_ms = 120_u64.saturating_add(TERMINAL_DEAD_RETENTION_MS);
+        store
+            .enqueue(&record("fresh", compact_at_ms))
+            .unwrap();
+
+        assert!(!store.terminal_suppresses("one").unwrap());
+        original.observed_at_ms = compact_at_ms;
+        original.not_before_ms = compact_at_ms;
+        store.enqueue(&original).unwrap();
+        assert!(store.get("one").unwrap().is_some());
+    }
+
+    #[test]
+    fn newer_schema_version_fails_closed() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("delivery.redb");
+        {
+            let _store = DeliveryStore::open(&path).unwrap();
+        }
+        {
+            let db = Database::open(&path).unwrap();
+            let write = db.begin_write().unwrap();
+            {
+                let mut meta = write.open_table(META).unwrap();
+                let newer = SCHEMA_VERSION.parse::<u32>().unwrap().saturating_add(1);
+                meta.insert("schema_version", newer.to_string().as_str())
+                    .unwrap();
+            }
+            write.commit().unwrap();
+        }
+
+        let error = match DeliveryStore::open(&path) {
+            Ok(_) => panic!("newer durable delivery schema must fail closed"),
+            Err(error) => error,
+        };
+
+        assert!(error
+            .to_string()
+            .contains("durable delivery schema newer than supported"));
+    }
+
+    #[test]
+    fn dead_record_keyed_reuse_marker_is_backward_compatible() {
+        let clean = DeadRecord {
+            delivery_id: "one".to_string(),
+            queue: "input".to_string(),
+            dept: "worker".to_string(),
+            source: None,
+            observed_at_ms: 10,
+            not_before_ms: 100,
+            dead_at_ms: 120,
+            attempts: 1,
+            redrive_count: 0,
+            replayable: false,
+            permanent: true,
+            allows_keyed_reuse: false,
+            error_excerpt: Some("final".to_string()),
+            record: None,
+        };
+        let encoded = serde_json::to_value(&clean).unwrap();
+        assert!(encoded.get("allows_keyed_reuse").is_none());
+
+        let decoded: DeadRecord = serde_json::from_value(encoded).unwrap();
+
+        assert!(!decoded.allows_keyed_reuse);
+        assert_eq!(decoded, clean);
+    }
+
+    #[test]
+    fn delivery_record_without_pending_dirty_defaults_clean() {
+        let mut encoded = serde_json::to_value(record("one", 100)).unwrap();
+        encoded.as_object_mut().unwrap().remove("pending_dirty");
+
+        let decoded: DeliveryRecord = serde_json::from_value(encoded).unwrap();
+
+        assert!(!decoded.pending_dirty);
+    }
+
+    #[test]
+    fn clean_delivery_record_serialization_omits_pending_dirty() {
+        let encoded = serde_json::to_value(record("one", 100)).unwrap();
+
+        assert!(encoded.get("pending_dirty").is_none());
+    }
+
+    #[test]
     fn schema_v1_open_clears_dead_rows_and_rebuilds_dept_indexes() {
         let temp = TempDir::new().unwrap();
         let path = temp.path().join("delivery.redb");
@@ -4141,6 +5419,7 @@ mod tests {
             redrive_count: 0,
             replayable: true,
             permanent: false,
+            allows_keyed_reuse: false,
             error_excerpt: Some("timeout".to_string()),
             record: Some(record("replayable", 100)),
         };
@@ -4156,6 +5435,7 @@ mod tests {
             redrive_count: 0,
             replayable: true,
             permanent: true,
+            allows_keyed_reuse: false,
             error_excerpt: Some("permanent".to_string()),
             record: Some(record("permanent", 100)),
         };
@@ -4171,6 +5451,7 @@ mod tests {
             redrive_count: 0,
             replayable: true,
             permanent: false,
+            allows_keyed_reuse: false,
             error_excerpt: Some("missing payload".to_string()),
             record: None,
         };
@@ -4254,6 +5535,7 @@ mod tests {
             redrive_count: 0,
             replayable: false,
             permanent: true,
+            allows_keyed_reuse: false,
             error_excerpt: Some("final".to_string()),
             record: None,
         };
@@ -4314,6 +5596,7 @@ mod tests {
             redrive_count: 0,
             replayable: false,
             permanent: true,
+            allows_keyed_reuse: false,
             error_excerpt: Some("final".to_string()),
             record: None,
         };
@@ -4354,6 +5637,8 @@ mod tests {
             lineage.terminal_dead_letter.unwrap().delivery_id,
             "latest-b"
         );
+        assert!(!store.get_dead("older").unwrap().unwrap().allows_keyed_reuse);
+        assert!(store.terminal_suppresses("older").unwrap());
     }
 
     #[test]

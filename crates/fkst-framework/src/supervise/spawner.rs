@@ -29,6 +29,10 @@ pub struct SpawnResult {
     pub exit_code: i32,
     pub stdout: String,
     pub stderr: String,
+    pub spawn_return_ms: u128,
+    pub first_pipe_read_ms: Option<u128>,
+    pub wait_complete_ms: u128,
+    pub capture_complete_ms: u128,
     pub elapsed_ms: u128,
     pub log_path: Option<PathBuf>,
 }
@@ -44,8 +48,8 @@ enum FrameworkStream {
 
 // output chunks and process exit share one wait channel.
 enum FrameworkEvent {
-    Output(FrameworkStream, Vec<u8>),
-    Exited(std::result::Result<std::process::ExitStatus, String>),
+    Output(FrameworkStream, Vec<u8>, u128),
+    Exited(std::result::Result<std::process::ExitStatus, String>, u128),
 }
 
 // Framework children run until natural exit; Department stall_window is a
@@ -174,8 +178,8 @@ pub async fn spawn_framework_with_stdout_observer(
     // tokio::process exposes `process_group(0)` to call setpgid(0,0); equivalent for our purposes.
     cmd.process_group(0);
 
-    let child = match cmd.spawn() {
-        Ok(child) => child,
+    let (child, spawn_return_ms) = match cmd.spawn() {
+        Ok(child) => (child, start.elapsed().as_millis()),
         Err(err) => {
             log.write_line(&format!("SPAWN_ERROR={err}"));
             return Err(err).context("spawn fkst-framework");
@@ -188,7 +192,16 @@ pub async fn spawn_framework_with_stdout_observer(
     info!(pid = pid, lua = %lua_path.display(), "framework spawned");
     let registration = process_groups.register(pid);
 
-    wait_for_framework_child(child, pid, start, log, registration, stdout_observer).await
+    wait_for_framework_child(
+        child,
+        pid,
+        start,
+        spawn_return_ms,
+        log,
+        registration,
+        stdout_observer,
+    )
+    .await
 }
 
 pub(crate) fn scrub_current_engine_binary_path_env() {
@@ -223,6 +236,7 @@ async fn wait_for_framework_child(
     mut child: Child,
     pid: u32,
     start: Instant,
+    spawn_return_ms: u128,
     mut log: FrameworkChildLog,
     _registration: ProcessGroupRegistration,
     stdout_observer: Option<StdoutLineObserver>,
@@ -233,6 +247,7 @@ async fn wait_for_framework_child(
         readers.push(spawn_stream_reader(
             stdout,
             FrameworkStream::Stdout,
+            start,
             tx.clone(),
         ));
     }
@@ -240,29 +255,41 @@ async fn wait_for_framework_child(
         readers.push(spawn_stream_reader(
             stderr,
             FrameworkStream::Stderr,
+            start,
             tx.clone(),
         ));
     }
     let waiter = tokio::spawn(async move {
-        let result = child.wait().await.map_err(|err| err.to_string());
-        let _ = tx.send(FrameworkEvent::Exited(result));
+        let result = child.wait().await;
+        let wait_complete_ms = start.elapsed().as_millis();
+        let _ = tx.send(FrameworkEvent::Exited(
+            result.map_err(|err| err.to_string()),
+            wait_complete_ms,
+        ));
     });
 
     let mut output = FrameworkOutput::default();
     let mut line_buffer = StdoutLineBuffer::default();
-    let status = loop {
+    let (status, wait_complete_ms) = loop {
         match rx.recv().await {
-            Some(FrameworkEvent::Output(stream, bytes)) => {
+            Some(FrameworkEvent::Output(stream, bytes, read_complete_ms)) => {
                 if !bytes.is_empty() {
                     log.write_chunk(stream, &bytes);
                     if matches!(stream, FrameworkStream::Stdout) {
                         line_buffer.push(&bytes, stdout_observer.as_deref())?;
                     }
-                    output.push(stream, bytes);
+                    output.push(stream, bytes, read_complete_ms);
                 }
             }
-            Some(FrameworkEvent::Exited(result)) => break result,
-            None => break Err("framework wait channel closed before process exit".to_string()),
+            Some(FrameworkEvent::Exited(result, wait_complete_ms)) => {
+                break (result, Some(wait_complete_ms));
+            }
+            None => {
+                break (
+                    Err("framework wait channel closed before process exit".to_string()),
+                    None,
+                );
+            }
         }
     };
 
@@ -277,8 +304,17 @@ async fn wait_for_framework_child(
         &mut line_buffer,
         stdout_observer.as_deref(),
     )?;
+    let capture_complete_ms = start.elapsed().as_millis();
 
-    spawn_result_from_status(pid, status, output, start, log)
+    spawn_result_from_status(
+        pid,
+        status,
+        output,
+        spawn_return_ms,
+        wait_complete_ms,
+        capture_complete_ms,
+        log,
+    )
 }
 
 // buffers accumulate incrementally as output events arrive.
@@ -286,10 +322,15 @@ async fn wait_for_framework_child(
 struct FrameworkOutput {
     stdout: Vec<u8>,
     stderr: Vec<u8>,
+    first_pipe_read_ms: Option<u128>,
 }
 
 impl FrameworkOutput {
-    fn push(&mut self, stream: FrameworkStream, bytes: Vec<u8>) {
+    fn push(&mut self, stream: FrameworkStream, bytes: Vec<u8>, read_complete_ms: u128) {
+        self.first_pipe_read_ms = Some(
+            self.first_pipe_read_ms
+                .map_or(read_complete_ms, |first| first.min(read_complete_ms)),
+        );
         match stream {
             FrameworkStream::Stdout => self.stdout.extend(bytes),
             FrameworkStream::Stderr => self.stderr.extend(bytes),
@@ -306,12 +347,12 @@ fn drain_framework_events(
     stdout_observer: Option<&(dyn Fn(&str) -> Result<()> + Send + Sync)>,
 ) -> Result<()> {
     while let Ok(event) = rx.try_recv() {
-        if let FrameworkEvent::Output(stream, bytes) = event {
+        if let FrameworkEvent::Output(stream, bytes, read_complete_ms) = event {
             log.write_chunk(stream, &bytes);
             if matches!(stream, FrameworkStream::Stdout) {
                 line_buffer.push(&bytes, stdout_observer)?;
             }
-            output.push(stream, bytes);
+            output.push(stream, bytes, read_complete_ms);
         }
     }
     Ok(())
@@ -350,22 +391,29 @@ fn spawn_result_from_status(
     pid: u32,
     status: std::result::Result<std::process::ExitStatus, String>,
     output: FrameworkOutput,
-    start: Instant,
+    spawn_return_ms: u128,
+    wait_complete_ms: Option<u128>,
+    capture_complete_ms: u128,
     mut log: FrameworkChildLog,
 ) -> Result<SpawnResult> {
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
     let exit_code = status.map_err(anyhow::Error::msg)?.code().unwrap_or(-1);
-    let elapsed_ms = start.elapsed().as_millis();
+    let wait_complete_ms = wait_complete_ms
+        .ok_or_else(|| anyhow::anyhow!("framework wait channel closed before process exit"))?;
     log.write_line(&format!("EXIT={exit_code}"));
-    log.write_line(&format!("ELAPSED_MS={elapsed_ms}"));
+    log.write_line(&format!("ELAPSED_MS={capture_complete_ms}"));
     let log_path = log.path().map(Path::to_path_buf);
     Ok(SpawnResult {
         pid,
         exit_code,
         stdout,
         stderr,
-        elapsed_ms,
+        spawn_return_ms,
+        first_pipe_read_ms: output.first_pipe_read_ms,
+        wait_complete_ms,
+        capture_complete_ms,
+        elapsed_ms: capture_complete_ms,
         log_path,
     })
 }
@@ -374,6 +422,7 @@ fn spawn_result_from_status(
 fn spawn_stream_reader<R>(
     mut reader: R,
     stream: FrameworkStream,
+    start: Instant,
     tx: mpsc::UnboundedSender<FrameworkEvent>,
 ) -> JoinHandle<()>
 where
@@ -385,8 +434,13 @@ where
             match reader.read(&mut buf).await {
                 Ok(0) => break,
                 Ok(n) => {
+                    let read_complete_ms = start.elapsed().as_millis();
                     if tx
-                        .send(FrameworkEvent::Output(stream, buf[..n].to_vec()))
+                        .send(FrameworkEvent::Output(
+                            stream,
+                            buf[..n].to_vec(),
+                            read_complete_ms,
+                        ))
                         .is_err()
                     {
                         break;
