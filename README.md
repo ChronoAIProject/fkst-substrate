@@ -26,8 +26,9 @@ As of this tree, `scripts/verify.sh` runs these checks from the repository root:
 
 - Tier I supervisor audit: all Rust source under `crates/fkst-supervisor/src` must be at most 150 lines.
 - Shell syntax audit for `scripts/*.sh`.
-- `cargo build --workspace`.
-- `cargo test --workspace -- --test-threads=1`.
+- Verification-script regression tests under `scripts/tests`.
+- `cargo build --workspace`, classified from structured Cargo diagnostics.
+- `cargo test --workspace -- --test-threads=1`, classified from structured Cargo diagnostics and test-process evidence.
 - `target/debug/fkst-framework --self-test` with a scratch `FKST_RUNTIME_ROOT`.
 - `target/debug/fkst-framework conformance --project-root <scratch-host> --package-root <scratch-host>`.
 - `target/debug/fkst-framework test --project-root <scratch-host> --package-root <scratch-host>`.
