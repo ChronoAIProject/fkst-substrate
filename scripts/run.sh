@@ -51,11 +51,18 @@ run_verification() {
   fi
   local status=0
   "$repo/scripts/verify.sh" || status=$?
-  if [ "$status" -eq 0 ]; then
-    emit_local_iteration_result "PASS:NONE"
-  else
-    emit_local_iteration_result "UNKNOWN:UNKNOWN"
-  fi
+  # verify.sh exits with a distinct code per gate so the failure can be typed.
+  # Every one of these gates fails because the tree under test is wrong — a
+  # compile error, a failing test, an oversized supervisor, an unparseable
+  # script, a conformance violation. That is SEMANTIC. An exit code outside the
+  # known set is genuinely unclassifiable and stays UNKNOWN rather than being
+  # guessed at, since misreporting an infrastructure fault as "your diff is
+  # wrong" is worse than admitting ignorance.
+  case "$status" in
+    0)                    emit_local_iteration_result "PASS:NONE" ;;
+    10|11|12|13|14|15|16) emit_local_iteration_result "FAIL:SEMANTIC" ;;
+    *)                    emit_local_iteration_result "UNKNOWN:UNKNOWN" ;;
+  esac
   return "$status"
 }
 
