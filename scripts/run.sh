@@ -51,11 +51,29 @@ run_verification() {
   fi
   local status=0
   "$repo/scripts/verify.sh" || status=$?
-  if [ "$status" -eq 0 ]; then
-    emit_local_iteration_result "PASS:NONE"
-  else
-    emit_local_iteration_result "UNKNOWN:UNKNOWN"
-  fi
+  # verify.sh exits with a distinct code per gate so the failure can be typed.
+  # Every one of these gates fails because the tree under test is wrong — a
+  # compile error, a failing test, an oversized supervisor, an unparseable
+  # script, a conformance violation. That is SEMANTIC. An exit code outside the
+  # known set is genuinely unclassifiable and stays UNKNOWN rather than being
+  # guessed at, since misreporting an infrastructure fault as "your diff is
+  # wrong" is worse than admitting ignorance.
+  # Only gates that cannot fail for an environmental reason may accuse the tree.
+  # The audit, shell-syntax, self-test, conformance and lua-test gates each ran
+  # to a verdict about the tree, so their failure is SEMANTIC.
+  #
+  # `cargo build` (12) and `cargo test` (13) are excluded on purpose: each
+  # conflates "ran and rejected the tree" with "could not run" — lock
+  # contention, target-dir/IO failure, a registry fetch. #327 observed exactly
+  # that: #314's base probe reported base_exit=12 -> SEMANTIC for
+  # 171c7395, while CI on that same sha was green three times over. Until the
+  # two are told apart they stay UNKNOWN, because an honest UNKNOWN costs a
+  # redrive while a false SEMANTIC parks a healthy strand on an accusation.
+  case "$status" in
+    0)              emit_local_iteration_result "PASS:NONE" ;;
+    10|11|14|15|16) emit_local_iteration_result "FAIL:SEMANTIC" ;;
+    *)              emit_local_iteration_result "UNKNOWN:UNKNOWN" ;;
+  esac
   return "$status"
 }
 

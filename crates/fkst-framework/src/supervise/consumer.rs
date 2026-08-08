@@ -17,6 +17,7 @@ use crate::path_resolver::PackageRoots;
 use crate::process_tree::ProcessGroupRegistry;
 use fkst_common::config::{DepartmentDecl, RetryDecl};
 use fkst_common::{Event, RuntimeKind};
+use nix::errno::Errno;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -571,7 +572,7 @@ async fn run_durable_record(
                     ("reason", format!("spawn_error:{err}")),
                 ],
             );
-            Some(DeliveryFailure::permanent(format!("spawn error: {err}")))
+            Some(DeliveryFailure::from_spawn_error(&err))
         }
     };
 
@@ -1191,6 +1192,19 @@ async fn spawn_and_report_with_stdout_observer(
             ("dept", dept_name.to_string()),
             ("pid", result.pid.to_string()),
             ("exit_code", result.exit_code.to_string()),
+            ("spawn_return_ms", result.spawn_return_ms.to_string()),
+            (
+                "first_pipe_read_ms",
+                result
+                    .first_pipe_read_ms
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "none".to_string()),
+            ),
+            ("wait_complete_ms", result.wait_complete_ms.to_string()),
+            (
+                "capture_complete_ms",
+                result.capture_complete_ms.to_string(),
+            ),
             ("elapsed_ms", result.elapsed_ms.to_string()),
             ("log_path", optional_path(result.log_path.as_deref())),
             ("reason", "natural_exit".to_string()),
@@ -1269,7 +1283,7 @@ pub(crate) fn finish_test_durable_record(
                 message: completion
                     .error
                     .unwrap_or_else(|| format!("exit={}", completion.exit_code)),
-                replayable: completion.exit_code == 124,
+                replayable: is_replayable_framework_exit_code(completion.exit_code),
             }),
             lock_busy: None,
         }
@@ -1318,9 +1332,41 @@ impl DeliveryFailure {
     fn from_spawn_result(result: &SpawnResult) -> Self {
         Self {
             message: format!("exit={} stderr={}", result.exit_code, result.stderr),
-            replayable: result.exit_code == 124,
+            replayable: is_replayable_framework_exit_code(result.exit_code),
         }
     }
+
+    fn from_spawn_error(error: &anyhow::Error) -> Self {
+        Self {
+            message: format!("spawn error: {error}"),
+            replayable: is_replayable_spawn_error(error),
+        }
+    }
+}
+
+fn is_replayable_framework_exit_code(exit_code: i32) -> bool {
+    exit_code == 124
+}
+
+fn is_replayable_spawn_error(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .filter_map(|source| source.downcast_ref::<std::io::Error>())
+        .any(|source| {
+            matches!(
+                source.kind(),
+                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::OutOfMemory
+            ) || source.raw_os_error().is_some_and(|errno| {
+                [
+                    Errno::EMFILE as i32,
+                    Errno::ENFILE as i32,
+                    Errno::EAGAIN as i32,
+                    Errno::EWOULDBLOCK as i32,
+                    Errno::ENOMEM as i32,
+                ]
+                .contains(&errno)
+            })
+        })
 }
 
 fn policy_from_decl(decl: &RetryDecl) -> anyhow::Result<RetryPolicy> {
@@ -1337,6 +1383,7 @@ mod tests {
     use crate::supervise::delivery_store::DeliveryStore;
     use base64::Engine;
     use fkst_common::config::{Config, LimitsDecl, QueueDecl};
+    use nix::errno::Errno;
     use std::collections::BTreeMap;
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
@@ -1401,6 +1448,7 @@ mod tests {
             attempt: 0,
             redrive_count: 0,
             collapse_by_dedup_id: false,
+            pending_dirty: false,
             subscriber_absent_since_ms: None,
             lease_generation: 0,
             lease_until_ms: None,
@@ -3380,6 +3428,10 @@ return M
             exit_code: 124,
             stdout: String::new(),
             stderr: "codex timed out".to_string(),
+            spawn_return_ms: 0,
+            first_pipe_read_ms: None,
+            wait_complete_ms: 1_000,
+            capture_complete_ms: 1_000,
             elapsed_ms: 1_000,
             log_path: None,
         });
@@ -3398,6 +3450,124 @@ return M
         assert!(dead.replayable);
         assert!(!dead.permanent);
         assert!(dead.record.is_some());
+    }
+
+    #[test]
+    fn framework_exit_classifier_keeps_timeout_as_the_only_replayable_exit() {
+        assert!(is_replayable_framework_exit_code(124));
+        for exit_code in [1, 123, 125] {
+            assert!(!is_replayable_framework_exit_code(exit_code));
+        }
+    }
+
+    #[test]
+    fn spawn_error_classifier_separates_transient_resource_failures() {
+        for errno in [
+            Errno::EMFILE,
+            Errno::ENFILE,
+            Errno::EAGAIN,
+            Errno::EWOULDBLOCK,
+            Errno::ENOMEM,
+        ] {
+            let error = anyhow::Error::new(std::io::Error::from_raw_os_error(errno as i32))
+                .context("spawn fkst-framework");
+
+            assert!(
+                DeliveryFailure::from_spawn_error(&error).replayable,
+                "{errno} must be replayable"
+            );
+        }
+
+        for errno in [Errno::ENOENT, Errno::EACCES, Errno::ENOEXEC] {
+            let error = anyhow::Error::new(std::io::Error::from_raw_os_error(errno as i32))
+                .context("spawn fkst-framework");
+
+            assert!(
+                !DeliveryFailure::from_spawn_error(&error).replayable,
+                "{errno} must be permanent"
+            );
+        }
+    }
+
+    #[test]
+    fn exhausted_emfile_spawn_failure_is_retained_for_redrive() {
+        let temp = TempDir::new().unwrap();
+        let store = Arc::new(DeliveryStore::open(temp.path().join("delivery.redb")).unwrap());
+        store.enqueue(&record("one")).unwrap();
+        let leased = store
+            .lease_for_dept("worker", now_unix_millis(), 8, Duration::from_millis(50))
+            .unwrap()
+            .remove(0);
+        let router = router_with_dead_letter(store.clone());
+        let error = anyhow::Error::new(std::io::Error::from_raw_os_error(Errno::EMFILE as i32))
+            .context("spawn fkst-framework");
+
+        retry_record(
+            &store,
+            &router,
+            Some(&policy(1)),
+            &leased,
+            DeliveryFailure::from_spawn_error(&error),
+            &SupervisorJournal::disabled(),
+        );
+
+        let dead = store.get_dead("one").unwrap().unwrap();
+        assert!(dead.replayable);
+        assert!(!dead.permanent);
+        assert!(dead.record.is_some());
+
+        let result = store
+            .redrive_due(
+                &RedrivePolicy {
+                    max_redrives: 3,
+                    cooldown: Duration::ZERO,
+                },
+                u64::MAX,
+                1,
+            )
+            .unwrap();
+        assert_eq!(result.redriven.len(), 1);
+        assert_eq!(result.redriven[0].delivery_id, "one");
+    }
+
+    #[test]
+    fn exhausted_enoent_spawn_failure_is_permanent() {
+        let temp = TempDir::new().unwrap();
+        let store = Arc::new(DeliveryStore::open(temp.path().join("delivery.redb")).unwrap());
+        store.enqueue(&record("one")).unwrap();
+        let leased = store
+            .lease_for_dept("worker", now_unix_millis(), 8, Duration::from_millis(50))
+            .unwrap()
+            .remove(0);
+        let router = router_with_dead_letter(store.clone());
+        let error = anyhow::Error::new(std::io::Error::from_raw_os_error(Errno::ENOENT as i32))
+            .context("spawn fkst-framework");
+
+        retry_record(
+            &store,
+            &router,
+            Some(&policy(1)),
+            &leased,
+            DeliveryFailure::from_spawn_error(&error),
+            &SupervisorJournal::disabled(),
+        );
+
+        let dead = store.get_dead("one").unwrap().unwrap();
+        assert!(!dead.replayable);
+        assert!(dead.permanent);
+        assert!(dead.record.is_none());
+
+        let result = store
+            .redrive_due(
+                &RedrivePolicy {
+                    max_redrives: 3,
+                    cooldown: Duration::ZERO,
+                },
+                u64::MAX,
+                1,
+            )
+            .unwrap();
+        assert!(result.redriven.is_empty());
     }
 
     #[test]
