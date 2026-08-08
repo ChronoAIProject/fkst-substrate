@@ -33,6 +33,9 @@ pub(crate) struct DeliveryRecord {
     pub redrive_count: u64,
     #[serde(default)]
     pub collapse_by_dedup_id: bool,
+    /// A stable keyed duplicate arrived while this delivery's lease was active.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub pending_dirty: bool,
     #[serde(default)]
     pub subscriber_absent_since_ms: Option<u64>,
     pub lease_generation: u64,
@@ -57,6 +60,9 @@ pub(crate) struct DeadRecord {
     pub replayable: bool,
     #[serde(default = "default_dead_permanent")]
     pub permanent: bool,
+    /// A keyed successor made this terminal delivery ID reusable.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub allows_keyed_reuse: bool,
     pub error_excerpt: Option<String>,
     #[serde(default)]
     pub record: Option<DeliveryRecord>,
@@ -77,4 +83,8 @@ pub(crate) struct RedrivePolicy {
 
 fn default_dead_permanent() -> bool {
     true
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
