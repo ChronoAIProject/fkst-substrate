@@ -81,6 +81,15 @@ class LocalIterationMappingTests(unittest.TestCase):
                 check=False,
             )
 
+    def test_success_emits_pass(self) -> None:
+        completed = self.run_with_verify_exit(0)
+
+        self.assertEqual(completed.returncode, 0)
+        self.assertEqual(
+            marker_lines(completed),
+            ["FKST_LOCAL_ITERATION_RESULT:v2:PASS:NONE"],
+        )
+
     def test_build_semantic_evidence_maps_to_semantic(self) -> None:
         completed = self.run_with_verify_exit(12)
 
