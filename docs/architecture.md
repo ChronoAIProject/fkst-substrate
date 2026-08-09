@@ -228,6 +228,10 @@ queue 是包内命名空间。多 graph-root 组合时，裸 queue 名按 owner 
 
 ## 7. 运行态数据流
 
+Reliable subscriptions use the redb store under `FKST_DURABLE_ROOT`; ephemeral subscriptions use only the in-memory fanout. A reliable publish commits a delivery record before its wake is useful. The consumer leases due rows with an incremented `lease_generation`, renews the lease while its registered child is running, and ACKs with that generation only after child exit zero and successful publication of all authenticated `RAISED-AUTH` frames. Spawn failure, nonzero exit, or raised-event publication failure leaves the row unacknowledged and applies the configured retry/dead-letter transition. An expired lease is eligible for another generation; generation matching rejects a stale ACK. See `supervise/delivery_store.rs`, `supervise/consumer.rs`, and `supervise/raised.rs`.
+
+The event runtime generates a distinct authentication token for each reliable invocation, passes it through `FKST_RAISED_AUTH_TOKEN`, and removes it from the Lua-visible environment before package code loads. Only the owning runtime's stdout observer compares that token and publishes the frame. The pipe and token are process-local ownership, so a replacement runtime cannot accept an old invocation's output. Publication can precede the parent delivery ACK; deterministic derived delivery identity prevents a second durable row when the same raised ordinal is republished, while external effects still require package idempotence.
+
 ```text
 source
   cron tick or file_watch event
@@ -340,13 +344,17 @@ validation 规则：
 
 ## 11. 并发与进程边界
 
-supervisor 使用 current-thread tokio runtime，spawn `fkst-framework supervise` 并把 stdout/stderr 继承出去。收到 interrupt/terminate 时 supervisor 返回对应 exit code，不 signal event runtime。它最后 best-effort reap children。
+The engine supports two entry topologies. `fkst-supervisor` is the shipped process root: it starts one `fkst-framework supervise` child as a process-group leader, inherits its stdout/stderr, and waits. Direct `fkst-framework supervise` is also supported; in that topology its lifecycle manager is external. The engine does not identify which topology an operator uses. The normative outcome matrix is in `SPEC.md` under “Runtime generations and termination outcomes.”
 
-supervise 运行在 current-thread tokio runtime 内，但每个 Department event 都会 spawn 一个 framework child process。framework child 是新的 process group leader，并运行到自然退出。Department `M.spec.stall_window` 是可靠投递 lease 与续租窗口，不是 codex kill deadline。
+On `SIGINT` or `SIGTERM`, `fkst-supervisor` sends `SIGTERM` to the event-runtime process group, waits up to two seconds, then sends `SIGKILL` if it has not exited. The event runtime has its own `SIGINT`/`SIGTERM` handlers. A caught signal makes it send `SIGTERM` to every registered Department invocation process group, wait up to two seconds, send `SIGKILL` to survivors, abort runtime tasks, and exit. The supervisor does not launch a replacement. The event runtime is placed in an independent process group, and the supervisor installs no parent-death signal or other handoff. `SIGKILL` or a crash bypasses the relevant handler. These sequences are implemented in `crates/fkst-supervisor/src/main.rs`, `crates/fkst-supervisor/src/process_tree.rs`, `supervise/mod.rs`, and `process_tree.rs`; their normative outcomes are defined only by the matrix in `SPEC.md`.
+
+Each Department event spawns a `fkst-framework run` child as a new process-group leader. The event runtime registers that group before observing pipes and exit. The child installs a catchable-signal watcher for SDK subprocess groups, but an uncatchable death does not execute it. Department `M.spec.stall_window` is the reliable delivery lease and renewal window, not a child kill deadline.
+
+Graph and bytes bind at different times. The event runtime scans and validates one composed `Config` at startup. It retains the configured runner path, which the OS resolves at every invocation spawn. Each invocation then creates a fresh Lua state and reads its owner-scoped Department and modules. These are the bind-time mechanisms for the graph and later runner/package bytes; `SPEC.md` alone defines the resulting coherence guarantee and replacement outcome.
 
 The supervise process boundary follows process-supervision practice: each `fkst-framework run` child has one engine owner that observes exit and reaps it, and that observation is the source for delivery ack or retry. Blocking `wait` and blocking pipe I/O are not allowed on the core async runtime thread; stdout/stderr capture and child exit observation must not starve cron ticks, file-watch ticks, reliable wakes, lease renewal, retry, or dead-letter maintenance. Department spawn admission is bounded before a reliable lease is consumed, so lack of capacity leaves delivery due for a later dispatch pass instead of creating an unobservable leased backlog.
 
-Codex SDK 也把 `codex exec` 放入 process group。`spawn_codex_sync` 与 `spawn_codex` 使用整体 wall-clock `timeout`，默认 3600 秒；只有总运行时间超过 timeout 时才 kill process group，stdout/stderr 输出只被捕获，不延长 timeout。permit 池使用 fcntl lock file，不是内存 semaphore。permit 数来自 registry 的 `codex_permit_slots`：env 或 host `fkst.env` 可覆盖，未设置时默认 `20`。
+Codex SDK 也把 `codex exec` 放入 process group。`spawn_codex_sync` 与 `spawn_codex` 使用整体 wall-clock `timeout`，默认 3600 秒；只有总运行时间超过 timeout 时才 kill process group，stdout/stderr 输出只被捕获，不延长 timeout。permit 池使用 fcntl lock file，不是内存 semaphore。permit 数来自 registry 的 `codex_permit_slots`：env 或 host `fkst.env` 可覆盖，未设置时默认 `20`。Worktree-backed synchronous calls use the adoption protocol described in §6: a request-derived key, locked intent, detached worker, per-`run_id` lifetime witness, and effect/result records allow a later invocation to observe or recover that same work. This is the only cross-invocation codex-adoption mechanism; it does not transfer Department stdout ownership or make runtime scratch a business fact.
 
 `with_lock(name, fn)` 是跨 pipeline 互斥 primitive。它把校验后的锁名解析到 `<RT>/locks/<name>/=lock` 并打开，获取 exclusive flock，执行 Lua function，释放 file handle。进程死时 lock 自动释放。
 
