@@ -1980,6 +1980,17 @@ return {
 "#,
     )
     .unwrap();
+    fs::write(
+        host.path().join("tests/runtime_error_test.lua"),
+        r#"
+return {
+  test_runtime_error = function()
+    error('eq: expected "expected", got "actual"')
+  end,
+}
+"#,
+    )
+    .unwrap();
     for missing_module in ["missing_observation_alpha", "missing_observation_beta"] {
         fs::write(
             host.path().join(format!("tests/{missing_module}_test.lua")),
@@ -2000,9 +2011,9 @@ return {
     );
     let report = read_report(&report_path);
     assert_eq!(report["summary"]["passed"], 0);
-    assert_eq!(report["summary"]["failed"], 3);
+    assert_eq!(report["summary"]["failed"], 4);
     let tests = report["tests"].as_array().unwrap();
-    assert_eq!(tests.len(), 3, "report: {report}");
+    assert_eq!(tests.len(), 4, "report: {report}");
 
     let failures = tests
         .iter()
@@ -2012,6 +2023,18 @@ return {
     assert_eq!(assertion["name"], "test_assertion");
     assert_eq!(assertion["status"], "fail");
     assert_eq!(assertion["failure_kind"], "assertion_failure");
+
+    let runtime_error = failures["tests/runtime_error_test.lua"];
+    assert_eq!(runtime_error["name"], "test_runtime_error");
+    assert_eq!(runtime_error["status"], "fail");
+    assert_eq!(runtime_error["failure_kind"], "test_error");
+    assert!(
+        runtime_error["error"]
+            .as_str()
+            .unwrap()
+            .contains("eq: expected \"expected\", got \"actual\""),
+        "report: {report}"
+    );
 
     for missing_module in ["missing_observation_alpha", "missing_observation_beta"] {
         let file = format!("tests/{missing_module}_test.lua");
