@@ -115,12 +115,14 @@ pub(crate) fn run_tests(
                             report.push_pass(&file.owner_namespace, &relpath, &name);
                         }
                         Err(err) => {
+                            let failure_kind = TestReportFailureKind::for_test_error(&err);
                             println!("FAIL {relpath}::{name}: {err}");
                             failed += 1;
                             report.push_fail(
                                 &file.owner_namespace,
                                 &relpath,
                                 &name,
+                                failure_kind,
                                 err.to_string(),
                             );
                         }
@@ -134,6 +136,7 @@ pub(crate) fn run_tests(
                     &file.owner_namespace,
                     &relpath,
                     "<load>",
+                    TestReportFailureKind::TestError,
                     format!("{err:#}"),
                 );
             }
@@ -198,16 +201,25 @@ impl TestReport {
             file: file.to_string(),
             name: name.to_string(),
             status: TestReportStatus::Pass,
+            failure_kind: None,
             error: None,
         });
     }
 
-    fn push_fail(&mut self, owner_namespace: &str, file: &str, name: &str, error: String) {
+    fn push_fail(
+        &mut self,
+        owner_namespace: &str,
+        file: &str,
+        name: &str,
+        failure_kind: TestReportFailureKind,
+        error: String,
+    ) {
         self.tests.push(TestReportEntry {
             owner_namespace: owner_namespace.to_string(),
             file: file.to_string(),
             name: name.to_string(),
             status: TestReportStatus::Fail,
+            failure_kind: Some(failure_kind),
             error: Some(error),
         });
     }
@@ -226,6 +238,8 @@ struct TestReportEntry {
     name: String,
     status: TestReportStatus,
     #[serde(skip_serializing_if = "Option::is_none")]
+    failure_kind: Option<TestReportFailureKind>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
 }
 
@@ -234,6 +248,23 @@ struct TestReportEntry {
 enum TestReportStatus {
     Pass,
     Fail,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum TestReportFailureKind {
+    AssertionFailure,
+    TestError,
+}
+
+impl TestReportFailureKind {
+    fn for_test_error(error: &mlua::Error) -> Self {
+        if crate::test_assertions::is_assertion_failure(error) {
+            Self::AssertionFailure
+        } else {
+            Self::TestError
+        }
+    }
 }
 
 fn write_report_json(path: &Path, report: &TestReport) -> Result<()> {

@@ -1,4 +1,22 @@
 use mlua::{Function, Lua, Table, Value};
+use std::fmt;
+
+#[derive(Debug)]
+struct AssertionFailure(String);
+
+impl fmt::Display for AssertionFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for AssertionFailure {}
+
+pub(crate) fn is_assertion_failure(error: &mlua::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.downcast_ref::<AssertionFailure>().is_some())
+}
 
 pub(crate) fn register(lua: &Lua, test: &Table) -> mlua::Result<()> {
     test.set(
@@ -73,7 +91,7 @@ fn assertion_error(name: &str, msg: Option<String>, detail: String) -> mlua::Err
         Some(msg) if !msg.is_empty() => format!("{name}: {msg}: "),
         _ => format!("{name}: "),
     };
-    mlua::Error::runtime(format!("{prefix}{detail}"))
+    mlua::Error::external(AssertionFailure(format!("runtime error: {prefix}{detail}")))
 }
 
 fn display_value(value: Value) -> String {
