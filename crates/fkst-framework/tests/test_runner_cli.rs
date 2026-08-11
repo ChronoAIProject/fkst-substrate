@@ -157,6 +157,15 @@ fn read_report(path: &Path) -> serde_json::Value {
     serde_json::from_slice(&fs::read(path).unwrap()).unwrap()
 }
 
+fn read_legacy_report_bytes(path: &Path) -> String {
+    fs::read_to_string(path)
+        .unwrap()
+        .lines()
+        .filter(|line| !line.trim_start().starts_with("\"failure_kind\":"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 fn stdout(output: &Output) -> String {
     String::from_utf8_lossy(&output.stdout).to_string()
 }
@@ -1861,6 +1870,27 @@ return {
             .any(|test| test["file"] == "forged" || test["name"] == "test_fake"),
         "report: {report}"
     );
+    let expected = format!(
+        concat!(
+            "{{\n",
+            "  \"schema\": \"fkst.test.report.v1\",\n",
+            "  \"summary\": {{\n",
+            "    \"passed\": 1,\n",
+            "    \"failed\": 0\n",
+            "  }},\n",
+            "  \"tests\": [\n",
+            "    {{\n",
+            "      \"owner_namespace\": \"{}\",\n",
+            "      \"file\": \"tests/forgery_test.lua\",\n",
+            "      \"name\": \"test_real\",\n",
+            "      \"status\": \"pass\"\n",
+            "    }}\n",
+            "  ]\n",
+            "}}"
+        ),
+        namespace(host.path())
+    );
+    assert_eq!(fs::read_to_string(&report_path).unwrap(), expected);
 }
 
 #[test]
@@ -1901,13 +1931,102 @@ return {
     assert_eq!(tests[0]["file"], "tests/failing_report_test.lua");
     assert_eq!(tests[0]["name"], "test_fails");
     assert_eq!(tests[0]["status"], "fail");
-    assert!(
-        tests[0]["error"]
-            .as_str()
-            .unwrap()
-            .contains("expected \"expected\", got \"actual\""),
-        "report: {report}"
+    let expected_error = concat!(
+        "runtime error: eq: expected \"expected\", got \"actual\"",
+        "\nstack traceback:",
+        "\n\t[C]: in field 'eq'",
+        "\n\ttests/failing_report_test.lua:4: in function <tests/failing_report_test.lua:4>\n"
     );
+    assert_eq!(tests[0]["error"], expected_error, "report: {report}");
+    let expected_legacy_report = format!(
+        concat!(
+            "{{\n",
+            "  \"schema\": \"fkst.test.report.v1\",\n",
+            "  \"summary\": {{\n",
+            "    \"passed\": 0,\n",
+            "    \"failed\": 1\n",
+            "  }},\n",
+            "  \"tests\": [\n",
+            "    {{\n",
+            "      \"owner_namespace\": \"{}\",\n",
+            "      \"file\": \"tests/failing_report_test.lua\",\n",
+            "      \"name\": \"test_fails\",\n",
+            "      \"status\": \"fail\",\n",
+            "      \"error\": {}\n",
+            "    }}\n",
+            "  ]\n",
+            "}}"
+        ),
+        namespace(host.path()),
+        serde_json::to_string(expected_error).unwrap()
+    );
+    assert_eq!(
+        read_legacy_report_bytes(&report_path),
+        expected_legacy_report
+    );
+}
+
+#[test]
+fn test_report_json_classifies_failures_by_origin_without_parsing_error_text() {
+    let host = tempfile::Builder::new().prefix("repo").tempdir().unwrap();
+    fs::create_dir_all(host.path().join("tests")).unwrap();
+    fs::write(
+        host.path().join("tests/assertion_test.lua"),
+        r#"
+local t = fkst.test
+return {
+  test_assertion = function() t.eq("actual", "expected") end,
+}
+"#,
+    )
+    .unwrap();
+    for missing_module in ["missing_observation_alpha", "missing_observation_beta"] {
+        fs::write(
+            host.path().join(format!("tests/{missing_module}_test.lua")),
+            format!("return require({missing_module:?})\n"),
+        )
+        .unwrap();
+    }
+    let report_path = host.path().join("report.json");
+
+    let output = run_lua_tests_with_report(host.path(), host.path(), &report_path);
+
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "stdout: {}\nstderr: {}",
+        stdout(&output),
+        stderr(&output)
+    );
+    let report = read_report(&report_path);
+    assert_eq!(report["summary"]["passed"], 0);
+    assert_eq!(report["summary"]["failed"], 3);
+    let tests = report["tests"].as_array().unwrap();
+    assert_eq!(tests.len(), 3, "report: {report}");
+
+    let failures = tests
+        .iter()
+        .map(|entry| (entry["file"].as_str().unwrap(), entry))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let assertion = failures["tests/assertion_test.lua"];
+    assert_eq!(assertion["name"], "test_assertion");
+    assert_eq!(assertion["status"], "fail");
+    assert_eq!(assertion["failure_kind"], "assertion_failure");
+
+    for missing_module in ["missing_observation_alpha", "missing_observation_beta"] {
+        let file = format!("tests/{missing_module}_test.lua");
+        let test_error = failures[file.as_str()];
+        assert_eq!(test_error["name"], "<load>");
+        assert_eq!(test_error["status"], "fail");
+        assert_eq!(test_error["failure_kind"], "test_error");
+        assert!(
+            test_error["error"]
+                .as_str()
+                .unwrap()
+                .contains(missing_module),
+            "report: {report}"
+        );
+    }
 }
 
 #[test]
