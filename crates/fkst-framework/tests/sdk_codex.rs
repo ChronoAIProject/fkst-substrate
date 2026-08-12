@@ -3130,7 +3130,7 @@ case "$prompt" in
     exit 0
     ;;
   *)
-    printf '%s\n' '{"type":"turn.failed","error":{"message":"capacity unavailable","codex_error_info":"server_overloaded"}}'
+    printf '%s\n' '{"type":"turn.failed","error":{"message":"server overloaded","codex_error_info":"server_overloaded"}}'
     exit 1
     ;;
 esac
