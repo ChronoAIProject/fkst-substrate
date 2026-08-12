@@ -866,7 +866,7 @@ printf 'ok'
     assert!(log_body.contains("EXIT=0\n"));
     assert!(log_body.contains("DONE_AT="));
     assert!(log_body.contains(
-        "CMD=codex exec --dangerously-bypass-approvals-and-sandbox --context ctx.json -C wt -\n"
+        "CMD=codex exec --dangerously-bypass-approvals-and-sandbox --context ctx.json -C wt --json -\n"
     ));
     assert!(log_body.contains("TIMEOUT_SECONDS=42\n"));
 
@@ -881,6 +881,7 @@ printf 'ok'
             "ctx.json",
             "-C",
             "wt",
+            "--json",
             "-"
         ]
     );
@@ -2426,7 +2427,9 @@ fn spawn_codex_sync_returns_visible_spawn_error() {
     let log_body = std::fs::read_to_string(log_path).unwrap();
     assert!(log_body.contains("codex spawn failed"));
     assert!(log_body.contains("EXIT=-1\n"));
-    assert!(log_body.contains("CMD=codex exec --dangerously-bypass-approvals-and-sandbox -\n"));
+    assert!(
+        log_body.contains("CMD=codex exec --dangerously-bypass-approvals-and-sandbox --json -\n")
+    );
 
     let status_fn: mlua::Function = codex_runs_fn(&lua);
     let status: Table = status_fn.call(()).unwrap();
@@ -3091,4 +3094,111 @@ read _ < "$TIMEOUT_FIFO"
         .unwrap()
         .contains("SIGKILL to process group"));
     assert!(kill(Pid::from_raw(child_pid), None).is_err());
+}
+
+#[cfg(unix)]
+#[test]
+fn spawn_codex_sync_preserves_typed_jsonl_refusal_through_adoption() {
+    let tmp = tempfile::tempdir().unwrap();
+    let bin_dir = tmp.path().join("bin");
+    let worktree = tmp.path().join("wt");
+    let capture_dir = tmp.path().join("capture");
+    std::fs::create_dir_all(&worktree).unwrap();
+    std::fs::create_dir_all(&capture_dir).unwrap();
+    install_codex_script(
+        &bin_dir,
+        r#"#!/bin/sh
+set -eu
+required=0
+for arg in "$@"; do
+  if [ "$arg" = "--json" ]; then required=1; fi
+done
+if [ "$required" -ne 1 ]; then exit 91; fi
+prompt=$(cat)
+count_file="$CAPTURE_DIR/spawns"
+count=0
+if [ -f "$count_file" ]; then count=$(cat "$count_file"); fi
+count=$((count + 1))
+printf '%s' "$count" > "$count_file"
+case "$prompt" in
+  *control*)
+    printf '%s\n' '{"type":"turn.failed","error":{"message":"server overloaded"}}'
+    exit 1
+    ;;
+  *success*)
+    printf '%s\n' '{"type":"item.completed","item":{"type":"agent_message","text":"final agent message"}}'
+    exit 0
+    ;;
+  *)
+    printf '%s\n' '{"type":"turn.failed","error":{"message":"server overloaded","codex_error_info":"server_overloaded"}}'
+    exit 1
+    ;;
+esac
+"#,
+    );
+
+    let mut sandbox = ProcessSandbox::new();
+    sandbox.enter_cwd(tmp.path()).runtime_root(".fkst/runtime");
+    sandbox.prepend_path(&bin_dir);
+    sandbox.set_env("CAPTURE_DIR", capture_dir.to_string_lossy().into_owned());
+    sandbox.set_env(CODEX_WORKER_BIN_ENV, framework_bin());
+    sandbox.runtime_log_dir(tmp.path().join("runtime"));
+    let (_lock, _guard) = sandbox.enter();
+
+    let lua = Lua::new();
+    register(&lua).unwrap();
+    let spawn: mlua::Function = lua.globals().get("spawn_codex_sync").unwrap();
+    let opts = lua_opts(&lua, "typed refusal");
+    opts.set("worktree", worktree.to_string_lossy().into_owned())
+        .unwrap();
+    opts.set("dedup_key", "typed-refusal").unwrap();
+    let first: Table = spawn.call(opts.clone()).unwrap();
+    assert_eq!(first.get::<i64>("exit_code").unwrap(), 1);
+    assert_eq!(
+        first.get::<String>("codex_error_info").unwrap(),
+        "server_overloaded"
+    );
+    let second: Table = spawn.call(opts).unwrap();
+    assert_eq!(second.get::<i64>("exit_code").unwrap(), 1);
+    assert_eq!(
+        second.get::<String>("codex_error_info").unwrap(),
+        "server_overloaded"
+    );
+    assert_eq!(
+        std::fs::read_to_string(capture_dir.join("spawns")).unwrap(),
+        "1"
+    );
+
+    let adoption = adoption_work_dir(tmp.path());
+    for file in ["effect.json", "result.json", "status.json"] {
+        let value: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(adoption.join(file)).unwrap()).unwrap();
+        assert_eq!(value["codex_error_info"], "server_overloaded");
+    }
+    let effect_log = std::fs::read_to_string(adoption.join("effect-receipts.log")).unwrap();
+    assert!(effect_log.contains("\"codex_error_info\":\"server_overloaded\""));
+
+    let control = lua_opts(&lua, "control");
+    control
+        .set("worktree", worktree.to_string_lossy().into_owned())
+        .unwrap();
+    control.set("dedup_key", "control-refusal").unwrap();
+    let control_result: Table = spawn.call(control).unwrap();
+    assert_eq!(control_result.get::<i64>("exit_code").unwrap(), 1);
+    assert_eq!(
+        control_result.get::<String>("codex_error_info").unwrap(),
+        "UNKNOWN"
+    );
+
+    let success = lua_opts(&lua, "success");
+    success
+        .set("worktree", worktree.to_string_lossy().into_owned())
+        .unwrap();
+    success.set("dedup_key", "success-result").unwrap();
+    let success_result: Table = spawn.call(success).unwrap();
+    assert_eq!(success_result.get::<i64>("exit_code").unwrap(), 0);
+    assert_eq!(
+        success_result.get::<String>("stdout").unwrap(),
+        "final agent message"
+    );
 }
