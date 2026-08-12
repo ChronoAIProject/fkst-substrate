@@ -148,6 +148,8 @@ struct CodexStatusRecord {
     permit_slot: Option<usize>,
     #[serde(default)]
     output_tail_path: Option<String>,
+    #[serde(default)]
+    codex_error_info: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -175,6 +177,8 @@ struct CodexAdoptionRecord {
     cmd_line: String,
     error_kind: Option<String>,
     error: Option<String>,
+    #[serde(default)]
+    codex_error_info: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -183,6 +187,8 @@ struct CodexAdoptionResultRecord {
     exit_code: i32,
     error_kind: Option<String>,
     error: Option<String>,
+    #[serde(default)]
+    codex_error_info: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -194,6 +200,8 @@ struct CodexAdoptionEffectRecord {
     exit_code: i32,
     error_kind: Option<String>,
     error: Option<String>,
+    #[serde(default)]
+    codex_error_info: Option<String>,
 }
 
 // worker threads return the same result shape before Lua table conversion.
@@ -206,6 +214,7 @@ pub(crate) struct CodexResult {
     error_kind: Option<String>,
     error_class: Option<String>,
     error: Option<String>,
+    codex_error_info: Option<String>,
 }
 
 // spawn_codex returns a pipeline-local opaque handle consumed by await_all.
@@ -289,7 +298,15 @@ impl CodexResult {
             error_kind: None,
             error_class,
             error: None,
+            codex_error_info: None,
         }
+    }
+
+    fn from_process(stdout: String, stderr: String, exit_code: i32, log_path: String) -> Self {
+        let (projected_stdout, codex_error_info) = project_codex_jsonl(&stdout);
+        let mut result = Self::success(projected_stdout, stderr, exit_code, log_path);
+        result.codex_error_info = codex_error_info;
+        result
     }
 
     fn failure(
@@ -317,6 +334,7 @@ impl CodexResult {
                     .to_string(),
             ),
             error: Some(message),
+            codex_error_info: None,
         }
     }
 
@@ -334,6 +352,7 @@ impl CodexResult {
                     .to_string(),
             ),
             error: Some(message),
+            codex_error_info: None,
         }
     }
 
@@ -347,6 +366,11 @@ impl CodexResult {
         }
         if let Some(message) = self.error {
             t.set("error", message)?;
+        }
+        if let Some(codex_error_info) = self.codex_error_info {
+            t.set("codex_error_info", codex_error_info)?;
+        } else if self.exit_code != 0 {
+            t.set("codex_error_info", "UNKNOWN")?;
         }
         Ok(t)
     }
@@ -365,6 +389,52 @@ fn result_table(
     t.set("exit_code", exit_code)?;
     t.set("log_path", log_path)?;
     Ok(t)
+}
+
+fn project_codex_jsonl(stdout: &str) -> (String, Option<String>) {
+    let mut saw_jsonl = false;
+    let mut final_message = None;
+    let mut codex_error_info = None;
+    for line in stdout.lines() {
+        let Ok(event) = serde_json::from_str::<serde_json::Value>(line) else {
+            if saw_jsonl {
+                return (stdout.to_string(), None);
+            }
+            continue;
+        };
+        let Some(event_type) = event.get("type").and_then(serde_json::Value::as_str) else {
+            continue;
+        };
+        if !matches!(event_type, "turn.failed" | "item.completed") {
+            continue;
+        }
+        saw_jsonl = true;
+        if event_type == "turn.failed" {
+            codex_error_info = event
+                .get("error")
+                .and_then(|error| error.get("codex_error_info"))
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string);
+        } else if event
+            .get("item")
+            .and_then(|item| item.get("type"))
+            .and_then(serde_json::Value::as_str)
+            == Some("agent_message")
+        {
+            if let Some(text) = event
+                .get("item")
+                .and_then(|item| item.get("text"))
+                .and_then(serde_json::Value::as_str)
+            {
+                final_message = Some(text.to_string());
+            }
+        }
+    }
+    if saw_jsonl {
+        (final_message.unwrap_or_default(), codex_error_info)
+    } else {
+        (stdout.to_string(), None)
+    }
 }
 
 pub fn register(
@@ -641,7 +711,7 @@ fn run_codex_request(
             &command_line_for_request(&request),
             request.timeout_seconds,
         );
-        status.finish(-1);
+        status.finish(-1, None);
         write_codex_status(&request.log_path, &status);
         return Ok(CodexResult::failure(
             "permit",
@@ -668,7 +738,7 @@ fn run_codex_request(
                 &command_line_for_request(&request),
                 request.timeout_seconds,
             );
-            status.finish(-1);
+            status.finish(-1, None);
             write_codex_status(&request.log_path, &status);
             return Ok(CodexResult::failure(
                 "permit",
@@ -682,7 +752,7 @@ fn run_codex_request(
     };
 
     let result = run_codex_request_with_permit(request, config, lifetime_witness.as_raw_fd());
-    status.finish(result.exit_code);
+    status.finish(result.exit_code, result.codex_error_info.clone());
     write_codex_status(Path::new(&result.log_path), &status);
     Ok(result)
 }
@@ -776,7 +846,7 @@ fn run_mocked_codex_request(
         &cmd_line,
         request.timeout_seconds,
     );
-    status.finish(result.exit_code);
+    status.finish(result.exit_code, None);
     write_codex_status(&request.log_path, &status);
     Ok(CodexResult::success(
         result.stdout,
@@ -897,8 +967,9 @@ fn read_completed_adoption_result(paths: &CodexAdoptionPaths) -> Result<Option<C
         stderr.as_bytes(),
     );
     let exit_code = record.exit_code.unwrap_or(-1);
+    let codex_error_info = record.codex_error_info.clone();
     if let Some(kind) = record.error_kind.as_deref() {
-        return Ok(Some(CodexResult::failure(
+        let mut result = CodexResult::failure(
             kind,
             record
                 .error
@@ -908,14 +979,13 @@ fn read_completed_adoption_result(paths: &CodexAdoptionPaths) -> Result<Option<C
             stderr,
             exit_code,
             record.log_path,
-        )));
+        );
+        result.codex_error_info = codex_error_info;
+        return Ok(Some(result));
     }
-    Ok(Some(CodexResult::success(
-        stdout,
-        stderr,
-        exit_code,
-        record.log_path,
-    )))
+    let mut result = CodexResult::success(stdout, stderr, exit_code, record.log_path);
+    result.codex_error_info = codex_error_info;
+    Ok(Some(result))
 }
 
 fn recover_completed_adoption_result(paths: &CodexAdoptionPaths) -> Result<Option<CodexResult>> {
@@ -961,6 +1031,7 @@ fn promote_completed_adoption_result(
     record.exit_code = Some(result.exit_code);
     record.error_kind = result.error_kind;
     record.error = result.error;
+    record.codex_error_info = result.codex_error_info;
     write_visible_adoption_record(&paths.status, &record, CODEX_ADOPTION_STATUS_COMPLETED)?;
     Ok(true)
 }
@@ -1011,6 +1082,7 @@ fn promote_completed_adoption_effect(
         exit_code: effect.exit_code,
         error_kind: effect.error_kind,
         error: effect.error,
+        codex_error_info: effect.codex_error_info,
     };
     write_adoption_result_record(&paths.result, &result)?;
     promote_completed_adoption_result(paths, result)
@@ -1348,6 +1420,7 @@ fn adoption_record_from_request(
         cmd_line: command_line_for_request(request),
         error_kind: None,
         error: None,
+        codex_error_info: None,
     }
 }
 
@@ -1681,6 +1754,7 @@ pub(crate) fn run_codex_worker(options: CodexWorkerOptions) -> anyhow::Result<i3
         cmd_line: command_line_for_request(&request),
         error_kind: None,
         error: None,
+        codex_error_info: None,
     };
     let Some(adoption_lifetime_witness) =
         claim_adoption_worker(&options, &mut adoption, &run_lock)?
@@ -1727,7 +1801,7 @@ pub(crate) fn run_codex_worker(options: CodexWorkerOptions) -> anyhow::Result<i3
             adoption.run_id, adoption.key
         );
     }
-    status.finish(result.exit_code);
+    status.finish(result.exit_code, result.codex_error_info.clone());
     write_codex_status(Path::new(&result.log_path), &status);
     Ok(0)
 }
@@ -1810,6 +1884,7 @@ fn publish_adoption_result_if_current(
             exit_code: result.exit_code,
             error_kind: result.error_kind.clone(),
             error: result.error.clone(),
+            codex_error_info: result.codex_error_info.clone(),
         },
     )?;
     write_atomic(&paths.stdout, result.stdout.as_bytes())?;
@@ -1821,6 +1896,7 @@ fn publish_adoption_result_if_current(
             exit_code: result.exit_code,
             error_kind: result.error_kind.clone(),
             error: result.error.clone(),
+            codex_error_info: result.codex_error_info.clone(),
         },
     )?;
     adoption.status = CODEX_ADOPTION_STATUS_COMPLETED.to_string();
@@ -1828,6 +1904,7 @@ fn publish_adoption_result_if_current(
     adoption.exit_code = Some(result.exit_code);
     adoption.error_kind = result.error_kind.clone();
     adoption.error = result.error.clone();
+    adoption.codex_error_info = result.codex_error_info.clone();
     write_visible_adoption_record(&paths.status, adoption, CODEX_ADOPTION_STATUS_COMPLETED)?;
     Ok(true)
 }
@@ -1980,16 +2057,18 @@ impl CodexStatusRecord {
             exit_code: None,
             permit_slot,
             output_tail_path: Some(request.output_tail_path.to_string_lossy().into_owned()),
+            codex_error_info: None,
         }
     }
 
-    fn finish(&mut self, exit_code: i32) {
+    fn finish(&mut self, exit_code: i32, codex_error_info: Option<String>) {
         let ended_at_ms = unix_duration().as_millis() as u64;
         self.ended_at = Some(unix_millis_to_iso8601(ended_at_ms));
         self.ended_at_ms = Some(ended_at_ms);
         self.elapsed_ms = Some(ended_at_ms.saturating_sub(self.started_at_ms));
         self.status = "completed".to_string();
         self.exit_code = Some(exit_code);
+        self.codex_error_info = codex_error_info;
     }
 }
 
@@ -2061,6 +2140,9 @@ fn codex_status_record_table(lua: &Lua, record: &CodexStatusRecord, now_ms: u64)
     table.set("status", sdk_status(record))?;
     if let Some(exit_code) = record.exit_code {
         table.set("exit_code", exit_code)?;
+    }
+    if let Some(codex_error_info) = record.codex_error_info.as_deref() {
+        table.set("codex_error_info", codex_error_info)?;
     }
     if let Some(permit_slot) = record.permit_slot {
         table.set("permit_slot", permit_slot)?;
@@ -2326,6 +2408,7 @@ fn codex_status_record_from_adoption(
                 .to_string_lossy()
                 .into_owned(),
         ),
+        codex_error_info: record.codex_error_info,
     }
 }
 
@@ -2540,7 +2623,7 @@ fn wait_for_codex_child(
                     );
                 }
             }
-            let result = CodexResult::success(
+            let result = CodexResult::from_process(
                 stdout,
                 stderr,
                 exit_code,
@@ -2616,6 +2699,7 @@ fn write_codex_effect_receipt(request: &CodexRequest, result: &CodexResult) -> a
         exit_code: result.exit_code,
         error_kind: result.error_kind.clone(),
         error: result.error.clone(),
+        codex_error_info: result.codex_error_info.clone(),
     };
     append_codex_effect_log(effect_log_path, &receipt)
 }
@@ -2986,6 +3070,7 @@ fn command_args_for_request(request: &CodexRequest) -> Vec<String> {
         args.push("-C".to_string());
         args.push(wt.to_string());
     }
+    args.push("--json".to_string());
     args.push("-".to_string());
     args
 }
@@ -3530,6 +3615,7 @@ mod tests {
             exit_code: None,
             permit_slot: None,
             output_tail_path: None,
+            codex_error_info: None,
         };
         append_codex_status_log(&log_path, &running).unwrap();
         let mut completed = running.clone();
@@ -3577,6 +3663,7 @@ mod tests {
             exit_code: None,
             permit_slot: None,
             output_tail_path: None,
+            codex_error_info: None,
         };
         append_codex_status_log(&log_path, &running).unwrap();
         let mut injected = running.clone();
@@ -3625,6 +3712,7 @@ mod tests {
             exit_code: None,
             permit_slot: None,
             output_tail_path: None,
+            codex_error_info: None,
         };
         append_codex_status_log(&log_path, &running).unwrap();
         let mut injected = running.clone();
@@ -3670,6 +3758,7 @@ mod tests {
                 "exec".to_string(),
                 "--sandbox".to_string(),
                 "read-only".to_string(),
+                "--json".to_string(),
                 "-".to_string()
             ]
         );
@@ -3692,6 +3781,7 @@ mod tests {
             vec![
                 "exec".to_string(),
                 "--dangerously-bypass-approvals-and-sandbox".to_string(),
+                "--json".to_string(),
                 "-".to_string()
             ]
         );
