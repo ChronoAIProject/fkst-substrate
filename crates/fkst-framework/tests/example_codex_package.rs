@@ -159,7 +159,7 @@ fn codex_demo_raises_fake_codex_result() {
         &format!(
             r#"#!/bin/sh
 cat > "{}"
-echo FAKE_CODEX_OK
+echo '{{"type":"item.completed","item":{{"type":"agent_message","text":"FAKE_CODEX_OK"}}}}'
 exit 0
 "#,
             prompt_path.display()
