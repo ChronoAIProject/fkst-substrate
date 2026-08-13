@@ -40,6 +40,8 @@ const DEFAULT_CODEX_LOG_MAX_AGE: Duration = Duration::from_secs(48 * 60 * 60);
 const CODEX_STATUS_RECENT_LIMIT: usize = 50;
 const CODEX_OUTPUT_TAIL_MAX_LINES: usize = 40;
 const CODEX_OUTPUT_TAIL_MAX_BYTES: usize = 4096;
+const CODEX_DIAGNOSTIC_MAX_RECORDS: usize = 64;
+const CODEX_DIAGNOSTIC_MAX_BYTES: usize = 4096;
 const CODEX_STATUS_LOG_PREFIX: &str = "CODEX_STATUS:";
 const CODEX_OUTPUT_LOG_BEGIN: &str = "CODEX_OUTPUT_BEGIN";
 const CODEX_OUTPUT_LOG_END: &str = "CODEX_OUTPUT_END\n";
@@ -150,6 +152,14 @@ struct CodexStatusRecord {
     output_tail_path: Option<String>,
     #[serde(default)]
     codex_error_info: Option<String>,
+    #[serde(default)]
+    diagnostics: Vec<CodexDiagnostic>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+struct CodexDiagnostic {
+    line: usize,
+    raw: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -179,6 +189,8 @@ struct CodexAdoptionRecord {
     error: Option<String>,
     #[serde(default)]
     codex_error_info: Option<String>,
+    #[serde(default)]
+    diagnostics: Vec<CodexDiagnostic>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -189,6 +201,8 @@ struct CodexAdoptionResultRecord {
     error: Option<String>,
     #[serde(default)]
     codex_error_info: Option<String>,
+    #[serde(default)]
+    diagnostics: Vec<CodexDiagnostic>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -202,6 +216,8 @@ struct CodexAdoptionEffectRecord {
     error: Option<String>,
     #[serde(default)]
     codex_error_info: Option<String>,
+    #[serde(default)]
+    diagnostics: Vec<CodexDiagnostic>,
 }
 
 // worker threads return the same result shape before Lua table conversion.
@@ -215,6 +231,7 @@ pub(crate) struct CodexResult {
     error_class: Option<String>,
     error: Option<String>,
     codex_error_info: Option<String>,
+    diagnostics: Vec<CodexDiagnostic>,
 }
 
 // spawn_codex returns a pipeline-local opaque handle consumed by await_all.
@@ -299,14 +316,31 @@ impl CodexResult {
             error_class,
             error: None,
             codex_error_info: None,
+            diagnostics: Vec::new(),
         }
     }
 
     fn from_process(stdout: String, stderr: String, exit_code: i32, log_path: String) -> Self {
-        let (projected_stdout, codex_error_info) = project_codex_jsonl(&stdout);
-        let mut result = Self::success(projected_stdout, stderr, exit_code, log_path);
-        result.codex_error_info = codex_error_info;
-        result
+        match parse_codex_jsonl(&stdout) {
+            Ok(parsed) => {
+                let mut result = Self::success(parsed.stdout, stderr, exit_code, log_path);
+                result.codex_error_info = parsed.codex_error_info;
+                result.diagnostics = parsed.diagnostics;
+                result
+            }
+            Err(error) => {
+                let mut result = Self::failure(
+                    "structured_adapter",
+                    error.message,
+                    String::new(),
+                    stderr,
+                    exit_code,
+                    log_path,
+                );
+                result.diagnostics = error.diagnostics;
+                result
+            }
+        }
     }
 
     fn failure(
@@ -335,6 +369,7 @@ impl CodexResult {
             ),
             error: Some(message),
             codex_error_info: None,
+            diagnostics: Vec::new(),
         }
     }
 
@@ -353,6 +388,7 @@ impl CodexResult {
             ),
             error: Some(message),
             codex_error_info: None,
+            diagnostics: Vec::new(),
         }
     }
 
@@ -391,50 +427,182 @@ fn result_table(
     Ok(t)
 }
 
-fn project_codex_jsonl(stdout: &str) -> (String, Option<String>) {
-    let mut saw_jsonl = false;
+#[derive(Debug)]
+struct CodexJsonlResult {
+    stdout: String,
+    codex_error_info: Option<String>,
+    diagnostics: Vec<CodexDiagnostic>,
+}
+
+#[derive(Debug)]
+struct CodexJsonlError {
+    message: String,
+    diagnostics: Vec<CodexDiagnostic>,
+}
+
+fn parse_codex_jsonl(stdout: &str) -> std::result::Result<CodexJsonlResult, CodexJsonlError> {
+    let lines = stdout
+        .lines()
+        .enumerate()
+        .filter(|(_, line)| !line.trim().is_empty());
+    let mut records: Vec<(usize, serde_json::Value)> = Vec::new();
+    let mut diagnostics = Vec::new();
+    let mut structured = false;
+    for (index, line) in lines {
+        if !structured && !line.trim_start().starts_with(['{', '[']) {
+            continue;
+        }
+        structured = true;
+        let value = serde_json::from_str::<serde_json::Value>(line).map_err(|error| {
+            let mut retained = diagnostics.clone();
+            if retained.len() < CODEX_DIAGNOSTIC_MAX_RECORDS {
+                retained.push(CodexDiagnostic {
+                    line: index + 1,
+                    raw: line.chars().take(CODEX_DIAGNOSTIC_MAX_BYTES).collect(),
+                });
+            }
+            CodexJsonlError {
+                message: format!(
+                    "codex structured adapter: malformed JSON at line {}: {error}",
+                    index + 1
+                ),
+                diagnostics: retained,
+            }
+        })?;
+        let object = value.as_object().ok_or_else(|| CodexJsonlError {
+            message: format!(
+                "codex structured adapter: record at line {} is not an object",
+                index + 1
+            ),
+            diagnostics: diagnostics.clone(),
+        })?;
+        let event_type = object
+            .get("type")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| CodexJsonlError {
+                message: format!(
+                    "codex structured adapter: record at line {} has no string type",
+                    index + 1
+                ),
+                diagnostics: diagnostics.clone(),
+            })?;
+        match event_type {
+            "turn.failed" => {
+                let error = object
+                    .get("error")
+                    .and_then(serde_json::Value::as_object)
+                    .ok_or_else(|| CodexJsonlError {
+                        message: format!(
+                            "codex structured adapter: turn.failed at line {} has malformed error",
+                            index + 1
+                        ),
+                        diagnostics: diagnostics.clone(),
+                    })?;
+                if error
+                    .get("message")
+                    .and_then(serde_json::Value::as_str)
+                    .is_none()
+                {
+                    return Err(CodexJsonlError {
+                        message: format!("codex structured adapter: turn.failed at line {} has no string error message", index + 1),
+                        diagnostics: diagnostics.clone(),
+                    });
+                }
+            }
+            "item.completed" => {
+                let item = object.get("item").and_then(serde_json::Value::as_object).ok_or_else(|| CodexJsonlError {
+                    message: format!("codex structured adapter: item.completed at line {} has malformed item", index + 1),
+                    diagnostics: diagnostics.clone(),
+                })?;
+                if item
+                    .get("type")
+                    .and_then(serde_json::Value::as_str)
+                    .is_none()
+                {
+                    return Err(CodexJsonlError {
+                        message: format!("codex structured adapter: item.completed at line {} has no string item type", index + 1),
+                        diagnostics: diagnostics.clone(),
+                    });
+                }
+                if item.get("type").and_then(serde_json::Value::as_str) == Some("agent_message")
+                    && item
+                        .get("text")
+                        .and_then(serde_json::Value::as_str)
+                        .is_none()
+                {
+                    return Err(CodexJsonlError {
+                        message: format!(
+                            "codex structured adapter: agent_message at line {} has no string text",
+                            index + 1
+                        ),
+                        diagnostics: diagnostics.clone(),
+                    });
+                }
+            }
+            _ => {}
+        }
+        records.push((index, value));
+    }
+    if !structured {
+        return Ok(CodexJsonlResult {
+            stdout: stdout.to_string(),
+            codex_error_info: None,
+            diagnostics: Vec::new(),
+        });
+    }
     let mut final_message = None;
     let mut codex_error_info = None;
-    for line in stdout.lines() {
-        let Ok(event) = serde_json::from_str::<serde_json::Value>(line) else {
-            if saw_jsonl {
-                return (stdout.to_string(), None);
-            }
-            continue;
-        };
-        let Some(event_type) = event.get("type").and_then(serde_json::Value::as_str) else {
-            continue;
-        };
-        if !matches!(event_type, "turn.failed" | "item.completed") {
-            continue;
-        }
-        saw_jsonl = true;
-        if event_type == "turn.failed" {
-            codex_error_info = event
-                .get("error")
-                .and_then(|error| error.get("codex_error_info"))
-                .and_then(serde_json::Value::as_str)
-                .map(str::to_string);
-        } else if event
-            .get("item")
-            .and_then(|item| item.get("type"))
+    diagnostics.clear();
+    for (index, value) in records {
+        let event_type = value
+            .get("type")
             .and_then(serde_json::Value::as_str)
-            == Some("agent_message")
-        {
-            if let Some(text) = event
-                .get("item")
-                .and_then(|item| item.get("text"))
-                .and_then(serde_json::Value::as_str)
-            {
-                final_message = Some(text.to_string());
+            .unwrap();
+        match event_type {
+            "turn.failed" => {
+                let error = value
+                    .get("error")
+                    .and_then(serde_json::Value::as_object)
+                    .unwrap();
+                if let Some(value) = error.get("codex_error_info") {
+                    if !value.is_null() && value.as_str().is_none() {
+                        return Err(CodexJsonlError {
+                            message: format!("codex structured adapter: turn.failed at line {} has non-string codex_error_info", index + 1),
+                            diagnostics,
+                        });
+                    }
+                    codex_error_info = value.as_str().map(str::to_string);
+                }
+            }
+            "item.completed" => {
+                let item = value
+                    .get("item")
+                    .and_then(serde_json::Value::as_object)
+                    .unwrap();
+                if item.get("type").and_then(serde_json::Value::as_str) == Some("agent_message") {
+                    final_message = item
+                        .get("text")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_string);
+                }
+            }
+            _ => {
+                if diagnostics.len() < CODEX_DIAGNOSTIC_MAX_RECORDS {
+                    let raw = serde_json::to_string(&value).unwrap_or_else(|_| "{}".to_string());
+                    let raw = raw.chars().take(CODEX_DIAGNOSTIC_MAX_BYTES).collect();
+                    diagnostics.push(CodexDiagnostic {
+                        line: index + 1,
+                        raw,
+                    });
+                }
             }
         }
     }
-    if saw_jsonl {
-        (final_message.unwrap_or_default(), codex_error_info)
-    } else {
-        (stdout.to_string(), None)
-    }
+    Ok(CodexJsonlResult {
+        stdout: final_message.unwrap_or_default(),
+        codex_error_info,
+        diagnostics,
+    })
 }
 
 pub fn register(
@@ -711,7 +879,7 @@ fn run_codex_request(
             &command_line_for_request(&request),
             request.timeout_seconds,
         );
-        status.finish(-1, None);
+        status.finish(-1, None, Vec::new());
         write_codex_status(&request.log_path, &status);
         return Ok(CodexResult::failure(
             "permit",
@@ -738,7 +906,7 @@ fn run_codex_request(
                 &command_line_for_request(&request),
                 request.timeout_seconds,
             );
-            status.finish(-1, None);
+            status.finish(-1, None, Vec::new());
             write_codex_status(&request.log_path, &status);
             return Ok(CodexResult::failure(
                 "permit",
@@ -752,7 +920,11 @@ fn run_codex_request(
     };
 
     let result = run_codex_request_with_permit(request, config, lifetime_witness.as_raw_fd());
-    status.finish(result.exit_code, result.codex_error_info.clone());
+    status.finish(
+        result.exit_code,
+        result.codex_error_info.clone(),
+        result.diagnostics.clone(),
+    );
     write_codex_status(Path::new(&result.log_path), &status);
     Ok(result)
 }
@@ -846,14 +1018,19 @@ fn run_mocked_codex_request(
         &cmd_line,
         request.timeout_seconds,
     );
-    status.finish(result.exit_code, None);
-    write_codex_status(&request.log_path, &status);
-    Ok(CodexResult::success(
-        result.stdout,
-        result.stderr,
+    let parsed = CodexResult::from_process(
+        result.stdout.clone(),
+        result.stderr.clone(),
         result.exit_code,
         request.log_path.to_string_lossy().into_owned(),
-    ))
+    );
+    status.finish(
+        parsed.exit_code,
+        parsed.codex_error_info.clone(),
+        parsed.diagnostics.clone(),
+    );
+    write_codex_status(&request.log_path, &status);
+    Ok(parsed)
 }
 
 fn adoption_paths_for_request(
@@ -968,6 +1145,7 @@ fn read_completed_adoption_result(paths: &CodexAdoptionPaths) -> Result<Option<C
     );
     let exit_code = record.exit_code.unwrap_or(-1);
     let codex_error_info = record.codex_error_info.clone();
+    let diagnostics = record.diagnostics.clone();
     if let Some(kind) = record.error_kind.as_deref() {
         let mut result = CodexResult::failure(
             kind,
@@ -981,10 +1159,12 @@ fn read_completed_adoption_result(paths: &CodexAdoptionPaths) -> Result<Option<C
             record.log_path,
         );
         result.codex_error_info = codex_error_info;
+        result.diagnostics = diagnostics;
         return Ok(Some(result));
     }
     let mut result = CodexResult::success(stdout, stderr, exit_code, record.log_path);
     result.codex_error_info = codex_error_info;
+    result.diagnostics = diagnostics;
     Ok(Some(result))
 }
 
@@ -1032,6 +1212,7 @@ fn promote_completed_adoption_result(
     record.error_kind = result.error_kind;
     record.error = result.error;
     record.codex_error_info = result.codex_error_info;
+    record.diagnostics = result.diagnostics;
     write_visible_adoption_record(&paths.status, &record, CODEX_ADOPTION_STATUS_COMPLETED)?;
     Ok(true)
 }
@@ -1083,6 +1264,7 @@ fn promote_completed_adoption_effect(
         error_kind: effect.error_kind,
         error: effect.error,
         codex_error_info: effect.codex_error_info,
+        diagnostics: effect.diagnostics,
     };
     write_adoption_result_record(&paths.result, &result)?;
     promote_completed_adoption_result(paths, result)
@@ -1421,6 +1603,7 @@ fn adoption_record_from_request(
         error_kind: None,
         error: None,
         codex_error_info: None,
+        diagnostics: Vec::new(),
     }
 }
 
@@ -1755,6 +1938,7 @@ pub(crate) fn run_codex_worker(options: CodexWorkerOptions) -> anyhow::Result<i3
         error_kind: None,
         error: None,
         codex_error_info: None,
+        diagnostics: Vec::new(),
     };
     let Some(adoption_lifetime_witness) =
         claim_adoption_worker(&options, &mut adoption, &run_lock)?
@@ -1801,7 +1985,11 @@ pub(crate) fn run_codex_worker(options: CodexWorkerOptions) -> anyhow::Result<i3
             adoption.run_id, adoption.key
         );
     }
-    status.finish(result.exit_code, result.codex_error_info.clone());
+    status.finish(
+        result.exit_code,
+        result.codex_error_info.clone(),
+        result.diagnostics.clone(),
+    );
     write_codex_status(Path::new(&result.log_path), &status);
     Ok(0)
 }
@@ -1885,6 +2073,7 @@ fn publish_adoption_result_if_current(
             error_kind: result.error_kind.clone(),
             error: result.error.clone(),
             codex_error_info: result.codex_error_info.clone(),
+            diagnostics: result.diagnostics.clone(),
         },
     )?;
     write_atomic(&paths.stdout, result.stdout.as_bytes())?;
@@ -1897,6 +2086,7 @@ fn publish_adoption_result_if_current(
             error_kind: result.error_kind.clone(),
             error: result.error.clone(),
             codex_error_info: result.codex_error_info.clone(),
+            diagnostics: result.diagnostics.clone(),
         },
     )?;
     adoption.status = CODEX_ADOPTION_STATUS_COMPLETED.to_string();
@@ -1905,6 +2095,7 @@ fn publish_adoption_result_if_current(
     adoption.error_kind = result.error_kind.clone();
     adoption.error = result.error.clone();
     adoption.codex_error_info = result.codex_error_info.clone();
+    adoption.diagnostics = result.diagnostics.clone();
     write_visible_adoption_record(&paths.status, adoption, CODEX_ADOPTION_STATUS_COMPLETED)?;
     Ok(true)
 }
@@ -2058,10 +2249,16 @@ impl CodexStatusRecord {
             permit_slot,
             output_tail_path: Some(request.output_tail_path.to_string_lossy().into_owned()),
             codex_error_info: None,
+            diagnostics: Vec::new(),
         }
     }
 
-    fn finish(&mut self, exit_code: i32, codex_error_info: Option<String>) {
+    fn finish(
+        &mut self,
+        exit_code: i32,
+        codex_error_info: Option<String>,
+        diagnostics: Vec<CodexDiagnostic>,
+    ) {
         let ended_at_ms = unix_duration().as_millis() as u64;
         self.ended_at = Some(unix_millis_to_iso8601(ended_at_ms));
         self.ended_at_ms = Some(ended_at_ms);
@@ -2069,6 +2266,7 @@ impl CodexStatusRecord {
         self.status = "completed".to_string();
         self.exit_code = Some(exit_code);
         self.codex_error_info = codex_error_info;
+        self.diagnostics = diagnostics;
     }
 }
 
@@ -2144,6 +2342,14 @@ fn codex_status_record_table(lua: &Lua, record: &CodexStatusRecord, now_ms: u64)
     if let Some(codex_error_info) = record.codex_error_info.as_deref() {
         table.set("codex_error_info", codex_error_info)?;
     }
+    let diagnostics = lua.create_table()?;
+    for (index, diagnostic) in record.diagnostics.iter().enumerate() {
+        let item = lua.create_table()?;
+        item.set("line", diagnostic.line)?;
+        item.set("raw", diagnostic.raw.clone())?;
+        diagnostics.set(index + 1, item)?;
+    }
+    table.set("diagnostics", diagnostics)?;
     if let Some(permit_slot) = record.permit_slot {
         table.set("permit_slot", permit_slot)?;
     }
@@ -2409,6 +2615,7 @@ fn codex_status_record_from_adoption(
                 .into_owned(),
         ),
         codex_error_info: record.codex_error_info,
+        diagnostics: record.diagnostics,
     }
 }
 
@@ -2700,6 +2907,7 @@ fn write_codex_effect_receipt(request: &CodexRequest, result: &CodexResult) -> a
         error_kind: result.error_kind.clone(),
         error: result.error.clone(),
         codex_error_info: result.codex_error_info.clone(),
+        diagnostics: result.diagnostics.clone(),
     };
     append_codex_effect_log(effect_log_path, &receipt)
 }
@@ -3616,6 +3824,7 @@ mod tests {
             permit_slot: None,
             output_tail_path: None,
             codex_error_info: None,
+            diagnostics: Vec::new(),
         };
         append_codex_status_log(&log_path, &running).unwrap();
         let mut completed = running.clone();
@@ -3664,6 +3873,7 @@ mod tests {
             permit_slot: None,
             output_tail_path: None,
             codex_error_info: None,
+            diagnostics: Vec::new(),
         };
         append_codex_status_log(&log_path, &running).unwrap();
         let mut injected = running.clone();
@@ -3713,6 +3923,7 @@ mod tests {
             permit_slot: None,
             output_tail_path: None,
             codex_error_info: None,
+            diagnostics: Vec::new(),
         };
         append_codex_status_log(&log_path, &running).unwrap();
         let mut injected = running.clone();
@@ -4093,5 +4304,41 @@ mod tests {
                         .is_some_and(|name| name == OsStr::new(&request.run_id))
                 })
         }));
+    }
+
+    #[test]
+    fn jsonl_parser_projects_final_message_and_retains_additive_records() {
+        let output = concat!(
+            "{\"type\":\"thread.started\",\"thread_id\":\"t1\"}\n",
+            "{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"final answer\"}}\n",
+            "{\"type\":\"turn.completed\",\"usage\":{\"input_tokens\":1}}\n",
+        );
+
+        let parsed = parse_codex_jsonl(output).expect("structured stream should parse");
+
+        assert_eq!(parsed.stdout, "final answer");
+        assert_eq!(parsed.codex_error_info, None);
+        assert_eq!(parsed.diagnostics.len(), 2);
+        assert_eq!(
+            parsed.diagnostics[0].raw,
+            "{\"thread_id\":\"t1\",\"type\":\"thread.started\"}"
+        );
+        assert_eq!(
+            parsed.diagnostics[1].raw,
+            "{\"type\":\"turn.completed\",\"usage\":{\"input_tokens\":1}}"
+        );
+    }
+
+    #[test]
+    fn jsonl_parser_rejects_malformed_records_and_trailing_data() {
+        for output in [
+            "{\"type\":\"item.completed\"}\n",
+            "{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\"}}\n",
+            "{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"ok\"}}\nnot-json\n",
+            "{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"ok\"}}\n[]\n",
+        ] {
+            let error = parse_codex_jsonl(output).expect_err("malformed JSONL must fail closed");
+            assert!(error.message.contains("codex structured adapter"));
+        }
     }
 }

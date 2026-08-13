@@ -186,6 +186,52 @@ fn lua_opts(lua: &Lua, prompt: &str) -> Table {
     opts
 }
 
+#[test]
+fn mocked_codex_uses_jsonl_adapter_and_preserves_typed_metadata() {
+    let tmp = tempfile::tempdir().unwrap();
+    let runner = external_command::MockCommandState::new();
+    runner
+        .push_mock(
+            "codex exec".to_string(),
+            external_command::MockCommandResult {
+                stdout: concat!(
+                    "{\"type\":\"thread.started\",\"thread_id\":\"mock\"}\n",
+                    "{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"mock final\"}}\n",
+                    "{\"type\":\"turn.failed\",\"error\":{\"message\":\"server overloaded\",\"codex_error_info\":\"server_overloaded\"}}\n",
+                )
+                .to_string(),
+                stderr: String::new(),
+                exit_code: 1,
+            },
+        )
+        .unwrap();
+    let mut sandbox = ProcessSandbox::new();
+    sandbox.enter_cwd(tmp.path()).runtime_root(".fkst/runtime");
+    sandbox.runtime_log_dir(tmp.path().join("runtime"));
+    let (_lock, _guard) = sandbox.enter();
+
+    let lua = Lua::new();
+    sdk_codex::register_with_runner(
+        &lua,
+        tmp.path(),
+        config_registry::ConfigContext::from_host_root(tmp.path()).unwrap(),
+        None,
+        Some(runner),
+        RaiseBuffer::new(),
+        None,
+    )
+    .unwrap();
+    let spawn: Function = lua.globals().get("spawn_codex_sync").unwrap();
+    let result: Table = spawn.call(lua_opts(&lua, "mock parity")).unwrap();
+    assert_eq!(result.get::<i64>("exit_code").unwrap(), 1);
+    assert_eq!(result.get::<String>("stdout").unwrap(), "mock final");
+    assert_eq!(
+        result.get::<String>("codex_error_info").unwrap(),
+        "server_overloaded"
+    );
+    assert_eq!(result.get::<String>("stderr").unwrap(), "");
+}
+
 fn adoption_status_values(root: &Path) -> Vec<String> {
     let adoption_dir = root.join(".fkst/runtime/logs/codex-adoption");
     let mut statuses = Vec::new();
