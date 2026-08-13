@@ -296,7 +296,10 @@ end
 
 return {
   test_run_graph_codex_logs_are_hermetic_per_run = function()
-    t.mock_command("codex exec", { stdout = "ambient", exit_code = 0 })
+    t.mock_command("codex exec", {
+      stdout = "{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"ambient\"}}\n",
+      exit_code = 0,
+    })
     local ambient = spawn_codex_sync({
       prompt = "ambient codex work",
       dedup_key = "shared-exec-ref",
@@ -304,8 +307,14 @@ return {
     t.eq(ambient.exit_code, 0)
     t.is_true(matching_run_exists(), "ambient codex status seed was not visible")
 
-    t.mock_command("codex exec", { stdout = "first graph", exit_code = 0 })
-    t.mock_command("codex exec", { stdout = "second graph", exit_code = 0 })
+    t.mock_command("codex exec", {
+      stdout = "{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"first graph\"}}\n",
+      exit_code = 0,
+    })
+    t.mock_command("codex exec", {
+      stdout = "{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"second graph\"}}\n",
+      exit_code = 0,
+    })
     local event = {
       queue = "PLACEHOLDER.start",
       payload = {},

@@ -224,6 +224,7 @@ struct CodexAdoptionEffectRecord {
 // crate-internal test seams expose only data needed by extracted integration tests.
 pub(crate) struct CodexResult {
     stdout: String,
+    raw_stdout: Option<String>,
     stderr: String,
     exit_code: i32,
     log_path: String,
@@ -309,6 +310,7 @@ impl CodexResult {
                 .map(|class| class.label().to_string());
         Self {
             stdout,
+            raw_stdout: None,
             stderr,
             exit_code,
             log_path,
@@ -321,9 +323,11 @@ impl CodexResult {
     }
 
     fn from_process(stdout: String, stderr: String, exit_code: i32, log_path: String) -> Self {
+        let raw_stdout = stdout.clone();
         match parse_codex_jsonl(&stdout) {
             Ok(parsed) => {
                 let mut result = Self::success(parsed.stdout, stderr, exit_code, log_path);
+                result.raw_stdout = Some(raw_stdout);
                 result.codex_error_info = parsed.codex_error_info;
                 result.diagnostics = parsed.diagnostics;
                 result
@@ -337,6 +341,7 @@ impl CodexResult {
                     exit_code,
                     log_path,
                 );
+                result.raw_stdout = Some(raw_stdout);
                 result.diagnostics = error.diagnostics;
                 result
             }
@@ -358,6 +363,7 @@ impl CodexResult {
         };
         Self {
             stdout,
+            raw_stdout: None,
             stderr: combined_stderr,
             exit_code,
             log_path,
@@ -377,6 +383,7 @@ impl CodexResult {
         let message = err.to_string();
         Self {
             stdout: String::new(),
+            raw_stdout: None,
             stderr: message.clone(),
             exit_code: -1,
             log_path: String::new(),
@@ -447,12 +454,7 @@ fn parse_codex_jsonl(stdout: &str) -> std::result::Result<CodexJsonlResult, Code
         .filter(|(_, line)| !line.trim().is_empty());
     let mut records: Vec<(usize, serde_json::Value)> = Vec::new();
     let mut diagnostics = Vec::new();
-    let mut structured = false;
     for (index, line) in lines {
-        if !structured && !line.trim_start().starts_with(['{', '[']) {
-            continue;
-        }
-        structured = true;
         let value = serde_json::from_str::<serde_json::Value>(line).map_err(|error| {
             let mut retained = diagnostics.clone();
             if retained.len() < CODEX_DIAGNOSTIC_MAX_RECORDS {
@@ -543,7 +545,7 @@ fn parse_codex_jsonl(stdout: &str) -> std::result::Result<CodexJsonlResult, Code
         }
         records.push((index, value));
     }
-    if !structured {
+    if records.is_empty() {
         return Ok(CodexJsonlResult {
             stdout: stdout.to_string(),
             codex_error_info: None,
@@ -993,7 +995,10 @@ fn run_mocked_codex_request(
             runner.record(
                 invocation,
                 MockCommandResult {
-                    stdout: result.stdout.clone(),
+                    stdout: result
+                        .raw_stdout
+                        .clone()
+                        .unwrap_or_else(|| result.stdout.clone()),
                     stderr: result.stderr.clone(),
                     exit_code: result.exit_code,
                 },
@@ -4332,6 +4337,10 @@ mod tests {
     #[test]
     fn jsonl_parser_rejects_malformed_records_and_trailing_data() {
         for output in [
+            "not-json\n",
+            "42\n",
+            "not-json\n{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"ok\"}}\n",
+            "42\n{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"ok\"}}\n",
             "{\"type\":\"item.completed\"}\n",
             "{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\"}}\n",
             "{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"ok\"}}\nnot-json\n",
