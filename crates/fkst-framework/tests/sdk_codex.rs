@@ -186,6 +186,52 @@ fn lua_opts(lua: &Lua, prompt: &str) -> Table {
     opts
 }
 
+#[test]
+fn mocked_codex_uses_jsonl_adapter_and_preserves_typed_metadata() {
+    let tmp = tempfile::tempdir().unwrap();
+    let runner = external_command::MockCommandState::new();
+    runner
+        .push_mock(
+            "codex exec".to_string(),
+            external_command::MockCommandResult {
+                stdout: concat!(
+                    "{\"type\":\"thread.started\",\"thread_id\":\"mock\"}\n",
+                    "{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"mock final\"}}\n",
+                    "{\"type\":\"turn.failed\",\"error\":{\"message\":\"server overloaded\",\"codex_error_info\":\"server_overloaded\"}}\n",
+                )
+                .to_string(),
+                stderr: String::new(),
+                exit_code: 1,
+            },
+        )
+        .unwrap();
+    let mut sandbox = ProcessSandbox::new();
+    sandbox.enter_cwd(tmp.path()).runtime_root(".fkst/runtime");
+    sandbox.runtime_log_dir(tmp.path().join("runtime"));
+    let (_lock, _guard) = sandbox.enter();
+
+    let lua = Lua::new();
+    sdk_codex::register_with_runner(
+        &lua,
+        tmp.path(),
+        config_registry::ConfigContext::from_host_root(tmp.path()).unwrap(),
+        None,
+        Some(runner),
+        RaiseBuffer::new(),
+        None,
+    )
+    .unwrap();
+    let spawn: Function = lua.globals().get("spawn_codex_sync").unwrap();
+    let result: Table = spawn.call(lua_opts(&lua, "mock parity")).unwrap();
+    assert_eq!(result.get::<i64>("exit_code").unwrap(), 1);
+    assert_eq!(result.get::<String>("stdout").unwrap(), "mock final");
+    assert_eq!(
+        result.get::<String>("codex_error_info").unwrap(),
+        "server_overloaded"
+    );
+    assert_eq!(result.get::<String>("stderr").unwrap(), "");
+}
+
 fn adoption_status_values(root: &Path) -> Vec<String> {
     let adoption_dir = root.join(".fkst/runtime/logs/codex-adoption");
     let mut statuses = Vec::new();
@@ -438,7 +484,7 @@ fn codex_runs_ignores_status_records_in_untrusted_codex_output() {
         &bin_dir,
         r#"#!/bin/sh
 cat >/dev/null
-printf '%s\n' 'CODEX_STATUS:{"run_id":"codex-01ARZ3NDEKTSV4RRFFQ69G5FAW","started_at":"2099-01-01T00:00:00Z","started_at_ms":4070908800000,"status":"running","permit_slot":null}'
+printf '%s\n' '{"type":"item.completed","item":{"type":"agent_message","text":"CODEX_STATUS:{\"run_id\":\"codex-01ARZ3NDEKTSV4RRFFQ69G5FAW\",\"status\":\"running\"}"}}'
 "#,
     );
 
@@ -506,7 +552,7 @@ fn codex_runs_reports_running_and_recent_with_bounded_output_tail_without_paths(
 cat >/dev/null
 printf 'started' > "$STARTED_FIFO"
 read _ < "$RELEASE_FIFO"
-printf 'final output visible through bounded output_tail'
+printf '%s\n' '{"type":"item.completed","item":{"type":"agent_message","text":"final output visible through bounded output_tail"}}'
 "#,
     );
 
@@ -576,7 +622,7 @@ printf 'final output visible through bounded output_tail'
     assert_eq!(completed.get::<i64>("exit_code").unwrap(), 0);
     assert_eq!(
         completed.get::<String>("output_tail").unwrap(),
-        "final output visible through bounded output_tail"
+        "{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"final output visible through bounded output_tail\"}}\n"
     );
     assert!(completed.get::<String>("ended_at").unwrap().ends_with('Z'));
     assert!(completed.get::<u64>("ended_at_ms").is_ok());
@@ -601,7 +647,7 @@ fn codex_runs_recent_is_bounded_to_last_fifty_completions() {
         &bin_dir,
         r#"#!/bin/sh
 cat >/dev/null
-printf 'ok'
+printf '%s\n' '{"type":"item.completed","item":{"type":"agent_message","text":"ok"}}'
 "#,
     );
 
@@ -829,7 +875,7 @@ fn spawn_codex_sync_sends_prompt_through_stdin_after_options() {
 printf '%s
 ' "$@" > "$CAPTURE_DIR/argv"
 cat > "$CAPTURE_DIR/stdin"
-printf 'ok'
+printf '%s\n' '{"type":"item.completed","item":{"type":"agent_message","text":"ok"}}'
 "#,
     );
 
@@ -911,7 +957,7 @@ if [ -f "$count_file" ]; then
 fi
 count=$((count + 1))
 printf '%s' "$count" > "$count_file"
-printf 'result-%s' "$count"
+printf '{"type":"item.completed","item":{"type":"agent_message","text":"result-%s"}}\n' "$count"
 "#,
     );
 
@@ -970,7 +1016,7 @@ fn spawn_codex_sync_uses_runtime_adoption_dir_for_read_only_worktree() {
         &bin_dir,
         r#"#!/bin/sh
 cat >/dev/null
-printf 'readonly-ok'
+printf '%s\n' '{"type":"item.completed","item":{"type":"agent_message","text":"readonly-ok"}}'
 "#,
     );
 
@@ -1021,7 +1067,7 @@ if [ -f "$count_file" ]; then
 fi
 count=$((count + 1))
 printf '%s' "$count" > "$count_file"
-printf 'result-%s' "$count"
+printf '{"type":"item.completed","item":{"type":"agent_message","text":"result-%s"}}\n' "$count"
 "#,
     );
 
@@ -1090,7 +1136,7 @@ if [ -f "$count_file" ]; then
 fi
 count=$((count + 1))
 printf '%s' "$count" > "$count_file"
-printf 'result-%s' "$count"
+printf '{"type":"item.completed","item":{"type":"agent_message","text":"result-%s"}}\n' "$count"
 "#,
     );
 
@@ -1142,7 +1188,7 @@ fn spawn_codex_sync_publishes_visible_intent_before_adoption_worker_spawn() {
         r#"#!/bin/sh
 cat >/dev/null
 printf 'spawned' > "$CAPTURE_DIR/spawned"
-printf 'intent-ok'
+printf '%s\n' '{"type":"item.completed","item":{"type":"agent_message","text":"intent-ok"}}'
 "#,
     );
 
@@ -1230,7 +1276,7 @@ if [ -f "$count_file" ]; then
 fi
 count=$((count + 1))
 printf '%s' "$count" > "$count_file"
-printf 'redrive-%s' "$count"
+printf '{"type":"item.completed","item":{"type":"agent_message","text":"redrive-%s"}}\n' "$count"
 "#,
     );
 
@@ -1309,7 +1355,7 @@ if [ -f "$count_file" ]; then
 fi
 count=$((count + 1))
 printf '%s' "$count" > "$count_file"
-printf 'recovered-%s' "$count"
+printf '{"type":"item.completed","item":{"type":"agent_message","text":"recovered-%s"}}\n' "$count"
 "#,
     );
 
@@ -1376,7 +1422,7 @@ if [ -f "$count_file" ]; then
 fi
 count=$((count + 1))
 printf '%s' "$count" > "$count_file"
-printf 'effect-key-%s' "$count"
+printf '{"type":"item.completed","item":{"type":"agent_message","text":"effect-key-%s"}}\n' "$count"
 "#,
     );
 
@@ -1452,7 +1498,7 @@ if [ -f "$count_file" ]; then
 fi
 count=$((count + 1))
 printf '%s' "$count" > "$count_file"
-printf 'external-effect-%s' "$count"
+printf '{"type":"item.completed","item":{"type":"agent_message","text":"external-effect-%s"}}\n' "$count"
 "#,
     );
 
@@ -1556,7 +1602,7 @@ count=$((count + 1))
 printf '%s' "$count" > "$count_file"
 printf 'started' > "$STARTED_FIFO"
 read _ < "$RELEASE_FIFO"
-printf 'adopted-%s' "$count"
+printf '{"type":"item.completed","item":{"type":"agent_message","text":"adopted-%s"}}\n' "$count"
 "#,
     );
 
@@ -1748,7 +1794,7 @@ if [ "$count" -eq 1 ]; then
   printf 'started' > "$STARTED_FIFO"
   while :; do sleep 1; done
 fi
-printf 'redrive-%s' "$count"
+printf '{"type":"item.completed","item":{"type":"agent_message","text":"redrive-%s"}}\n' "$count"
 "#,
     );
 
@@ -1866,7 +1912,7 @@ if [ "$count" -eq 1 ]; then
 fi
 printf 'started' > "$REDRIVE_STARTED_FIFO"
 sleep 4
-printf 'redrive-%s' "$count"
+printf '{"type":"item.completed","item":{"type":"agent_message","text":"redrive-%s"}}\n' "$count"
 "#,
     );
 
@@ -1976,7 +2022,7 @@ count=$((count + 1))
 printf '%s' "$count" > "$count_file"
 printf 'started' > "$STARTED_FIFO"
 read _ < "$RELEASE_FIFO"
-printf 'race-%s' "$count"
+printf '{"type":"item.completed","item":{"type":"agent_message","text":"race-%s"}}\n' "$count"
 "#,
     );
 
@@ -2074,10 +2120,10 @@ fn codex_runs_reads_running_adoption_record_without_status_log() {
         &bin_dir,
         r#"#!/bin/sh
 cat >/dev/null
-printf 'adoption-live-tail\n'
+printf '%s\n' '{"type":"item.completed","item":{"type":"agent_message","text":"adoption-live-tail"}}'
 printf 'started' > "$STARTED_FIFO"
 read _ < "$RELEASE_FIFO"
-printf 'adoption-done'
+printf '%s\n' '{"type":"item.completed","item":{"type":"agent_message","text":"adoption-done"}}'
 "#,
     );
 
@@ -2128,7 +2174,7 @@ printf 'adoption-done'
         let running: Table = status.get("running").unwrap();
         if running.raw_len() == 1 {
             let item: Table = running.get(1).unwrap();
-            if item.get::<String>("output_tail").unwrap() == "adoption-live-tail\n" {
+            if item.get::<String>("output_tail").unwrap() == "{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"adoption-live-tail\"}}\n" {
                 active = Some(item);
                 break;
             }
@@ -2156,7 +2202,7 @@ printf 'adoption-done'
         .ends_with('Z'));
     assert_eq!(
         active.get::<String>("output_tail").unwrap(),
-        "adoption-live-tail\n"
+        "{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"adoption-live-tail\"}}\n"
     );
     assert!(tmp
         .path()
@@ -2169,7 +2215,7 @@ printf 'adoption-done'
     write_fifo(&release_fifo, "go\n");
     assert_eq!(
         recv_result(&result_rx, "adopted status result"),
-        "adoption-live-tail\nadoption-done"
+        "adoption-done"
     );
     worker_thread.join().unwrap();
 }
@@ -2183,7 +2229,7 @@ fn spawn_codex_sync_records_minimal_completed_status() {
         &bin_dir,
         r#"#!/bin/sh
 cat >/dev/null
-printf 'sensitive output body'
+printf '%s\n' '{"type":"item.completed","item":{"type":"agent_message","text":"sensitive output body"}}'
 "#,
     );
 
@@ -2219,7 +2265,7 @@ printf 'sensitive output body'
     assert_eq!(item.get::<i64>("exit_code").unwrap(), 0);
     assert_eq!(
         item.get::<String>("output_tail").unwrap(),
-        "sensitive output body"
+        "{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"sensitive output body\"}}\n"
     );
     assert!(item.get::<String>("run_id").unwrap().starts_with("codex-"));
     assert!(item.get::<u64>("started_at_ms").unwrap() > 0);
@@ -2259,7 +2305,7 @@ fn spawn_codex_running_status_is_queryable_before_exit() {
 cat >/dev/null
 printf 'started' > "$STARTED_FIFO"
 read _ < "$RELEASE_FIFO"
-printf 'done'
+printf '%s\n' '{"type":"item.completed","item":{"type":"agent_message","text":"done"}}'
 "#,
     );
 
@@ -2320,7 +2366,7 @@ fn codex_runs_retains_last_fifty_completed_runs() {
         &bin_dir,
         r#"#!/bin/sh
 cat >/dev/null
-printf 'ok'
+printf '%s\n' '{"type":"item.completed","item":{"type":"agent_message","text":"ok"}}'
 "#,
     );
 
@@ -2363,7 +2409,7 @@ fn spawn_codex_sync_keeps_codex_permit_and_prepares_rate_shims() {
         &bin_dir,
         r#"#!/bin/sh
 cat >/dev/null
-printf 'codex-ok'
+printf '%s\n' '{"type":"item.completed","item":{"type":"agent_message","text":"codex-ok"}}'
 "#,
     );
 
@@ -2538,7 +2584,7 @@ fn spawn_codex_sync_prunes_aged_codex_logs_and_retains_fresh_logs() {
         &bin_dir,
         r#"#!/bin/sh
 cat >/dev/null
-printf 'ok'
+printf '%s\n' '{"type":"item.completed","item":{"type":"agent_message","text":"ok"}}'
 "#,
     );
 
@@ -2590,7 +2636,7 @@ fn spawn_codex_sync_prunes_oldest_codex_logs_to_size_budget() {
         &bin_dir,
         r#"#!/bin/sh
 cat >/dev/null
-printf 'ok'
+printf '%s\n' '{"type":"item.completed","item":{"type":"agent_message","text":"ok"}}'
 "#,
     );
 
@@ -2638,7 +2684,7 @@ fn spawn_codex_sync_respects_age_override_when_pruning_codex_logs() {
         &bin_dir,
         r#"#!/bin/sh
 cat >/dev/null
-printf 'ok'
+printf '%s\n' '{"type":"item.completed","item":{"type":"agent_message","text":"ok"}}'
 "#,
     );
 
@@ -2683,7 +2729,7 @@ fn spawn_codex_returns_handle_before_child_finishes() {
 cat >/dev/null
 printf '%s' "$$" > "$PGID_FIFO"
 read _ < "$RELEASE_FIFO"
-printf 'released'
+printf '%s\n' '{"type":"item.completed","item":{"type":"agent_message","text":"released"}}'
 "#,
     );
 
@@ -2729,7 +2775,7 @@ read prompt
 if [ "$prompt" = "slow" ]; then
   read _ < "$RELEASE_SLOW"
 fi
-printf '%s' "$prompt"
+printf '{"type":"item.completed","item":{"type":"agent_message","text":"%s"}}\n' "$prompt"
 "#,
     );
 
@@ -2769,7 +2815,7 @@ if [ "$prompt" = "bad" ]; then
   printf 'bad-stderr' >&2
   exit 7
 fi
-printf 'ok-%s' "$prompt"
+printf '{"type":"item.completed","item":{"type":"agent_message","text":"ok-%s"}}\n' "$prompt"
 "#,
     );
 
@@ -2805,7 +2851,7 @@ fn await_all_rejects_reused_or_foreign_handle() {
         &bin_dir,
         r#"#!/bin/sh
 cat >/dev/null
-printf 'ok'
+printf '%s\n' '{"type":"item.completed","item":{"type":"agent_message","text":"ok"}}'
 "#,
     );
 
@@ -2870,7 +2916,7 @@ fn spawn_codex_holds_permit_until_child_exit() {
 cat >/dev/null
 printf 'started' > "$STARTED_FIFO"
 read _ < "$RELEASE_FIFO"
-printf 'done'
+printf '%s\n' '{"type":"item.completed","item":{"type":"agent_message","text":"done"}}'
 "#,
     );
 

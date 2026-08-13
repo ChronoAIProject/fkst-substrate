@@ -2254,7 +2254,10 @@ return {
   end,
 
   test_02_codex_sync_uses_mock_and_records_prompt = function()
-    t.mock_command("codex exec", { stdout = "draft", exit_code = 0 })
+    t.mock_command("codex exec", {
+      stdout = "{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"draft\"}}\n",
+      exit_code = 0,
+    })
     local result = spawn_codex_sync({ prompt = "write draft" })
     t.eq(result.stdout, "draft")
     t.eq(result.stderr, "")
@@ -2362,7 +2365,10 @@ return {
   end,
 
   test_11_spawn_codex_await_all_uses_mock = function()
-    t.mock_command("codex exec", { stdout = "async draft", exit_code = 0 })
+    t.mock_command("codex exec", {
+      stdout = "{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"async draft\"}}\n",
+      exit_code = 0,
+    })
     local handle = spawn_codex({ prompt = "async prompt" })
     local results = await_all({ handle })
     t.eq(results[1].stdout, "async draft")
@@ -2439,7 +2445,10 @@ end
 
 return {
   test_01_records_mocked_codex_status = function()
-    t.mock_command("codex exec", { stdout = "done", exit_code = 0 })
+    t.mock_command("codex exec", {
+      stdout = "{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"done\"}}\n",
+      exit_code = 0,
+    })
     local result = spawn_codex_sync({
       prompt = "record top-level test status",
       dedup_key = "top-level-test-a",
@@ -2499,7 +2508,7 @@ fn test_runner_records_and_replays_external_command_cassettes() {
     let codex = bin_dir.join("codex");
     fs::write(
         &codex,
-        "#!/bin/sh\ncat >/dev/null\nprintf 'codex-secret-token'\n",
+        "#!/bin/sh\ncat >/dev/null\nprintf '%s\\n' '{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"codex-secret-token\"}}'\n",
     )
     .unwrap();
     #[cfg(unix)]
@@ -2553,7 +2562,7 @@ return {
     local calls = t.command_calls()
     t.eq(#calls, 2)
     t.eq(calls[1].stdout, "<TOKEN>")
-    t.eq(calls[2].stdout, "codex-<TOKEN>")
+    t.eq(calls[2].stdout, "{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"codex-<TOKEN>\"}}\n")
   end,
 
   test_03_replay_mismatch_fails_closed = function()
