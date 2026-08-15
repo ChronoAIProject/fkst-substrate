@@ -3079,8 +3079,16 @@ fn write_live_output_tail(path: Option<&Path>, stdout: &[u8], stderr: &[u8]) {
     let Some(path) = path else {
         return;
     };
-    let mut combined = Vec::with_capacity(stdout.len().saturating_add(stderr.len()));
+    let needs_separator = !stdout.is_empty() && !stderr.is_empty() && !stdout.ends_with(b"\n");
+    let capacity = stdout
+        .len()
+        .saturating_add(stderr.len())
+        .saturating_add(usize::from(needs_separator));
+    let mut combined = Vec::with_capacity(capacity);
     combined.extend_from_slice(stdout);
+    if needs_separator {
+        combined.push(b'\n');
+    }
     combined.extend_from_slice(stderr);
     let tail = bounded_output_tail(&combined);
     if let Err(err) = write_atomic(path, tail.as_bytes()) {
@@ -3093,28 +3101,23 @@ fn write_live_output_tail(path: Option<&Path>, stdout: &[u8], stderr: &[u8]) {
 
 fn bounded_output_tail(bytes: &[u8]) -> String {
     let text = String::from_utf8_lossy(bytes);
-    let mut lines = text
-        .lines()
-        .rev()
-        .take(CODEX_OUTPUT_TAIL_MAX_LINES)
-        .collect::<Vec<_>>();
+    let trailing_newline = text.ends_with('\n');
+    let mut tail_bytes = usize::from(trailing_newline);
+    let mut lines = Vec::new();
+    for line in text.lines().rev().take(CODEX_OUTPUT_TAIL_MAX_LINES) {
+        let additional_bytes = line.len().saturating_add(usize::from(!lines.is_empty()));
+        if tail_bytes.saturating_add(additional_bytes) > CODEX_OUTPUT_TAIL_MAX_BYTES {
+            break;
+        }
+        tail_bytes += additional_bytes;
+        lines.push(line);
+    }
     lines.reverse();
     let mut tail = lines.join("\n");
-    if text.ends_with('\n') && !tail.is_empty() {
+    if trailing_newline && !tail.is_empty() {
         tail.push('\n');
     }
-    truncate_tail_utf8(&tail, CODEX_OUTPUT_TAIL_MAX_BYTES)
-}
-
-fn truncate_tail_utf8(value: &str, max_bytes: usize) -> String {
-    if value.len() <= max_bytes {
-        return value.to_string();
-    }
-    let mut start = value.len() - max_bytes;
-    while !value.is_char_boundary(start) {
-        start += 1;
-    }
-    value[start..].to_string()
+    tail
 }
 
 // positive values become overall timeout caps; invalid values mean unbounded wait.
@@ -3762,6 +3765,37 @@ mod tests {
             effect_key: None,
             effect_log_path: None,
         }
+    }
+
+    #[test]
+    fn output_tail_preserves_stdout_stderr_boundary() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("output.tail");
+
+        write_live_output_tail(
+            Some(&path),
+            br#"{"type":"handoff"}"#,
+            b"stderr diagnostic\n",
+        );
+
+        assert_eq!(
+            std::fs::read_to_string(path).unwrap(),
+            "{\"type\":\"handoff\"}\nstderr diagnostic\n"
+        );
+    }
+
+    #[test]
+    fn output_tail_byte_limit_retains_only_complete_records() {
+        let oversized = format!(
+            "{{\"record\":\"{}\"}}",
+            "x".repeat(CODEX_OUTPUT_TAIL_MAX_BYTES)
+        );
+        let output = format!("{oversized}\n{{\"record\":\"last\"}}\n");
+
+        assert_eq!(
+            bounded_output_tail(output.as_bytes()),
+            "{\"record\":\"last\"}\n"
+        );
     }
 
     #[test]
