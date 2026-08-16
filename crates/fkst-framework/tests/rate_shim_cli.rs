@@ -281,6 +281,7 @@ fn generated_shim_preserves_streams_stdin_exit_and_writes_audit_file() {
     assert!(audit.contains("PKG_VER=pkg-test"), "audit={audit}");
     assert!(audit.contains("EXIT=17"), "audit={audit}");
     assert!(audit.contains("TIMED_OUT=false"), "audit={audit}");
+    assert!(audit.contains("ELAPSED_MS="), "audit={audit}");
     assert!(!audit.contains("STDOUT_EXCERPT"), "audit={audit}");
     assert!(!audit.contains("STDERR_EXCERPT"), "audit={audit}");
     assert_eq!(ledger_tokens(&root.join("gh.bucket")), 0);

@@ -492,10 +492,13 @@ pub(crate) struct AuditedOutput {
 
 pub(crate) fn run_audited(spec: CommandSpec) -> Result<AuditedOutput> {
     let rendered = format_command(&spec.program.to_string_lossy(), &spec.args);
+    // Any rate permits are acquired by callers before this command-attempt boundary.
+    let started_at = Instant::now();
     let result = run_audited_inner(&spec);
+    let elapsed_ms = started_at.elapsed().as_millis();
     match &result {
-        Ok(output) => emit_audit_line(&rendered, output),
-        Err(err) => emit_audit_error_line(&rendered, err),
+        Ok(output) => emit_audit_line(&rendered, output, elapsed_ms),
+        Err(err) => emit_audit_error_line(&rendered, err, elapsed_ms),
     }
     result
 }
@@ -676,19 +679,27 @@ fn join_stdin_writer(writer: Option<JoinHandle<std::io::Result<()>>>) -> Result<
     Ok(())
 }
 
-fn emit_audit_line(rendered: &str, output: &AuditedOutput) {
+fn emit_audit_line(rendered: &str, output: &AuditedOutput, elapsed_ms: u128) {
     emit_audit(&audit_line(
         rendered,
         output.exit_code,
         output.timed_out,
+        elapsed_ms,
         &output.stdout,
         &output.stderr,
     ));
 }
 
-fn emit_audit_error_line(rendered: &str, err: &anyhow::Error) {
+fn emit_audit_error_line(rendered: &str, err: &anyhow::Error, elapsed_ms: u128) {
     let stderr = err.to_string();
-    emit_audit(&audit_line(rendered, -1, false, b"", stderr.as_bytes()));
+    emit_audit(&audit_line(
+        rendered,
+        -1,
+        false,
+        elapsed_ms,
+        b"",
+        stderr.as_bytes(),
+    ));
 }
 
 fn emit_audit(line: &str) {
@@ -725,18 +736,20 @@ pub(crate) fn audit_line(
     rendered: &str,
     exit_code: i32,
     timed_out: bool,
+    elapsed_ms: u128,
     stdout: &[u8],
     stderr: &[u8],
 ) -> String {
     format!(
-        "LEVEL=info EVENT=external_command CMD={} EXIT={} TIMED_OUT={} STDOUT_BYTES={} STDERR_BYTES={} STDOUT_EXCERPT={} STDERR_EXCERPT={}",
+        "LEVEL=info EVENT=external_command CMD={} EXIT={} TIMED_OUT={} STDOUT_BYTES={} STDERR_BYTES={} STDOUT_EXCERPT={} STDERR_EXCERPT={} ELAPSED_MS={}",
         escape_value(rendered),
         exit_code,
         timed_out,
         stdout.len(),
         stderr.len(),
         escaped_excerpt(stdout, AUDIT_EXCERPT_LIMIT),
-        escaped_excerpt(stderr, AUDIT_EXCERPT_LIMIT)
+        escaped_excerpt(stderr, AUDIT_EXCERPT_LIMIT),
+        elapsed_ms
     )
 }
 
@@ -773,14 +786,20 @@ fn truncate_escaped_field(value: &str, limit: usize) -> String {
     format!("{}{}", &value[..end], MARKER)
 }
 
-pub(crate) fn shim_audit_line(rendered: &str, exit_code: i32, timed_out: bool) -> String {
+pub(crate) fn shim_audit_line(
+    rendered: &str,
+    exit_code: i32,
+    timed_out: bool,
+    elapsed_ms: u128,
+) -> String {
     format!(
-        "LEVEL=info ENGINE_VER={} PKG_VER={} EVENT=external_command CMD={} EXIT={} TIMED_OUT={}",
+        "LEVEL=info ENGINE_VER={} PKG_VER={} EVENT=external_command CMD={} EXIT={} TIMED_OUT={} ELAPSED_MS={}",
         escape_value(&crate::provenance::current_engine_ver()),
         escape_value(&crate::provenance::current_pkg_ver()),
         escape_value(rendered),
         exit_code,
-        timed_out
+        timed_out,
+        elapsed_ms
     )
 }
 
@@ -936,7 +955,14 @@ mod tests {
     #[test]
     fn audit_excerpt_is_bounded_and_single_line_escaped() {
         let stdout = format!("{}x\n", "a".repeat(5000));
-        let line = audit_line("gh issue list", 0, false, stdout.as_bytes(), b"err\r\nnext");
+        let line = audit_line(
+            "gh issue list",
+            0,
+            false,
+            7,
+            stdout.as_bytes(),
+            b"err\r\nnext",
+        );
         assert!(!line.contains('\n'), "{line}");
         assert!(!line.contains('\r'), "{line}");
         let excerpt = line
@@ -952,26 +978,91 @@ mod tests {
 
     #[test]
     fn audit_line_captures_exit_timeout_and_byte_counts() {
-        let line = audit_line("sh -c false", 124, true, b"out", b"err");
+        let line = audit_line("sh -c false", 124, true, 42, b"out", b"err");
         assert!(line.contains("EVENT=external_command"), "{line}");
         assert!(!line.contains("ENGINE_VER="), "{line}");
         assert!(!line.contains("PKG_VER="), "{line}");
         assert!(line.contains("EXIT=124"), "{line}");
         assert!(line.contains("TIMED_OUT=true"), "{line}");
+        assert!(line.contains("ELAPSED_MS=42"), "{line}");
         assert!(line.contains("STDOUT_BYTES=3"), "{line}");
         assert!(line.contains("STDERR_BYTES=3"), "{line}");
     }
 
     #[test]
     fn shim_audit_line_omits_captured_excerpts() {
-        let line = shim_audit_line("gh issue list", 17, false);
+        let line = shim_audit_line("gh issue list", 17, false, 23);
         assert!(line.contains("EVENT=external_command"), "{line}");
         assert!(line.contains("ENGINE_VER="), "{line}");
         assert!(line.contains("PKG_VER="), "{line}");
         assert!(line.contains("CMD=gh\\sissue\\slist"), "{line}");
         assert!(line.contains("EXIT=17"), "{line}");
+        assert!(line.contains("ELAPSED_MS=23"), "{line}");
         assert!(!line.contains("STDOUT_EXCERPT"), "{line}");
         assert!(!line.contains("STDERR_EXCERPT"), "{line}");
+    }
+
+    #[test]
+    fn run_audited_measures_known_command_duration() {
+        let lines = Arc::new(Mutex::new(Vec::new()));
+        let captured = lines.clone();
+        let _sink = install_audit_sink_for_test(Arc::new(move |line| {
+            captured.lock().unwrap().push(line.to_string())
+        }));
+
+        run_audited(CommandSpec {
+            program: PathBuf::from("/bin/sh"),
+            args: vec!["-c".to_string(), "sleep 0.1".to_string()],
+            cwd: None,
+            env: Vec::new(),
+            stdin: CommandStdin::Null,
+            timeout: None,
+            process_group: false,
+        })
+        .unwrap();
+
+        let lines = lines.lock().unwrap();
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        let elapsed_ms = audit_elapsed_ms(&lines[0]);
+        assert!(
+            elapsed_ms >= 80,
+            "elapsed_ms={elapsed_ms} line={}",
+            lines[0]
+        );
+    }
+
+    #[test]
+    fn run_audited_error_includes_elapsed_duration() {
+        let lines = Arc::new(Mutex::new(Vec::new()));
+        let captured = lines.clone();
+        let _sink = install_audit_sink_for_test(Arc::new(move |line| {
+            captured.lock().unwrap().push(line.to_string())
+        }));
+        let dir = tempfile::tempdir().unwrap();
+
+        let result = run_audited(CommandSpec {
+            program: dir.path().join("not-a-command"),
+            args: Vec::new(),
+            cwd: None,
+            env: Vec::new(),
+            stdin: CommandStdin::Null,
+            timeout: None,
+            process_group: false,
+        });
+
+        assert!(result.is_err());
+        let lines = lines.lock().unwrap();
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(lines[0].contains("EXIT=-1"), "{}", lines[0]);
+        let _elapsed_ms = audit_elapsed_ms(&lines[0]);
+    }
+
+    fn audit_elapsed_ms(line: &str) -> u128 {
+        line.split_ascii_whitespace()
+            .find_map(|field| field.strip_prefix("ELAPSED_MS="))
+            .expect("audit line must contain ELAPSED_MS")
+            .parse()
+            .expect("ELAPSED_MS must be an integer")
     }
 
     #[test]
