@@ -318,8 +318,7 @@ fn validate_catalog(
     validate_cycles(&validation_catalog, &library_names, failures);
 
     for unit in validation_catalog.units() {
-        let required =
-            scan_actual_library_requires(unit, &validation_catalog, &library_names, failures)?;
+        let required = scan_actual_library_requires(unit, &validation_catalog, failures)?;
         validate_actual_requires(unit, &required, &library_names, failures, warnings);
         actual_requires.insert(unit.catalog_name().to_string(), required);
     }
@@ -521,29 +520,26 @@ fn validate_actual_requires(
 fn scan_actual_library_requires(
     unit: &CatalogUnit,
     catalog: &UnitCatalog,
-    library_names: &BTreeSet<String>,
     failures: &mut Vec<Diagnostic>,
 ) -> Result<BTreeSet<String>> {
     let mut required = BTreeSet::new();
     for path in lua_files(unit.code_root())? {
         let body = fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
         for module in require_literals(&body) {
-            if let Some((library, export)) = module.split_once('.') {
-                if library_names.contains(library) {
-                    let self_library_require = unit.is_library() && unit.library_name() == library;
-                    if !self_library_require {
-                        required.insert(library.to_string());
-                    }
-                    validate_public_export_reference(
-                        unit.name(),
-                        library,
-                        export,
-                        &module,
-                        catalog,
-                        failures,
-                    );
-                }
+            if unit.own_modules().contains_key(&module) {
+                continue;
             }
+            let library = module
+                .split_once('.')
+                .map_or(module.as_str(), |(library, _)| library);
+            if catalog.library_unit_name(library).is_none() {
+                continue;
+            }
+            let self_library_require = unit.is_library() && unit.library_name() == library;
+            if !self_library_require {
+                required.insert(library.to_string());
+            }
+            validate_public_export_reference(unit.name(), library, &module, catalog, failures);
         }
     }
     Ok(required)
@@ -608,7 +604,6 @@ fn require_literals(source: &str) -> Vec<String> {
 fn validate_public_export_reference(
     unit_name: &str,
     library: &str,
-    export: &str,
     module: &str,
     catalog: &UnitCatalog,
     failures: &mut Vec<Diagnostic>,
@@ -623,12 +618,16 @@ fn validate_public_export_reference(
         return;
     };
     if !library_unit.public_modules().contains_key(module) {
+        let diagnostic_module = module
+            .strip_prefix(library)
+            .and_then(|suffix| suffix.strip_prefix('.'))
+            .unwrap_or(module);
         failures.push(Diagnostic::fail(
             "missing-export",
             Some(unit_name),
             Some(library),
-            Some(export),
-            format!("{unit_name} references missing public export `{library}.{export}`"),
+            Some(diagnostic_module),
+            format!("{unit_name} references missing public export `{module}`"),
         ));
     }
 }
