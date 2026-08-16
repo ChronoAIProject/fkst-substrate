@@ -803,6 +803,7 @@ fn run_rate_exec(pool: &str, program: PathBuf, args: Vec<String>) -> Result<i32>
         .with_context(|| "parse rate pool configuration for rate-exec")?;
     registry.acquire_for_name(pool)?;
     let rendered = external_command::format_command(&program.to_string_lossy(), &args);
+    let started_at = std::time::Instant::now();
     let status = match std::process::Command::new(&program)
         .args(&args)
         .stdin(std::process::Stdio::inherit())
@@ -813,14 +814,20 @@ fn run_rate_exec(pool: &str, program: PathBuf, args: Vec<String>) -> Result<i32>
         Ok(status) => status,
         Err(_) => {
             external_command::append_shim_audit_line(&external_command::shim_audit_line(
-                &rendered, 127, false,
+                &rendered,
+                127,
+                false,
+                started_at.elapsed().as_millis(),
             ));
             return Ok(127);
         }
     };
     let exit_code = status_exit_code(status);
     external_command::append_shim_audit_line(&external_command::shim_audit_line(
-        &rendered, exit_code, false,
+        &rendered,
+        exit_code,
+        false,
+        started_at.elapsed().as_millis(),
     ));
     Ok(exit_code)
 }
