@@ -71,6 +71,7 @@ fn declared_spec_queues(
     }
 
     let lua = crate::mlua_init::new_lua();
+    crate::supervise::graph_scan::register_spec_eval_pure_primitives(&lua, owner_root)?;
     let env = crate::lua_require::unit_environment(&lua, catalog, owner_unit)?;
     let value = match chunk_cache.eval_cached_chunk_with_env(&lua, lua_path, owner_root, env) {
         Ok(value) => value,

@@ -82,9 +82,11 @@ queue 是包内命名空间。多 graph-root 组合时，裸 queue 名按 owner 
 
 Lua SDK surface 固定为：
 
-`pipeline / source / raise / spawn_codex_sync / spawn_codex / exec_sync / await_all / with_lock / once / cache_set / cache_get / truncate_utf8 / git_log_count / git_log_grep / count_worktrees / list_orphan_worktrees / setup_worktree / file / json.decode / log.{info,warn,error} / now`
+`pipeline / source / raise / spawn_codex_sync / spawn_codex / exec_sync / env_read / await_all / with_lock / once / cache_set / cache_get / truncate_utf8 / git_log_count / git_log_grep / count_worktrees / list_orphan_worktrees / setup_worktree / file / json.decode / log.{info,warn,error} / now`
 
 其中 `pipeline` 与 `source` 是 graph/package 侧约定，Rust 注册的运行时 primitive 是 `raise`、codex、exec、await、lock、mark/cache、git/worktree、file、json、log、now。`json` 仅 decode（`json.decode`）：JSON 是 engine wire format，Lua 值经 `raise` 出引擎，故不提供 `json.encode`。`truncate_utf8` 是已发布的 blessed utility name，保持精确语义与全上下文可用性；新增同类纯数据能力不得顺手变成 Rust primitive。
+
+`env_read(name) -> string` returns the current process environment value without spawning a child; unset and set-empty both return `""`. Test-mode calls use the command mock/cassette boundary and fail closed when unmatched. Production calls have no mock state and read the process environment directly.
 
 Lua-side capability 的决策顺序固定为：第一，Lua 5.4 stdlib first；所有 engine-constructed Lua context 都通过 `Lua::new()` 创建并加载 safe standard library，`utf8`、`string`、`table`、`math`、`coroutine`、`os` 和 base functions 已覆盖的需求是文档任务，不是新 SDK 任务。第二，stdlib 之外的纯 utility 只能进入 engine-vendored pure Lua prelude；prelude 必须由 engine 在 production、test、conformance、graph-scan/spec-eval 等所有 Lua context 中统一加载，新增能力按 curated battery 处理，不按 incident 增长。第三，Rust primitive 只用于 host authority / side effects（`raise`、subprocess、locks、cache、worktree）、性能瓶颈或 fail-closed boundary enforcement（如 `json.decode`）。任何新增 Rust primitive 提案必须先证明前两层不能承载。
 

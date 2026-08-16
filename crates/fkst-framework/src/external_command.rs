@@ -155,22 +155,8 @@ impl MockCommandState {
         invocation: MockCommandInvocation,
     ) -> mlua::Result<MockCommandPlan> {
         let mut inner = self.lock()?;
-        let index = inner
-            .mocks
-            .iter()
-            .position(|mock| {
-                invocation.rendered.starts_with(&mock.pattern)
-                    || invocation.rendered.contains(&mock.pattern)
-            })
-            .map(|index| inner.mocks.remove(index));
-        if let Some(mock) = index {
-            inner.calls.push(call_from_invocation(
-                invocation,
-                mock.result.stdout.clone(),
-                mock.result.stderr.clone(),
-                mock.result.exit_code,
-            ));
-            return Ok(MockCommandPlan::Return(mock.result));
+        if let Some(result) = consume_matching_mock(&mut inner, invocation.clone()) {
+            return Ok(MockCommandPlan::Return(result));
         }
 
         let Some(cassette) = inner.cassette.as_mut() else {
@@ -300,6 +286,24 @@ impl MockCommandState {
             .lock()
             .map_err(|_| mlua::Error::external("mock command state lock is poisoned"))
     }
+}
+
+fn consume_matching_mock(
+    inner: &mut MockCommandInner,
+    invocation: MockCommandInvocation,
+) -> Option<MockCommandResult> {
+    let index = inner.mocks.iter().position(|mock| {
+        invocation.rendered.starts_with(&mock.pattern)
+            || invocation.rendered.contains(&mock.pattern)
+    })?;
+    let mock = inner.mocks.remove(index);
+    inner.calls.push(call_from_invocation(
+        invocation,
+        mock.result.stdout.clone(),
+        mock.result.stderr.clone(),
+        mock.result.exit_code,
+    ));
+    Some(mock.result)
 }
 
 impl ActiveCommandCassette {

@@ -173,6 +173,7 @@ fn check_sdk_registration(host_root: &std::path::Path) -> Result<()> {
         expect_type("t", t, "function")
         expect_type("exec_sync", exec_sync, "function")
         expect_type("exec_argv", exec_argv, "function")
+        expect_type("env_read", env_read, "function")
         expect_type("file", file, "table")
         expect_type("file.read", file.read, "function")
         expect_type("file.write", file.write, "function")
