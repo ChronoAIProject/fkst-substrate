@@ -1026,6 +1026,103 @@ return json
 }
 
 #[test]
+fn deps_counts_declared_bare_library_root_require() {
+    let temp = tempfile::tempdir().unwrap();
+    workspace(temp.path(), &["packages/app", "libraries/contract"]);
+    package(temp.path(), "app", &["contract"], &[]);
+    write(
+        &temp.path().join("packages/app/main.lua"),
+        r#"return require("contract")"#,
+    );
+    library(temp.path(), "contract", &[], None);
+    write(
+        &temp.path().join("libraries/contract/public/init.lua"),
+        "return {}\n",
+    );
+
+    let output = deps(temp.path()).output().unwrap();
+
+    assert_exit(&output, 0);
+    let out = stdout(&output);
+    assert!(out.contains("fkst deps: PASS"), "{out}");
+    assert!(!out.contains("[unused-lib-dep]"), "{out}");
+}
+
+#[test]
+fn deps_reports_undeclared_bare_library_root_require() {
+    let temp = tempfile::tempdir().unwrap();
+    workspace(temp.path(), &["packages/app", "libraries/contract"]);
+    package(temp.path(), "app", &[], &[]);
+    write(
+        &temp.path().join("packages/app/main.lua"),
+        r#"return require("contract")"#,
+    );
+    library(temp.path(), "contract", &[], None);
+    write(
+        &temp.path().join("libraries/contract/public/init.lua"),
+        "return {}\n",
+    );
+
+    let output = deps(temp.path()).output().unwrap();
+
+    assert_exit(&output, 1);
+    let out = stdout(&output);
+    assert!(out.contains("[undeclared-require]"), "{out}");
+    assert!(out.contains("app requires library `contract`"), "{out}");
+}
+
+#[test]
+fn deps_reports_missing_bare_library_root_export() {
+    let temp = tempfile::tempdir().unwrap();
+    workspace(temp.path(), &["packages/app", "libraries/contract"]);
+    package(temp.path(), "app", &["contract"], &[]);
+    write(
+        &temp.path().join("packages/app/main.lua"),
+        r#"return require("contract")"#,
+    );
+    library(temp.path(), "contract", &[], None);
+    write(
+        &temp.path().join("libraries/contract/public/api.lua"),
+        "return {}\n",
+    );
+
+    let output = deps(temp.path()).output().unwrap();
+
+    assert_exit(&output, 1);
+    let out = stdout(&output);
+    assert!(out.contains("[missing-export]"), "{out}");
+    assert!(
+        out.contains("app references missing public export `contract`"),
+        "{out}"
+    );
+}
+
+#[test]
+fn deps_excludes_bare_self_library_require() {
+    let temp = tempfile::tempdir().unwrap();
+    workspace(temp.path(), &["libraries/contract"]);
+    library(temp.path(), "contract", &[], None);
+    write(
+        &temp.path().join("libraries/contract/public/init.lua"),
+        "return {}\n",
+    );
+    write(
+        &temp.path().join("libraries/contract/private/helper.lua"),
+        r#"return require("contract")"#,
+    );
+
+    let output = deps(temp.path()).arg("--json").output().unwrap();
+
+    assert_exit(&output, 0);
+    let value: JsonValue = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        value["units"][0]["actual_lib_requires"],
+        serde_json::json!([])
+    );
+    assert_eq!(value["failures"], serde_json::json!([]));
+}
+
+#[test]
 fn deps_fails_for_undeclared_require_visibility_violation_and_cycle() {
     let temp = tempfile::tempdir().unwrap();
     workspace(
