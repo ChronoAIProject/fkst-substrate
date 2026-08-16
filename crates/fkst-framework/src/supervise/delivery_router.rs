@@ -1,6 +1,6 @@
 //! Durable/ephemeral delivery split for supervise producers.
 
-use super::delivery_store::DeliveryStore;
+use super::delivery_store::{DeliveryStore, EnqueueOutcome};
 use super::delivery_types::{DeliveryRecord, SourceKind, SourceRef};
 use super::event_fanout::Fanout;
 use super::failure_fact::{FAILURE_FACT_QUEUE, FAILURE_FACT_SCHEMA};
@@ -158,19 +158,35 @@ impl DeliveryRouter {
                     not_before_ms: (self.clock)(),
                     last_error_excerpt: None,
                 };
-                store
+                let enqueue_outcome = store
                     .enqueue(&record)
                     .with_context(|| format!("enqueue delivery `{}`", record.delivery_id))?;
-                self.journal.event(
-                    "delivered",
-                    [
-                        ("queue", queue.clone()),
-                        ("dept", sub.dept.clone()),
-                        ("delivery_id", record.delivery_id.clone()),
-                        ("reason", "durable_enqueue".to_string()),
-                    ],
-                );
-                self.notify_reliable(&sub.dept);
+                match enqueue_outcome {
+                    EnqueueOutcome::Accepted => {
+                        self.journal.event(
+                            "delivered",
+                            [
+                                ("queue", queue.clone()),
+                                ("dept", sub.dept.clone()),
+                                ("delivery_id", record.delivery_id.clone()),
+                                ("reason", "durable_enqueue".to_string()),
+                            ],
+                        );
+                        self.notify_reliable(&sub.dept);
+                    }
+                    EnqueueOutcome::TerminallySuppressed => {
+                        self.journal.event(
+                            "delivery_suppressed",
+                            [
+                                ("queue", queue.clone()),
+                                ("dept", sub.dept.clone()),
+                                ("delivery_id", record.delivery_id.clone()),
+                                ("reason", "terminal_tombstone".to_string()),
+                            ],
+                        );
+                        bail!("delivery terminally suppressed: {}", record.delivery_id);
+                    }
+                }
             } else {
                 self.journal.event(
                     "delivered",
@@ -673,7 +689,8 @@ pub(crate) fn now_unix_millis() -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::super::delivery_store::DeliveryStore;
+    use super::super::delivery_store::{DeliveryStore, RetryFailure, RetryOutcome};
+    use super::super::delivery_types::RetryPolicy;
     use super::*;
     use fkst_common::config::{Config, DepartmentDecl, LimitsDecl, QueueDecl};
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -1376,6 +1393,81 @@ mod tests {
             .unwrap();
 
         assert_eq!(leased.len(), 2);
+    }
+
+    #[test]
+    fn terminally_suppressed_publish_is_reported_and_fresh_identity_is_accepted() {
+        let cfg = config(false);
+        let temp = TempDir::new().unwrap();
+        let store = Arc::new(DeliveryStore::open(temp.path().join("delivery.redb")).unwrap());
+        let journal_path = temp.path().join("supervisor.log");
+        let journal = SupervisorJournal::open_at(&journal_path);
+        let router = DeliveryRouter::new_with_clock(
+            &cfg,
+            Fanout::new(),
+            Some(store.clone()),
+            Some(journal),
+            Arc::new(|| 100),
+        );
+        let publish = |dedup_key: &str, observed_at_ms: u64| {
+            let mut event = Event::new("jobs", serde_json::json!({"dedup_key": dedup_key}));
+            event.ts = observed_at_ms;
+            router.publish(PublishEnvelope {
+                event,
+                source: Some(cron_source("tick/slot/100")),
+                cron_payload: None,
+                derived: Some(DerivedDelivery {
+                    parent_delivery_id: "parent".to_string(),
+                    ordinal: 0,
+                }),
+            })
+        };
+
+        publish("proposal/attempt/1", 100).unwrap();
+        let leased = store
+            .lease_for_dept("worker", 100, 1, Duration::from_millis(50))
+            .unwrap()
+            .remove(0);
+        assert_eq!(
+            store
+                .retry(
+                    &leased.delivery_id,
+                    leased.lease_generation,
+                    &RetryFailure {
+                        message: "permanent".to_string(),
+                        replayable: false,
+                    },
+                    &RetryPolicy {
+                        max_attempts: 1,
+                        base: Duration::ZERO,
+                        cap: Duration::ZERO,
+                    },
+                    120,
+                )
+                .unwrap(),
+            RetryOutcome::PermanentDead
+        );
+
+        let suppressed = publish("proposal/attempt/1", 130).unwrap_err();
+        assert!(
+            suppressed
+                .to_string()
+                .contains("delivery terminally suppressed"),
+            "{suppressed}"
+        );
+        publish("proposal/attempt/2", 140).unwrap();
+
+        let fresh = store
+            .lease_for_dept("worker", 140, 1, Duration::from_millis(50))
+            .unwrap();
+        assert_eq!(fresh.len(), 1);
+        assert!(fresh[0]
+            .delivery_id
+            .ends_with("/dedup/proposal_2F_attempt_2F_2"));
+        let journal = std::fs::read_to_string(journal_path).unwrap();
+        assert_eq!(journal.matches("reason=durable_enqueue").count(), 2);
+        assert_eq!(journal.matches("event=delivery_suppressed").count(), 1);
+        assert!(journal.contains("reason=terminal_tombstone"), "{journal}");
     }
 
     #[test]
