@@ -526,6 +526,9 @@ fn scan_actual_library_requires(
     for path in lua_files(unit.code_root())? {
         let body = fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
         for module in require_literals(&body) {
+            if unit.own_modules().contains_key(&module) {
+                continue;
+            }
             let library = module
                 .split_once('.')
                 .map_or(module.as_str(), |(library, _)| library);

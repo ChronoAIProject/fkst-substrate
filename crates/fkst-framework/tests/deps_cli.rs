@@ -1072,6 +1072,33 @@ fn deps_reports_undeclared_bare_library_root_require() {
 }
 
 #[test]
+fn deps_prefers_bare_caller_owned_module_over_undeclared_library() {
+    let temp = tempfile::tempdir().unwrap();
+    workspace(temp.path(), &["packages/app", "libraries/contract"]);
+    package(temp.path(), "app", &[], &[]);
+    write(
+        &temp.path().join("packages/app/main.lua"),
+        r#"return require("contract")"#,
+    );
+    write(
+        &temp.path().join("packages/app/contract.lua"),
+        "return {}\n",
+    );
+    library(temp.path(), "contract", &[], None);
+    write(
+        &temp.path().join("libraries/contract/public/init.lua"),
+        "return {}\n",
+    );
+
+    let output = deps(temp.path()).output().unwrap();
+
+    assert_exit(&output, 0);
+    let out = stdout(&output);
+    assert!(out.contains("fkst deps: PASS"), "{out}");
+    assert!(!out.contains("[undeclared-require]"), "{out}");
+}
+
+#[test]
 fn deps_reports_missing_bare_library_root_export() {
     let temp = tempfile::tempdir().unwrap();
     workspace(temp.path(), &["packages/app", "libraries/contract"]);
