@@ -63,6 +63,15 @@ pub(crate) static BOUNDARY_RESOURCE_REGISTRY: &[BoundaryResourceEntry] = &[
         errors: "quota-exhausted,auth-degraded,provider-unavailable,provider-throttle",
     },
     BoundaryResourceEntry {
+        id: "host.environment",
+        resource_type: "host-authority",
+        adapters: "env_read",
+        grant: "env_read adapter; test-mode command cassette",
+        meter: "test-mode command_calls; no production process or provider meter",
+        budget: "none; reads current process environment without a child",
+        errors: "provider-unavailable",
+    },
+    BoundaryResourceEntry {
         id: "git.process",
         resource_type: "external-source",
         adapters: "git_log_count,git_log_grep,count_worktrees,list_orphan_worktrees,setup_worktree",
@@ -190,6 +199,7 @@ mod tests {
         assert!(ids.contains("codex.process"));
         assert!(ids.contains("shell.process"));
         assert!(ids.contains("argv.process"));
+        assert!(ids.contains("host.environment"));
         assert!(ids.contains("git.process"));
         assert!(ids.contains("runtime.filesystem"));
         assert!(ids.contains("wall-clock"));

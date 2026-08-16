@@ -294,6 +294,7 @@ engine 维护 durable 在途 delivery state，但它不是实体业务真相、a
 | `spawn_codex(opts)` | `sdk_codex.rs`，返回 pipeline-local handle |
 | `await_all(handles)` | `sdk_codex.rs`，join handles，防跨 pipeline/重复消费 |
 | `exec_sync(cmd|opts)` | `sdk_basic.rs`，运行 `/bin/sh -c`，可选 cwd/env/timeout/read_coalesce |
+| `env_read(name) -> string` | `sdk_env.rs`, reads the process environment without a child; unset and set-empty return `""`; test-mode mock/cassette reads fail closed when unmatched |
 | `with_lock(name, fn)` | `sdk_git.rs`，fcntl exclusive flock |
 | `once(key, fn)` | `sdk_mark.rs`，locked per-key marker，成功后写入 scratch marker |
 | `cache_set(key, value[, ttl_seconds])` | `sdk_cache.rs`，best-effort scratch KV 原子覆盖写，支持可选 expiry metadata |

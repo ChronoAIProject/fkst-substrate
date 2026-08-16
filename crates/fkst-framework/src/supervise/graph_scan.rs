@@ -210,9 +210,17 @@ fn reject_removed_surfaces(graph_root: &GraphRoot) -> Result<()> {
     Ok(())
 }
 
-fn register_spec_eval_pure_primitives(lua: &Lua, owner_root: &Path) -> mlua::Result<()> {
+pub(crate) fn register_spec_eval_pure_primitives(lua: &Lua, owner_root: &Path) -> mlua::Result<()> {
     crate::sdk_strings::register_truncate_utf8(lua)?;
     crate::sdk_i18n::register(lua, owner_root)?;
+    lua.globals().set(
+        "env_read",
+        lua.create_function(|_, _: String| -> mlua::Result<String> {
+            Err(mlua::Error::external(
+                "env_read is unavailable during graph scan",
+            ))
+        })?,
+    )?;
     Ok(())
 }
 

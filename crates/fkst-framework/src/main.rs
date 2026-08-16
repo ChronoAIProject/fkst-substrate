@@ -55,6 +55,7 @@ mod runtime_context;
 mod sdk_basic;
 mod sdk_cache;
 mod sdk_codex;
+mod sdk_env;
 mod sdk_exec_argv;
 mod sdk_fs;
 mod sdk_git;
