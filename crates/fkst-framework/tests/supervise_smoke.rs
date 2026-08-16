@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -130,13 +131,17 @@ fn read_single_supervisor_journal(runtime_root: &Path) -> String {
     fs::read_to_string(&entries[0]).unwrap()
 }
 
-fn journal_millis(line: &str, key: &str) -> u128 {
+fn record_field<'a>(line: &'a str, key: &str) -> &'a str {
     let prefix = format!("{key}=");
     line.split_ascii_whitespace()
         .find_map(|field| field.strip_prefix(&prefix))
-        .unwrap_or_else(|| panic!("missing {key} in journal record: {line}"))
+        .unwrap_or_else(|| panic!("missing {key} in record: {line}"))
+}
+
+fn record_millis(line: &str, key: &str) -> u128 {
+    record_field(line, key)
         .parse()
-        .unwrap_or_else(|err| panic!("invalid {key} in journal record: {err}: {line}"))
+        .unwrap_or_else(|err| panic!("invalid {key} in record: {err}: {line}"))
 }
 
 fn wait_for_journal_event(
@@ -433,7 +438,7 @@ exit 0
 }
 
 #[test]
-fn supervise_explicit_package_root_child_emits_lifecycle_milestones() {
+fn supervise_child_lifecycle_reconciles_external_command_attribution() {
     let _lock = supervise_smoke_lock();
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();
@@ -474,6 +479,9 @@ local M = {{}}
 M.spec = {{ consumes = {{"{}.standard_input"}}, ephemeral = {{"{}.standard_input"}}, stall_window = standard.stall_window() }}
 function pipeline(event)
   print("milestone-output")
+  assert(exec_sync({{ cmd = "sleep 1.5" }}).exit_code == 0)
+  assert(exec_sync({{ cmd = "sleep 1.0" }}).exit_code == 0)
+  assert(exec_sync({{ cmd = "printf attribution-probe" }}).exit_code == 0)
   local f = assert(io.open({}, "w"))
   f:write("marker=" .. standard.marker() .. "\n")
   f:write("event_path=" .. tostring(event.payload.path) .. "\n")
@@ -560,16 +568,48 @@ return M
                 && line.contains(" exit_code=0 ")
         })
         .unwrap_or_else(|| panic!("missing successful child exit record: {journal}"));
-    let spawn_return_ms = journal_millis(exit_record, "spawn_return_ms");
-    let first_pipe_read_ms = journal_millis(exit_record, "first_pipe_read_ms");
-    let wait_complete_ms = journal_millis(exit_record, "wait_complete_ms");
-    let capture_complete_ms = journal_millis(exit_record, "capture_complete_ms");
-    let elapsed_ms = journal_millis(exit_record, "elapsed_ms");
+    let spawn_return_ms = record_millis(exit_record, "spawn_return_ms");
+    let first_pipe_read_ms = record_millis(exit_record, "first_pipe_read_ms");
+    let wait_complete_ms = record_millis(exit_record, "wait_complete_ms");
+    let capture_complete_ms = record_millis(exit_record, "capture_complete_ms");
+    let elapsed_ms = record_millis(exit_record, "elapsed_ms");
     assert!(spawn_return_ms <= first_pipe_read_ms, "{exit_record}");
     assert!(spawn_return_ms <= wait_complete_ms, "{exit_record}");
     assert!(first_pipe_read_ms <= capture_complete_ms, "{exit_record}");
     assert!(wait_complete_ms <= capture_complete_ms, "{exit_record}");
     assert_eq!(capture_complete_ms, elapsed_ms, "{exit_record}");
+
+    let child_log = fs::read_to_string(record_field(exit_record, "log_path")).unwrap();
+    let mut duration_by_command_class = BTreeMap::new();
+    for audit in child_log
+        .lines()
+        .filter(|line| line.contains("EVENT=external_command"))
+    {
+        let class = if audit.contains(r"CMD=/bin/sh\s-c\s'sleep\s") {
+            "sleep"
+        } else if audit.contains(r"CMD=/bin/sh\s-c\s'printf\s") {
+            "printf"
+        } else {
+            panic!("unexpected command class in audit record: {audit}");
+        };
+        *duration_by_command_class.entry(class).or_insert(0_u128) +=
+            record_millis(audit, "ELAPSED_MS");
+    }
+    assert_eq!(
+        duration_by_command_class
+            .keys()
+            .copied()
+            .collect::<Vec<_>>(),
+        vec!["printf", "sleep"],
+        "child_log={child_log}"
+    );
+    let command_attempt_ms = duration_by_command_class.values().sum::<u128>();
+    let overlap_aware_residual_ms = elapsed_ms as i128 - command_attempt_ms as i128;
+    const ATTRIBUTION_TOLERANCE_MS: u128 = 1_000;
+    assert!(
+        overlap_aware_residual_ms.unsigned_abs() <= ATTRIBUTION_TOLERANCE_MS,
+        "duration_by_command_class={duration_by_command_class:?} department_elapsed_ms={elapsed_ms} overlap_aware_residual_ms={overlap_aware_residual_ms} tolerance_ms={ATTRIBUTION_TOLERANCE_MS}; a positive residual is non-command wall time and a negative residual is overlapping command-attempt time"
+    );
     assert!(
         journal.contains("event=shutdown_initiated ") && journal.contains(" reason=signal:SIGTERM"),
         "journal={journal}"
