@@ -111,6 +111,7 @@ impl DeliveryRouter {
             ],
         );
         let mut sent_ephemeral = false;
+        let mut terminally_suppressed_delivery = None;
         for sub in subscribers {
             if sub.reliable {
                 let source = envelope.source.clone().ok_or_else(|| {
@@ -184,7 +185,7 @@ impl DeliveryRouter {
                                 ("reason", "terminal_tombstone".to_string()),
                             ],
                         );
-                        bail!("delivery terminally suppressed: {}", record.delivery_id);
+                        terminally_suppressed_delivery.get_or_insert(record.delivery_id);
                     }
                 }
             } else {
@@ -202,6 +203,9 @@ impl DeliveryRouter {
         }
         if sent_ephemeral {
             self.fanout.send(&queue, envelope.event.clone())?;
+        }
+        if let Some(delivery_id) = terminally_suppressed_delivery {
+            bail!("delivery terminally suppressed: {delivery_id}");
         }
         Ok(())
     }
@@ -1468,6 +1472,87 @@ mod tests {
         assert_eq!(journal.matches("reason=durable_enqueue").count(), 2);
         assert_eq!(journal.matches("event=delivery_suppressed").count(), 1);
         assert!(journal.contains("reason=terminal_tombstone"), "{journal}");
+    }
+
+    #[test]
+    fn terminal_suppression_does_not_short_circuit_later_fanout_subscriber() {
+        let mut cfg = config(false);
+        cfg.queue.get_mut("jobs").unwrap().fanout = true;
+        let first = cfg.department.remove("worker").unwrap();
+        let mut second = first.clone();
+        second.lua = "departments/b_fresh/main.lua".into();
+        cfg.department.insert("a_suppressed".to_string(), first);
+        cfg.department.insert("b_fresh".to_string(), second);
+
+        let temp = TempDir::new().unwrap();
+        let store = Arc::new(DeliveryStore::open(temp.path().join("delivery.redb")).unwrap());
+        let router = DeliveryRouter::new_with_clock(
+            &cfg,
+            Fanout::new(),
+            Some(store.clone()),
+            None,
+            Arc::new(|| 100),
+        );
+        let publish = |observed_at_ms: u64| {
+            let mut event = Event::new(
+                "jobs",
+                serde_json::json!({"dedup_key": "proposal/attempt/1"}),
+            );
+            event.ts = observed_at_ms;
+            router.publish(PublishEnvelope {
+                event,
+                source: Some(cron_source("tick/slot/100")),
+                cron_payload: None,
+                derived: Some(DerivedDelivery {
+                    parent_delivery_id: "parent".to_string(),
+                    ordinal: 0,
+                }),
+            })
+        };
+
+        publish(100).unwrap();
+        let suppressed = store
+            .lease_for_dept("a_suppressed", 100, 1, Duration::from_millis(50))
+            .unwrap()
+            .remove(0);
+        assert_eq!(
+            store
+                .retry(
+                    &suppressed.delivery_id,
+                    suppressed.lease_generation,
+                    &RetryFailure {
+                        message: "permanent".to_string(),
+                        replayable: false,
+                    },
+                    &RetryPolicy {
+                        max_attempts: 1,
+                        base: Duration::ZERO,
+                        cap: Duration::ZERO,
+                    },
+                    120,
+                )
+                .unwrap(),
+            RetryOutcome::PermanentDead
+        );
+        let accepted = store
+            .lease_for_dept("b_fresh", 100, 1, Duration::from_millis(50))
+            .unwrap()
+            .remove(0);
+        assert!(store
+            .ack(&accepted.delivery_id, accepted.lease_generation)
+            .unwrap());
+
+        let replay = publish(130).unwrap_err();
+        assert!(
+            replay
+                .to_string()
+                .contains("delivery terminally suppressed"),
+            "{replay}"
+        );
+        let later = store
+            .lease_for_dept("b_fresh", 130, 1, Duration::from_millis(50))
+            .unwrap();
+        assert_eq!(later.len(), 1);
     }
 
     #[test]
