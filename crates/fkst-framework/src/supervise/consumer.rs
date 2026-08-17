@@ -1,6 +1,8 @@
 //! Per-department consumer task.
 
-use super::delivery_router::{now_unix_millis, DeliveryRouter, DerivedDelivery, PublishEnvelope};
+use super::delivery_router::{
+    now_unix_millis, DeliveryRouter, DerivedDelivery, PublishEnvelope, PublishOutcome,
+};
 use super::delivery_store::{DeliveryStore, LockBusyDeferOutcome, RetryFailure, RetryOutcome};
 use super::delivery_types::{
     DeadRecord, DeliveryRecord, RedrivePolicy, RetryPolicy, SourceKind, SourceRef,
@@ -1032,7 +1034,7 @@ fn publish_raised_events(
         raised_ev.ts = parent.observed_at_ms;
         let ordinal = *next_ordinal;
         *next_ordinal = next_ordinal.saturating_add(1);
-        router.publish(PublishEnvelope {
+        let outcome = router.publish_outcome(PublishEnvelope {
             event: raised_ev,
             source: parent.source.clone(),
             cron_payload: None,
@@ -1041,6 +1043,10 @@ fn publish_raised_events(
                 ordinal,
             }),
         })?;
+        match outcome {
+            PublishOutcome::Published => {}
+            PublishOutcome::TerminallySuppressed { .. } => continue,
+        }
     }
     Ok(())
 }
@@ -3703,6 +3709,357 @@ return M
             )
             .unwrap();
 
+        assert!(leased.is_empty());
+    }
+
+    fn raised_batch_router(
+        store: Arc<DeliveryStore>,
+        journal: SupervisorJournal,
+    ) -> DeliveryRouter {
+        let mut queue = BTreeMap::new();
+        queue.insert(
+            "next".to_string(),
+            QueueDecl {
+                capacity: 8,
+                fanout: false,
+            },
+        );
+        let mut department = BTreeMap::new();
+        department.insert(
+            "next_worker".to_string(),
+            DepartmentDecl {
+                lua: "departments/next_worker/main.lua".into(),
+                owner_root: std::path::PathBuf::from("."),
+                owner_namespace: "pkg".to_string(),
+                consumes: vec!["next".to_string()],
+                produces: Vec::new(),
+                published_seam: Vec::new(),
+                ephemeral: Vec::new(),
+                stall_window: "30s".to_string(),
+                graph_json: false,
+                retry: None,
+            },
+        );
+        let cfg = Config {
+            queue,
+            raiser: BTreeMap::new(),
+            department,
+            limits: LimitsDecl {
+                global_codex_processes: 1,
+            },
+        };
+        DeliveryRouter::new(&cfg, Fanout::new(), Some(store), Some(journal))
+    }
+
+    fn terminalize_raised_event(
+        router: &DeliveryRouter,
+        store: &DeliveryStore,
+        parent: &DeliveryRecord,
+        event: Event,
+        ordinal: usize,
+    ) {
+        router
+            .publish(PublishEnvelope {
+                event,
+                source: parent.source.clone(),
+                cron_payload: None,
+                derived: Some(DerivedDelivery {
+                    parent_delivery_id: parent.delivery_id.clone(),
+                    ordinal,
+                }),
+            })
+            .unwrap();
+        let leased = store
+            .lease_for_dept("next_worker", u64::MAX, 1, Duration::from_millis(50))
+            .unwrap()
+            .remove(0);
+        assert_eq!(
+            store
+                .retry(
+                    &leased.delivery_id,
+                    leased.lease_generation,
+                    &RetryFailure {
+                        message: "terminal test failure".to_string(),
+                        replayable: false,
+                    },
+                    &policy(1),
+                    parent.observed_at_ms,
+                )
+                .unwrap(),
+            RetryOutcome::PermanentDead
+        );
+    }
+
+    #[test]
+    fn raised_batch_continues_after_terminally_suppressed_event() {
+        let temp = TempDir::new().unwrap();
+        let store = Arc::new(DeliveryStore::open(temp.path().join("delivery.redb")).unwrap());
+        let journal_path = temp.path().join("supervisor.log");
+        let router = raised_batch_router(store.clone(), SupervisorJournal::open_at(&journal_path));
+        let parent = record("parent");
+        let suppressed = Event::new(
+            "next",
+            serde_json::json!({"dedup_key": "suppressed", "n": 2}),
+        );
+        terminalize_raised_event(&router, &store, &parent, suppressed.clone(), 1);
+        let mut next_ordinal = 0;
+
+        publish_raised_events(
+            &router,
+            vec![
+                Event::new("next", serde_json::json!({"dedup_key": "first", "n": 1})),
+                suppressed,
+                Event::new("next", serde_json::json!({"dedup_key": "last", "n": 3})),
+            ],
+            &parent,
+            &mut next_ordinal,
+        )
+        .unwrap();
+
+        let leased = store
+            .lease_for_dept("next_worker", u64::MAX, 8, Duration::from_millis(50))
+            .unwrap();
+        let published_values = leased
+            .iter()
+            .map(|record| record.payload["n"].as_i64().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(published_values, vec![1, 3]);
+        assert_eq!(next_ordinal, 3);
+        let journal = fs::read_to_string(journal_path).unwrap();
+        assert_eq!(journal.matches("event=delivery_suppressed").count(), 1);
+        assert!(journal.contains("reason=terminal_tombstone"), "{journal}");
+    }
+
+    #[test]
+    fn raised_batch_non_suppression_error_remains_permanent_and_aborts() {
+        let temp = TempDir::new().unwrap();
+        let store = Arc::new(DeliveryStore::open(temp.path().join("delivery.redb")).unwrap());
+        let router = raised_batch_router(store.clone(), SupervisorJournal::disabled());
+        store.enqueue(&record("parent")).unwrap();
+        let parent = store
+            .lease_for_dept("worker", u64::MAX, 1, Duration::from_millis(50))
+            .unwrap()
+            .remove(0);
+
+        finish_test_durable_record(
+            &store,
+            &router,
+            Some(&policy(1)),
+            parent,
+            TestDurableCompletion {
+                exit_code: 0,
+                error: None,
+                raises: vec![
+                    Event::new("next", serde_json::json!({"dedup_key": "first", "n": 1})),
+                    Event::new("missing", serde_json::json!({"n": 2})),
+                    Event::new("next", serde_json::json!({"dedup_key": "last", "n": 3})),
+                ],
+            },
+            &SupervisorJournal::disabled(),
+        )
+        .unwrap();
+
+        let dead = store.get_dead("parent").unwrap().unwrap();
+        assert!(dead.permanent);
+        assert!(!dead.replayable);
+        assert!(
+            dead.error_excerpt
+                .as_deref()
+                .unwrap()
+                .contains("raised publish error: queue `missing` has no delivery subscriptions"),
+            "{dead:?}"
+        );
+        let leased = store
+            .lease_for_dept("next_worker", u64::MAX, 8, Duration::from_millis(50))
+            .unwrap();
+        assert_eq!(leased.len(), 1);
+        assert_eq!(leased[0].payload["n"], 1);
+    }
+
+    #[test]
+    fn raised_batch_succeeds_when_last_event_is_terminally_suppressed() {
+        let temp = TempDir::new().unwrap();
+        let store = Arc::new(DeliveryStore::open(temp.path().join("delivery.redb")).unwrap());
+        let journal_path = temp.path().join("supervisor.log");
+        let router = raised_batch_router(store.clone(), SupervisorJournal::open_at(&journal_path));
+        let parent = record("parent");
+        let suppressed = Event::new(
+            "next",
+            serde_json::json!({"dedup_key": "suppressed-last", "n": 2}),
+        );
+        terminalize_raised_event(&router, &store, &parent, suppressed.clone(), 1);
+        let mut next_ordinal = 0;
+
+        publish_raised_events(
+            &router,
+            vec![
+                Event::new("next", serde_json::json!({"dedup_key": "first", "n": 1})),
+                suppressed,
+            ],
+            &parent,
+            &mut next_ordinal,
+        )
+        .unwrap();
+
+        let leased = store
+            .lease_for_dept("next_worker", u64::MAX, 8, Duration::from_millis(50))
+            .unwrap();
+        assert_eq!(leased.len(), 1);
+        assert_eq!(leased[0].payload["n"], 1);
+        assert_eq!(next_ordinal, 2);
+        let journal = fs::read_to_string(journal_path).unwrap();
+        assert_eq!(journal.matches("event=delivery_suppressed").count(), 1);
+        assert!(journal.contains("reason=terminal_tombstone"), "{journal}");
+    }
+
+    #[test]
+    fn raised_batch_suppression_allows_parent_ack_and_later_publish() {
+        let temp = TempDir::new().unwrap();
+        let store = Arc::new(DeliveryStore::open(temp.path().join("delivery.redb")).unwrap());
+        let router = raised_batch_router(store.clone(), SupervisorJournal::disabled());
+        store.enqueue(&record("parent")).unwrap();
+        let parent = store
+            .lease_for_dept("worker", u64::MAX, 1, Duration::from_millis(50))
+            .unwrap()
+            .remove(0);
+        let suppressed = Event::new(
+            "next",
+            serde_json::json!({"dedup_key": "suppressed-before-ack", "n": 1}),
+        );
+        terminalize_raised_event(&router, &store, &parent, suppressed.clone(), 0);
+
+        finish_test_durable_record(
+            &store,
+            &router,
+            Some(&policy(1)),
+            parent,
+            TestDurableCompletion {
+                exit_code: 0,
+                error: None,
+                raises: vec![
+                    suppressed,
+                    Event::new(
+                        "next",
+                        serde_json::json!({"dedup_key": "published-after-suppression", "n": 2}),
+                    ),
+                ],
+            },
+            &SupervisorJournal::disabled(),
+        )
+        .unwrap();
+
+        let leased = store
+            .lease_for_dept("next_worker", u64::MAX, 8, Duration::from_millis(50))
+            .unwrap();
+        assert_eq!(leased.len(), 1);
+        assert_eq!(leased[0].payload["n"], 2);
+        assert!(store.get("parent").unwrap().is_none());
+        assert!(store.get_dead("parent").unwrap().is_none());
+    }
+
+    #[test]
+    fn raised_batch_all_suppressed_advances_ordinals_and_acks_parent() {
+        let temp = TempDir::new().unwrap();
+        let store = Arc::new(DeliveryStore::open(temp.path().join("delivery.redb")).unwrap());
+        let router = raised_batch_router(store.clone(), SupervisorJournal::disabled());
+        store.enqueue(&record("parent")).unwrap();
+        let parent = store
+            .lease_for_dept("worker", u64::MAX, 1, Duration::from_millis(50))
+            .unwrap()
+            .remove(0);
+        let first = Event::new(
+            "next",
+            serde_json::json!({"dedup_key": "all-suppressed-first", "n": 1}),
+        );
+        let second = Event::new(
+            "next",
+            serde_json::json!({"dedup_key": "all-suppressed-second", "n": 2}),
+        );
+        terminalize_raised_event(&router, &store, &parent, first.clone(), 0);
+        terminalize_raised_event(&router, &store, &parent, second.clone(), 1);
+        let mut next_ordinal = 0;
+
+        publish_raised_events(
+            &router,
+            vec![first.clone(), second.clone()],
+            &parent,
+            &mut next_ordinal,
+        )
+        .unwrap();
+        assert_eq!(next_ordinal, 2);
+
+        finish_test_durable_record(
+            &store,
+            &router,
+            Some(&policy(1)),
+            parent,
+            TestDurableCompletion {
+                exit_code: 0,
+                error: None,
+                raises: vec![first, second],
+            },
+            &SupervisorJournal::disabled(),
+        )
+        .unwrap();
+
+        let leased = store
+            .lease_for_dept("next_worker", u64::MAX, 8, Duration::from_millis(50))
+            .unwrap();
+        assert!(leased.is_empty());
+        assert!(store.get("parent").unwrap().is_none());
+        assert!(store.get_dead("parent").unwrap().is_none());
+    }
+
+    #[test]
+    fn raised_batch_suppression_before_error_dead_letters_parent_and_aborts() {
+        let temp = TempDir::new().unwrap();
+        let store = Arc::new(DeliveryStore::open(temp.path().join("delivery.redb")).unwrap());
+        let router = raised_batch_router(store.clone(), SupervisorJournal::disabled());
+        store.enqueue(&record("parent")).unwrap();
+        let parent = store
+            .lease_for_dept("worker", u64::MAX, 1, Duration::from_millis(50))
+            .unwrap()
+            .remove(0);
+        let suppressed = Event::new(
+            "next",
+            serde_json::json!({"dedup_key": "suppressed-before-error", "n": 1}),
+        );
+        terminalize_raised_event(&router, &store, &parent, suppressed.clone(), 0);
+
+        finish_test_durable_record(
+            &store,
+            &router,
+            Some(&policy(1)),
+            parent,
+            TestDurableCompletion {
+                exit_code: 0,
+                error: None,
+                raises: vec![
+                    suppressed,
+                    Event::new("missing", serde_json::json!({"n": 2})),
+                    Event::new(
+                        "next",
+                        serde_json::json!({"dedup_key": "must-not-publish", "n": 3}),
+                    ),
+                ],
+            },
+            &SupervisorJournal::disabled(),
+        )
+        .unwrap();
+
+        let dead = store.get_dead("parent").unwrap().unwrap();
+        assert!(dead.permanent);
+        assert!(!dead.replayable);
+        assert!(
+            dead.error_excerpt
+                .as_deref()
+                .unwrap()
+                .contains("raised publish error: queue `missing` has no delivery subscriptions"),
+            "{dead:?}"
+        );
+        let leased = store
+            .lease_for_dept("next_worker", u64::MAX, 8, Duration::from_millis(50))
+            .unwrap();
         assert!(leased.is_empty());
     }
 }
