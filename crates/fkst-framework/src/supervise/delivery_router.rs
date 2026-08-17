@@ -49,6 +49,22 @@ pub(crate) struct DerivedDelivery {
     pub ordinal: usize,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+/// The result of routing one publish request across all queue subscribers.
+///
+/// `TerminallySuppressed` means at least one reliable subscriber retained an exact
+/// terminal tombstone. Other fanout subscribers may already have accepted the event
+/// and been awakened.
+pub(crate) enum PublishOutcome {
+    /// No reliable subscriber reported suppression by an exact terminal tombstone.
+    Published,
+    /// At least one reliable subscriber suppressed the delivery.
+    ///
+    /// `delivery_id` identifies the first suppressed subscriber encountered. Other
+    /// fanout subscribers may already have accepted the event and been awakened.
+    TerminallySuppressed { delivery_id: String },
+}
+
 impl DeliveryRouter {
     pub(crate) fn new(
         cfg: &Config,
@@ -95,7 +111,16 @@ impl DeliveryRouter {
         }
     }
 
-    pub(crate) fn publish(&self, mut envelope: PublishEnvelope) -> Result<()> {
+    pub(crate) fn publish(&self, envelope: PublishEnvelope) -> Result<()> {
+        match self.publish_outcome(envelope)? {
+            PublishOutcome::Published => Ok(()),
+            PublishOutcome::TerminallySuppressed { delivery_id } => {
+                bail!("delivery terminally suppressed: {delivery_id}")
+            }
+        }
+    }
+
+    pub(crate) fn publish_outcome(&self, mut envelope: PublishEnvelope) -> Result<PublishOutcome> {
         queue_starvation::canonicalize_event(&mut envelope.event, envelope.source.as_ref());
         let queue = envelope.event.queue.clone();
         let subscribers = self
@@ -205,9 +230,9 @@ impl DeliveryRouter {
             self.fanout.send(&queue, envelope.event.clone())?;
         }
         if let Some(delivery_id) = terminally_suppressed_delivery {
-            bail!("delivery terminally suppressed: {delivery_id}");
+            return Ok(PublishOutcome::TerminallySuppressed { delivery_id });
         }
-        Ok(())
+        Ok(PublishOutcome::Published)
     }
 
     pub(crate) fn publish_failure_fact(&self, event: Event) -> Result<()> {
