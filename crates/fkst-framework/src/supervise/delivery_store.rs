@@ -14,6 +14,7 @@ use super::delivery_retry::{backoff_delay, bounded_jitter, error_excerpt};
 use super::delivery_transition::{lease_key, read_delivery_table, rebuild_due_indexes};
 use super::delivery_types::{
     DeadRecord, DeliveryRecord, RedrivePolicy, RetryPolicy, SourceKind, SourceRef,
+    TerminalSuppressionRecord,
 };
 use super::delivery_watch::StoreOpWatch;
 use anyhow::{bail, Context, Result};
@@ -25,8 +26,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::time::Duration;
 
-const SCHEMA_VERSION: &str = "12";
-const TERMINAL_DEAD_RETENTION_MS: u64 = 24 * 60 * 60 * 1_000;
+const SCHEMA_VERSION: &str = "13";
+pub(super) const TERMINAL_DEAD_RETENTION_MS: u64 = 24 * 60 * 60 * 1_000;
 const TERMINAL_DEAD_COMPACTION_LIMIT: usize = 1_024;
 const TERMINAL_SUPPRESSION_SLOTS: u64 = 16_777_216;
 
@@ -123,6 +124,7 @@ pub(crate) struct LineageLookup {
 pub(crate) enum DeliveryScanRecord {
     Delivery(DeliveryRecord),
     Dead(DeadRecord),
+    TerminalSuppression(TerminalSuppressionRecord),
 }
 
 impl DeliveryStore {
@@ -173,6 +175,7 @@ impl DeliveryStore {
                 rebuild_dead_time_index(&write)?;
                 rebuild_terminal_dead_tables(&write, current_schema_version)?;
                 import_legacy_terminal_suppressed_ids(&write)?;
+                migrate_terminal_suppression_records(&write)?;
                 drop_legacy_terminal_suppressed_table(&write)?;
                 drop_legacy_terminal_suppression_filter(&write)?;
                 rebuild_lineage_index(&write)?;
@@ -1029,7 +1032,10 @@ impl DeliveryStore {
                                     &(),
                                 )?;
                             } else {
-                                suppress_terminal_delivery(&write, delivery_id)?;
+                                suppress_terminal_delivery(
+                                    &write,
+                                    &terminal_suppression_from_delivery(&current, now_ms),
+                                )?;
                             }
                         }
                         if !promoted_dirty_follow_up {
@@ -1166,7 +1172,7 @@ impl DeliveryStore {
                             .as_str(),
                         &(),
                     )?;
-                    suppress_terminal_delivery(&write, delivery_id.as_str())?;
+                    suppress_terminal_delivery(&write, &terminal_suppression_from_dead(&dead))?;
                     result.permanent.push(dead);
                     mutated = true;
                     continue;
@@ -1212,7 +1218,10 @@ impl DeliveryStore {
                             &(),
                         )?;
                     } else if !live_preserves_keyed_delivery {
-                        suppress_terminal_delivery(&write, delivery_id.as_str())?;
+                        suppress_terminal_delivery(
+                            &write,
+                            &terminal_suppression_from_delivery(&record, dead.dead_at_ms),
+                        )?;
                     }
                     result.permanent.push(dead);
                     mutated = true;
@@ -1237,7 +1246,10 @@ impl DeliveryStore {
                         &(),
                     )?;
                     if !live_preserves_keyed_delivery {
-                        suppress_terminal_delivery(&write, delivery_id.as_str())?;
+                        suppress_terminal_delivery(
+                            &write,
+                            &terminal_suppression_from_delivery(&record, dead.dead_at_ms),
+                        )?;
                     }
                     result.permanent.push(dead);
                     mutated = true;
@@ -1393,11 +1405,17 @@ impl DeliveryStore {
 
     pub(crate) fn scan_records(
         &self,
+        terminal_suppression_limit: usize,
         mut visit: impl FnMut(DeliveryScanRecord) -> Result<()>,
     ) -> Result<()> {
         let read = self.db.begin_read()?;
         let delivery = read.open_table(DELIVERY_BY_ID)?;
         let dead = read.open_table(DEAD_BY_ID)?;
+        let suppression = match read.open_table(TERMINAL_SUPPRESSION_BY_SLOT) {
+            Ok(table) => Some(table),
+            Err(redb::TableError::TableDoesNotExist(_)) => None,
+            Err(error) => return Err(error.into()),
+        };
 
         for entry in delivery.iter()? {
             let (delivery_id, bytes) = entry?;
@@ -1425,6 +1443,20 @@ impl DeliveryStore {
             visit(DeliveryScanRecord::Dead(record))?;
         }
 
+        if let Some(suppression) = suppression {
+            let mut suppression_count = 0;
+            for entry in suppression.iter()? {
+                if suppression_count >= terminal_suppression_limit {
+                    break;
+                }
+                let (_, value) = entry?;
+                visit(DeliveryScanRecord::TerminalSuppression(
+                    decode_terminal_suppression_record(value.value())?,
+                ))?;
+                suppression_count += 1;
+            }
+        }
+
         Ok(())
     }
 
@@ -1432,12 +1464,18 @@ impl DeliveryStore {
         &self,
         after: Option<(u64, &str)>,
         limit: usize,
-        mut visit_delivery: impl FnMut(DeliveryRecord) -> Result<()>,
+        terminal_suppression_limit: usize,
+        mut visit: impl FnMut(DeliveryScanRecord) -> Result<()>,
     ) -> Result<Vec<DeadRecord>> {
         let read = self.db.begin_read()?;
         let delivery = read.open_table(DELIVERY_BY_ID)?;
         let dead = read.open_table(DEAD_BY_ID)?;
         let dead_by_time = read.open_table(DEAD_BY_TIME)?;
+        let suppression = match read.open_table(TERMINAL_SUPPRESSION_BY_SLOT) {
+            Ok(table) => Some(table),
+            Err(redb::TableError::TableDoesNotExist(_)) => None,
+            Err(error) => return Err(error.into()),
+        };
 
         for entry in delivery.iter()? {
             let (delivery_id, bytes) = entry?;
@@ -1453,7 +1491,21 @@ impl DeliveryStore {
                     continue;
                 }
             };
-            visit_delivery(record)?;
+            visit(DeliveryScanRecord::Delivery(record))?;
+        }
+
+        if let Some(suppression) = suppression {
+            let mut suppression_count = 0;
+            for entry in suppression.iter()? {
+                if suppression_count >= terminal_suppression_limit {
+                    break;
+                }
+                let (_, value) = entry?;
+                visit(DeliveryScanRecord::TerminalSuppression(
+                    decode_terminal_suppression_record(value.value())?,
+                ))?;
+                suppression_count += 1;
+            }
         }
 
         let mut records = Vec::new();
@@ -1930,7 +1982,7 @@ fn rebuild_terminal_dead_tables(
                 dead.insert(delivery_id.as_str(), bytes.as_slice())?;
             }
             if !record.allows_keyed_reuse {
-                suppress_terminal_delivery(write, delivery_id.as_str())?;
+                suppress_terminal_delivery(write, &terminal_suppression_from_dead(&record))?;
             }
         }
     }
@@ -1945,28 +1997,39 @@ fn is_terminal_dead_record(record: &DeadRecord) -> bool {
     record.permanent || !record.replayable
 }
 
-fn suppress_terminal_delivery(write: &redb::WriteTransaction, delivery_id: &str) -> Result<()> {
+fn suppress_terminal_delivery(
+    write: &redb::WriteTransaction,
+    record: &TerminalSuppressionRecord,
+) -> Result<()> {
     let mut suppression = write.open_table(TERMINAL_SUPPRESSION_BY_SLOT)?;
-    suppress_terminal_delivery_in_table(&mut suppression, delivery_id)
+    suppress_terminal_delivery_in_table(&mut suppression, record)
 }
 
 fn suppress_terminal_delivery_in_table(
     suppression: &mut redb::Table<'_, &str, &str>,
-    delivery_id: &str,
+    record: &TerminalSuppressionRecord,
 ) -> Result<()> {
-    for slot in terminal_suppression_probe_keys(delivery_id) {
-        if let Some(current) = suppression.get(slot.as_str())? {
-            if current.value() == delivery_id {
+    for slot in terminal_suppression_probe_keys(&record.delivery_id) {
+        let current_value = suppression
+            .get(slot.as_str())?
+            .map(|current| current.value().to_string());
+        if let Some(current_value) = current_value {
+            let current = decode_terminal_suppression_record(&current_value)?;
+            if current.delivery_id == record.delivery_id {
+                let merged = merge_terminal_suppression_records(current, record);
+                let encoded = serde_json::to_string(&merged)?;
+                suppression.insert(slot.as_str(), encoded.as_str())?;
                 return Ok(());
             }
             continue;
         }
-        suppression.insert(slot.as_str(), delivery_id)?;
+        let encoded = serde_json::to_string(record)?;
+        suppression.insert(slot.as_str(), encoded.as_str())?;
         return Ok(());
     }
     bail!(
         "terminal suppression table exhausted for delivery_id: {}",
-        delivery_id
+        record.delivery_id
     );
 }
 
@@ -1986,11 +2049,135 @@ where
         let Some(current) = table.get(slot.as_str())? else {
             return Ok(false);
         };
-        if current.value() == delivery_id {
+        if decode_terminal_suppression_record(current.value())?.delivery_id == delivery_id {
             return Ok(true);
         }
     }
     Ok(false)
+}
+
+fn terminal_suppression_from_delivery(
+    record: &DeliveryRecord,
+    terminal_at_ms: u64,
+) -> TerminalSuppressionRecord {
+    TerminalSuppressionRecord {
+        delivery_id: record.delivery_id.clone(),
+        queue: Some(record.queue.clone()),
+        dept: Some(record.dept.clone()),
+        source: record.source.clone(),
+        observed_at_ms: Some(record.observed_at_ms),
+        terminal_at_ms: Some(terminal_at_ms),
+        dedup_key: record
+            .payload
+            .get("dedup_key")
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string),
+    }
+}
+
+fn terminal_suppression_from_dead(record: &DeadRecord) -> TerminalSuppressionRecord {
+    if let Some(delivery) = &record.record {
+        return terminal_suppression_from_delivery(delivery, record.dead_at_ms);
+    }
+    let mut suppression = terminal_suppression_from_delivery_id(&record.delivery_id);
+    suppression.queue = Some(record.queue.clone());
+    suppression.dept = Some(record.dept.clone());
+    suppression.source = record.source.clone();
+    suppression.observed_at_ms = Some(record.observed_at_ms);
+    suppression.terminal_at_ms = Some(record.dead_at_ms);
+    suppression
+}
+
+fn terminal_suppression_from_delivery_id(delivery_id: &str) -> TerminalSuppressionRecord {
+    let (queue, dept, dedup_key) = terminal_suppression_identity_parts(delivery_id);
+    TerminalSuppressionRecord {
+        delivery_id: delivery_id.to_string(),
+        queue,
+        dept,
+        source: None,
+        observed_at_ms: None,
+        terminal_at_ms: None,
+        dedup_key,
+    }
+}
+
+fn terminal_suppression_identity_parts(
+    delivery_id: &str,
+) -> (Option<String>, Option<String>, Option<String>) {
+    let parts = delivery_id.split('/').collect::<Vec<_>>();
+    let queue_index = parts.iter().position(|part| *part == "queue");
+    let dept_index = parts.iter().position(|part| *part == "dept");
+    let queue = queue_index
+        .and_then(|index| parts.get(index.saturating_add(1)))
+        .map(|value| (*value).to_string());
+    let dept = dept_index
+        .and_then(|index| parts.get(index.saturating_add(1)))
+        .map(|value| (*value).to_string());
+    let dedup_key = if parts.get(0..3) == Some(&["delivery", "v3", "raised"])
+        && parts.get(7) == Some(&"dedup")
+    {
+        decode_runtime_key_part_v3(&parts[8..])
+    } else {
+        None
+    };
+    (queue, dept, dedup_key)
+}
+
+fn decode_runtime_key_part_v3(segments: &[&str]) -> Option<String> {
+    let encoded = segments.concat();
+    if encoded == "_" {
+        return Some(String::new());
+    }
+    let bytes = encoded.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] != b'_' {
+            decoded.push(bytes[index]);
+            index += 1;
+            continue;
+        }
+        if index.saturating_add(3) >= bytes.len() || bytes[index + 3] != b'_' {
+            return None;
+        }
+        let high = hex_digit(bytes[index + 1])?;
+        let low = hex_digit(bytes[index + 2])?;
+        decoded.push((high << 4) | low);
+        index += 4;
+    }
+    String::from_utf8(decoded).ok()
+}
+
+fn hex_digit(value: u8) -> Option<u8> {
+    match value {
+        b'0'..=b'9' => Some(value - b'0'),
+        b'A'..=b'F' => Some(value - b'A' + 10),
+        b'a'..=b'f' => Some(value - b'a' + 10),
+        _ => None,
+    }
+}
+
+fn decode_terminal_suppression_record(value: &str) -> Result<TerminalSuppressionRecord> {
+    if value.trim_start().starts_with('{') {
+        return serde_json::from_str(value).context("decode terminal suppression record");
+    }
+    Ok(terminal_suppression_from_delivery_id(value))
+}
+
+fn merge_terminal_suppression_records(
+    current: TerminalSuppressionRecord,
+    candidate: &TerminalSuppressionRecord,
+) -> TerminalSuppressionRecord {
+    TerminalSuppressionRecord {
+        delivery_id: current.delivery_id,
+        queue: candidate.queue.clone().or(current.queue),
+        dept: candidate.dept.clone().or(current.dept),
+        source: candidate.source.clone().or(current.source),
+        observed_at_ms: candidate.observed_at_ms.or(current.observed_at_ms),
+        terminal_at_ms: candidate.terminal_at_ms.or(current.terminal_at_ms),
+        dedup_key: candidate.dedup_key.clone().or(current.dedup_key),
+    }
 }
 
 fn terminal_suppression_probe_keys(delivery_id: &str) -> impl Iterator<Item = String> {
@@ -2061,7 +2248,43 @@ fn count_suppression_slots(table: &redb::ReadOnlyTable<&str, &str>) -> Result<us
 
 fn import_legacy_terminal_suppressed_ids(write: &redb::WriteTransaction) -> Result<()> {
     for delivery_id in read_legacy_terminal_suppressed_ids(write)? {
-        suppress_terminal_delivery(write, delivery_id.as_str())?;
+        suppress_terminal_delivery(
+            write,
+            &terminal_suppression_from_delivery_id(delivery_id.as_str()),
+        )?;
+    }
+    Ok(())
+}
+
+fn migrate_terminal_suppression_records(write: &redb::WriteTransaction) -> Result<()> {
+    let rows = {
+        let suppression = write.open_table(TERMINAL_SUPPRESSION_BY_SLOT)?;
+        let mut rows = Vec::new();
+        for entry in suppression.iter()? {
+            let (slot, value) = entry?;
+            rows.push((slot.value().to_string(), value.value().to_string()));
+        }
+        rows
+    };
+    if rows.is_empty() {
+        return Ok(());
+    }
+    let dead = write.open_table(DEAD_BY_ID)?;
+    let mut migrated = Vec::with_capacity(rows.len());
+    for (slot, value) in rows {
+        let current = decode_terminal_suppression_record(&value)?;
+        let record = match read_dead_table(&dead, &current.delivery_id)? {
+            Some(dead) => {
+                merge_terminal_suppression_records(current, &terminal_suppression_from_dead(&dead))
+            }
+            None => current,
+        };
+        migrated.push((slot, serde_json::to_string(&record)?));
+    }
+    drop(dead);
+    let mut suppression = write.open_table(TERMINAL_SUPPRESSION_BY_SLOT)?;
+    for (slot, record) in migrated {
+        suppression.insert(slot.as_str(), record.as_str())?;
     }
     Ok(())
 }
@@ -2103,7 +2326,7 @@ fn compact_terminal_dead_records(write: &redb::WriteTransaction, now_ms: u64) ->
                     &(),
                 )?;
                 if !record.allows_keyed_reuse {
-                    suppress_terminal_delivery(write, delivery_id.as_str())?;
+                    suppress_terminal_delivery(write, &terminal_suppression_from_dead(&record))?;
                 }
             }
             compacted += 1;
@@ -2393,7 +2616,7 @@ mod tests {
                     &(),
                 )
                 .unwrap();
-            suppress_terminal_delivery(&write, delivery_id).unwrap();
+            suppress_terminal_delivery(&write, &terminal_suppression_from_dead(&dead)).unwrap();
         }
         write.commit().unwrap();
     }
@@ -2407,6 +2630,51 @@ mod tests {
             }
         }
         panic!("failed to find terminal suppression slot collision");
+    }
+
+    fn terminalize_permanently(
+        store: &DeliveryStore,
+        delivery: &DeliveryRecord,
+        terminal_at_ms: u64,
+    ) {
+        store.enqueue(delivery).unwrap();
+        let leased = store
+            .lease_for_dept(
+                &delivery.dept,
+                delivery.not_before_ms,
+                1,
+                Duration::from_millis(50),
+            )
+            .unwrap()
+            .remove(0);
+        assert_eq!(
+            store
+                .retry(
+                    &leased.delivery_id,
+                    leased.lease_generation,
+                    &failure("final", false),
+                    &policy(1),
+                    terminal_at_ms,
+                )
+                .unwrap(),
+            RetryOutcome::PermanentDead
+        );
+    }
+
+    #[test]
+    fn terminal_suppression_decode_preserves_legacy_ids_and_rejects_malformed_records() {
+        let legacy = decode_terminal_suppression_record(
+            "delivery/v3/raised/queue/jobs/dept/worker/dedup/issue_2F_399",
+        )
+        .unwrap();
+        assert_eq!(legacy.queue.as_deref(), Some("jobs"));
+        assert_eq!(legacy.dept.as_deref(), Some("worker"));
+        assert_eq!(legacy.dedup_key.as_deref(), Some("issue/399"));
+
+        let error = decode_terminal_suppression_record("{not-json").unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("decode terminal suppression record"));
     }
 
     #[test]
@@ -3791,7 +4059,7 @@ mod tests {
             .unwrap();
 
         let page = store
-            .scan_records_for_dead_letter_page(None, 2, |_| Ok(()))
+            .scan_records_for_dead_letter_page(None, 2, 2, |_| Ok(()))
             .unwrap();
 
         assert_eq!(page.len(), 1);
@@ -5239,6 +5507,96 @@ mod tests {
     }
 
     #[test]
+    fn schema_v12_open_migrates_structured_and_compacted_suppression_facts() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("delivery.redb");
+        let compacted_id = "delivery/v3/raised/queue/first/dept/first_worker/dedup/compact_2F_key";
+        let retained_id =
+            "delivery/v3/raised/queue/second/dept/second_worker/dedup/retained_2F_key";
+        let retained_source = lineage_source("owner/repo#issue/399");
+        let compact_at_ms = 120_u64
+            .saturating_add(TERMINAL_DEAD_RETENTION_MS)
+            .saturating_add(1);
+        {
+            let store = DeliveryStore::open(&path).unwrap();
+            let mut compacted = record(compacted_id, 100);
+            compacted.queue = "first".to_string();
+            compacted.dept = "first_worker".to_string();
+            compacted.payload = serde_json::json!({"dedup_key": "compact/key"});
+            compacted.collapse_by_dedup_id = true;
+            terminalize_permanently(&store, &compacted, 120);
+
+            let mut retained = record(retained_id, compact_at_ms);
+            retained.queue = "second".to_string();
+            retained.dept = "second_worker".to_string();
+            retained.payload = serde_json::json!({"dedup_key": "retained/key"});
+            retained.source = Some(retained_source.clone());
+            retained.observed_at_ms = compact_at_ms;
+            retained.collapse_by_dedup_id = true;
+            terminalize_permanently(&store, &retained, compact_at_ms.saturating_add(20));
+
+            assert!(store.get_dead(compacted_id).unwrap().is_none());
+            assert!(store.get_dead(retained_id).unwrap().is_some());
+        }
+        {
+            let db = Database::open(&path).unwrap();
+            let write = db.begin_write().unwrap();
+            {
+                let mut suppression = write.open_table(TERMINAL_SUPPRESSION_BY_SLOT).unwrap();
+                for delivery_id in [compacted_id, retained_id] {
+                    let slot = terminal_suppression_probe_keys(delivery_id).next().unwrap();
+                    assert!(suppression.get(slot.as_str()).unwrap().is_some());
+                    suppression.insert(slot.as_str(), delivery_id).unwrap();
+                }
+                let mut meta = write.open_table(META).unwrap();
+                meta.insert("schema_version", "12").unwrap();
+            }
+            write.commit().unwrap();
+        }
+
+        let store = DeliveryStore::open(&path).unwrap();
+        let mut suppressions = Vec::new();
+        store
+            .scan_records(10, |record| {
+                if let DeliveryScanRecord::TerminalSuppression(record) = record {
+                    suppressions.push(record);
+                }
+                Ok(())
+            })
+            .unwrap();
+        suppressions.sort_by(|left, right| left.delivery_id.cmp(&right.delivery_id));
+
+        assert_eq!(suppressions.len(), 2);
+        let compacted = suppressions
+            .iter()
+            .find(|record| record.delivery_id == compacted_id)
+            .unwrap();
+        assert_eq!(compacted.queue.as_deref(), Some("first"));
+        assert_eq!(compacted.dept.as_deref(), Some("first_worker"));
+        assert_eq!(compacted.dedup_key.as_deref(), Some("compact/key"));
+        assert_eq!(compacted.terminal_at_ms, None);
+        let retained = suppressions
+            .iter()
+            .find(|record| record.delivery_id == retained_id)
+            .unwrap();
+        assert_eq!(retained.queue.as_deref(), Some("second"));
+        assert_eq!(retained.dept.as_deref(), Some("second_worker"));
+        assert_eq!(retained.dedup_key.as_deref(), Some("retained/key"));
+        assert_eq!(retained.source.as_ref(), Some(&retained_source));
+        assert_eq!(retained.observed_at_ms, Some(compact_at_ms));
+        assert_eq!(
+            retained.terminal_at_ms,
+            Some(compact_at_ms.saturating_add(20))
+        );
+        let read = store.db.begin_read().unwrap();
+        let meta = read.open_table(META).unwrap();
+        assert_eq!(
+            meta.get("schema_version").unwrap().unwrap().value(),
+            SCHEMA_VERSION
+        );
+    }
+
+    #[test]
     fn terminal_index_repair_preserves_keyed_reuse_after_dirty_follow_up_ack() {
         let temp = TempDir::new().unwrap();
         let store = store(&temp);
@@ -5491,7 +5849,7 @@ mod tests {
         assert_eq!(store.dead_due_index_len().unwrap(), 1);
         assert_eq!(store.dead_time_index_len().unwrap(), 3);
         let dead_page = store
-            .scan_records_for_dead_letter_page(None, 4, |_| Ok(()))
+            .scan_records_for_dead_letter_page(None, 4, 4, |_| Ok(()))
             .unwrap();
         assert_eq!(
             dead_page

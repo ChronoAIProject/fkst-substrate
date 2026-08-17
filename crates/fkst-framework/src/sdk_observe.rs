@@ -284,7 +284,7 @@ fn apply_dead_letter_page(
         page_result.insert("next".to_string(), JsonValue::String(next));
     }
     object.insert("page".to_string(), JsonValue::Object(page_result));
-    update_truncated(object.get_mut("truncated"), false, has_more)?;
+    update_truncated(object.get_mut("truncated"), false, has_more, false)?;
     Ok(())
 }
 
@@ -478,11 +478,17 @@ fn apply_limit(snapshot: &mut JsonValue, limit: usize) -> mlua::Result<()> {
     let deliveries_truncated = truncate_array(object.get_mut("deliveries"), limit, "deliveries")?;
     let dead_letters_truncated =
         truncate_array(object.get_mut("dead_letters"), limit, "dead_letters")?;
+    let terminal_suppressions_truncated = truncate_array(
+        object.get_mut("terminal_suppressions"),
+        limit,
+        "terminal_suppressions",
+    )?;
     update_limits(object.get_mut("limits"), limit)?;
     update_truncated(
         object.get_mut("truncated"),
         deliveries_truncated,
         dead_letters_truncated,
+        terminal_suppressions_truncated,
     )?;
     Ok(())
 }
@@ -516,6 +522,10 @@ fn update_limits(limits: Option<&mut JsonValue>, limit: usize) -> mlua::Result<(
     })?;
     limits.insert("max_deliveries".to_string(), JsonValue::from(limit));
     limits.insert("max_dead_letters".to_string(), JsonValue::from(limit));
+    limits.insert(
+        "max_terminal_suppressions".to_string(),
+        JsonValue::from(limit),
+    );
     Ok(())
 }
 
@@ -523,6 +533,7 @@ fn update_truncated(
     truncated: Option<&mut JsonValue>,
     deliveries_truncated: bool,
     dead_letters_truncated: bool,
+    terminal_suppressions_truncated: bool,
 ) -> mlua::Result<()> {
     let Some(truncated) = truncated else {
         return Ok(());
@@ -533,6 +544,8 @@ fn update_truncated(
     let deliveries_truncated = existing_truncated(truncated, "deliveries")? || deliveries_truncated;
     let dead_letters_truncated =
         existing_truncated(truncated, "dead_letters")? || dead_letters_truncated;
+    let terminal_suppressions_truncated =
+        existing_truncated(truncated, "terminal_suppressions")? || terminal_suppressions_truncated;
     truncated.insert(
         "deliveries".to_string(),
         JsonValue::Bool(deliveries_truncated),
@@ -540,6 +553,10 @@ fn update_truncated(
     truncated.insert(
         "dead_letters".to_string(),
         JsonValue::Bool(dead_letters_truncated),
+    );
+    truncated.insert(
+        "terminal_suppressions".to_string(),
+        JsonValue::Bool(terminal_suppressions_truncated),
     );
     Ok(())
 }
@@ -598,6 +615,7 @@ fn apply_include(snapshot: JsonValue, include: &BTreeSet<String>) -> mlua::Resul
     }
     if include.contains("errors") {
         copy_if_present(&mut filtered, object, "dead_letters");
+        copy_if_present(&mut filtered, object, "terminal_suppressions");
     }
     Ok(JsonValue::Object(filtered))
 }
@@ -934,6 +952,76 @@ return fkst.observe({
         assert!(value.get("queues").is_none());
         assert!(value.get("dead_letters").is_none());
         assert!(value.get("source").is_none());
+    }
+
+    #[test]
+    fn observe_errors_include_terminal_suppressions() {
+        let lua = Lua::new();
+        let mock = MockObserveState::new();
+        register(&lua, Some(mock.clone())).unwrap();
+        mock.set(serde_json::json!({
+            "schema_version": 1,
+            "deliveries": [{"delivery_id": "live-one"}],
+            "dead_letters": [{"delivery_id": "dead-one"}],
+            "terminal_suppressions": [{"delivery_id": "suppressed-one"}]
+        }))
+        .unwrap();
+
+        let value: JsonValue = lua
+            .from_value(
+                lua.load("return fkst.observe({ include = { 'errors' } })")
+                    .eval()
+                    .unwrap(),
+            )
+            .unwrap();
+
+        assert_eq!(value["dead_letters"][0]["delivery_id"], "dead-one");
+        assert_eq!(
+            value["terminal_suppressions"][0]["delivery_id"],
+            "suppressed-one"
+        );
+        assert!(value.get("deliveries").is_none());
+    }
+
+    #[test]
+    fn mock_observe_limits_terminal_suppressions_independently() {
+        let lua = Lua::new();
+        let mock = MockObserveState::new();
+        register(&lua, Some(mock.clone())).unwrap();
+        mock.set(serde_json::json!({
+            "schema_version": 1,
+            "limits": {
+                "max_deliveries": 10,
+                "max_dead_letters": 10,
+                "max_terminal_suppressions": 10
+            },
+            "truncated": {
+                "deliveries": false,
+                "dead_letters": false,
+                "terminal_suppressions": false
+            },
+            "deliveries": [],
+            "dead_letters": [],
+            "terminal_suppressions": [
+                {"delivery_id": "suppressed-one"},
+                {"delivery_id": "suppressed-two"}
+            ]
+        }))
+        .unwrap();
+
+        let value: JsonValue = lua
+            .from_value(
+                lua.load("return fkst.observe({ limit = 1, include = { 'errors', 'entities' } })")
+                    .eval()
+                    .unwrap(),
+            )
+            .unwrap();
+
+        assert_eq!(value["terminal_suppressions"].as_array().unwrap().len(), 1);
+        assert_eq!(value["limits"]["max_terminal_suppressions"], 1);
+        assert!(value["truncated"]["terminal_suppressions"]
+            .as_bool()
+            .unwrap());
     }
 
     #[test]

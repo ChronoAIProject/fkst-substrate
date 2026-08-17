@@ -68,6 +68,23 @@ pub(crate) struct DeadRecord {
     pub record: Option<DeliveryRecord>,
 }
 
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub(crate) struct TerminalSuppressionRecord {
+    pub delivery_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub queue: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dept: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<SourceRef>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub observed_at_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub terminal_at_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dedup_key: Option<String>,
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct RetryPolicy {
     pub max_attempts: u64,

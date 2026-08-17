@@ -374,10 +374,35 @@ fn print_human(snapshot: &DeliveryObserveSnapshot) {
         }
     }
 
-    if snapshot.truncated.deliveries || snapshot.truncated.dead_letters {
+    println!("terminal_suppressions");
+    if snapshot.terminal_suppressions.is_empty() {
+        println!("  none");
+    } else {
+        for suppression in &snapshot.terminal_suppressions {
+            println!(
+                "  id={} queue={} dept={} terminal_at_ms={} dedup_key={}",
+                suppression.delivery_id,
+                suppression.queue.as_deref().unwrap_or("-"),
+                suppression.dept.as_deref().unwrap_or("-"),
+                suppression
+                    .terminal_at_ms
+                    .map(|value| value.to_string())
+                    .as_deref()
+                    .unwrap_or("-"),
+                suppression.dedup_key.as_deref().unwrap_or("-")
+            );
+        }
+    }
+
+    if snapshot.truncated.deliveries
+        || snapshot.truncated.dead_letters
+        || snapshot.truncated.terminal_suppressions
+    {
         println!(
-            "truncated deliveries={} dead_letters={}",
-            snapshot.truncated.deliveries, snapshot.truncated.dead_letters
+            "truncated deliveries={} dead_letters={} terminal_suppressions={}",
+            snapshot.truncated.deliveries,
+            snapshot.truncated.dead_letters,
+            snapshot.truncated.terminal_suppressions
         );
     }
 }

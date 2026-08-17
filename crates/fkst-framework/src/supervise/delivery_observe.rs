@@ -1,5 +1,5 @@
 use super::delivery_store::{DeliveryScanRecord, DeliveryStore};
-use super::delivery_types::{DeadRecord, DeliveryRecord, SourceRef};
+use super::delivery_types::{DeadRecord, DeliveryRecord, SourceRef, TerminalSuppressionRecord};
 use crate::manifest_hash::sha256_hex;
 use crate::observe::{DeadLetterPageCursor, DeadLetterPageOptions};
 use anyhow::Result;
@@ -27,6 +27,8 @@ pub(crate) struct DeliveryObserveSnapshot {
     pub(crate) queues: Vec<QueueObserveState>,
     pub(crate) deliveries: Vec<DeliveryObserveEntry>,
     pub(crate) dead_letters: Vec<DeadLetterObserveEntry>,
+    #[serde(default)]
+    pub(crate) terminal_suppressions: Vec<TerminalSuppressionObserveEntry>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) page: Option<DeliveryObservePage>,
 }
@@ -58,12 +60,16 @@ pub(crate) struct DeliveryObserveSource {
 pub(crate) struct DeliveryObserveLimits {
     pub(crate) max_deliveries: usize,
     pub(crate) max_dead_letters: usize,
+    #[serde(default)]
+    pub(crate) max_terminal_suppressions: usize,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
 pub(crate) struct DeliveryObserveTruncated {
     pub(crate) deliveries: bool,
     pub(crate) dead_letters: bool,
+    #[serde(default)]
+    pub(crate) terminal_suppressions: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -133,6 +139,17 @@ pub(crate) struct DeadLetterObserveEntry {
     pub(crate) error_excerpt: Option<String>,
 }
 
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub(crate) struct TerminalSuppressionObserveEntry {
+    pub(crate) delivery_id: String,
+    pub(crate) queue: Option<String>,
+    pub(crate) dept: Option<String>,
+    pub(crate) source: Option<SourceRef>,
+    pub(crate) observed_at_ms: Option<u64>,
+    pub(crate) terminal_at_ms: Option<u64>,
+    pub(crate) dedup_key: Option<String>,
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub(crate) enum DeliveryObserveStatus {
@@ -163,6 +180,7 @@ pub(crate) fn observe_snapshot(
     }
     let mut delivery_records = Vec::new();
     let mut dead_records = Vec::new();
+    let mut terminal_suppression_records = Vec::new();
     let mut queues = BTreeMap::<String, QueueAccumulator>::new();
 
     if let Some(page) = &options.dead_letter_page {
@@ -173,17 +191,28 @@ pub(crate) fn observe_snapshot(
         dead_records = store.scan_records_for_dead_letter_page(
             after,
             options.limit.saturating_add(1),
+            options.limit.saturating_add(1),
             |record| {
-                queues
-                    .entry(record.queue.clone())
-                    .or_default()
-                    .observe_delivery(&record, options.now_ms);
-                delivery_records.push(record);
+                match record {
+                    DeliveryScanRecord::Delivery(record) => {
+                        queues
+                            .entry(record.queue.clone())
+                            .or_default()
+                            .observe_delivery(&record, options.now_ms);
+                        delivery_records.push(record);
+                    }
+                    DeliveryScanRecord::TerminalSuppression(record) => {
+                        terminal_suppression_records.push(record);
+                    }
+                    DeliveryScanRecord::Dead(_) => {
+                        unreachable!("paged scan returns dead records separately")
+                    }
+                }
                 Ok(())
             },
         )?;
     } else {
-        store.scan_records(|record| {
+        store.scan_records(options.limit.saturating_add(1), |record| {
             match record {
                 DeliveryScanRecord::Delivery(record) => {
                     queues
@@ -194,6 +223,9 @@ pub(crate) fn observe_snapshot(
                 }
                 DeliveryScanRecord::Dead(record) => {
                     dead_records.push(record);
+                }
+                DeliveryScanRecord::TerminalSuppression(record) => {
+                    terminal_suppression_records.push(record);
                 }
             }
             Ok(())
@@ -212,6 +244,11 @@ pub(crate) fn observe_snapshot(
             .cmp(&right.dead_at_ms)
             .then_with(|| left.delivery_id.cmp(&right.delivery_id))
     });
+    terminal_suppression_records.sort_by(|left, right| {
+        left.terminal_at_ms
+            .cmp(&right.terminal_at_ms)
+            .then_with(|| left.delivery_id.cmp(&right.delivery_id))
+    });
     if let Some(since) = options.since.as_deref() {
         trim_deliveries_after_cursor(&mut delivery_records, since);
         trim_dead_letters_after_cursor(&mut dead_records, since);
@@ -219,6 +256,7 @@ pub(crate) fn observe_snapshot(
     let truncated = DeliveryObserveTruncated {
         deliveries: apply_limit(&mut delivery_records, options.limit),
         dead_letters: apply_limit(&mut dead_records, options.limit),
+        terminal_suppressions: apply_limit(&mut terminal_suppression_records, options.limit),
     };
     let page = options
         .dead_letter_page
@@ -251,6 +289,10 @@ pub(crate) fn observe_snapshot(
         .into_iter()
         .map(dead_letter_observe_entry)
         .collect::<Result<Vec<_>>>()?;
+    let terminal_suppressions = terminal_suppression_records
+        .into_iter()
+        .map(terminal_suppression_observe_entry)
+        .collect();
 
     Ok(DeliveryObserveSnapshot {
         schema_version: 1,
@@ -262,12 +304,13 @@ pub(crate) fn observe_snapshot(
                 "single read transaction over the owner redb handle for live supervise snapshots or over an offline database open"
                     .to_string(),
             history_semantics:
-                "delivery queue snapshot only; acked deliveries are removed and historical timelines require a journal"
+                "mutable delivery queue snapshot; terminal suppression facts remain while their exact delivery identities are suppressed, and other historical timelines require a journal"
                     .to_string(),
         },
         limits: DeliveryObserveLimits {
             max_deliveries: options.limit,
             max_dead_letters: options.limit,
+            max_terminal_suppressions: options.limit,
         },
         truncated,
         queues: queues
@@ -282,6 +325,7 @@ pub(crate) fn observe_snapshot(
             .collect(),
         deliveries,
         dead_letters,
+        terminal_suppressions,
         page,
     })
 }
@@ -436,6 +480,20 @@ fn dead_letter_observe_entry(record: DeadRecord) -> Result<DeadLetterObserveEntr
     })
 }
 
+fn terminal_suppression_observe_entry(
+    record: TerminalSuppressionRecord,
+) -> TerminalSuppressionObserveEntry {
+    TerminalSuppressionObserveEntry {
+        delivery_id: record.delivery_id,
+        queue: record.queue,
+        dept: record.dept,
+        source: record.source,
+        observed_at_ms: record.observed_at_ms,
+        terminal_at_ms: record.terminal_at_ms,
+        dedup_key: record.dedup_key,
+    }
+}
+
 fn delivery_status(record: &DeliveryRecord, now_ms: u64) -> DeliveryObserveStatus {
     if record
         .lease_until_ms
@@ -489,8 +547,10 @@ fn stable_json_digest(value: &JsonValue) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::supervise::delivery_store::{DeliveryStore, RetryFailure};
-    use crate::supervise::delivery_types::{DeliveryRecord, RetryPolicy};
+    use crate::supervise::delivery_store::{
+        DeliveryStore, EnqueueOutcome, RetryFailure, TERMINAL_DEAD_RETENTION_MS,
+    };
+    use crate::supervise::delivery_types::{DeliveryRecord, RetryPolicy, SourceKind, SourceRef};
     use std::time::Duration;
     use tempfile::TempDir;
 
@@ -535,7 +595,7 @@ mod tests {
     }
 
     #[test]
-    fn non_page_snapshot_serialization_is_unchanged() {
+    fn snapshot_serialization_includes_terminal_suppression_bounds() {
         let snapshot = DeliveryObserveSnapshot {
             schema_version: 1,
             generated_at_ms: 1,
@@ -548,17 +608,19 @@ mod tests {
             limits: DeliveryObserveLimits {
                 max_deliveries: 2,
                 max_dead_letters: 2,
+                max_terminal_suppressions: 2,
             },
             truncated: DeliveryObserveTruncated::default(),
             queues: Vec::new(),
             deliveries: Vec::new(),
             dead_letters: Vec::new(),
+            terminal_suppressions: Vec::new(),
             page: None,
         };
 
         assert_eq!(
             serde_json::to_string(&snapshot).unwrap(),
-            r#"{"schema_version":1,"generated_at_ms":1,"source":{"durable_root":"/durable","database":"/durable/delivery.redb","read_semantics":"one read","history_semantics":"mutable"},"limits":{"max_deliveries":2,"max_dead_letters":2},"truncated":{"deliveries":false,"dead_letters":false},"queues":[],"deliveries":[],"dead_letters":[]}"#
+            r#"{"schema_version":1,"generated_at_ms":1,"source":{"durable_root":"/durable","database":"/durable/delivery.redb","read_semantics":"one read","history_semantics":"mutable"},"limits":{"max_deliveries":2,"max_dead_letters":2,"max_terminal_suppressions":2},"truncated":{"deliveries":false,"dead_letters":false,"terminal_suppressions":false},"queues":[],"deliveries":[],"dead_letters":[],"terminal_suppressions":[]}"#
         );
     }
 
@@ -666,6 +728,121 @@ mod tests {
         assert_eq!(snapshot.dead_letters.len(), 1);
         assert_eq!(snapshot.dead_letters[0].delivery_id, "dead");
         assert_eq!(snapshot.dead_letters[0].payload.bytes, 4);
+    }
+
+    #[test]
+    fn observe_snapshot_retains_terminal_suppression_after_dead_letter_compaction() {
+        let temp = TempDir::new().unwrap();
+        let store = store(&temp);
+        let delivery_id = "delivery/v3/raised/queue/next/dept/next_worker/dedup/issue_2F_399";
+        let mut terminal = record(delivery_id, 100);
+        terminal.queue = "next".to_string();
+        terminal.dept = "next_worker".to_string();
+        terminal.payload = serde_json::json!({"dedup_key": "issue/399"});
+        terminal.source = Some(SourceRef {
+            kind: SourceKind::External,
+            reference: "owner/repo#issue/399".to_string(),
+        });
+        terminal.collapse_by_dedup_id = true;
+        store.enqueue(&terminal).unwrap();
+        let leased = store
+            .lease_for_dept("next_worker", 100, 1, Duration::from_millis(50))
+            .unwrap()
+            .remove(0);
+        assert_eq!(
+            store
+                .retry(
+                    &leased.delivery_id,
+                    leased.lease_generation,
+                    &failure("final", false),
+                    &policy(1),
+                    120,
+                )
+                .unwrap(),
+            crate::supervise::delivery_store::RetryOutcome::PermanentDead
+        );
+
+        let compact_at_ms = 120_u64
+            .saturating_add(TERMINAL_DEAD_RETENTION_MS)
+            .saturating_add(1);
+        let mut trigger = record("compaction-trigger", compact_at_ms);
+        trigger.dept = "maintenance".to_string();
+        trigger.observed_at_ms = compact_at_ms;
+        store.enqueue(&trigger).unwrap();
+
+        assert!(store.get_dead(delivery_id).unwrap().is_none());
+        let snapshot = observe_snapshot(
+            &store,
+            temp.path(),
+            &temp.path().join("delivery.redb"),
+            &DeliveryObserveOptions {
+                now_ms: compact_at_ms,
+                limit: 10,
+                since: None,
+                dead_letter_page: None,
+                current_subscriber_queues: None,
+            },
+        )
+        .unwrap();
+        assert!(snapshot.dead_letters.is_empty());
+        let suppression = snapshot
+            .terminal_suppressions
+            .iter()
+            .find(|record| record.delivery_id == delivery_id)
+            .unwrap();
+        assert_eq!(suppression.queue.as_deref(), Some("next"));
+        assert_eq!(suppression.dept.as_deref(), Some("next_worker"));
+        assert_eq!(suppression.observed_at_ms, Some(10));
+        assert_eq!(suppression.terminal_at_ms, Some(120));
+        assert_eq!(suppression.dedup_key.as_deref(), Some("issue/399"));
+
+        terminal.observed_at_ms = compact_at_ms.saturating_add(1);
+        terminal.not_before_ms = compact_at_ms.saturating_add(1);
+        assert_eq!(
+            store.enqueue(&terminal).unwrap(),
+            EnqueueOutcome::TerminallySuppressed
+        );
+    }
+
+    #[test]
+    fn observe_snapshot_bounds_terminal_suppressions_independently() {
+        let temp = TempDir::new().unwrap();
+        let store = store(&temp);
+        for (delivery_id, terminal_at_ms) in [("terminal-one", 120), ("terminal-two", 121)] {
+            let delivery = record(delivery_id, 100);
+            store.enqueue(&delivery).unwrap();
+            let leased = store
+                .lease_for_dept("worker", 100, 1, Duration::from_millis(50))
+                .unwrap()
+                .remove(0);
+            store
+                .retry(
+                    &leased.delivery_id,
+                    leased.lease_generation,
+                    &failure("final", false),
+                    &policy(1),
+                    terminal_at_ms,
+                )
+                .unwrap();
+        }
+
+        let snapshot = observe_snapshot(
+            &store,
+            temp.path(),
+            &temp.path().join("delivery.redb"),
+            &DeliveryObserveOptions {
+                now_ms: 121,
+                limit: 1,
+                since: None,
+                dead_letter_page: None,
+                current_subscriber_queues: None,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(snapshot.terminal_suppressions.len(), 1);
+        assert_eq!(snapshot.limits.max_terminal_suppressions, 1);
+        assert!(snapshot.truncated.terminal_suppressions);
     }
 
     #[test]
