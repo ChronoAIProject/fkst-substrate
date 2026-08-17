@@ -53,6 +53,12 @@ thread_local! {
 }
 
 #[derive(Debug, PartialEq, Eq)]
+pub(crate) enum EnqueueOutcome {
+    Accepted,
+    TerminallySuppressed,
+}
+
+#[derive(Debug, PartialEq, Eq)]
 pub(crate) enum RetryOutcome {
     Scheduled,
     DeadPendingRedrive,
@@ -188,7 +194,7 @@ impl DeliveryStore {
         Ok(Self { db })
     }
 
-    pub(crate) fn enqueue(&self, record: &DeliveryRecord) -> Result<()> {
+    pub(crate) fn enqueue(&self, record: &DeliveryRecord) -> Result<EnqueueOutcome> {
         let _op = StoreOpWatch::new("enqueue", &record.dept);
         let write = self.begin_write()?;
         {
@@ -235,12 +241,12 @@ impl DeliveryStore {
                     }
                     drop(delivery);
                     commit_write(write)?;
-                    return Ok(());
+                    return Ok(EnqueueOutcome::Accepted);
                 }
                 if same_delivery_content(&current, record) {
                     drop(delivery);
                     commit_write(write)?;
-                    return Ok(());
+                    return Ok(EnqueueOutcome::Accepted);
                 }
                 bail!("conflicting duplicate delivery_id: {}", record.delivery_id);
             }
@@ -250,7 +256,7 @@ impl DeliveryStore {
             if terminal_delivery_is_suppressed(&write, record.delivery_id.as_str())? {
                 drop(delivery);
                 commit_write(write)?;
-                return Ok(());
+                return Ok(EnqueueOutcome::TerminallySuppressed);
             }
             let bytes = serde_json::to_vec(record)?;
             delivery.insert(record.delivery_id.as_str(), bytes.as_slice())?;
@@ -262,7 +268,7 @@ impl DeliveryStore {
             )?;
         }
         commit_write(write)?;
-        Ok(())
+        Ok(EnqueueOutcome::Accepted)
     }
 
     pub(crate) fn lookup_lineage(
@@ -4724,8 +4730,9 @@ mod tests {
         );
         duplicate.observed_at_ms = duplicate.not_before_ms;
 
-        store.enqueue(&duplicate).unwrap();
+        let outcome = store.enqueue(&duplicate).unwrap();
 
+        assert_eq!(outcome, EnqueueOutcome::TerminallySuppressed);
         assert!(store.get_dead("old").unwrap().is_some());
         assert_eq!(store.terminal_dead_index_len().unwrap(), 1);
         assert_eq!(store.terminal_suppression_slot_len().unwrap(), 1);
@@ -5277,9 +5284,7 @@ mod tests {
         }
 
         let compact_at_ms = 120_u64.saturating_add(TERMINAL_DEAD_RETENTION_MS);
-        store
-            .enqueue(&record("fresh", compact_at_ms))
-            .unwrap();
+        store.enqueue(&record("fresh", compact_at_ms)).unwrap();
 
         assert!(!store.terminal_suppresses("one").unwrap());
         original.observed_at_ms = compact_at_ms;
