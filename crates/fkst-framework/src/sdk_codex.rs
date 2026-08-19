@@ -937,7 +937,7 @@ fn run_adoptable_codex_request(
     host_root: &Path,
     config: &ConfigContext,
 ) -> Result<CodexResult> {
-    if let Some(result) = read_completed_adoption_result(&paths)? {
+    if let Some(result) = read_reusable_adoption_result(&paths)? {
         return Ok(result);
     }
     std::fs::create_dir_all(&paths.dir).map_err(mlua::Error::external)?;
@@ -950,11 +950,11 @@ fn run_adoptable_codex_request(
         .open(lock_path)
         .map_err(mlua::Error::external)?;
     flock(lock_file.as_raw_fd(), FlockArg::LockExclusive).map_err(mlua::Error::external)?;
-    if let Some(result) = read_completed_adoption_result(&paths)? {
+    if let Some(result) = read_reusable_adoption_result(&paths)? {
         drop(lock_file);
         return Ok(result);
     }
-    if let Some(result) = recover_completed_adoption_result_locked(&paths)? {
+    if let Some(result) = recover_reusable_adoption_result_locked(&paths)? {
         drop(lock_file);
         return Ok(result);
     }
@@ -1170,6 +1170,47 @@ fn read_completed_adoption_result(paths: &CodexAdoptionPaths) -> Result<Option<C
     let mut result = CodexResult::success(stdout, stderr, exit_code, record.log_path);
     result.codex_error_info = codex_error_info;
     result.diagnostics = diagnostics;
+    Ok(Some(result))
+}
+
+/// A completed adoption record is reusable by a *later* dispatch only when the run
+/// succeeded.
+///
+/// Every codex failure is classified as an environmental boundary condition —
+/// `boundary_resource::class_for_adapter_failure` has no "deterministic failure"
+/// class and defaults to `provider-unavailable`. A stored failure therefore
+/// describes the environment at the time of that run, not a property of the
+/// prompt, and replaying it to a later dispatch freezes one transient fault into
+/// a permanent answer that no retry can ever clear.
+///
+/// Waiters attached to a run in flight keep reading the completed record through
+/// `read_completed_adoption_result`; they are entitled to their own run's failure.
+fn read_reusable_adoption_result(paths: &CodexAdoptionPaths) -> Result<Option<CodexResult>> {
+    let Some(result) = read_completed_adoption_result(paths)? else {
+        return Ok(None);
+    };
+    if !adoption_result_succeeded(&result) {
+        return Ok(None);
+    }
+    Ok(Some(result))
+}
+
+/// A stored record without `error_kind` is still a failure when the process
+/// exited non-zero: `read_completed_adoption_result` builds those through
+/// `CodexResult::success`, so the exit code is the only reliable outcome signal.
+fn adoption_result_succeeded(result: &CodexResult) -> bool {
+    result.error_kind.is_none() && result.exit_code == 0
+}
+
+fn recover_reusable_adoption_result_locked(
+    paths: &CodexAdoptionPaths,
+) -> Result<Option<CodexResult>> {
+    let Some(result) = recover_completed_adoption_result_locked(paths)? else {
+        return Ok(None);
+    };
+    if !adoption_result_succeeded(&result) {
+        return Ok(None);
+    }
     Ok(Some(result))
 }
 
@@ -1556,6 +1597,7 @@ fn start_adoption_worker(
 ) -> Result<()> {
     ensure_pool_with_context(host_root, config)?;
     std::fs::create_dir_all(&paths.dir).map_err(mlua::Error::external)?;
+    discard_previous_run_outcome(paths).map_err(mlua::Error::external)?;
     write_atomic(&paths.prompt, request.prompt.as_bytes()).map_err(mlua::Error::external)?;
     let intent =
         adoption_record_from_request(request, paths, CODEX_ADOPTION_STATUS_INTENT, None, None);
@@ -1578,6 +1620,28 @@ fn start_adoption_worker(
     }
     let child = command.spawn().map_err(mlua::Error::external)?;
     drop(child);
+    Ok(())
+}
+
+/// Starting a run invalidates the previous run's outcome artifacts.
+///
+/// `status.json` is overwritten with the new intent, but the three recovery
+/// paths — `result.json`, the effect record, and the effect log — are otherwise
+/// never cleared, so a waiter on the fresh run would promote the previous run's
+/// stored result straight back through `recover_completed_adoption_result`.
+fn discard_previous_run_outcome(paths: &CodexAdoptionPaths) -> anyhow::Result<()> {
+    for path in [&paths.result, &paths.effect, &paths.effect_log] {
+        match std::fs::remove_file(path) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => {
+                return Err(anyhow::anyhow!(
+                    "codex adoption could not discard previous run outcome {}: {err}",
+                    path.display()
+                ))
+            }
+        }
+    }
     Ok(())
 }
 

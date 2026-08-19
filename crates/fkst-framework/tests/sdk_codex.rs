@@ -1002,6 +1002,77 @@ printf '{"type":"item.completed","item":{"type":"agent_message","text":"result-%
 
 #[cfg(unix)]
 #[test]
+fn spawn_codex_sync_does_not_adopt_a_failed_result_for_a_later_dispatch() {
+    // A stored codex failure describes the environment at the time of that run,
+    // not a property of the prompt: every codex failure is classified as a
+    // boundary condition. Adopting one for a later dispatch turns a single
+    // transient upstream fault into a permanent answer that no retry can clear.
+    let tmp = tempfile::tempdir().unwrap();
+    let bin_dir = tmp.path().join("bin");
+    let worktree = tmp.path().join("wt");
+    let capture_dir = tmp.path().join("capture");
+    std::fs::create_dir_all(&worktree).unwrap();
+    std::fs::create_dir_all(&capture_dir).unwrap();
+    install_codex_script(
+        &bin_dir,
+        r#"#!/bin/sh
+cat >/dev/null
+count_file="$CAPTURE_DIR/spawns"
+count=0
+if [ -f "$count_file" ]; then
+  count=$(cat "$count_file")
+fi
+count=$((count + 1))
+printf '%s' "$count" > "$count_file"
+if [ "$count" = "1" ]; then
+  echo "upstream refused the request: 503 service unavailable" >&2
+  exit 1
+fi
+printf '{"type":"item.completed","item":{"type":"agent_message","text":"result-%s"}}\n' "$count"
+"#,
+    );
+
+    let mut sandbox = ProcessSandbox::new();
+    sandbox.enter_cwd(tmp.path()).runtime_root(".fkst/runtime");
+    sandbox.prepend_path(&bin_dir);
+    sandbox.set_env("CAPTURE_DIR", capture_dir.to_string_lossy().into_owned());
+    sandbox.set_env(CODEX_WORKER_BIN_ENV, framework_bin());
+    sandbox.runtime_log_dir(tmp.path().join("runtime"));
+    let (_lock, _guard) = sandbox.enter();
+
+    let lua = Lua::new();
+    register(&lua).unwrap();
+    let spawn: mlua::Function = lua.globals().get("spawn_codex_sync").unwrap();
+
+    let first_opts = lua_opts(&lua, "same-work");
+    first_opts
+        .set("worktree", worktree.to_string_lossy().into_owned())
+        .unwrap();
+    first_opts.set("dedup_key", "same-dedup").unwrap();
+    let first: Table = spawn.call(first_opts).unwrap();
+    assert_ne!(first.get::<i64>("exit_code").unwrap(), 0);
+
+    let second_opts = lua_opts(&lua, "same-work");
+    second_opts
+        .set("worktree", worktree.to_string_lossy().into_owned())
+        .unwrap();
+    second_opts.set("dedup_key", "same-dedup").unwrap();
+    let second: Table = spawn.call(second_opts).unwrap();
+    assert_eq!(
+        second.get::<i64>("exit_code").unwrap(),
+        0,
+        "the second dispatch must run codex again instead of replaying the stored failure"
+    );
+    assert_eq!(second.get::<String>("stdout").unwrap(), "result-2");
+    assert_eq!(
+        std::fs::read_to_string(capture_dir.join("spawns")).unwrap(),
+        "2",
+        "a stored failure must not suppress the respawn"
+    );
+}
+
+#[cfg(unix)]
+#[test]
 fn spawn_codex_sync_uses_runtime_adoption_dir_for_read_only_worktree() {
     use std::os::unix::fs::PermissionsExt;
 
@@ -3204,6 +3275,10 @@ esac
         first.get::<String>("codex_error_info").unwrap(),
         "server_overloaded"
     );
+    // The typed refusal this fixture emits is `turn.failed` / "server overloaded",
+    // an environmental condition. A later dispatch runs codex again rather than
+    // replaying it; the typed metadata this test is about still survives the
+    // adoption machinery on every run.
     let second: Table = spawn.call(opts).unwrap();
     assert_eq!(second.get::<i64>("exit_code").unwrap(), 1);
     assert_eq!(
@@ -3212,7 +3287,7 @@ esac
     );
     assert_eq!(
         std::fs::read_to_string(capture_dir.join("spawns")).unwrap(),
-        "1"
+        "2"
     );
 
     let adoption = adoption_work_dir(tmp.path());
