@@ -1,7 +1,9 @@
 use super::delivery_store::{DeliveryScanRecord, DeliveryStore};
 use super::delivery_types::{DeadRecord, DeliveryRecord, SourceRef, TerminalSuppressionRecord};
 use crate::manifest_hash::sha256_hex;
-use crate::observe::{DeadLetterPageCursor, DeadLetterPageOptions};
+use crate::observe::{
+    DeadLetterPageCursor, DeadLetterWindow, ObservePageOptions, TerminalSuppressionPageCursor,
+};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
@@ -13,7 +15,8 @@ pub(crate) struct DeliveryObserveOptions {
     pub(crate) now_ms: u64,
     pub(crate) limit: usize,
     pub(crate) since: Option<String>,
-    pub(crate) dead_letter_page: Option<DeadLetterPageOptions>,
+    pub(crate) page: Option<ObservePageOptions>,
+    pub(crate) dead_letter_window: Option<DeadLetterWindow>,
     pub(crate) current_subscriber_queues: Option<BTreeSet<String>>,
 }
 
@@ -24,6 +27,8 @@ pub(crate) struct DeliveryObserveSnapshot {
     pub(crate) source: DeliveryObserveSource,
     pub(crate) limits: DeliveryObserveLimits,
     pub(crate) truncated: DeliveryObserveTruncated,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) dead_letters_complete: Option<bool>,
     pub(crate) queues: Vec<QueueObserveState>,
     pub(crate) deliveries: Vec<DeliveryObserveEntry>,
     pub(crate) dead_letters: Vec<DeadLetterObserveEntry>,
@@ -175,22 +180,41 @@ pub(crate) fn observe_snapshot(
     if options.since.as_deref().is_some_and(str::is_empty) {
         anyhow::bail!("observe since cursor must not be empty");
     }
-    if options.dead_letter_page.is_some() && options.since.is_some() {
+    if options.page.is_some() && options.since.is_some() {
         anyhow::bail!("fkst.observe page cannot be combined with since");
     }
+    if options.page.is_some() && options.dead_letter_window.is_some() {
+        anyhow::bail!("fkst.observe dead_letter_window cannot be combined with page");
+    }
+    let dead_letter_page = options.page.as_ref().and_then(|page| match page {
+        ObservePageOptions::DeadLetters(page) => Some(page),
+        ObservePageOptions::TerminalSuppressions(_) => None,
+    });
+    let terminal_suppression_page = options.page.as_ref().and_then(|page| match page {
+        ObservePageOptions::DeadLetters(_) => None,
+        ObservePageOptions::TerminalSuppressions(page) => Some(page),
+    });
     let mut delivery_records = Vec::new();
     let mut dead_records = Vec::new();
     let mut terminal_suppression_records = Vec::new();
     let mut queues = BTreeMap::<String, QueueAccumulator>::new();
 
-    if let Some(page) = &options.dead_letter_page {
-        let after = page
-            .after
-            .as_ref()
+    if options.dead_letter_window.is_some() || dead_letter_page.is_some() {
+        let after = dead_letter_page
+            .and_then(|page| page.after.as_ref())
             .map(|cursor| (cursor.dead_at_ms, cursor.delivery_id.as_str()));
-        dead_records = store.scan_records_for_dead_letter_page(
+        dead_records = store.scan_records_for_dead_letter_window(
             after,
-            options.limit.saturating_add(1),
+            options
+                .dead_letter_window
+                .as_ref()
+                .map(|window| (window.start_ms, window.end_ms)),
+            if options.since.is_some() && dead_letter_page.is_none() {
+                usize::MAX
+            } else {
+                options.limit.saturating_add(1)
+            },
+            None,
             options.limit.saturating_add(1),
             |record| {
                 match record {
@@ -201,8 +225,8 @@ pub(crate) fn observe_snapshot(
                             .observe_delivery(&record, options.now_ms);
                         delivery_records.push(record);
                     }
-                    DeliveryScanRecord::TerminalSuppression(record) => {
-                        terminal_suppression_records.push(record);
+                    DeliveryScanRecord::TerminalSuppression { slot, record } => {
+                        terminal_suppression_records.push((slot, record));
                     }
                     DeliveryScanRecord::Dead(_) => {
                         unreachable!("paged scan returns dead records separately")
@@ -212,24 +236,31 @@ pub(crate) fn observe_snapshot(
             },
         )?;
     } else {
-        store.scan_records(options.limit.saturating_add(1), |record| {
-            match record {
-                DeliveryScanRecord::Delivery(record) => {
-                    queues
-                        .entry(record.queue.clone())
-                        .or_default()
-                        .observe_delivery(&record, options.now_ms);
-                    delivery_records.push(record);
+        let suppression_after = terminal_suppression_page
+            .and_then(|page| page.after.as_ref())
+            .map(|cursor| cursor.delivery_id.as_str());
+        store.scan_records(
+            suppression_after,
+            options.limit.saturating_add(1),
+            |record| {
+                match record {
+                    DeliveryScanRecord::Delivery(record) => {
+                        queues
+                            .entry(record.queue.clone())
+                            .or_default()
+                            .observe_delivery(&record, options.now_ms);
+                        delivery_records.push(record);
+                    }
+                    DeliveryScanRecord::Dead(record) => {
+                        dead_records.push(record);
+                    }
+                    DeliveryScanRecord::TerminalSuppression { slot, record } => {
+                        terminal_suppression_records.push((slot, record));
+                    }
                 }
-                DeliveryScanRecord::Dead(record) => {
-                    dead_records.push(record);
-                }
-                DeliveryScanRecord::TerminalSuppression(record) => {
-                    terminal_suppression_records.push(record);
-                }
-            }
-            Ok(())
-        })?;
+                Ok(())
+            },
+        )?;
     }
 
     delivery_records.sort_by(|left, right| {
@@ -244,11 +275,14 @@ pub(crate) fn observe_snapshot(
             .cmp(&right.dead_at_ms)
             .then_with(|| left.delivery_id.cmp(&right.delivery_id))
     });
-    terminal_suppression_records.sort_by(|left, right| {
-        left.terminal_at_ms
-            .cmp(&right.terminal_at_ms)
-            .then_with(|| left.delivery_id.cmp(&right.delivery_id))
-    });
+    if terminal_suppression_page.is_none() {
+        terminal_suppression_records.sort_by(|left, right| {
+            left.1
+                .terminal_at_ms
+                .cmp(&right.1.terminal_at_ms)
+                .then_with(|| left.1.delivery_id.cmp(&right.1.delivery_id))
+        });
+    }
     if let Some(since) = options.since.as_deref() {
         trim_deliveries_after_cursor(&mut delivery_records, since);
         trim_dead_letters_after_cursor(&mut dead_records, since);
@@ -258,27 +292,53 @@ pub(crate) fn observe_snapshot(
         dead_letters: apply_limit(&mut dead_records, options.limit),
         terminal_suppressions: apply_limit(&mut terminal_suppression_records, options.limit),
     };
-    let page = options
-        .dead_letter_page
+    let dead_letters_complete = options
+        .dead_letter_window
         .as_ref()
-        .map(|_| {
-            let next = if truncated.dead_letters {
-                dead_records
-                    .last()
-                    .map(|record| {
-                        crate::observe::encode_dead_letter_cursor(&DeadLetterPageCursor {
-                            dead_at_ms: record.dead_at_ms,
-                            delivery_id: record.delivery_id.clone(),
+        .map(|_| !truncated.dead_letters);
+    let page = options
+        .page
+        .as_ref()
+        .map(|page| match page {
+            ObservePageOptions::DeadLetters(_) => {
+                let next = if truncated.dead_letters {
+                    dead_records
+                        .last()
+                        .map(|record| {
+                            crate::observe::encode_dead_letter_cursor(&DeadLetterPageCursor {
+                                dead_at_ms: record.dead_at_ms,
+                                delivery_id: record.delivery_id.clone(),
+                            })
                         })
-                    })
-                    .transpose()?
-            } else {
-                None
-            };
-            Ok::<DeliveryObservePage, anyhow::Error>(DeliveryObservePage {
-                section: "dead_letters".to_string(),
-                next,
-            })
+                        .transpose()?
+                } else {
+                    None
+                };
+                Ok::<DeliveryObservePage, anyhow::Error>(DeliveryObservePage {
+                    section: "dead_letters".to_string(),
+                    next,
+                })
+            }
+            ObservePageOptions::TerminalSuppressions(_) => {
+                let next = if truncated.terminal_suppressions {
+                    terminal_suppression_records
+                        .last()
+                        .map(|(_, record)| {
+                            crate::observe::encode_terminal_suppression_cursor(
+                                &TerminalSuppressionPageCursor {
+                                    delivery_id: record.delivery_id.clone(),
+                                },
+                            )
+                        })
+                        .transpose()?
+                } else {
+                    None
+                };
+                Ok(DeliveryObservePage {
+                    section: "terminal_suppressions".to_string(),
+                    next,
+                })
+            }
         })
         .transpose()?;
     let deliveries = delivery_records
@@ -291,7 +351,7 @@ pub(crate) fn observe_snapshot(
         .collect::<Result<Vec<_>>>()?;
     let terminal_suppressions = terminal_suppression_records
         .into_iter()
-        .map(terminal_suppression_observe_entry)
+        .map(|(_, record)| terminal_suppression_observe_entry(record))
         .collect();
 
     Ok(DeliveryObserveSnapshot {
@@ -313,6 +373,7 @@ pub(crate) fn observe_snapshot(
             max_terminal_suppressions: options.limit,
         },
         truncated,
+        dead_letters_complete,
         queues: queues
             .into_iter()
             .map(|(queue, accumulator)| {
@@ -611,6 +672,7 @@ mod tests {
                 max_terminal_suppressions: 2,
             },
             truncated: DeliveryObserveTruncated::default(),
+            dead_letters_complete: None,
             queues: Vec::new(),
             deliveries: Vec::new(),
             dead_letters: Vec::new(),
@@ -647,7 +709,8 @@ mod tests {
                 now_ms: 150,
                 limit: 10,
                 since: None,
-                dead_letter_page: None,
+                page: None,
+                dead_letter_window: None,
                 current_subscriber_queues: None,
             },
         )
@@ -713,7 +776,8 @@ mod tests {
                 now_ms: 121,
                 limit: 10,
                 since: None,
-                dead_letter_page: None,
+                page: None,
+                dead_letter_window: None,
                 current_subscriber_queues: None,
             },
         )
@@ -779,7 +843,8 @@ mod tests {
                 now_ms: compact_at_ms,
                 limit: 10,
                 since: None,
-                dead_letter_page: None,
+                page: None,
+                dead_letter_window: None,
                 current_subscriber_queues: None,
             },
         )
@@ -834,7 +899,8 @@ mod tests {
                 now_ms: 121,
                 limit: 1,
                 since: None,
-                dead_letter_page: None,
+                page: None,
+                dead_letter_window: None,
                 current_subscriber_queues: None,
             },
         )
@@ -843,6 +909,196 @@ mod tests {
         assert_eq!(snapshot.terminal_suppressions.len(), 1);
         assert_eq!(snapshot.limits.max_terminal_suppressions, 1);
         assert!(snapshot.truncated.terminal_suppressions);
+    }
+
+    #[test]
+    fn observe_snapshot_pages_terminal_suppressions_after_dead_letter_compaction() {
+        let temp = TempDir::new().unwrap();
+        let store = store(&temp);
+        let delivery_ids = ["terminal-one", "terminal-two", "terminal-three"];
+        for (index, delivery_id) in delivery_ids.iter().enumerate() {
+            let mut delivery = record(delivery_id, 100);
+            delivery.payload = serde_json::json!({"dedup_key": format!("key-{index}")});
+            delivery.collapse_by_dedup_id = true;
+            store.enqueue(&delivery).unwrap();
+            let leased = store
+                .lease_for_dept("worker", 100, 1, Duration::from_millis(50))
+                .unwrap()
+                .remove(0);
+            store
+                .retry(
+                    &leased.delivery_id,
+                    leased.lease_generation,
+                    &failure("final", false),
+                    &policy(1),
+                    120 + index as u64,
+                )
+                .unwrap();
+        }
+        let compact_at_ms = 122_u64
+            .saturating_add(TERMINAL_DEAD_RETENTION_MS)
+            .saturating_add(1);
+        let mut trigger = record("compaction-trigger", compact_at_ms);
+        trigger.observed_at_ms = compact_at_ms;
+        store.enqueue(&trigger).unwrap();
+        for delivery_id in delivery_ids {
+            assert!(store.get_dead(delivery_id).unwrap().is_none());
+        }
+
+        let first = observe_snapshot(
+            &store,
+            temp.path(),
+            &temp.path().join("delivery.redb"),
+            &DeliveryObserveOptions {
+                now_ms: compact_at_ms,
+                limit: 2,
+                since: None,
+                page: Some(ObservePageOptions::TerminalSuppressions(
+                    crate::observe::TerminalSuppressionPageOptions { after: None },
+                )),
+                dead_letter_window: None,
+                current_subscriber_queues: None,
+            },
+        )
+        .unwrap();
+        assert!(first.dead_letters.is_empty());
+        assert_eq!(first.terminal_suppressions.len(), 2);
+        assert!(first.truncated.terminal_suppressions);
+        let cursor = first.page.as_ref().unwrap().next.clone().unwrap();
+        let page = crate::observe::validate_page(
+            Some(&crate::observe::ObservePageRequest {
+                section: "terminal_suppressions".to_string(),
+                after: Some(cursor),
+            }),
+            None,
+        )
+        .unwrap()
+        .unwrap();
+        let second = observe_snapshot(
+            &store,
+            temp.path(),
+            &temp.path().join("delivery.redb"),
+            &DeliveryObserveOptions {
+                now_ms: compact_at_ms,
+                limit: 2,
+                since: None,
+                page: Some(page),
+                dead_letter_window: None,
+                current_subscriber_queues: None,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(second.terminal_suppressions.len(), 1);
+        assert!(!second.truncated.terminal_suppressions);
+        assert!(second.page.as_ref().unwrap().next.is_none());
+        let mut actual = first
+            .terminal_suppressions
+            .iter()
+            .chain(second.terminal_suppressions.iter())
+            .map(|record| record.delivery_id.as_str())
+            .collect::<Vec<_>>();
+        actual.sort_unstable();
+        let mut expected = delivery_ids.to_vec();
+        expected.sort_unstable();
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn observe_snapshot_filters_dead_letters_by_half_open_window_before_limit() {
+        let temp = TempDir::new().unwrap();
+        let store = store(&temp);
+        for (id, dead_at_ms) in [
+            ("outside", 100),
+            ("inside", 200),
+            ("inside-tie", 200),
+            ("end", 300),
+            ("end-tie", 300),
+        ] {
+            store.enqueue(&record(id, 100)).unwrap();
+            let leased = store
+                .lease(100, 1, Duration::from_millis(50))
+                .unwrap()
+                .remove(0);
+            store
+                .retry(
+                    &leased.delivery_id,
+                    leased.lease_generation,
+                    &failure("final", false),
+                    &policy(1),
+                    dead_at_ms,
+                )
+                .unwrap();
+        }
+
+        let snapshot = observe_snapshot(
+            &store,
+            temp.path(),
+            &temp.path().join("delivery.redb"),
+            &DeliveryObserveOptions {
+                now_ms: 400,
+                limit: 2,
+                since: None,
+                page: None,
+                dead_letter_window: Some(DeadLetterWindow {
+                    start_ms: 200,
+                    end_ms: 300,
+                }),
+                current_subscriber_queues: None,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(snapshot.dead_letters.len(), 2);
+        assert_eq!(snapshot.dead_letters[0].delivery_id, "inside");
+        assert_eq!(snapshot.dead_letters[1].delivery_id, "inside-tie");
+        assert!(!snapshot.truncated.dead_letters);
+        assert_eq!(snapshot.dead_letters_complete, Some(true));
+    }
+
+    #[test]
+    fn observe_snapshot_reports_in_window_incompleteness_without_old_history() {
+        let temp = TempDir::new().unwrap();
+        let store = store(&temp);
+        for (id, dead_at_ms) in [("outside", 100), ("inside-one", 200), ("inside-two", 210)] {
+            store.enqueue(&record(id, 100)).unwrap();
+            let leased = store
+                .lease(100, 1, Duration::from_millis(50))
+                .unwrap()
+                .remove(0);
+            store
+                .retry(
+                    &leased.delivery_id,
+                    leased.lease_generation,
+                    &failure("final", false),
+                    &policy(1),
+                    dead_at_ms,
+                )
+                .unwrap();
+        }
+
+        let snapshot = observe_snapshot(
+            &store,
+            temp.path(),
+            &temp.path().join("delivery.redb"),
+            &DeliveryObserveOptions {
+                now_ms: 400,
+                limit: 1,
+                since: None,
+                page: None,
+                dead_letter_window: Some(DeadLetterWindow {
+                    start_ms: 200,
+                    end_ms: 300,
+                }),
+                current_subscriber_queues: None,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(snapshot.dead_letters.len(), 1);
+        assert_eq!(snapshot.dead_letters[0].delivery_id, "inside-one");
+        assert!(snapshot.truncated.dead_letters);
+        assert_eq!(snapshot.dead_letters_complete, Some(false));
     }
 
     #[test]
@@ -860,7 +1116,8 @@ mod tests {
                 now_ms: 100,
                 limit: 1,
                 since: None,
-                dead_letter_page: None,
+                page: None,
+                dead_letter_window: None,
                 current_subscriber_queues: None,
             },
         )
@@ -886,7 +1143,8 @@ mod tests {
                 now_ms: 100,
                 limit: 1,
                 since: Some("delivery-001".to_string()),
-                dead_letter_page: None,
+                page: None,
+                dead_letter_window: None,
                 current_subscriber_queues: None,
             },
         )
@@ -915,7 +1173,8 @@ mod tests {
                 now_ms: 100,
                 limit: 10,
                 since: None,
-                dead_letter_page: None,
+                page: None,
+                dead_letter_window: None,
                 current_subscriber_queues: Some(BTreeSet::from(["input".to_string()])),
             },
         )

@@ -124,7 +124,10 @@ pub(crate) struct LineageLookup {
 pub(crate) enum DeliveryScanRecord {
     Delivery(DeliveryRecord),
     Dead(DeadRecord),
-    TerminalSuppression(TerminalSuppressionRecord),
+    TerminalSuppression {
+        slot: String,
+        record: TerminalSuppressionRecord,
+    },
 }
 
 impl DeliveryStore {
@@ -1405,6 +1408,7 @@ impl DeliveryStore {
 
     pub(crate) fn scan_records(
         &self,
+        terminal_suppression_after: Option<&str>,
         terminal_suppression_limit: usize,
         mut visit: impl FnMut(DeliveryScanRecord) -> Result<()>,
     ) -> Result<()> {
@@ -1444,17 +1448,12 @@ impl DeliveryStore {
         }
 
         if let Some(suppression) = suppression {
-            let mut suppression_count = 0;
-            for entry in suppression.iter()? {
-                if suppression_count >= terminal_suppression_limit {
-                    break;
-                }
-                let (_, value) = entry?;
-                visit(DeliveryScanRecord::TerminalSuppression(
-                    decode_terminal_suppression_record(value.value())?,
-                ))?;
-                suppression_count += 1;
-            }
+            scan_terminal_suppression_records(
+                &suppression,
+                terminal_suppression_after,
+                terminal_suppression_limit,
+                &mut visit,
+            )?;
         }
 
         Ok(())
@@ -1464,6 +1463,25 @@ impl DeliveryStore {
         &self,
         after: Option<(u64, &str)>,
         limit: usize,
+        terminal_suppression_limit: usize,
+        visit: impl FnMut(DeliveryScanRecord) -> Result<()>,
+    ) -> Result<Vec<DeadRecord>> {
+        self.scan_records_for_dead_letter_window(
+            after,
+            None,
+            limit,
+            None,
+            terminal_suppression_limit,
+            visit,
+        )
+    }
+
+    pub(crate) fn scan_records_for_dead_letter_window(
+        &self,
+        after: Option<(u64, &str)>,
+        window: Option<(u64, u64)>,
+        limit: usize,
+        terminal_suppression_after: Option<&str>,
         terminal_suppression_limit: usize,
         mut visit: impl FnMut(DeliveryScanRecord) -> Result<()>,
     ) -> Result<Vec<DeadRecord>> {
@@ -1495,39 +1513,36 @@ impl DeliveryStore {
         }
 
         if let Some(suppression) = suppression {
-            let mut suppression_count = 0;
-            for entry in suppression.iter()? {
-                if suppression_count >= terminal_suppression_limit {
-                    break;
-                }
-                let (_, value) = entry?;
-                visit(DeliveryScanRecord::TerminalSuppression(
-                    decode_terminal_suppression_record(value.value())?,
-                ))?;
-                suppression_count += 1;
-            }
+            scan_terminal_suppression_records(
+                &suppression,
+                terminal_suppression_after,
+                terminal_suppression_limit,
+                &mut visit,
+            )?;
         }
 
         let mut records = Vec::new();
-        if let Some((dead_at_ms, delivery_id)) = after {
-            let start = make_dead_time_index_key(dead_at_ms, delivery_id);
-            for entry in dead_by_time.range::<&str>((
-                std::ops::Bound::Excluded(start.as_str()),
-                std::ops::Bound::Unbounded,
-            ))? {
-                let (key, _) = entry?;
-                collect_dead_letter_page_record(&dead, key.value(), &mut records)?;
-                if records.len() >= limit {
-                    break;
-                }
+        if window.is_some_and(|(start_ms, end_ms)| start_ms >= end_ms) {
+            return Ok(records);
+        }
+        let (lower_bound, upper_bound) = dead_letter_time_bounds(after, window);
+        if lower_bound > upper_bound {
+            return Ok(records);
+        }
+        for entry in dead_by_time.range::<&str>((
+            std::ops::Bound::Included(lower_bound.as_str()),
+            std::ops::Bound::Included(upper_bound.as_str()),
+        ))? {
+            let (key, _) = entry?;
+            let parsed = parse_dead_time_index_key(key.value())?;
+            if after.is_some_and(|(dead_at_ms, delivery_id)| {
+                (parsed.due_ms, parsed.delivery_id.as_str()) <= (dead_at_ms, delivery_id)
+            }) {
+                continue;
             }
-        } else {
-            for entry in dead_by_time.iter()? {
-                let (key, _) = entry?;
-                collect_dead_letter_page_record(&dead, key.value(), &mut records)?;
-                if records.len() >= limit {
-                    break;
-                }
+            collect_dead_letter_page_record(&dead, key.value(), &mut records)?;
+            if records.len() >= limit {
+                break;
             }
         }
         Ok(records)
@@ -1606,6 +1621,59 @@ impl DeliveryStore {
     fn begin_write(&self) -> Result<redb::WriteTransaction> {
         begin_write(&self.db)
     }
+}
+
+fn scan_terminal_suppression_records(
+    table: &redb::ReadOnlyTable<&str, &str>,
+    after_delivery_id: Option<&str>,
+    limit: usize,
+    visit: &mut impl FnMut(DeliveryScanRecord) -> Result<()>,
+) -> Result<()> {
+    if limit == 0 {
+        return Ok(());
+    }
+    let after_slot = after_delivery_id
+        .map(|delivery_id| {
+            terminal_suppression_slot_in_table(table, delivery_id)?.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "observe terminal-suppression cursor invalid: delivery_id not found"
+                )
+            })
+        })
+        .transpose()?;
+    let lower_bound = after_slot
+        .as_deref()
+        .map_or(std::ops::Bound::Unbounded, std::ops::Bound::Excluded);
+    let mut count = 0;
+    for entry in table.range::<&str>((lower_bound, std::ops::Bound::Unbounded))? {
+        let (slot, value) = entry?;
+        visit(DeliveryScanRecord::TerminalSuppression {
+            slot: slot.value().to_string(),
+            record: decode_terminal_suppression_record(value.value())?,
+        })?;
+        count += 1;
+        if count >= limit {
+            break;
+        }
+    }
+    Ok(())
+}
+
+fn dead_letter_time_bounds(
+    after: Option<(u64, &str)>,
+    window: Option<(u64, u64)>,
+) -> (String, String) {
+    let lower_ms = match (after, window) {
+        (Some((after_ms, _)), Some((start_ms, _))) => after_ms.max(start_ms),
+        (Some((after_ms, _)), None) => after_ms,
+        (None, Some((start_ms, _))) => start_ms,
+        (None, None) => 0,
+    };
+    let upper_ms = window.map(|(_, end_ms)| end_ms - 1).unwrap_or(u64::MAX);
+    (
+        format!("{lower_ms:020}/"),
+        format!("{upper_ms:020}/\u{10ffff}"),
+    )
 }
 
 pub(crate) const SUBSCRIBER_ABSENT_DEAD_REASON: &str = "subscriber-absent";
@@ -2045,15 +2113,22 @@ fn terminal_delivery_is_suppressed_in_table<T>(table: &T, delivery_id: &str) -> 
 where
     T: ReadableTable<&'static str, &'static str>,
 {
+    Ok(terminal_suppression_slot_in_table(table, delivery_id)?.is_some())
+}
+
+fn terminal_suppression_slot_in_table<T>(table: &T, delivery_id: &str) -> Result<Option<String>>
+where
+    T: ReadableTable<&'static str, &'static str>,
+{
     for slot in terminal_suppression_probe_keys(delivery_id) {
         let Some(current) = table.get(slot.as_str())? else {
-            return Ok(false);
+            return Ok(None);
         };
         if decode_terminal_suppression_record(current.value())?.delivery_id == delivery_id {
-            return Ok(true);
+            return Ok(Some(slot));
         }
     }
-    Ok(false)
+    Ok(None)
 }
 
 fn terminal_suppression_from_delivery(
@@ -5557,8 +5632,8 @@ mod tests {
         let store = DeliveryStore::open(&path).unwrap();
         let mut suppressions = Vec::new();
         store
-            .scan_records(10, |record| {
-                if let DeliveryScanRecord::TerminalSuppression(record) = record {
+            .scan_records(None, 10, |record| {
+                if let DeliveryScanRecord::TerminalSuppression { record, .. } = record {
                     suppressions.push(record);
                 }
                 Ok(())

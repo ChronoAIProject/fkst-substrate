@@ -27,7 +27,8 @@ pub(crate) struct ObserveOptions {
 pub(crate) struct ObserveSnapshotOptions {
     pub(crate) limit: usize,
     pub(crate) since: Option<String>,
-    pub(crate) page: Option<DeadLetterPageRequest>,
+    pub(crate) page: Option<ObservePageRequest>,
+    pub(crate) dead_letter_window: Option<DeadLetterWindowRequest>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -40,10 +41,23 @@ pub(crate) struct LineageObserveRequest {
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct DeadLetterPageRequest {
+pub(crate) struct ObservePageRequest {
     pub(crate) section: String,
     #[serde(default)]
     pub(crate) after: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct DeadLetterWindowRequest {
+    pub(crate) start_ms: u64,
+    pub(crate) end_ms: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct DeadLetterWindow {
+    pub(crate) start_ms: u64,
+    pub(crate) end_ms: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -52,8 +66,24 @@ pub(crate) struct DeadLetterPageOptions {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct TerminalSuppressionPageOptions {
+    pub(crate) after: Option<TerminalSuppressionPageCursor>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ObservePageOptions {
+    DeadLetters(DeadLetterPageOptions),
+    TerminalSuppressions(TerminalSuppressionPageOptions),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct DeadLetterPageCursor {
     pub(crate) dead_at_ms: u64,
+    pub(crate) delivery_id: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct TerminalSuppressionPageCursor {
     pub(crate) delivery_id: String,
 }
 
@@ -100,6 +130,7 @@ pub(crate) fn run(options: ObserveOptions) -> Result<i32> {
             limit: options.limit,
             since: None,
             page: None,
+            dead_letter_window: None,
         },
     )?;
     if options.json {
@@ -116,8 +147,9 @@ pub(crate) fn snapshot_for_durable_root(
 ) -> Result<DeliveryObserveSnapshot> {
     let limit = validate_limit(options.limit)?;
     validate_since(options.since.as_deref())?;
-    let dead_letter_page =
-        validate_dead_letter_page(options.page.as_ref(), options.since.as_deref())?;
+    let page = validate_page(options.page.as_ref(), options.since.as_deref())?;
+    let dead_letter_window =
+        validate_dead_letter_window(options.dead_letter_window.as_ref(), options.page.as_ref())?;
     let durable_root = durable_root.into();
     let layout = DurableLayout::new(&durable_root)?;
     let database = layout.delivery_db_path();
@@ -127,6 +159,7 @@ pub(crate) fn snapshot_for_durable_root(
             limit,
             since: options.since.clone(),
             page: options.page.clone(),
+            dead_letter_window: options.dead_letter_window.clone(),
         },
     )? {
         Some(snapshot) => Ok(snapshot),
@@ -140,7 +173,8 @@ pub(crate) fn snapshot_for_durable_root(
                     now_ms: now_ms(),
                     limit,
                     since: options.since.clone(),
-                    dead_letter_page,
+                    page,
+                    dead_letter_window,
                     current_subscriber_queues: None,
                 },
             )
@@ -205,6 +239,7 @@ pub(crate) fn request_live_snapshot(
         limit: options.limit,
         since: options.since.clone(),
         page: options.page.clone(),
+        dead_letter_window: options.dead_letter_window.clone(),
         lineage: None,
         now_ms: now_ms(),
     };
@@ -230,6 +265,7 @@ pub(crate) fn request_live_lineage(
         limit: DEFAULT_LIMIT,
         since: None,
         page: None,
+        dead_letter_window: None,
         lineage: Some(lineage.clone()),
         now_ms: now_ms(),
     };
@@ -287,7 +323,9 @@ pub(crate) struct ObserveSocketRequest {
     #[serde(default)]
     pub(crate) since: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) page: Option<DeadLetterPageRequest>,
+    pub(crate) page: Option<ObservePageRequest>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) dead_letter_window: Option<DeadLetterWindowRequest>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) lineage: Option<LineageObserveRequest>,
     pub(crate) now_ms: u64,
@@ -428,25 +466,60 @@ pub(crate) fn validate_since(since: Option<&str>) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn validate_dead_letter_page(
-    page: Option<&DeadLetterPageRequest>,
+pub(crate) fn validate_page(
+    page: Option<&ObservePageRequest>,
     since: Option<&str>,
-) -> Result<Option<DeadLetterPageOptions>> {
+) -> Result<Option<ObservePageOptions>> {
     let Some(page) = page else {
         return Ok(None);
     };
-    if page.section != "dead_letters" {
-        anyhow::bail!("fkst.observe page section must be `dead_letters`");
-    }
     if since.is_some() {
         anyhow::bail!("fkst.observe page cannot be combined with since");
     }
-    let after = page
-        .after
-        .as_deref()
-        .map(decode_dead_letter_cursor)
-        .transpose()?;
-    Ok(Some(DeadLetterPageOptions { after }))
+    match page.section.as_str() {
+        "dead_letters" => {
+            let after = page
+                .after
+                .as_deref()
+                .map(decode_dead_letter_cursor)
+                .transpose()?;
+            Ok(Some(ObservePageOptions::DeadLetters(
+                DeadLetterPageOptions { after },
+            )))
+        }
+        "terminal_suppressions" => {
+            let after = page
+                .after
+                .as_deref()
+                .map(decode_terminal_suppression_cursor)
+                .transpose()?;
+            Ok(Some(ObservePageOptions::TerminalSuppressions(
+                TerminalSuppressionPageOptions { after },
+            )))
+        }
+        _ => anyhow::bail!(
+            "fkst.observe page section must be `dead_letters` or `terminal_suppressions`"
+        ),
+    }
+}
+
+pub(crate) fn validate_dead_letter_window(
+    window: Option<&DeadLetterWindowRequest>,
+    page: Option<&ObservePageRequest>,
+) -> Result<Option<DeadLetterWindow>> {
+    let Some(window) = window else {
+        return Ok(None);
+    };
+    if page.is_some() {
+        anyhow::bail!("fkst.observe dead_letter_window cannot be combined with page");
+    }
+    if window.start_ms > window.end_ms {
+        anyhow::bail!("fkst.observe dead-letter window requires start_ms <= end_ms");
+    }
+    Ok(Some(DeadLetterWindow {
+        start_ms: window.start_ms,
+        end_ms: window.end_ms,
+    }))
 }
 
 pub(crate) fn encode_dead_letter_cursor(cursor: &DeadLetterPageCursor) -> Result<String> {
@@ -454,6 +527,17 @@ pub(crate) fn encode_dead_letter_cursor(cursor: &DeadLetterPageCursor) -> Result
         version: 1,
         section: "dead_letters".to_string(),
         dead_at_ms: cursor.dead_at_ms,
+        delivery_id: cursor.delivery_id.clone(),
+    };
+    Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(serde_json::to_vec(&envelope)?))
+}
+
+pub(crate) fn encode_terminal_suppression_cursor(
+    cursor: &TerminalSuppressionPageCursor,
+) -> Result<String> {
+    let envelope = TerminalSuppressionCursorEnvelope {
+        version: 1,
+        section: "terminal_suppressions".to_string(),
         delivery_id: cursor.delivery_id.clone(),
     };
     Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(serde_json::to_vec(&envelope)?))
@@ -482,12 +566,47 @@ fn decode_dead_letter_cursor(encoded: &str) -> Result<DeadLetterPageCursor> {
     })
 }
 
+fn decode_terminal_suppression_cursor(encoded: &str) -> Result<TerminalSuppressionPageCursor> {
+    let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(encoded)
+        .map_err(|err| {
+            anyhow::anyhow!("observe terminal-suppression cursor invalid: base64: {err}")
+        })?;
+    let envelope: TerminalSuppressionCursorEnvelope =
+        serde_json::from_slice(&decoded).map_err(|err| {
+            anyhow::anyhow!("observe terminal-suppression cursor invalid: json: {err}")
+        })?;
+    if envelope.version != 1 {
+        anyhow::bail!(
+            "observe terminal-suppression cursor invalid: unsupported version {}",
+            envelope.version
+        );
+    }
+    if envelope.section != "terminal_suppressions" {
+        anyhow::bail!("observe terminal-suppression cursor invalid: section mismatch");
+    }
+    validate_runtime_key(&envelope.delivery_id).map_err(|err| {
+        anyhow::anyhow!("observe terminal-suppression cursor invalid: delivery_id: {err}")
+    })?;
+    Ok(TerminalSuppressionPageCursor {
+        delivery_id: envelope.delivery_id,
+    })
+}
+
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct DeadLetterCursorEnvelope {
     version: u32,
     section: String,
     dead_at_ms: u64,
+    delivery_id: String,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct TerminalSuppressionCursorEnvelope {
+    version: u32,
+    section: String,
     delivery_id: String,
 }
 
@@ -537,6 +656,7 @@ mod tests {
                 limit: DEFAULT_LIMIT,
                 since: Some(String::new()),
                 page: None,
+                dead_letter_window: None,
             },
         )
         .unwrap_err();
@@ -577,6 +697,7 @@ mod tests {
             limit: DEFAULT_LIMIT,
             since: None,
             page: None,
+            dead_letter_window: None,
             lineage: None,
             now_ms: 1,
         };

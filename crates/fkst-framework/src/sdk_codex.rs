@@ -233,6 +233,28 @@ pub(crate) struct CodexResult {
     error: Option<String>,
     codex_error_info: Option<String>,
     diagnostics: Vec<CodexDiagnostic>,
+    /// Identity of the codex run that produced this result. A caller that adopted
+    /// another run's record needs it to tell whose outcome it is holding.
+    run_id: Option<String>,
+    /// Whether this call ran codex (`produced`) or read another run's completed
+    /// record (`adopted`). Without it, an adopted five-second read and a real
+    /// hour-long run report the same thing.
+    provenance: CodexProvenance,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CodexProvenance {
+    Produced,
+    Adopted,
+}
+
+impl CodexProvenance {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Produced => "produced",
+            Self::Adopted => "adopted",
+        }
+    }
 }
 
 // spawn_codex returns a pipeline-local opaque handle consumed by await_all.
@@ -319,6 +341,8 @@ impl CodexResult {
             error: None,
             codex_error_info: None,
             diagnostics: Vec::new(),
+            run_id: None,
+            provenance: CodexProvenance::Produced,
         }
     }
 
@@ -376,6 +400,8 @@ impl CodexResult {
             error: Some(message),
             codex_error_info: None,
             diagnostics: Vec::new(),
+            run_id: None,
+            provenance: CodexProvenance::Produced,
         }
     }
 
@@ -396,6 +422,8 @@ impl CodexResult {
             error: Some(message),
             codex_error_info: None,
             diagnostics: Vec::new(),
+            run_id: None,
+            provenance: CodexProvenance::Produced,
         }
     }
 
@@ -414,6 +442,10 @@ impl CodexResult {
             t.set("codex_error_info", codex_error_info)?;
         } else if self.exit_code != 0 {
             t.set("codex_error_info", "UNKNOWN")?;
+        }
+        t.set("provenance", self.provenance.label())?;
+        if let Some(run_id) = self.run_id {
+            t.set("run_id", run_id)?;
         }
         Ok(t)
     }
@@ -937,7 +969,7 @@ fn run_adoptable_codex_request(
     host_root: &Path,
     config: &ConfigContext,
 ) -> Result<CodexResult> {
-    if let Some(result) = read_completed_adoption_result(&paths)? {
+    if let Some(result) = read_reusable_adoption_result(&paths, &request.run_id)? {
         return Ok(result);
     }
     std::fs::create_dir_all(&paths.dir).map_err(mlua::Error::external)?;
@@ -950,11 +982,11 @@ fn run_adoptable_codex_request(
         .open(lock_path)
         .map_err(mlua::Error::external)?;
     flock(lock_file.as_raw_fd(), FlockArg::LockExclusive).map_err(mlua::Error::external)?;
-    if let Some(result) = read_completed_adoption_result(&paths)? {
+    if let Some(result) = read_reusable_adoption_result(&paths, &request.run_id)? {
         drop(lock_file);
         return Ok(result);
     }
-    if let Some(result) = recover_completed_adoption_result_locked(&paths)? {
+    if let Some(result) = recover_reusable_adoption_result_locked(&paths, &request.run_id)? {
         drop(lock_file);
         return Ok(result);
     }
@@ -1133,7 +1165,10 @@ fn adoption_request_hash(request: &CodexRequest) -> String {
     hex
 }
 
-fn read_completed_adoption_result(paths: &CodexAdoptionPaths) -> Result<Option<CodexResult>> {
+fn read_completed_adoption_result(
+    paths: &CodexAdoptionPaths,
+    requesting_run_id: &str,
+) -> Result<Option<CodexResult>> {
     let Some(record) = read_adoption_record(&paths.status)? else {
         return Ok(None);
     };
@@ -1151,6 +1186,12 @@ fn read_completed_adoption_result(paths: &CodexAdoptionPaths) -> Result<Option<C
     let exit_code = record.exit_code.unwrap_or(-1);
     let codex_error_info = record.codex_error_info.clone();
     let diagnostics = record.diagnostics.clone();
+    let produced_by = record.run_id.clone();
+    let provenance = if produced_by == requesting_run_id {
+        CodexProvenance::Produced
+    } else {
+        CodexProvenance::Adopted
+    };
     if let Some(kind) = record.error_kind.as_deref() {
         let mut result = CodexResult::failure(
             kind,
@@ -1165,31 +1206,84 @@ fn read_completed_adoption_result(paths: &CodexAdoptionPaths) -> Result<Option<C
         );
         result.codex_error_info = codex_error_info;
         result.diagnostics = diagnostics;
+        result.run_id = Some(produced_by.clone());
+        result.provenance = provenance;
         return Ok(Some(result));
     }
     let mut result = CodexResult::success(stdout, stderr, exit_code, record.log_path);
     result.codex_error_info = codex_error_info;
     result.diagnostics = diagnostics;
+    result.run_id = Some(produced_by);
+    result.provenance = provenance;
     Ok(Some(result))
 }
 
-fn recover_completed_adoption_result(paths: &CodexAdoptionPaths) -> Result<Option<CodexResult>> {
+/// A completed adoption record is reusable by a *later* dispatch only when the run
+/// succeeded.
+///
+/// Every codex failure is classified as an environmental boundary condition —
+/// `boundary_resource::class_for_adapter_failure` has no "deterministic failure"
+/// class and defaults to `provider-unavailable`. A stored failure therefore
+/// describes the environment at the time of that run, not a property of the
+/// prompt, and replaying it to a later dispatch freezes one transient fault into
+/// a permanent answer that no retry can ever clear.
+///
+/// Waiters attached to a run in flight keep reading the completed record through
+/// `read_completed_adoption_result`; they are entitled to their own run's failure.
+fn read_reusable_adoption_result(
+    paths: &CodexAdoptionPaths,
+    requesting_run_id: &str,
+) -> Result<Option<CodexResult>> {
+    let Some(result) = read_completed_adoption_result(paths, requesting_run_id)? else {
+        return Ok(None);
+    };
+    if !adoption_result_succeeded(&result) {
+        return Ok(None);
+    }
+    Ok(Some(result))
+}
+
+/// A stored record without `error_kind` is still a failure when the process
+/// exited non-zero: `read_completed_adoption_result` builds those through
+/// `CodexResult::success`, so the exit code is the only reliable outcome signal.
+fn adoption_result_succeeded(result: &CodexResult) -> bool {
+    result.error_kind.is_none() && result.exit_code == 0
+}
+
+fn recover_reusable_adoption_result_locked(
+    paths: &CodexAdoptionPaths,
+    requesting_run_id: &str,
+) -> Result<Option<CodexResult>> {
+    let Some(result) = recover_completed_adoption_result_locked(paths, requesting_run_id)? else {
+        return Ok(None);
+    };
+    if !adoption_result_succeeded(&result) {
+        return Ok(None);
+    }
+    Ok(Some(result))
+}
+
+fn recover_completed_adoption_result(
+    paths: &CodexAdoptionPaths,
+    requesting_run_id: &str,
+) -> Result<Option<CodexResult>> {
     let lock_file = open_adoption_run_lock(&paths.dir).map_err(mlua::Error::external)?;
     flock(lock_file.as_raw_fd(), FlockArg::LockExclusive).map_err(mlua::Error::external)?;
-    let result = recover_completed_adoption_result_locked(paths);
+    let result = recover_completed_adoption_result_locked(paths, requesting_run_id);
     drop(lock_file);
     result
 }
 
 fn recover_completed_adoption_result_locked(
     paths: &CodexAdoptionPaths,
+    requesting_run_id: &str,
 ) -> Result<Option<CodexResult>> {
     let recovered =
         recover_completed_adoption_result_locked_from_disk(paths).map_err(mlua::Error::external)?;
     if !recovered {
         return Ok(None);
     };
-    read_completed_adoption_result(paths)
+    read_completed_adoption_result(paths, requesting_run_id)
 }
 
 fn recover_completed_adoption_result_locked_from_disk(
@@ -1556,6 +1650,7 @@ fn start_adoption_worker(
 ) -> Result<()> {
     ensure_pool_with_context(host_root, config)?;
     std::fs::create_dir_all(&paths.dir).map_err(mlua::Error::external)?;
+    discard_previous_run_outcome(paths).map_err(mlua::Error::external)?;
     write_atomic(&paths.prompt, request.prompt.as_bytes()).map_err(mlua::Error::external)?;
     let intent =
         adoption_record_from_request(request, paths, CODEX_ADOPTION_STATUS_INTENT, None, None);
@@ -1578,6 +1673,28 @@ fn start_adoption_worker(
     }
     let child = command.spawn().map_err(mlua::Error::external)?;
     drop(child);
+    Ok(())
+}
+
+/// Starting a run invalidates the previous run's outcome artifacts.
+///
+/// `status.json` is overwritten with the new intent, but the three recovery
+/// paths — `result.json`, the effect record, and the effect log — are otherwise
+/// never cleared, so a waiter on the fresh run would promote the previous run's
+/// stored result straight back through `recover_completed_adoption_result`.
+fn discard_previous_run_outcome(paths: &CodexAdoptionPaths) -> anyhow::Result<()> {
+    for path in [&paths.result, &paths.effect, &paths.effect_log] {
+        match std::fs::remove_file(path) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => {
+                return Err(anyhow::anyhow!(
+                    "codex adoption could not discard previous run outcome {}: {err}",
+                    path.display()
+                ))
+            }
+        }
+    }
     Ok(())
 }
 
@@ -1714,10 +1831,10 @@ fn wait_for_adoption_result(
             .unwrap_or_else(|| Duration::from_secs(DEFAULT_CODEX_TIMEOUT_SECONDS as u64))
         + CODEX_ADOPTION_TIMEOUT_GRACE;
     loop {
-        if let Some(result) = read_completed_adoption_result(paths)? {
+        if let Some(result) = read_completed_adoption_result(paths, &request.run_id)? {
             return Ok(result);
         }
-        if let Some(result) = recover_completed_adoption_result(paths)? {
+        if let Some(result) = recover_completed_adoption_result(paths, &request.run_id)? {
             return Ok(result);
         }
         if Instant::now() >= deadline {
