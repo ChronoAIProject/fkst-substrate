@@ -631,6 +631,7 @@ mod tests {
         use std::os::unix::process::CommandExt;
 
         let process_groups = ProcessGroupRegistry::default();
+        let spawn_guard = process_groups.begin_spawn().unwrap();
         let mut child = Command::new("/bin/sh")
             .arg("-c")
             .arg("trap '' TERM; sleep 60")
@@ -639,9 +640,8 @@ mod tests {
             .unwrap();
         let child_pid = child.id();
         let (registered_tx, registered_rx) = oneshot::channel();
-        let process_groups_for_task = process_groups.clone();
         let handle = tokio::spawn(async move {
-            let _registration = process_groups_for_task.register(child_pid);
+            let _registration = spawn_guard.register(child_pid);
             let _ = registered_tx.send(());
             std::future::pending::<()>().await;
         });
@@ -658,6 +658,47 @@ mod tests {
             wait_for_child_exit(&mut child, Duration::from_secs(5)),
             "process group registration was dropped before termination"
         );
+    }
+
+    #[tokio::test]
+    async fn shutdown_fences_an_in_progress_process_group_spawn() {
+        use std::os::unix::process::CommandExt;
+
+        let process_groups = ProcessGroupRegistry::default();
+        let spawn_guard = process_groups.begin_spawn().unwrap();
+        let process_groups_for_shutdown = process_groups.clone();
+        let shutdown = tokio::spawn(async move {
+            process_groups_for_shutdown
+                .terminate_all("late department")
+                .await;
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            if process_groups.begin_spawn().is_none() {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "process group spawn gate did not close"
+            );
+            tokio::task::yield_now().await;
+        }
+
+        let mut child = Command::new("/bin/sh")
+            .arg("-c")
+            .arg("trap '' TERM; sleep 60")
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let child_pid = child.id();
+        let registration = spawn_guard.register(child_pid);
+        let status = child.wait().unwrap();
+        drop(registration);
+        shutdown.await.unwrap();
+
+        assert!(!status.success(), "late process group was not terminated");
+        assert!(process_groups.begin_spawn().is_none());
     }
 
     fn wait_for_child_exit(child: &mut std::process::Child, timeout: Duration) -> bool {

@@ -19,24 +19,43 @@ static SHUTDOWN_SIGNAL: AtomicI32 = AtomicI32::new(0);
 
 #[derive(Clone, Default)]
 pub(crate) struct ProcessGroupRegistry {
-    pgids: Arc<Mutex<BTreeSet<u32>>>,
+    state: Arc<Mutex<ProcessGroupState>>,
+}
+
+#[derive(Default)]
+struct ProcessGroupState {
+    pgids: BTreeSet<u32>,
+    spawns_in_progress: usize,
+    terminating: bool,
 }
 
 impl ProcessGroupRegistry {
-    pub(crate) fn register(&self, pgid: u32) -> ProcessGroupRegistration {
-        self.pgids
-            .lock()
-            .expect("process group registry poisoned")
-            .insert(pgid);
-        ProcessGroupRegistration {
-            pgid,
-            registry: self.pgids.clone(),
+    pub(crate) fn begin_spawn(&self) -> Option<ProcessGroupSpawnGuard> {
+        let mut state = self.state.lock().expect("process group registry poisoned");
+        if state.terminating {
+            return None;
         }
+        state.spawns_in_progress += 1;
+        Some(ProcessGroupSpawnGuard {
+            state: self.state.clone(),
+            active: true,
+        })
+    }
+
+    fn begin_termination(&self) -> Vec<u32> {
+        let mut state = self.state.lock().expect("process group registry poisoned");
+        state.terminating = true;
+        state.pgids.iter().copied().collect()
+    }
+
+    fn is_idle(&self) -> bool {
+        let state = self.state.lock().expect("process group registry poisoned");
+        state.pgids.is_empty() && state.spawns_in_progress == 0
     }
 
     pub(crate) async fn terminate_all(&self, label: &str) {
-        let pgids = self.snapshot();
-        if pgids.is_empty() {
+        let pgids = self.begin_termination();
+        if pgids.is_empty() && self.is_idle() {
             return;
         }
         info!(
@@ -49,23 +68,19 @@ impl ProcessGroupRegistry {
         }
         let deadline = Instant::now() + TERMINATION_GRACE;
         while Instant::now() < deadline {
-            if pgids.iter().all(|pgid| !process_group_exists(*pgid)) {
+            if self.is_idle() {
                 return;
             }
             tokio::time::sleep(POLL_INTERVAL).await;
         }
-        for pgid in pgids {
+        for pgid in self.snapshot() {
             if process_group_exists(pgid) {
                 send_group_signal(pgid, Signal::SIGKILL, label);
             }
         }
         let deadline = Instant::now() + TERMINATION_GRACE;
         while Instant::now() < deadline {
-            if self
-                .snapshot()
-                .iter()
-                .all(|pgid| !process_group_exists(*pgid))
-            {
+            if self.is_idle() {
                 return;
             }
             tokio::time::sleep(POLL_INTERVAL).await;
@@ -74,8 +89,8 @@ impl ProcessGroupRegistry {
     }
 
     pub(crate) fn terminate_all_blocking(&self, label: &str) {
-        let pgids = self.snapshot();
-        if pgids.is_empty() {
+        let pgids = self.begin_termination();
+        if pgids.is_empty() && self.is_idle() {
             return;
         }
         for pgid in &pgids {
@@ -83,23 +98,19 @@ impl ProcessGroupRegistry {
         }
         let deadline = Instant::now() + TERMINATION_GRACE;
         while Instant::now() < deadline {
-            if pgids.iter().all(|pgid| !process_group_exists(*pgid)) {
+            if self.is_idle() {
                 return;
             }
             std::thread::sleep(POLL_INTERVAL);
         }
-        for pgid in pgids {
+        for pgid in self.snapshot() {
             if process_group_exists(pgid) {
                 send_group_signal(pgid, Signal::SIGKILL, label);
             }
         }
         let deadline = Instant::now() + TERMINATION_GRACE;
         while Instant::now() < deadline {
-            if self
-                .snapshot()
-                .iter()
-                .all(|pgid| !process_group_exists(*pgid))
-            {
+            if self.is_idle() {
                 return;
             }
             std::thread::sleep(POLL_INTERVAL);
@@ -108,17 +119,19 @@ impl ProcessGroupRegistry {
     }
 
     fn snapshot(&self) -> Vec<u32> {
-        self.pgids
+        self.state
             .lock()
             .expect("process group registry poisoned")
+            .pgids
             .iter()
             .copied()
             .collect()
     }
 
     fn warn_survivors(&self, label: &str) {
-        for pgid in self.snapshot() {
-            if process_group_exists(pgid) {
+        let state = self.state.lock().expect("process group registry poisoned");
+        for pgid in &state.pgids {
+            if process_group_exists(*pgid) {
                 warn!(
                     pgid = pgid,
                     label = label,
@@ -126,19 +139,66 @@ impl ProcessGroupRegistry {
                 );
             }
         }
+        if state.spawns_in_progress > 0 {
+            warn!(
+                spawns = state.spawns_in_progress,
+                label = label,
+                "process group spawns did not finish during termination grace"
+            );
+        }
+    }
+}
+
+pub(crate) struct ProcessGroupSpawnGuard {
+    state: Arc<Mutex<ProcessGroupState>>,
+    active: bool,
+}
+
+impl ProcessGroupSpawnGuard {
+    pub(crate) fn register(mut self, pgid: u32) -> ProcessGroupRegistration {
+        let terminating = {
+            let mut state = self.state.lock().expect("process group registry poisoned");
+            state.spawns_in_progress = state
+                .spawns_in_progress
+                .checked_sub(1)
+                .expect("process group spawn guard underflow");
+            state.pgids.insert(pgid);
+            state.terminating
+        };
+        self.active = false;
+        if terminating {
+            send_group_signal(pgid, Signal::SIGKILL, "process spawned during shutdown");
+        }
+        ProcessGroupRegistration {
+            pgid,
+            state: self.state.clone(),
+        }
+    }
+}
+
+impl Drop for ProcessGroupSpawnGuard {
+    fn drop(&mut self) {
+        if self.active {
+            let mut state = self.state.lock().expect("process group registry poisoned");
+            state.spawns_in_progress = state
+                .spawns_in_progress
+                .checked_sub(1)
+                .expect("process group spawn guard underflow");
+        }
     }
 }
 
 pub(crate) struct ProcessGroupRegistration {
     pgid: u32,
-    registry: Arc<Mutex<BTreeSet<u32>>>,
+    state: Arc<Mutex<ProcessGroupState>>,
 }
 
 impl Drop for ProcessGroupRegistration {
     fn drop(&mut self) {
-        self.registry
+        self.state
             .lock()
             .expect("process group registry poisoned")
+            .pgids
             .remove(&self.pgid);
     }
 }

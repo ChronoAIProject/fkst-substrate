@@ -178,6 +178,10 @@ pub async fn spawn_framework_with_stdout_observer(
     // tokio::process exposes `process_group(0)` to call setpgid(0,0); equivalent for our purposes.
     cmd.process_group(0);
 
+    let spawn_guard = process_groups.begin_spawn().ok_or_else(|| {
+        log.write_line("SPAWN_ERROR=event runtime shutdown in progress");
+        anyhow::anyhow!("framework spawn rejected: event runtime shutdown in progress")
+    })?;
     let (child, spawn_return_ms) = match cmd.spawn() {
         Ok(child) => (child, start.elapsed().as_millis()),
         Err(err) => {
@@ -190,7 +194,7 @@ pub async fn spawn_framework_with_stdout_observer(
         .ok_or_else(|| anyhow::anyhow!("no pid after spawn"))?;
     log.write_line(&format!("PID={pid}"));
     info!(pid = pid, lua = %lua_path.display(), "framework spawned");
-    let registration = process_groups.register(pid);
+    let registration = spawn_guard.register(pid);
 
     wait_for_framework_child(
         child,

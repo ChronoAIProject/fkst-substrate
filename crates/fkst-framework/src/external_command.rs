@@ -533,13 +533,18 @@ fn run_audited_inner(spec: &CommandSpec) -> Result<AuditedOutput> {
 
 fn run_audited_with_timeout(spec: &CommandSpec, timeout: Duration) -> Result<AuditedOutput> {
     let mut command = build_command(spec);
-    let mut child = command.spawn()?;
-    let child_pid = child.id();
-    let _registration = if spec.process_group {
-        Some(crate::process_tree::sdk_process_groups().register(child_pid))
+    let spawn_guard = if spec.process_group {
+        Some(
+            crate::process_tree::sdk_process_groups()
+                .begin_spawn()
+                .context("external command spawn rejected: process shutdown in progress")?,
+        )
     } else {
         None
     };
+    let mut child = command.spawn()?;
+    let child_pid = child.id();
+    let _registration = spawn_guard.map(|guard| guard.register(child_pid));
     let stdout_reader = child
         .stdout
         .take()

@@ -1675,11 +1675,20 @@ fn start_adoption_worker(
         command.process_group(0);
         inherit_fd_on_exec(&mut command, run_lock_fd);
     }
+    let spawn_guard = crate::process_tree::sdk_process_groups()
+        .begin_spawn()
+        .ok_or_else(|| {
+            mlua::Error::external(
+                "codex adoption worker spawn rejected: process shutdown in progress",
+            )
+        })?;
     let child = command.spawn().map_err(mlua::Error::external)?;
     let worker_pid = child.id();
-    let registration = crate::process_tree::sdk_process_groups().register(worker_pid);
+    let registration = spawn_guard.register(worker_pid);
     let child_slot = Arc::new(Mutex::new(Some(child)));
+    let registration_slot = Arc::new(Mutex::new(Some(registration)));
     let reaper_child_slot = Arc::clone(&child_slot);
+    let reaper_registration_slot = Arc::clone(&registration_slot);
     if let Err(err) = std::thread::Builder::new()
         .name("fkst-codex-worker-reaper".to_string())
         .spawn(move || {
@@ -1694,7 +1703,12 @@ fn start_adoption_worker(
                     );
                 }
             }
-            drop(registration);
+            drop(
+                reaper_registration_slot
+                    .lock()
+                    .expect("codex adoption worker registration slot poisoned")
+                    .take(),
+            );
         })
     {
         kill_process_group_by_pid(worker_pid);
@@ -1705,6 +1719,12 @@ fn start_adoption_worker(
         {
             let _ = child.wait();
         }
+        drop(
+            registration_slot
+                .lock()
+                .expect("codex adoption worker registration slot poisoned")
+                .take(),
+        );
         return Err(mlua::Error::external(format!(
             "codex adoption worker reaper spawn failed: {err}"
         )));
@@ -2866,13 +2886,24 @@ fn run_codex_request_with_permit(
         request.timeout_seconds
     );
 
+    let Some(spawn_guard) = crate::process_tree::sdk_process_groups().begin_spawn() else {
+        return logged_failure(
+            &request,
+            &cmd_line,
+            "shutdown",
+            "codex spawn rejected: process shutdown in progress".to_string(),
+            String::new(),
+            String::new(),
+            -1,
+        );
+    };
     let child = match spawn_codex_child(&request, &mut cmd, &cmd_line) {
         Ok(child) => child,
         Err(result) => return *result,
     };
     let child_pid = child.id();
     write_adoption_child_pid(&request, child_pid);
-    let registration = crate::process_tree::sdk_process_groups().register(child_pid);
+    let registration = spawn_guard.register(child_pid);
     let prompt = std::mem::take(&mut request.prompt);
     let (child, stdin_writer) = match spawn_stdin_writer(child, prompt, &request, &cmd_line) {
         Ok(parts) => parts,
@@ -2938,6 +2969,8 @@ fn spawn_stdin_writer(
     cmd_line: &str,
 ) -> std::result::Result<(Child, JoinHandle<std::io::Result<()>>), Box<CodexResult>> {
     let Some(mut stdin) = child.stdin.take() else {
+        kill_process_group_by_pid(child.id());
+        let _ = child.wait();
         return Err(Box::new(logged_failure(
             request,
             cmd_line,
