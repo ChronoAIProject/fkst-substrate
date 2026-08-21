@@ -133,7 +133,8 @@ pub(crate) fn snapshot_for_durable_root(
     validate_since(options.since.as_deref())?;
     let dead_letter_page =
         validate_dead_letter_page(options.page.as_ref(), options.since.as_deref())?;
-    let dead_letter_window = validate_dead_letter_window(options.dead_letter_window.as_ref())?;
+    let dead_letter_window =
+        validate_dead_letter_window(options.dead_letter_window.as_ref(), options.page.as_ref())?;
     let durable_root = durable_root.into();
     let layout = DurableLayout::new(&durable_root)?;
     let database = layout.delivery_db_path();
@@ -448,10 +449,14 @@ pub(crate) fn validate_dead_letter_page(
 
 pub(crate) fn validate_dead_letter_window(
     window: Option<&DeadLetterWindowRequest>,
+    page: Option<&DeadLetterPageRequest>,
 ) -> Result<Option<DeadLetterWindow>> {
     let Some(window) = window else {
         return Ok(None);
     };
+    if page.is_some() {
+        anyhow::bail!("fkst.observe dead_letter_window cannot be combined with page");
+    }
     if window.start_ms > window.end_ms {
         anyhow::bail!("fkst.observe dead-letter window requires start_ms <= end_ms");
     }

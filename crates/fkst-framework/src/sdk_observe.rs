@@ -159,8 +159,10 @@ impl ObserveSdkOptions {
         let since = opts.get::<Option<String>>("since")?;
         crate::observe::validate_since(since.as_deref()).map_err(mlua::Error::external)?;
         let page = parse_page(opts.get::<Option<Table>>("page")?, since.as_deref())?;
-        let dead_letter_window =
-            parse_dead_letter_window(opts.get::<Option<Table>>("dead_letter_window")?)?;
+        let dead_letter_window = parse_dead_letter_window(
+            opts.get::<Option<Table>>("dead_letter_window")?,
+            page.as_ref(),
+        )?;
         Ok(Self {
             limit,
             include,
@@ -185,9 +187,10 @@ impl ObserveSdkOptions {
             return Ok(snapshot);
         }
         if let Some(window) = &self.dead_letter_window {
-            let window = crate::observe::validate_dead_letter_window(Some(window))
-                .map_err(mlua::Error::external)?
-                .expect("window request must produce window options");
+            let window =
+                crate::observe::validate_dead_letter_window(Some(window), self.page.as_ref())
+                    .map_err(mlua::Error::external)?
+                    .expect("window request must produce window options");
             apply_dead_letter_window(&mut snapshot, &window)?;
         }
         if let Some(page_request) = &self.page {
@@ -363,6 +366,7 @@ fn reject_unknown_options(opts: &Table) -> mlua::Result<()> {
 
 fn parse_dead_letter_window(
     window: Option<Table>,
+    page: Option<&crate::observe::DeadLetterPageRequest>,
 ) -> mlua::Result<Option<crate::observe::DeadLetterWindowRequest>> {
     let Some(window) = window else {
         return Ok(None);
@@ -384,7 +388,8 @@ fn parse_dead_letter_window(
         mlua::Error::external("fkst.observe dead_letter_window end_ms must be non-negative")
     })?;
     let request = crate::observe::DeadLetterWindowRequest { start_ms, end_ms };
-    crate::observe::validate_dead_letter_window(Some(&request)).map_err(mlua::Error::external)?;
+    crate::observe::validate_dead_letter_window(Some(&request), page)
+        .map_err(mlua::Error::external)?;
     Ok(Some(request))
 }
 
@@ -918,6 +923,14 @@ return fkst.observe({
         assert_observe_rejected(
             "return fkst.observe({ since = 'dead-one', page = { section = 'dead_letters' } })",
             "fkst.observe page cannot be combined with since",
+        );
+    }
+
+    #[test]
+    fn observe_rejects_dead_letter_window_combined_with_page() {
+        assert_observe_rejected(
+            "return fkst.observe({ page = { section = 'dead_letters' }, dead_letter_window = { start_ms = 10, end_ms = 20 } })",
+            "fkst.observe dead_letter_window cannot be combined with page",
         );
     }
 

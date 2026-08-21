@@ -136,6 +136,7 @@ async fn serve_connection(
                 ) {
                     Ok(dead_letter_page) => match crate::observe::validate_dead_letter_window(
                         request.dead_letter_window.as_ref(),
+                        request.page.as_ref(),
                     ) {
                         Ok(dead_letter_window) => match observe_snapshot(
                             &store,

@@ -164,6 +164,9 @@ pub(crate) fn observe_snapshot(
     if options.dead_letter_page.is_some() && options.since.is_some() {
         anyhow::bail!("fkst.observe page cannot be combined with since");
     }
+    if options.dead_letter_page.is_some() && options.dead_letter_window.is_some() {
+        anyhow::bail!("fkst.observe dead_letter_window cannot be combined with page");
+    }
     let mut delivery_records = Vec::new();
     let mut dead_records = Vec::new();
     let mut queues = BTreeMap::<String, QueueAccumulator>::new();
