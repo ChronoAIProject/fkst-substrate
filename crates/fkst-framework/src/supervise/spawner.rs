@@ -158,7 +158,7 @@ pub async fn spawn_framework_with_stdout_observer(
         codex_permit_slots.to_string(),
     );
     cmd.env(
-        "FKST_SUPERVISOR_PID",
+        crate::process_tree::SUPERVISOR_PID_ENV,
         crate::process_tree::current_pid().to_string(),
     );
     if let Some(token) = raised_auth_token {

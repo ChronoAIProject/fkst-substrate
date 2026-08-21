@@ -1666,13 +1666,49 @@ fn start_adoption_worker(
     command.stdin(Stdio::null());
     command.stdout(Stdio::null());
     command.stderr(Stdio::null());
+    command.env(
+        crate::process_tree::SUPERVISOR_PID_ENV,
+        crate::process_tree::current_pid().to_string(),
+    );
     #[cfg(unix)]
     {
         command.process_group(0);
         inherit_fd_on_exec(&mut command, run_lock_fd);
     }
     let child = command.spawn().map_err(mlua::Error::external)?;
-    drop(child);
+    let worker_pid = child.id();
+    let registration = crate::process_tree::sdk_process_groups().register(worker_pid);
+    let child_slot = Arc::new(Mutex::new(Some(child)));
+    let reaper_child_slot = Arc::clone(&child_slot);
+    if let Err(err) = std::thread::Builder::new()
+        .name("fkst-codex-worker-reaper".to_string())
+        .spawn(move || {
+            if let Some(mut child) = reaper_child_slot
+                .lock()
+                .expect("codex adoption worker child slot poisoned")
+                .take()
+            {
+                if let Err(err) = child.wait() {
+                    eprintln!(
+                        "WARN: codex adoption worker wait failed pid={worker_pid} error={err}"
+                    );
+                }
+            }
+            drop(registration);
+        })
+    {
+        kill_process_group_by_pid(worker_pid);
+        if let Some(mut child) = child_slot
+            .lock()
+            .expect("codex adoption worker child slot poisoned")
+            .take()
+        {
+            let _ = child.wait();
+        }
+        return Err(mlua::Error::external(format!(
+            "codex adoption worker reaper spawn failed: {err}"
+        )));
+    }
     Ok(())
 }
 
@@ -2017,6 +2053,7 @@ pub(crate) fn parse_worker_args(args: Vec<String>) -> anyhow::Result<CodexWorker
 }
 
 pub(crate) fn run_codex_worker(options: CodexWorkerOptions) -> anyhow::Result<i32> {
+    crate::process_tree::install_sdk_shutdown_watch();
     let run_lock = inherited_adoption_run_lock(&options)?;
     std::fs::create_dir_all(&options.work_dir)?;
     let prompt = std::fs::read_to_string(&options.prompt_file)?;

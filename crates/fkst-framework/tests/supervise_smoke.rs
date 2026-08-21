@@ -116,6 +116,19 @@ fn process_exists(pid: i32) -> bool {
     nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None).is_ok()
 }
 
+fn process_parent_pid(pid: i32) -> i32 {
+    let output = Command::new("ps")
+        .args(["-o", "ppid=", "-p", &pid.to_string()])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "ps status={}", output.status);
+    String::from_utf8(output.stdout)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap()
+}
+
 fn read_single_supervisor_journal(runtime_root: &Path) -> String {
     let entries = fs::read_dir(runtime_root.join("logs"))
         .unwrap()
@@ -709,6 +722,207 @@ return M
     assert!(
         wait_for_process_exit(descendant_pid, Duration::from_secs(5)),
         "department descendant survived supervise SIGTERM"
+    );
+}
+
+#[test]
+fn supervise_restart_terminates_codex_tree_and_redelivers_expired_lease() {
+    let _lock = supervise_smoke_lock();
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let bin_dir = root.join("bin");
+    let capture_dir = root.join("capture");
+    let worktree = root.join("worktree");
+    let runtime_one = root.join("runtime-one");
+    let runtime_two = root.join("runtime-two");
+    let durable_root = root.join("durable");
+    let input = root.join("input.txt");
+    let completed = root.join("completed.txt");
+    let second_release = root.join("second-release");
+    fs::create_dir_all(root.join("departments/worker")).unwrap();
+    fs::create_dir_all(root.join("raisers")).unwrap();
+    fs::create_dir_all(&bin_dir).unwrap();
+    fs::create_dir_all(&capture_dir).unwrap();
+    fs::create_dir_all(&worktree).unwrap();
+    write_fkst_env(root);
+    fs::write(&input, "ready").unwrap();
+    fs::write(
+        root.join("raisers/input.lua"),
+        format!(
+            r#"return {{ type = "file_watch", glob = {}, produces = "jobs" }}"#,
+            lua_string(&input)
+        ),
+    )
+    .unwrap();
+    fs::write(
+        root.join("departments/worker/main.lua"),
+        format!(
+            r#"
+local M = {{}}
+M.spec = {{ consumes = {{ "jobs" }}, stall_window = "1s" }}
+function pipeline(event)
+  local result = spawn_codex_sync({{
+    prompt = "restart-owned-work",
+    worktree = {},
+    dedup_key = "restart-owned-work",
+    timeout = 60,
+  }})
+  assert(result.exit_code == 0, result.error or result.stderr)
+  local f = assert(io.open({}, "w"))
+  f:write(result.stdout)
+  f:close()
+end
+return M
+"#,
+            lua_string(&worktree),
+            lua_string(&completed)
+        ),
+    )
+    .unwrap();
+    write_executable(
+        &bin_dir.join("codex"),
+        r#"#!/bin/sh
+set -eu
+cat >/dev/null
+count_file="$CAPTURE_DIR/spawn-count"
+count=0
+if [ -f "$count_file" ]; then
+  count=$(cat "$count_file")
+fi
+count=$((count + 1))
+printf '%s' "$count" > "$count_file"
+printf '%s\n' "$$" > "$CAPTURE_DIR/codex-$count.pid"
+printf '%s\n' "$PPID" > "$CAPTURE_DIR/worker-$count.pid"
+if [ "$count" -eq 1 ]; then
+  printf 'started' > "$CAPTURE_DIR/first-started"
+  while :; do sleep 1; done
+fi
+printf 'started' > "$CAPTURE_DIR/second-started"
+while [ ! -f "$SECOND_RELEASE" ]; do sleep 0.05; done
+printf '%s\n' '{"type":"item.completed","item":{"type":"agent_message","text":"restart-complete"}}'
+"#,
+    );
+    write_single_package_workspace(root);
+
+    let mut search_path = vec![bin_dir.clone()];
+    search_path.extend(std::env::split_paths(
+        &std::env::var_os("PATH").unwrap_or_default(),
+    ));
+    let search_path = std::env::join_paths(search_path).unwrap();
+    let start_runtime = |runtime_root: &Path| {
+        Command::new(env!("CARGO_BIN_EXE_fkst-framework"))
+            .current_dir(root)
+            .arg("supervise")
+            .arg("--project-root")
+            .arg(root)
+            .arg("--package-root")
+            .arg(root)
+            .arg("--framework-bin")
+            .arg(env!("CARGO_BIN_EXE_fkst-framework"))
+            .env("PATH", &search_path)
+            .env("CAPTURE_DIR", &capture_dir)
+            .env("SECOND_RELEASE", &second_release)
+            .env("FKST_RUNTIME_ROOT", runtime_root)
+            .env("FKST_RUNTIME_LOG_DIR", runtime_root.join("codex-logs"))
+            .env("FKST_DURABLE_ROOT", &durable_root)
+            .spawn()
+            .unwrap()
+    };
+
+    let mut first = start_runtime(&runtime_one);
+    wait_for_file_containing(
+        &capture_dir.join("first-started"),
+        "started",
+        Duration::from_secs(10),
+    )
+    .unwrap_or_else(|| {
+        let _ = first.kill();
+        let _ = first.wait();
+        panic!("timed out waiting for first Codex invocation");
+    });
+    let worker_pid: i32 = fs::read_to_string(capture_dir.join("worker-1.pid"))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    let codex_pid: i32 = fs::read_to_string(capture_dir.join("codex-1.pid"))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    let department_pid = process_parent_pid(worker_pid);
+
+    first.kill().unwrap();
+    let first_status = first.wait().unwrap();
+    assert!(!first_status.success(), "status={first_status}");
+    let survivors = [
+        ("Department", department_pid),
+        ("adoption worker", worker_pid),
+        ("Codex", codex_pid),
+    ]
+    .into_iter()
+    .filter(|(_, pid)| !wait_for_process_exit(*pid, Duration::from_secs(8)))
+    .collect::<Vec<_>>();
+    for (_, pid) in &survivors {
+        let _ = nix::sys::signal::killpg(
+            nix::unistd::Pid::from_raw(*pid),
+            nix::sys::signal::Signal::SIGKILL,
+        );
+    }
+    assert!(survivors.is_empty(), "surviving processes={survivors:?}");
+
+    let mut second = start_runtime(&runtime_two);
+    wait_for_file_containing(
+        &capture_dir.join("second-started"),
+        "started",
+        Duration::from_secs(15),
+    )
+    .unwrap_or_else(|| {
+        let _ = second.kill();
+        let _ = second.wait();
+        panic!("timed out waiting for redelivered Codex invocation");
+    });
+    let observe = Command::new(env!("CARGO_BIN_EXE_fkst-framework"))
+        .arg("observe")
+        .arg("--durable-root")
+        .arg(&durable_root)
+        .arg("--json")
+        .env_remove(process_tree::SUPERVISOR_PID_ENV)
+        .output()
+        .unwrap();
+    assert!(
+        observe.status.success(),
+        "observe stderr={}",
+        String::from_utf8_lossy(&observe.stderr)
+    );
+    let snapshot: serde_json::Value = serde_json::from_slice(&observe.stdout).unwrap();
+    assert_eq!(snapshot["deliveries"][0]["lease_generation"], 2);
+
+    fs::write(&second_release, "release").unwrap();
+    let result = wait_for_file_containing(&completed, "restart-complete", Duration::from_secs(10))
+        .unwrap_or_else(|| {
+            let _ = second.kill();
+            let _ = second.wait();
+            panic!("timed out waiting for redelivered result");
+        });
+    wait_for_journal_event(&runtime_two, "acked", "worker", Duration::from_secs(5)).unwrap_or_else(
+        || {
+            let _ = second.kill();
+            let _ = second.wait();
+            panic!("timed out waiting for redelivered delivery ACK");
+        },
+    );
+    nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(second.id() as i32),
+        nix::sys::signal::Signal::SIGTERM,
+    )
+    .unwrap();
+    let second_status = second.wait().unwrap();
+    assert!(second_status.success(), "status={second_status}");
+    assert_eq!(result, "restart-complete");
+    assert_eq!(
+        fs::read_to_string(capture_dir.join("spawn-count")).unwrap(),
+        "2"
     );
 }
 

@@ -2,6 +2,7 @@ use nix::errno::Errno;
 use nix::sys::signal::{killpg, SaFlags, SigAction, SigHandler, SigSet, Signal};
 use nix::unistd::Pid;
 use std::collections::BTreeSet;
+use std::io::Write;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::OnceLock;
 use std::sync::{Arc, Mutex};
@@ -10,6 +11,7 @@ use tracing::{info, warn};
 
 const TERMINATION_GRACE: Duration = Duration::from_secs(2);
 const POLL_INTERVAL: Duration = Duration::from_millis(25);
+pub(crate) const SUPERVISOR_PID_ENV: &str = "FKST_SUPERVISOR_PID";
 static SDK_PROCESS_GROUPS: OnceLock<ProcessGroupRegistry> = OnceLock::new();
 static SIGNAL_WATCH_INSTALLED: OnceLock<()> = OnceLock::new();
 static SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
@@ -57,6 +59,18 @@ impl ProcessGroupRegistry {
                 send_group_signal(pgid, Signal::SIGKILL, label);
             }
         }
+        let deadline = Instant::now() + TERMINATION_GRACE;
+        while Instant::now() < deadline {
+            if self
+                .snapshot()
+                .iter()
+                .all(|pgid| !process_group_exists(*pgid))
+            {
+                return;
+            }
+            tokio::time::sleep(POLL_INTERVAL).await;
+        }
+        self.warn_survivors(label);
     }
 
     pub(crate) fn terminate_all_blocking(&self, label: &str) {
@@ -79,6 +93,18 @@ impl ProcessGroupRegistry {
                 send_group_signal(pgid, Signal::SIGKILL, label);
             }
         }
+        let deadline = Instant::now() + TERMINATION_GRACE;
+        while Instant::now() < deadline {
+            if self
+                .snapshot()
+                .iter()
+                .all(|pgid| !process_group_exists(*pgid))
+            {
+                return;
+            }
+            std::thread::sleep(POLL_INTERVAL);
+        }
+        self.warn_survivors(label);
     }
 
     fn snapshot(&self) -> Vec<u32> {
@@ -88,6 +114,18 @@ impl ProcessGroupRegistry {
             .iter()
             .copied()
             .collect()
+    }
+
+    fn warn_survivors(&self, label: &str) {
+        for pgid in self.snapshot() {
+            if process_group_exists(pgid) {
+                warn!(
+                    pgid = pgid,
+                    label = label,
+                    "process group survived SIGKILL grace"
+                );
+            }
+        }
     }
 }
 
@@ -133,23 +171,39 @@ pub(crate) fn install_sdk_shutdown_watch() {
     SIGNAL_WATCH_INSTALLED.get_or_init(|| {
         install_signal_handler(Signal::SIGTERM);
         install_signal_handler(Signal::SIGINT);
-        std::thread::spawn(|| loop {
+        let expected_parent_pid = supervisor_parent_pid();
+        std::thread::spawn(move || loop {
             if SHUTDOWN_REQUESTED.load(Ordering::SeqCst) {
                 sdk_process_groups().terminate_all_blocking("sdk child");
                 let signal = SHUTDOWN_SIGNAL.load(Ordering::SeqCst);
                 std::process::exit(128 + signal);
+            }
+            if let Some(expected_parent_pid) =
+                expected_parent_pid.filter(|pid| parent_changed(*pid))
+            {
+                let _ = writeln!(
+                    std::io::stderr().lock(),
+                    "[framework] process owner parent lost: expected parent pid {}, current parent pid {}",
+                    expected_parent_pid,
+                    current_parent_pid()
+                );
+                sdk_process_groups().terminate_all_blocking("sdk child after parent loss");
+                std::process::exit(125);
             }
             std::thread::sleep(POLL_INTERVAL);
         });
     });
 }
 
-#[cfg(not(test))]
-pub(crate) fn ensure_supervisor_parent_alive() -> mlua::Result<()> {
-    let Some(expected_parent_pid) = std::env::var("FKST_SUPERVISOR_PID")
+fn supervisor_parent_pid() -> Option<u32> {
+    std::env::var(SUPERVISOR_PID_ENV)
         .ok()
         .and_then(|value| value.parse::<u32>().ok())
-    else {
+}
+
+#[cfg(not(test))]
+pub(crate) fn ensure_supervisor_parent_alive() -> mlua::Result<()> {
+    let Some(expected_parent_pid) = supervisor_parent_pid() else {
         return Ok(());
     };
     if parent_changed(expected_parent_pid) {
