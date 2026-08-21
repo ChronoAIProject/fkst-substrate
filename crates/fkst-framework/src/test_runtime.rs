@@ -414,6 +414,7 @@ fn final_state(store: &DeliveryStore) -> mlua::Result<FinalState> {
             limit: MAX_TRACE_DELIVERIES,
             since: None,
             dead_letter_page: None,
+            dead_letter_window: None,
             current_subscriber_queues: None,
         },
     )

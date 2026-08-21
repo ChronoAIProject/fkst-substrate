@@ -1,7 +1,7 @@
 use super::delivery_store::{DeliveryScanRecord, DeliveryStore};
 use super::delivery_types::{DeadRecord, DeliveryRecord, SourceRef};
 use crate::manifest_hash::sha256_hex;
-use crate::observe::{DeadLetterPageCursor, DeadLetterPageOptions};
+use crate::observe::{DeadLetterPageCursor, DeadLetterPageOptions, DeadLetterWindow};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
@@ -14,6 +14,7 @@ pub(crate) struct DeliveryObserveOptions {
     pub(crate) limit: usize,
     pub(crate) since: Option<String>,
     pub(crate) dead_letter_page: Option<DeadLetterPageOptions>,
+    pub(crate) dead_letter_window: Option<DeadLetterWindow>,
     pub(crate) current_subscriber_queues: Option<BTreeSet<String>>,
 }
 
@@ -24,6 +25,8 @@ pub(crate) struct DeliveryObserveSnapshot {
     pub(crate) source: DeliveryObserveSource,
     pub(crate) limits: DeliveryObserveLimits,
     pub(crate) truncated: DeliveryObserveTruncated,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) dead_letters_complete: Option<bool>,
     pub(crate) queues: Vec<QueueObserveState>,
     pub(crate) deliveries: Vec<DeliveryObserveEntry>,
     pub(crate) dead_letters: Vec<DeadLetterObserveEntry>,
@@ -161,18 +164,29 @@ pub(crate) fn observe_snapshot(
     if options.dead_letter_page.is_some() && options.since.is_some() {
         anyhow::bail!("fkst.observe page cannot be combined with since");
     }
+    if options.dead_letter_page.is_some() && options.dead_letter_window.is_some() {
+        anyhow::bail!("fkst.observe dead_letter_window cannot be combined with page");
+    }
     let mut delivery_records = Vec::new();
     let mut dead_records = Vec::new();
     let mut queues = BTreeMap::<String, QueueAccumulator>::new();
 
-    if let Some(page) = &options.dead_letter_page {
+    if options.dead_letter_window.is_some() || options.dead_letter_page.is_some() {
+        let page = options.dead_letter_page.as_ref();
         let after = page
-            .after
-            .as_ref()
+            .and_then(|page| page.after.as_ref())
             .map(|cursor| (cursor.dead_at_ms, cursor.delivery_id.as_str()));
-        dead_records = store.scan_records_for_dead_letter_page(
+        dead_records = store.scan_records_for_dead_letter_window(
             after,
-            options.limit.saturating_add(1),
+            options
+                .dead_letter_window
+                .as_ref()
+                .map(|window| (window.start_ms, window.end_ms)),
+            if options.since.is_some() && page.is_none() {
+                usize::MAX
+            } else {
+                options.limit.saturating_add(1)
+            },
             |record| {
                 queues
                     .entry(record.queue.clone())
@@ -220,6 +234,10 @@ pub(crate) fn observe_snapshot(
         deliveries: apply_limit(&mut delivery_records, options.limit),
         dead_letters: apply_limit(&mut dead_records, options.limit),
     };
+    let dead_letters_complete = options
+        .dead_letter_window
+        .as_ref()
+        .map(|_| !truncated.dead_letters);
     let page = options
         .dead_letter_page
         .as_ref()
@@ -270,6 +288,7 @@ pub(crate) fn observe_snapshot(
             max_dead_letters: options.limit,
         },
         truncated,
+        dead_letters_complete,
         queues: queues
             .into_iter()
             .map(|(queue, accumulator)| {
@@ -550,6 +569,7 @@ mod tests {
                 max_dead_letters: 2,
             },
             truncated: DeliveryObserveTruncated::default(),
+            dead_letters_complete: None,
             queues: Vec::new(),
             deliveries: Vec::new(),
             dead_letters: Vec::new(),
@@ -586,6 +606,7 @@ mod tests {
                 limit: 10,
                 since: None,
                 dead_letter_page: None,
+                dead_letter_window: None,
                 current_subscriber_queues: None,
             },
         )
@@ -652,6 +673,7 @@ mod tests {
                 limit: 10,
                 since: None,
                 dead_letter_page: None,
+                dead_letter_window: None,
                 current_subscriber_queues: None,
             },
         )
@@ -666,6 +688,103 @@ mod tests {
         assert_eq!(snapshot.dead_letters.len(), 1);
         assert_eq!(snapshot.dead_letters[0].delivery_id, "dead");
         assert_eq!(snapshot.dead_letters[0].payload.bytes, 4);
+    }
+
+    #[test]
+    fn observe_snapshot_filters_dead_letters_by_half_open_window_before_limit() {
+        let temp = TempDir::new().unwrap();
+        let store = store(&temp);
+        for (id, dead_at_ms) in [
+            ("outside", 100),
+            ("inside", 200),
+            ("inside-tie", 200),
+            ("end", 300),
+            ("end-tie", 300),
+        ] {
+            store.enqueue(&record(id, 100)).unwrap();
+            let leased = store
+                .lease(100, 1, Duration::from_millis(50))
+                .unwrap()
+                .remove(0);
+            store
+                .retry(
+                    &leased.delivery_id,
+                    leased.lease_generation,
+                    &failure("final", false),
+                    &policy(1),
+                    dead_at_ms,
+                )
+                .unwrap();
+        }
+
+        let snapshot = observe_snapshot(
+            &store,
+            temp.path(),
+            &temp.path().join("delivery.redb"),
+            &DeliveryObserveOptions {
+                now_ms: 400,
+                limit: 2,
+                since: None,
+                dead_letter_page: None,
+                dead_letter_window: Some(DeadLetterWindow {
+                    start_ms: 200,
+                    end_ms: 300,
+                }),
+                current_subscriber_queues: None,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(snapshot.dead_letters.len(), 2);
+        assert_eq!(snapshot.dead_letters[0].delivery_id, "inside");
+        assert_eq!(snapshot.dead_letters[1].delivery_id, "inside-tie");
+        assert!(!snapshot.truncated.dead_letters);
+        assert_eq!(snapshot.dead_letters_complete, Some(true));
+    }
+
+    #[test]
+    fn observe_snapshot_reports_in_window_incompleteness_without_old_history() {
+        let temp = TempDir::new().unwrap();
+        let store = store(&temp);
+        for (id, dead_at_ms) in [("outside", 100), ("inside-one", 200), ("inside-two", 210)] {
+            store.enqueue(&record(id, 100)).unwrap();
+            let leased = store
+                .lease(100, 1, Duration::from_millis(50))
+                .unwrap()
+                .remove(0);
+            store
+                .retry(
+                    &leased.delivery_id,
+                    leased.lease_generation,
+                    &failure("final", false),
+                    &policy(1),
+                    dead_at_ms,
+                )
+                .unwrap();
+        }
+
+        let snapshot = observe_snapshot(
+            &store,
+            temp.path(),
+            &temp.path().join("delivery.redb"),
+            &DeliveryObserveOptions {
+                now_ms: 400,
+                limit: 1,
+                since: None,
+                dead_letter_page: None,
+                dead_letter_window: Some(DeadLetterWindow {
+                    start_ms: 200,
+                    end_ms: 300,
+                }),
+                current_subscriber_queues: None,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(snapshot.dead_letters.len(), 1);
+        assert_eq!(snapshot.dead_letters[0].delivery_id, "inside-one");
+        assert!(snapshot.truncated.dead_letters);
+        assert_eq!(snapshot.dead_letters_complete, Some(false));
     }
 
     #[test]
@@ -684,6 +803,7 @@ mod tests {
                 limit: 1,
                 since: None,
                 dead_letter_page: None,
+                dead_letter_window: None,
                 current_subscriber_queues: None,
             },
         )
@@ -710,6 +830,7 @@ mod tests {
                 limit: 1,
                 since: Some("delivery-001".to_string()),
                 dead_letter_page: None,
+                dead_letter_window: None,
                 current_subscriber_queues: None,
             },
         )
@@ -739,6 +860,7 @@ mod tests {
                 limit: 10,
                 since: None,
                 dead_letter_page: None,
+                dead_letter_window: None,
                 current_subscriber_queues: Some(BTreeSet::from(["input".to_string()])),
             },
         )
