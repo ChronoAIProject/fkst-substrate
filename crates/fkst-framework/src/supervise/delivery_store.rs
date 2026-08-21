@@ -1432,6 +1432,16 @@ impl DeliveryStore {
         &self,
         after: Option<(u64, &str)>,
         limit: usize,
+        visit_delivery: impl FnMut(DeliveryRecord) -> Result<()>,
+    ) -> Result<Vec<DeadRecord>> {
+        self.scan_records_for_dead_letter_window(after, None, limit, visit_delivery)
+    }
+
+    pub(crate) fn scan_records_for_dead_letter_window(
+        &self,
+        after: Option<(u64, &str)>,
+        window: Option<(u64, u64)>,
+        limit: usize,
         mut visit_delivery: impl FnMut(DeliveryRecord) -> Result<()>,
     ) -> Result<Vec<DeadRecord>> {
         let read = self.db.begin_read()?;
@@ -1457,25 +1467,27 @@ impl DeliveryStore {
         }
 
         let mut records = Vec::new();
-        if let Some((dead_at_ms, delivery_id)) = after {
-            let start = make_dead_time_index_key(dead_at_ms, delivery_id);
-            for entry in dead_by_time.range::<&str>((
-                std::ops::Bound::Excluded(start.as_str()),
-                std::ops::Bound::Unbounded,
-            ))? {
-                let (key, _) = entry?;
-                collect_dead_letter_page_record(&dead, key.value(), &mut records)?;
-                if records.len() >= limit {
-                    break;
-                }
+        if window.is_some_and(|(start_ms, end_ms)| start_ms >= end_ms) {
+            return Ok(records);
+        }
+        let (lower_bound, upper_bound) = dead_letter_time_bounds(after, window);
+        if lower_bound > upper_bound {
+            return Ok(records);
+        }
+        for entry in dead_by_time.range::<&str>((
+            std::ops::Bound::Included(lower_bound.as_str()),
+            std::ops::Bound::Included(upper_bound.as_str()),
+        ))? {
+            let (key, _) = entry?;
+            let parsed = parse_dead_time_index_key(key.value())?;
+            if after.is_some_and(|(dead_at_ms, delivery_id)| {
+                (parsed.due_ms, parsed.delivery_id.as_str()) <= (dead_at_ms, delivery_id)
+            }) {
+                continue;
             }
-        } else {
-            for entry in dead_by_time.iter()? {
-                let (key, _) = entry?;
-                collect_dead_letter_page_record(&dead, key.value(), &mut records)?;
-                if records.len() >= limit {
-                    break;
-                }
+            collect_dead_letter_page_record(&dead, key.value(), &mut records)?;
+            if records.len() >= limit {
+                break;
             }
         }
         Ok(records)
@@ -1554,6 +1566,23 @@ impl DeliveryStore {
     fn begin_write(&self) -> Result<redb::WriteTransaction> {
         begin_write(&self.db)
     }
+}
+
+fn dead_letter_time_bounds(
+    after: Option<(u64, &str)>,
+    window: Option<(u64, u64)>,
+) -> (String, String) {
+    let lower_ms = match (after, window) {
+        (Some((after_ms, _)), Some((start_ms, _))) => after_ms.max(start_ms),
+        (Some((after_ms, _)), None) => after_ms,
+        (None, Some((start_ms, _))) => start_ms,
+        (None, None) => 0,
+    };
+    let upper_ms = window.map(|(_, end_ms)| end_ms - 1).unwrap_or(u64::MAX);
+    (
+        format!("{lower_ms:020}/"),
+        format!("{upper_ms:020}/\u{10ffff}"),
+    )
 }
 
 pub(crate) const SUBSCRIBER_ABSENT_DEAD_REASON: &str = "subscriber-absent";

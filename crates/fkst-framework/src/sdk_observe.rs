@@ -123,6 +123,7 @@ struct ObserveSdkOptions {
     include: Option<BTreeSet<String>>,
     since: Option<String>,
     page: Option<crate::observe::DeadLetterPageRequest>,
+    dead_letter_window: Option<crate::observe::DeadLetterWindowRequest>,
     lineage: Option<crate::observe::LineageObserveRequest>,
 }
 
@@ -134,6 +135,7 @@ impl ObserveSdkOptions {
                 include: None,
                 since: None,
                 page: None,
+                dead_letter_window: None,
                 lineage: None,
             });
         };
@@ -142,7 +144,8 @@ impl ObserveSdkOptions {
         let has_snapshot_options = opts.contains_key("limit")?
             || opts.contains_key("include")?
             || opts.contains_key("since")?
-            || opts.contains_key("page")?;
+            || opts.contains_key("page")?
+            || opts.contains_key("dead_letter_window")?;
         if lineage.is_some() && has_snapshot_options {
             return Err(mlua::Error::external(
                 "fkst.observe lineage cannot be combined with snapshot options",
@@ -156,11 +159,14 @@ impl ObserveSdkOptions {
         let since = opts.get::<Option<String>>("since")?;
         crate::observe::validate_since(since.as_deref()).map_err(mlua::Error::external)?;
         let page = parse_page(opts.get::<Option<Table>>("page")?, since.as_deref())?;
+        let dead_letter_window =
+            parse_dead_letter_window(opts.get::<Option<Table>>("dead_letter_window")?)?;
         Ok(Self {
             limit,
             include,
             since,
             page,
+            dead_letter_window,
             lineage,
         })
     }
@@ -170,12 +176,19 @@ impl ObserveSdkOptions {
             limit: self.limit,
             since: self.since.clone(),
             page: self.page.clone(),
+            dead_letter_window: self.dead_letter_window.clone(),
         }
     }
 
     fn apply_to_mock(&self, mut snapshot: JsonValue) -> mlua::Result<JsonValue> {
         if self.lineage.is_some() {
             return Ok(snapshot);
+        }
+        if let Some(window) = &self.dead_letter_window {
+            let window = crate::observe::validate_dead_letter_window(Some(window))
+                .map_err(mlua::Error::external)?
+                .expect("window request must produce window options");
+            apply_dead_letter_window(&mut snapshot, &window)?;
         }
         if let Some(page_request) = &self.page {
             let page = crate::observe::validate_dead_letter_page(
@@ -288,6 +301,45 @@ fn apply_dead_letter_page(
     Ok(())
 }
 
+fn apply_dead_letter_window(
+    snapshot: &mut JsonValue,
+    window: &crate::observe::DeadLetterWindow,
+) -> mlua::Result<()> {
+    let object = snapshot.as_object_mut().ok_or_else(|| {
+        mlua::Error::external(
+            "fkst.observe snapshot must be an object when dead_letter_window is set",
+        )
+    })?;
+    let entries = object
+        .get_mut("dead_letters")
+        .ok_or_else(|| {
+            mlua::Error::external(
+                "fkst.observe snapshot field `dead_letters` is required when dead_letter_window is set",
+            )
+        })?
+        .as_array_mut()
+        .ok_or_else(|| {
+            mlua::Error::external("fkst.observe snapshot field `dead_letters` must be an array")
+        })?;
+    let mut filtered = Vec::with_capacity(entries.len());
+    for entry in entries.drain(..) {
+        let dead_at_ms = entry
+            .get("dead_at_ms")
+            .and_then(JsonValue::as_u64)
+            .ok_or_else(|| {
+                mlua::Error::external(
+                    "fkst.observe dead_letters window entry requires integer dead_at_ms",
+                )
+            })?;
+        if window.start_ms <= dead_at_ms && dead_at_ms < window.end_ms {
+            filtered.push(entry);
+        }
+    }
+    *entries = filtered;
+    object.insert("dead_letters_complete".to_string(), JsonValue::Bool(true));
+    Ok(())
+}
+
 fn reject_unknown_options(opts: &Table) -> mlua::Result<()> {
     for pair in opts.pairs::<Value, Value>() {
         let (key, _) = pair?;
@@ -299,7 +351,7 @@ fn reject_unknown_options(opts: &Table) -> mlua::Result<()> {
         let key = key.to_str()?;
         if !matches!(
             key.as_ref(),
-            "limit" | "include" | "since" | "page" | "lineage"
+            "limit" | "include" | "since" | "page" | "dead_letter_window" | "lineage"
         ) {
             return Err(mlua::Error::external(format!(
                 "unknown fkst.observe option `{key}`"
@@ -307,6 +359,33 @@ fn reject_unknown_options(opts: &Table) -> mlua::Result<()> {
         }
     }
     Ok(())
+}
+
+fn parse_dead_letter_window(
+    window: Option<Table>,
+) -> mlua::Result<Option<crate::observe::DeadLetterWindowRequest>> {
+    let Some(window) = window else {
+        return Ok(None);
+    };
+    reject_nested_options(&window, &["start_ms", "end_ms"], "dead_letter_window")?;
+    let start_ms = window
+        .get::<Value>("start_ms")?
+        .as_integer()
+        .ok_or_else(|| {
+            mlua::Error::external("fkst.observe dead_letter_window start_ms must be an integer")
+        })?;
+    let end_ms = window.get::<Value>("end_ms")?.as_integer().ok_or_else(|| {
+        mlua::Error::external("fkst.observe dead_letter_window end_ms must be an integer")
+    })?;
+    let start_ms = u64::try_from(start_ms).map_err(|_| {
+        mlua::Error::external("fkst.observe dead_letter_window start_ms must be non-negative")
+    })?;
+    let end_ms = u64::try_from(end_ms).map_err(|_| {
+        mlua::Error::external("fkst.observe dead_letter_window end_ms must be non-negative")
+    })?;
+    let request = crate::observe::DeadLetterWindowRequest { start_ms, end_ms };
+    crate::observe::validate_dead_letter_window(Some(&request)).map_err(mlua::Error::external)?;
+    Ok(Some(request))
 }
 
 fn parse_lineage(
@@ -484,6 +563,12 @@ fn apply_limit(snapshot: &mut JsonValue, limit: usize) -> mlua::Result<()> {
         deliveries_truncated,
         dead_letters_truncated,
     )?;
+    if object.contains_key("dead_letters_complete") {
+        object.insert(
+            "dead_letters_complete".to_string(),
+            JsonValue::Bool(!dead_letters_truncated),
+        );
+    }
     Ok(())
 }
 
@@ -598,6 +683,7 @@ fn apply_include(snapshot: JsonValue, include: &BTreeSet<String>) -> mlua::Resul
     }
     if include.contains("errors") {
         copy_if_present(&mut filtered, object, "dead_letters");
+        copy_if_present(&mut filtered, object, "dead_letters_complete");
     }
     Ok(JsonValue::Object(filtered))
 }
@@ -986,5 +1072,80 @@ return fkst.observe({
         );
         assert_eq!(second["dead_letters"][0]["delivery_id"], "dead-c");
         assert!(second["page"].get("next").is_none());
+    }
+
+    #[test]
+    fn mock_observe_filters_dead_letters_by_half_open_window() {
+        let lua = Lua::new();
+        let mock = MockObserveState::new();
+        register(&lua, Some(mock.clone())).unwrap();
+        mock.set(serde_json::json!({
+            "schema_version": 1,
+            "limits": {"max_deliveries": 10, "max_dead_letters": 10},
+            "truncated": {"deliveries": false, "dead_letters": false},
+            "queues": [],
+            "deliveries": [],
+            "dead_letters": [
+                {"delivery_id": "old", "dead_at_ms": 10},
+                {"delivery_id": "inside", "dead_at_ms": 20},
+                {"delivery_id": "end", "dead_at_ms": 30}
+            ]
+        }))
+        .unwrap();
+
+        let value: JsonValue = lua
+            .from_value(
+                lua.load(
+                    "return fkst.observe({ limit = 1, include = { 'errors', 'entities' }, dead_letter_window = { start_ms = 20, end_ms = 30 } })",
+                )
+                .eval()
+                .unwrap(),
+            )
+            .unwrap();
+
+        assert_eq!(value["dead_letters"][0]["delivery_id"], "inside");
+        assert_eq!(value["dead_letters_complete"], true);
+        assert_eq!(value["truncated"]["dead_letters"], false);
+    }
+
+    #[test]
+    fn mock_observe_reports_window_incompleteness_after_filtering() {
+        let lua = Lua::new();
+        let mock = MockObserveState::new();
+        register(&lua, Some(mock.clone())).unwrap();
+        mock.set(serde_json::json!({
+            "limits": {"max_deliveries": 10, "max_dead_letters": 10},
+            "truncated": {"deliveries": false, "dead_letters": false},
+            "queues": [],
+            "deliveries": [],
+            "dead_letters": [
+                {"delivery_id": "old", "dead_at_ms": 10},
+                {"delivery_id": "inside-one", "dead_at_ms": 20},
+                {"delivery_id": "inside-two", "dead_at_ms": 21}
+            ]
+        }))
+        .unwrap();
+
+        let value: JsonValue = lua
+            .from_value(
+                lua.load(
+                    "return fkst.observe({ limit = 1, dead_letter_window = { start_ms = 20, end_ms = 30 } })",
+                )
+                .eval()
+                .unwrap(),
+            )
+            .unwrap();
+
+        assert_eq!(value["dead_letters"][0]["delivery_id"], "inside-one");
+        assert_eq!(value["dead_letters_complete"], false);
+        assert_eq!(value["truncated"]["dead_letters"], true);
+    }
+
+    #[test]
+    fn observe_rejects_inverted_dead_letter_window() {
+        assert_observe_rejected(
+            "return fkst.observe({ dead_letter_window = { start_ms = 3, end_ms = 2 } })",
+            "start_ms <= end_ms",
+        );
     }
 }

@@ -28,6 +28,7 @@ pub(crate) struct ObserveSnapshotOptions {
     pub(crate) limit: usize,
     pub(crate) since: Option<String>,
     pub(crate) page: Option<DeadLetterPageRequest>,
+    pub(crate) dead_letter_window: Option<DeadLetterWindowRequest>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -44,6 +45,19 @@ pub(crate) struct DeadLetterPageRequest {
     pub(crate) section: String,
     #[serde(default)]
     pub(crate) after: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct DeadLetterWindowRequest {
+    pub(crate) start_ms: u64,
+    pub(crate) end_ms: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct DeadLetterWindow {
+    pub(crate) start_ms: u64,
+    pub(crate) end_ms: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -100,6 +114,7 @@ pub(crate) fn run(options: ObserveOptions) -> Result<i32> {
             limit: options.limit,
             since: None,
             page: None,
+            dead_letter_window: None,
         },
     )?;
     if options.json {
@@ -118,6 +133,7 @@ pub(crate) fn snapshot_for_durable_root(
     validate_since(options.since.as_deref())?;
     let dead_letter_page =
         validate_dead_letter_page(options.page.as_ref(), options.since.as_deref())?;
+    let dead_letter_window = validate_dead_letter_window(options.dead_letter_window.as_ref())?;
     let durable_root = durable_root.into();
     let layout = DurableLayout::new(&durable_root)?;
     let database = layout.delivery_db_path();
@@ -127,6 +143,7 @@ pub(crate) fn snapshot_for_durable_root(
             limit,
             since: options.since.clone(),
             page: options.page.clone(),
+            dead_letter_window: options.dead_letter_window.clone(),
         },
     )? {
         Some(snapshot) => Ok(snapshot),
@@ -141,6 +158,7 @@ pub(crate) fn snapshot_for_durable_root(
                     limit,
                     since: options.since.clone(),
                     dead_letter_page,
+                    dead_letter_window,
                     current_subscriber_queues: None,
                 },
             )
@@ -205,6 +223,7 @@ pub(crate) fn request_live_snapshot(
         limit: options.limit,
         since: options.since.clone(),
         page: options.page.clone(),
+        dead_letter_window: options.dead_letter_window.clone(),
         lineage: None,
         now_ms: now_ms(),
     };
@@ -230,6 +249,7 @@ pub(crate) fn request_live_lineage(
         limit: DEFAULT_LIMIT,
         since: None,
         page: None,
+        dead_letter_window: None,
         lineage: Some(lineage.clone()),
         now_ms: now_ms(),
     };
@@ -288,6 +308,8 @@ pub(crate) struct ObserveSocketRequest {
     pub(crate) since: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) page: Option<DeadLetterPageRequest>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) dead_letter_window: Option<DeadLetterWindowRequest>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) lineage: Option<LineageObserveRequest>,
     pub(crate) now_ms: u64,
@@ -424,6 +446,21 @@ pub(crate) fn validate_dead_letter_page(
     Ok(Some(DeadLetterPageOptions { after }))
 }
 
+pub(crate) fn validate_dead_letter_window(
+    window: Option<&DeadLetterWindowRequest>,
+) -> Result<Option<DeadLetterWindow>> {
+    let Some(window) = window else {
+        return Ok(None);
+    };
+    if window.start_ms > window.end_ms {
+        anyhow::bail!("fkst.observe dead-letter window requires start_ms <= end_ms");
+    }
+    Ok(Some(DeadLetterWindow {
+        start_ms: window.start_ms,
+        end_ms: window.end_ms,
+    }))
+}
+
 pub(crate) fn encode_dead_letter_cursor(cursor: &DeadLetterPageCursor) -> Result<String> {
     let envelope = DeadLetterCursorEnvelope {
         version: 1,
@@ -512,6 +549,7 @@ mod tests {
                 limit: DEFAULT_LIMIT,
                 since: Some(String::new()),
                 page: None,
+                dead_letter_window: None,
             },
         )
         .unwrap_err();
@@ -552,6 +590,7 @@ mod tests {
             limit: DEFAULT_LIMIT,
             since: None,
             page: None,
+            dead_letter_window: None,
             lineage: None,
             now_ms: 1,
         };
