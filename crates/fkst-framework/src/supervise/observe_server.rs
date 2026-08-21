@@ -134,19 +134,28 @@ async fn serve_connection(
                     request.page.as_ref(),
                     request.since.as_deref(),
                 ) {
-                    Ok(dead_letter_page) => match observe_snapshot(
-                        &store,
-                        &endpoint.durable_root,
-                        &endpoint.database,
-                        &DeliveryObserveOptions {
-                            now_ms: request.now_ms,
-                            limit: request.limit.clamp(1, MAX_LIMIT),
-                            since: request.since,
-                            dead_letter_page,
-                            current_subscriber_queues: Some(current_subscriber_queues),
-                        },
+                    Ok(dead_letter_page) => match crate::observe::validate_dead_letter_window(
+                        request.dead_letter_window.as_ref(),
+                        request.page.as_ref(),
                     ) {
-                        Ok(snapshot) => ObserveSocketResponse::Ok { snapshot },
+                        Ok(dead_letter_window) => match observe_snapshot(
+                            &store,
+                            &endpoint.durable_root,
+                            &endpoint.database,
+                            &DeliveryObserveOptions {
+                                now_ms: request.now_ms,
+                                limit: request.limit.clamp(1, MAX_LIMIT),
+                                since: request.since,
+                                dead_letter_page,
+                                dead_letter_window,
+                                current_subscriber_queues: Some(current_subscriber_queues),
+                            },
+                        ) {
+                            Ok(snapshot) => ObserveSocketResponse::Ok { snapshot },
+                            Err(err) => ObserveSocketResponse::Err {
+                                error: err.to_string(),
+                            },
+                        },
                         Err(err) => ObserveSocketResponse::Err {
                             error: err.to_string(),
                         },
@@ -244,6 +253,7 @@ mod tests {
             limit: crate::observe::DEFAULT_LIMIT,
             since: None,
             page: None,
+            dead_letter_window: None,
             lineage: Some(crate::observe::LineageObserveRequest {
                 queue: "jobs".to_string(),
                 dept: "worker".to_string(),
@@ -329,6 +339,7 @@ mod tests {
                     limit: 10,
                     since: None,
                     page: None,
+                    dead_letter_window: None,
                 },
             )
         })
@@ -347,6 +358,7 @@ mod tests {
                     limit: 10,
                     since: None,
                     page: None,
+                    dead_letter_window: None,
                 },
             )
         })
@@ -396,6 +408,7 @@ mod tests {
                     limit: 10,
                     since: None,
                     page: None,
+                    dead_letter_window: None,
                 },
             )
         })
@@ -424,6 +437,7 @@ mod tests {
                         section: "dead_letters".to_string(),
                         after: None,
                     }),
+                    dead_letter_window: None,
                 },
             )
         })
