@@ -223,7 +223,7 @@ fn write_package_helper(root: &std::path::Path) {
 }
 
 #[test]
-fn external_explicit_package_root_uses_its_own_manifest_catalog() {
+fn manifestless_host_uses_explicit_external_package_catalog() {
     let root = tempfile::Builder::new()
         .prefix("external-manifest")
         .tempdir()
@@ -235,7 +235,6 @@ fn external_explicit_package_root_uses_its_own_manifest_catalog() {
     fs::create_dir_all(&host).unwrap();
     fs::create_dir_all(&external_package).unwrap();
     fs::create_dir_all(&external_std).unwrap();
-    write_workspace(&host, &[]);
     write_workspace(&external_workspace, &[&external_package, &external_std]);
     write_package_manifest(&external_package, "platform-pkg", &["std"]);
     write_library_manifest(&external_std, "std", &[]);
@@ -274,6 +273,30 @@ return M
     assert!(cfg.department.contains_key("platform-pkg.worker"));
     assert!(cfg.raiser.contains_key("platform-pkg.input"));
     assert!(cfg.queue.contains_key("platform-pkg.tick"));
+}
+
+#[test]
+fn manifestless_host_with_own_graph_fails_closed() {
+    let root = tempfile::Builder::new()
+        .prefix("manifestless-host-graph")
+        .tempdir()
+        .unwrap();
+    let host = root.path().join("host");
+    let external_package = root.path().join("platform/package");
+    fs::create_dir_all(host.join("departments/worker")).unwrap();
+    fs::create_dir_all(&external_package).unwrap();
+    write_workspace(&external_package, &[&external_package]);
+    write_package_manifest(&external_package, "package", &[]);
+    write_host_defaults(&host, "100\n", "30m\n", "20\n");
+
+    let _env_lock = env_lock();
+    let _runtime = EnvGuard::set(RUNTIME_ROOT_ENV, root.path().join("runtime"));
+    let roots = PackageRoots::resolve(&host, vec![external_package]).unwrap();
+    let err = graph_scan::load_roots(&roots).unwrap_err();
+    let msg = format!("{err:#}");
+
+    assert!(msg.contains("no manifest unit owns"), "{msg}");
+    assert!(msg.ends_with("/host"), "{msg}");
 }
 
 #[test]

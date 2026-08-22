@@ -25,7 +25,7 @@ pub(crate) struct PackageRoots {
     host_root: PathBuf,
     package_namespaces: Vec<String>,
     run_host_owner: bool,
-    catalog: UnitCatalog,
+    catalog: Option<UnitCatalog>,
     external_catalogs: BTreeMap<PathBuf, UnitCatalog>,
     external_package_catalog_roots: BTreeMap<PathBuf, PathBuf>,
 }
@@ -135,33 +135,46 @@ impl PackageRoots {
         } else {
             BTreeSet::new()
         };
-        let mut catalog = UnitCatalog::discover_excluding_roots(&host_root, &excluded_roots)?
-            .ok_or_else(|| {
-                anyhow::anyhow!("manifest catalog is required: missing fkst.workspace.toml")
-            })?;
+        let host_catalog_may_be_absent = package_roots_are_explicit
+            && package_roots
+                .iter()
+                .all(|package_root| !package_root.starts_with(&host_root));
+        let mut catalog = UnitCatalog::discover_excluding_roots(&host_root, &excluded_roots)?;
+        if catalog.is_none() && !host_catalog_may_be_absent {
+            bail!("manifest catalog is required: missing fkst.workspace.toml");
+        }
         let local_source_roots = if package_roots_are_explicit {
-            local_source_roots_for_package_roots(
-                &host_root,
-                catalog.workspace().external_sources(),
-                &package_roots,
-            )?
+            match catalog.as_ref() {
+                Some(catalog) => local_source_roots_for_package_roots(
+                    &host_root,
+                    catalog.workspace().external_sources(),
+                    &package_roots,
+                )?,
+                None => BTreeMap::new(),
+            }
         } else {
             BTreeMap::new()
         };
         if !local_source_roots.is_empty() {
-            catalog = UnitCatalog::discover_excluding_roots_with_local_sources(
-                &host_root,
-                &excluded_roots,
-                local_source_roots.clone(),
-            )?
-            .ok_or_else(|| {
-                anyhow::anyhow!("manifest catalog is required: missing fkst.workspace.toml")
-            })?;
+            catalog = Some(
+                UnitCatalog::discover_excluding_roots_with_local_sources(
+                    &host_root,
+                    &excluded_roots,
+                    local_source_roots.clone(),
+                )?
+                .ok_or_else(|| {
+                    anyhow::anyhow!("manifest catalog is required: missing fkst.workspace.toml")
+                })?,
+            );
         }
-        validate_locked_local_package_sources(&catalog, &local_source_roots)?;
+        if let Some(catalog) = catalog.as_ref() {
+            validate_locked_local_package_sources(catalog, &local_source_roots)?;
+        }
         let (external_catalogs, external_package_catalog_roots) = if package_roots_are_explicit {
-            validate_external_package_declarations(&host_root, &catalog, &package_roots)?;
-            external_package_catalogs(&host_root, &catalog, &package_roots)?
+            if let Some(catalog) = catalog.as_ref() {
+                validate_external_package_declarations(&host_root, catalog, &package_roots)?;
+            }
+            external_package_catalogs(&host_root, catalog.as_ref(), &package_roots)?
         } else {
             (BTreeMap::new(), BTreeMap::new())
         };
@@ -176,37 +189,58 @@ impl PackageRoots {
         })
     }
 
-    pub(crate) fn unit_catalog(&self) -> &UnitCatalog {
-        &self.catalog
+    pub(crate) fn unit_catalog(&self) -> Option<&UnitCatalog> {
+        self.catalog.as_ref()
     }
 
     pub(crate) fn catalog_for_owner_root(&self, owner_root: &Path) -> Result<&UnitCatalog> {
         let canonical = owner_root
             .canonicalize()
             .with_context(|| format!("canonicalize {}", owner_root.display()))?;
-        if let Some(workspace_root) = self.external_package_catalog_roots.get(&canonical) {
-            return self.external_catalogs.get(workspace_root).ok_or_else(|| {
+        self.catalog_for_canonical_owner_root(&canonical)?
+            .ok_or_else(|| {
                 anyhow::anyhow!(
-                    "external package root {} maps to missing catalog {}",
-                    canonical.display(),
-                    workspace_root.display()
+                    "manifest catalog is required for owner root {}",
+                    canonical.display()
                 )
-            });
+            })
+    }
+
+    fn catalog_for_canonical_owner_root(&self, canonical: &Path) -> Result<Option<&UnitCatalog>> {
+        if let Some(workspace_root) = self.external_package_catalog_roots.get(canonical) {
+            return self
+                .external_catalogs
+                .get(workspace_root)
+                .map(Some)
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "external package root {} maps to missing catalog {}",
+                        canonical.display(),
+                        workspace_root.display()
+                    )
+                });
         }
-        if self.catalog.unit_name_for_root(&canonical)?.is_some() {
-            return Ok(&self.catalog);
-        }
-        for catalog in self.external_catalogs.values() {
-            if catalog.unit_name_for_root(&canonical)?.is_some() {
-                return Ok(catalog);
+        if let Some(catalog) = self.catalog.as_ref() {
+            if catalog.unit_name_for_root(canonical)?.is_some() {
+                return Ok(Some(catalog));
             }
         }
-        Ok(&self.catalog)
+        for catalog in self.external_catalogs.values() {
+            if catalog.unit_name_for_root(canonical)?.is_some() {
+                return Ok(Some(catalog));
+            }
+        }
+        Ok(self.catalog.as_ref())
     }
 
     pub(crate) fn unit_name_for_owner_root(&self, owner_root: &Path) -> Result<Option<String>> {
-        self.catalog_for_owner_root(owner_root)?
-            .unit_name_for_root(owner_root)
+        let canonical = owner_root
+            .canonicalize()
+            .with_context(|| format!("canonicalize {}", owner_root.display()))?;
+        match self.catalog_for_canonical_owner_root(&canonical)? {
+            Some(catalog) => catalog.unit_name_for_root(&canonical),
+            None => Ok(None),
+        }
     }
 
     pub(crate) fn graph_roots(&self) -> Vec<GraphRoot> {
@@ -276,7 +310,9 @@ impl PackageRoots {
 
     pub(crate) fn conformance_library_roots(&self) -> Vec<LibraryConformanceRoot> {
         let mut roots = BTreeMap::new();
-        collect_conformance_library_roots(self.catalog.units(), &mut roots);
+        if let Some(catalog) = self.catalog.as_ref() {
+            collect_conformance_library_roots(catalog.units(), &mut roots);
+        }
         for catalog in self.external_catalogs.values() {
             collect_conformance_library_roots(catalog.units(), &mut roots);
         }
@@ -422,13 +458,17 @@ fn explicit_external_roots(
 
 fn external_package_catalogs(
     host_root: &Path,
-    host_catalog: &UnitCatalog,
+    host_catalog: Option<&UnitCatalog>,
     package_roots: &[PathBuf],
 ) -> Result<(BTreeMap<PathBuf, UnitCatalog>, BTreeMap<PathBuf, PathBuf>)> {
     let mut catalogs = BTreeMap::new();
     let mut package_catalog_roots = BTreeMap::new();
     for package_root in package_roots {
-        if package_root == host_root || host_catalog.unit_name_for_root(package_root)?.is_some() {
+        let owned_by_host = match host_catalog {
+            Some(catalog) => catalog.unit_name_for_root(package_root)?.is_some(),
+            None => false,
+        };
+        if package_root == host_root || owned_by_host {
             continue;
         }
         let catalog = UnitCatalog::discover(package_root)?.ok_or_else(|| {
@@ -437,7 +477,7 @@ fn external_package_catalogs(
                 package_root.display()
             )
         })?;
-        if catalog.workspace_root() == host_catalog.workspace_root() {
+        if host_catalog.is_some_and(|host| catalog.workspace_root() == host.workspace_root()) {
             bail!("no manifest unit owns {}", package_root.display());
         }
         if catalog.unit_name_for_root(package_root)?.is_none() {
@@ -752,7 +792,7 @@ root = "."
                 })
                 .collect(),
             run_host_owner: false,
-            catalog,
+            catalog: Some(catalog),
             external_catalogs: BTreeMap::new(),
             external_package_catalog_roots: BTreeMap::new(),
         }
@@ -835,6 +875,61 @@ tree_sha256 = "sha256-{tree_hash}"
     }
 
     #[test]
+    fn manifestless_host_accepts_explicit_external_package_catalog() {
+        let temp = tempfile::tempdir().unwrap();
+        let host = temp.path().join("host");
+        let package = temp.path().join("external/package");
+        std::fs::create_dir_all(&host).unwrap();
+        std::fs::create_dir_all(&package).unwrap();
+        write_workspace_with_units(&package, &["."]);
+        write_package_unit_manifest(&package, "package");
+
+        let roots = PackageRoots::resolve(&host, vec![package.clone()]).unwrap();
+
+        assert!(roots.unit_catalog().is_none());
+        assert_eq!(
+            roots.unit_name_for_owner_root(&package).unwrap().as_deref(),
+            Some("package")
+        );
+    }
+
+    #[test]
+    fn manifestless_host_rejects_unowned_external_package_root() {
+        let temp = tempfile::tempdir().unwrap();
+        let host = temp.path().join("host");
+        let package = temp.path().join("external/package");
+        std::fs::create_dir_all(&host).unwrap();
+        std::fs::create_dir_all(&package).unwrap();
+
+        let err = PackageRoots::resolve(&host, vec![package.clone()]).unwrap_err();
+        let msg = format!("{err:#}");
+
+        assert!(
+            msg.contains("manifest catalog is required for package root"),
+            "{msg}"
+        );
+        assert!(msg.contains("external/package"), "{msg}");
+    }
+
+    #[test]
+    fn manifestless_host_rejects_explicit_internal_package_root() {
+        let temp = tempfile::tempdir().unwrap();
+        let host = temp.path().join("host");
+        let package = host.join("packages/package");
+        std::fs::create_dir_all(&package).unwrap();
+        write_workspace_with_units(&package, &["."]);
+        write_package_unit_manifest(&package, "package");
+
+        let err = PackageRoots::resolve(&host, vec![package]).unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("manifest catalog is required: missing fkst.workspace.toml"),
+            "{err:#}"
+        );
+    }
+
+    #[test]
     fn workspace_manifest_yields_catalog() {
         let temp = tempfile::tempdir().unwrap();
         write(
@@ -873,7 +968,11 @@ root = "."
         let app_root = temp.path().join("packages/app");
         let r = PackageRoots::resolve(temp.path(), vec![app_root.clone()]).unwrap();
 
-        let scope = r.unit_catalog().require_scope_for_root(&app_root).unwrap();
+        let scope = r
+            .unit_catalog()
+            .unwrap()
+            .require_scope_for_root(&app_root)
+            .unwrap();
         assert_eq!(scope.owner_unit(), "app");
         assert!(scope.resolve("main").is_some());
         assert!(scope.resolve("std.fkst.json").is_some());
