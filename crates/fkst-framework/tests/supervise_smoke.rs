@@ -713,7 +713,7 @@ return M
 }
 
 #[test]
-fn supervise_delivers_cross_package_raise_from_composed_child() {
+fn supervise_composes_manifestless_host_from_explicit_external_packages() {
     let _lock = supervise_smoke_lock();
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path();
@@ -774,7 +774,9 @@ return M
         ),
     )
     .unwrap();
-    write_workspace_for_roots(&host, &[&producer_pkg, &consumer_pkg]);
+    write_single_package_workspace(&producer_pkg);
+    write_single_package_workspace(&consumer_pkg);
+    assert!(!host.join("fkst.workspace.toml").exists());
 
     let mut child = Command::new(env!("CARGO_BIN_EXE_fkst-framework"))
         .current_dir(&host)
