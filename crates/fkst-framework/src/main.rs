@@ -1,8 +1,9 @@
 //! fkst-framework — Tier III one-shot Lua runner.
 //!
-//! CLI: `fkst-framework run <lua_file> --project-root <path> --package-root <path> ... --owner-namespace <id> --event '<json>'`
+//! CLI: `fkst-framework run <lua_file> --project-root <path> --package-root <path> ... --owner-namespace <id> --event '<json>' [--catalog-stdin]`
 //! Multiple `--package-root` flags give composed namespace knowledge; `--owner-namespace`
 //! selects the owner root used for Lua `require`.
+//! `--catalog-stdin` is the internal supervise-to-run catalog transport.
 //! CLI: `fkst-framework supervise --project-root <path> --framework-bin <path>`
 //! CLI: `fkst-framework conformance --project-root <path> [--package-root <path> ...] [--config <path>]`
 //! CLI: `fkst-framework test --project-root <path> [--package-root <path> ...] [--report-json <path>]`
@@ -228,6 +229,7 @@ fn parse_args() -> Result<CliCommand> {
         let mut package_roots: Vec<PathBuf> = Vec::new();
         let mut owner_namespace: Option<String> = None;
         let mut event_json: Option<String> = None;
+        let mut catalog_stdin = false;
         while let Some(a) = args_iter.next() {
             match a.as_str() {
                 "--event" => event_json = args_iter.next(),
@@ -238,6 +240,10 @@ fn parse_args() -> Result<CliCommand> {
                 "--owner-namespace" => {
                     owner_namespace = Some(next_iter_value(&mut args_iter, "--owner-namespace")?)
                 }
+                "--catalog-stdin" if catalog_stdin => {
+                    anyhow::bail!("duplicate --catalog-stdin")
+                }
+                "--catalog-stdin" => catalog_stdin = true,
                 other => anyhow::bail!("unknown run argument: {}", other),
             }
         }
@@ -245,7 +251,12 @@ fn parse_args() -> Result<CliCommand> {
         let event: JsonValue = serde_json::from_str(&event_str)
             .with_context(|| format!("--event not valid json: {}", event_str))?;
         let project_root = project_root.ok_or_else(|| anyhow::anyhow!("missing --project-root"))?;
-        let roots = PackageRoots::resolve_run(project_root, package_roots)?;
+        let roots = if catalog_stdin {
+            let stdin = std::io::stdin();
+            PackageRoots::resolve_run_snapshot(project_root, package_roots, stdin.lock())?
+        } else {
+            PackageRoots::resolve_run(project_root, package_roots)?
+        };
         // --owner-namespace is optional: a direct `run` with a single --package-root
         // (dogfood, package departments) defaults to that package's namespace. Multiple
         // package roots form the namespace catalog; the owner namespace still selects

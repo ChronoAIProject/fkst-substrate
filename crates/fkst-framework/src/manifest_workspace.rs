@@ -1,10 +1,10 @@
 use anyhow::{Context, Result};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub(crate) struct WorkspaceManifest {
     discovered_units: Vec<String>,
     registries: BTreeMap<String, String>,
@@ -34,7 +34,7 @@ impl WorkspaceManifest {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub(crate) struct ExternalSourceDecl {
     pub(crate) id: String,
     pub(crate) git: String,

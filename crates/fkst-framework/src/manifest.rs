@@ -3,7 +3,7 @@
 #![allow(dead_code)]
 
 use anyhow::{bail, Context, Result};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -41,7 +41,7 @@ pub(crate) enum PackageKind {
     Composed,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum PersistenceClass {
     Saga,
@@ -71,6 +71,19 @@ impl<'de> Deserialize<'de> for UnitKind {
     }
 }
 
+impl Serialize for UnitKind {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(match self {
+            Self::Package(PackageKind::Flat) => "package.flat",
+            Self::Package(PackageKind::Composed) => "package.composed",
+            Self::Library => "library",
+        })
+    }
+}
+
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub(crate) struct LibDep {
     name: String,
@@ -95,6 +108,15 @@ impl<'de> Deserialize<'de> for LibDep {
     }
 }
 
+impl Serialize for LibDep {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(&self.name)
+    }
+}
+
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub(crate) struct EventDep {
     name: String,
@@ -116,6 +138,15 @@ impl<'de> Deserialize<'de> for EventDep {
         D: serde::Deserializer<'de>,
     {
         Ok(Self::new(String::deserialize(deserializer)?))
+    }
+}
+
+impl Serialize for EventDep {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(&self.name)
     }
 }
 
@@ -144,12 +175,32 @@ impl<'de> Deserialize<'de> for Visibility {
     }
 }
 
+impl Serialize for Visibility {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        #[derive(Serialize)]
+        struct VisibilityWire<'a> {
+            allow: Option<&'a [String]>,
+        }
+
+        VisibilityWire {
+            allow: match self {
+                Self::Public => None,
+                Self::Allow(allow) => Some(allow),
+            },
+        }
+        .serialize(serializer)
+    }
+}
+
 #[derive(Deserialize)]
 struct VisibilityToml {
     allow: Option<Vec<String>>,
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct LibraryMeta {
     pub(crate) name: String,
@@ -159,7 +210,7 @@ pub(crate) struct LibraryMeta {
     pub(crate) publishable: bool,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub(crate) struct UnitManifest {
     pub(crate) kind: UnitKind,
     pub(crate) name: String,
@@ -289,7 +340,7 @@ struct CodeToml {
     root: PathBuf,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub(crate) struct ConformanceManifest {
     pub(crate) pack: Option<PathBuf>,
     pub(crate) function: Option<String>,
@@ -345,7 +396,7 @@ struct LibDepsToml {
     libraries: Vec<LibDep>,
 }
 
-#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct DependencyConstraints {
     allowed_lib_deps: Option<Vec<LibDep>>,
@@ -385,7 +436,7 @@ struct EventDepsToml {
     packages: Vec<EventDep>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub(crate) struct UnitCatalog {
     workspace_root: PathBuf,
     workspace: WorkspaceManifest,
@@ -802,7 +853,7 @@ impl UnitCatalog {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub(crate) struct CatalogUnit {
     catalog_name: String,
     unit_root: PathBuf,
@@ -884,7 +935,7 @@ impl CatalogUnit {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub(crate) struct UnitGraph {
     lib_deps: BTreeMap<String, Vec<String>>,
 }
@@ -916,7 +967,7 @@ impl UnitGraph {
 pub(crate) type ModuleIndex = BTreeMap<String, ModuleEntry>;
 pub(crate) type ModulePaths = BTreeMap<String, PathBuf>;
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub(crate) struct ModuleEntry {
     pub(crate) provider_source: Option<String>,
     pub(crate) provider_unit: String,
@@ -943,7 +994,7 @@ impl ModuleEntry {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub(crate) enum ModuleVisibility {
     Owner,
     PublicLibrary,

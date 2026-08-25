@@ -14,7 +14,9 @@ use super::failure_fact::{
 use super::journal::{optional_path, SupervisorJournal};
 use super::raised::{parse_authenticated_raised, parse_authenticated_raised_line};
 use super::source_runner::parse_duration;
-use super::spawner::{spawn_framework_with_stdout_observer, SpawnResult, StdoutLineObserver};
+use super::spawner::{
+    spawn_framework_with_catalog_and_stdout_observer, SpawnResult, StdoutLineObserver,
+};
 use crate::path_resolver::PackageRoots;
 use crate::process_tree::ProcessGroupRegistry;
 use fkst_common::config::{DepartmentDecl, RetryDecl};
@@ -1124,6 +1126,7 @@ fn spawn_args(
         },
         project_root: project_root.to_path_buf(),
         graph_package_roots: roots.package_roots().to_vec(),
+        catalog_snapshot: roots.catalog_snapshot()?,
         event_json: serde_json::to_string(&event)?,
         stall_window,
         codex_permit_slots,
@@ -1140,6 +1143,7 @@ struct SpawnArgs {
     lua_full: PathBuf,
     project_root: PathBuf,
     graph_package_roots: Vec<PathBuf>,
+    catalog_snapshot: Arc<[u8]>,
     event_json: String,
     stall_window: Duration,
     codex_permit_slots: usize,
@@ -1164,7 +1168,7 @@ async fn spawn_and_report_with_stdout_observer(
     stdout_observer: Option<StdoutLineObserver>,
     journal: &SupervisorJournal,
 ) -> anyhow::Result<SpawnResult> {
-    let result = spawn_framework_with_stdout_observer(
+    let result = spawn_framework_with_catalog_and_stdout_observer(
         &args.framework_bin,
         &args.lua_full,
         &args.project_root,
@@ -1177,6 +1181,7 @@ async fn spawn_and_report_with_stdout_observer(
         args.process_groups.clone(),
         args.raised_auth_token.as_deref(),
         args.replay_scratch_bypass,
+        Arc::clone(&args.catalog_snapshot),
         stdout_observer,
     )
     .await?;
@@ -2069,6 +2074,7 @@ units = [{units}]
             lua_full: lua,
             project_root: temp.path().into(),
             graph_package_roots: vec![temp.path().into()],
+            catalog_snapshot: Arc::from(Vec::<u8>::new()),
             event_json: "{}".to_string(),
             stall_window: Duration::from_secs(30),
             codex_permit_slots: 1,
@@ -2223,6 +2229,7 @@ units = [{units}]
             lua_full: lua,
             project_root: temp.path().into(),
             graph_package_roots: vec![temp.path().into()],
+            catalog_snapshot: Arc::from(Vec::<u8>::new()),
             event_json: "{}".to_string(),
             stall_window: Duration::from_secs(30),
             codex_permit_slots: 1,
@@ -2970,6 +2977,7 @@ units = [{units}]
             lua_full: lua,
             project_root: temp.path().into(),
             graph_package_roots: vec![temp.path().into()],
+            catalog_snapshot: Arc::from(Vec::<u8>::new()),
             event_json: "{}".to_string(),
             stall_window: Duration::from_secs(30),
             codex_permit_slots: 1,

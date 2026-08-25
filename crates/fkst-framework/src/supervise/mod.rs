@@ -58,7 +58,7 @@ pub(crate) fn scrub_current_engine_binary_path_env() {
     spawner::scrub_current_engine_binary_path_env();
 }
 
-pub async fn supervise(roots: PackageRoots, framework_bin: PathBuf) -> Result<()> {
+pub async fn supervise(mut roots: PackageRoots, framework_bin: PathBuf) -> Result<()> {
     let project_root = roots.host_root().to_path_buf();
     let journal = SupervisorJournal::open(&project_root);
     info!(
@@ -114,6 +114,12 @@ pub async fn supervise(roots: PackageRoots, framework_bin: PathBuf) -> Result<()
         warn!(warning = %warning, "schema validation warning");
     }
     info!("schema validation passed");
+    roots.prepare_catalog_snapshot()?;
+    let catalog_snapshot_bytes = roots.catalog_snapshot()?.len();
+    info!(
+        bytes = catalog_snapshot_bytes,
+        "package catalog snapshot prepared"
+    );
     let config_context = ConfigContext::from_host_root(&project_root)?;
     let rate_pools = crate::rate_pool::RatePoolRegistry::from_config(&config_context)?;
     if !rate_pools.is_empty() {
