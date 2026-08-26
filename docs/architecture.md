@@ -242,7 +242,7 @@ Vec<mpsc::Sender<Event>>
     ↓
 consumer inbox
     ↓
-spawn fkst-framework run <department main.lua> --project-root <HOST> --package-root <PKG_A> --package-root <PKG_B> ... --owner-namespace <id> --event <json>
+spawn fkst-framework run <department main.lua> --project-root <HOST> --package-root <PKG_A> --package-root <PKG_B> ... --owner-namespace <id> --event <json> --catalog-stdin
     ↓
 single Lua state + owner-scoped package.path + pipeline(event)
     ↓
@@ -258,6 +258,10 @@ Fanout::send(raised.queue, raised_event)
 Department 收到的标准事件是 `Event{queue,payload,ts}`，其中 `ts` 是 Unix 毫秒。
 
 `consumer.rs` 为每个 Department 的每个 consumed queue 建 receiver，再汇入该 Department 的 inbox。每个事件 spawn 一个 framework child，不是在 supervisor 进程内直接调用 Lua。framework child 的 stdout/stderr 会写到 `<RT>/logs/framework-child/` 下的具名 log；dept 的 `log.*` 以结构化行写 stderr，并由这个具名 log 捕获。RAISED 解析不依赖 log 文件，而是解析 captured stdout。
+
+The event runtime serializes its validated `PackageRoots` catalog once after graph validation and retains the bytes in an immutable `Arc`. Every Department child receives those same bytes over piped stdin. `--catalog-stdin` is an internal supervise-to-run transport flag, not an alternate package-root input surface: the child still receives the complete ordered `--package-root` set and rejects a snapshot whose schema, canonical host root, package roots, namespace binding, or owner coverage does not match. The pipe input is bounded to 64 MiB and never becomes a runtime fact or filesystem artifact. Direct `run` calls without the flag retain independent catalog discovery.
+
+The catalog snapshot contains manifest metadata and resolved module paths, not Lua source bytes or a Lua state. Each child creates a fresh Lua state and reads every loaded chunk from its module path at invocation time, preserving package-byte coherence while avoiding repeated workspace scans and per-file canonicalization.
 
 `raise` 不落盘。它通过 `LuaSerdeExt` 的 `lua.from_value` 将 Lua payload 转为 JSON 后进入 stdout `RAISED:` 协议。bare Lua empty table 没有数组 / 对象意图标记，序列化为 JSON object `{}`；由 `json.decode("[]")` 构造的 array-tagged empty table 会保持为 JSON array `[]`。需要可能为空的数组字段时，package 必须显式构造 array-tagged table；engine 不根据字段名或 schema 推断空表形态。
 

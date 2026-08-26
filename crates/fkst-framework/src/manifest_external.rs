@@ -10,7 +10,7 @@ use std::process::Command;
 
 pub(crate) const CACHE_ROOT_ENV: &str = "FKST_CACHE_ROOT";
 
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub(crate) struct Lockfile {
     entries: Vec<LockEntry>,
     external_sources: Vec<ExternalSourceLock>,

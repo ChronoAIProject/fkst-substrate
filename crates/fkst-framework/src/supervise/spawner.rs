@@ -1,6 +1,6 @@
 //! Framework spawn with new process group, output capture, and child log.
 //!
-//! Spawn `fkst-framework run <lua_path> --project-root <path> --package-root <path> ... --owner-namespace <id> --event <json>` with setsid.
+//! Spawn `fkst-framework run <lua_path> --project-root <path> --package-root <path> ... --owner-namespace <id> --event <json> --catalog-stdin` with setsid.
 
 use crate::process_tree::{ProcessGroupRegistration, ProcessGroupRegistry};
 use anyhow::{Context, Result};
@@ -11,7 +11,7 @@ use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tokio::io::{AsyncRead, AsyncReadExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::process::{Child, Command};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -100,9 +100,86 @@ pub async fn spawn_framework_with_stdout_observer(
     replay_scratch_bypass: bool,
     stdout_observer: Option<StdoutLineObserver>,
 ) -> Result<SpawnResult> {
+    spawn_framework_inner(
+        binary,
+        lua_path,
+        host_root,
+        package_roots,
+        owner_namespace,
+        event_json,
+        codex_permit_slots,
+        child_label,
+        log_dir,
+        process_groups,
+        raised_auth_token,
+        replay_scratch_bypass,
+        None,
+        stdout_observer,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn spawn_framework_with_catalog_and_stdout_observer(
+    binary: &Path,
+    lua_path: &Path,
+    host_root: &Path,
+    package_roots: &[PathBuf],
+    owner_namespace: &str,
+    event_json: &str,
+    codex_permit_slots: usize,
+    child_label: &str,
+    log_dir: &Path,
+    process_groups: ProcessGroupRegistry,
+    raised_auth_token: Option<&str>,
+    replay_scratch_bypass: bool,
+    catalog_snapshot: Arc<[u8]>,
+    stdout_observer: Option<StdoutLineObserver>,
+) -> Result<SpawnResult> {
+    spawn_framework_inner(
+        binary,
+        lua_path,
+        host_root,
+        package_roots,
+        owner_namespace,
+        event_json,
+        codex_permit_slots,
+        child_label,
+        log_dir,
+        process_groups,
+        raised_auth_token,
+        replay_scratch_bypass,
+        Some(catalog_snapshot),
+        stdout_observer,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn spawn_framework_inner(
+    binary: &Path,
+    lua_path: &Path,
+    host_root: &Path,
+    package_roots: &[PathBuf],
+    owner_namespace: &str,
+    event_json: &str,
+    codex_permit_slots: usize,
+    child_label: &str,
+    log_dir: &Path,
+    process_groups: ProcessGroupRegistry,
+    raised_auth_token: Option<&str>,
+    replay_scratch_bypass: bool,
+    catalog_snapshot: Option<Arc<[u8]>>,
+    stdout_observer: Option<StdoutLineObserver>,
+) -> Result<SpawnResult> {
     let start = std::time::Instant::now();
+    let catalog_flag = if catalog_snapshot.is_some() {
+        " --catalog-stdin"
+    } else {
+        ""
+    };
     let cmd_line = format!(
-        "{} run {} --project-root {} {} --owner-namespace {} --event <json>",
+        "{} run {} --project-root {} {} --owner-namespace {} --event <json>{catalog_flag}",
         binary.display(),
         lua_path.display(),
         host_root.display(),
@@ -137,6 +214,9 @@ pub async fn spawn_framework_with_stdout_observer(
     if replay_scratch_bypass {
         log.write_line("REPLAY_SCRATCH_BYPASS=enabled");
     }
+    if let Some(snapshot) = catalog_snapshot.as_ref() {
+        log.write_line(&format!("CATALOG_SNAPSHOT_BYTES={}", snapshot.len()));
+    }
 
     let mut cmd = Command::new(binary);
     cmd.arg("run")
@@ -146,11 +226,18 @@ pub async fn spawn_framework_with_stdout_observer(
     for package_root in package_roots {
         cmd.arg("--package-root").arg(package_root);
     }
+    if catalog_snapshot.is_some() {
+        cmd.arg("--catalog-stdin");
+    }
     cmd.arg("--owner-namespace")
         .arg(owner_namespace)
         .arg("--event")
         .arg(event_json)
-        .stdin(Stdio::null())
+        .stdin(if catalog_snapshot.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     cmd.env(
@@ -178,7 +265,7 @@ pub async fn spawn_framework_with_stdout_observer(
     // tokio::process exposes `process_group(0)` to call setpgid(0,0); equivalent for our purposes.
     cmd.process_group(0);
 
-    let (child, spawn_return_ms) = match cmd.spawn() {
+    let (mut child, spawn_return_ms) = match cmd.spawn() {
         Ok(child) => (child, start.elapsed().as_millis()),
         Err(err) => {
             log.write_line(&format!("SPAWN_ERROR={err}"));
@@ -191,6 +278,22 @@ pub async fn spawn_framework_with_stdout_observer(
     log.write_line(&format!("PID={pid}"));
     info!(pid = pid, lua = %lua_path.display(), "framework spawned");
     let registration = process_groups.register(pid);
+    let snapshot_writer = match catalog_snapshot {
+        Some(snapshot) => {
+            let mut stdin = child
+                .stdin
+                .take()
+                .ok_or_else(|| anyhow::anyhow!("catalog snapshot stdin pipe is unavailable"))?;
+            Some(tokio::spawn(async move {
+                stdin
+                    .write_all(&snapshot)
+                    .await
+                    .map_err(|err| err.to_string())?;
+                stdin.shutdown().await.map_err(|err| err.to_string())
+            }))
+        }
+        None => None,
+    };
 
     wait_for_framework_child(
         child,
@@ -199,6 +302,7 @@ pub async fn spawn_framework_with_stdout_observer(
         spawn_return_ms,
         log,
         registration,
+        snapshot_writer,
         stdout_observer,
     )
     .await
@@ -239,6 +343,7 @@ async fn wait_for_framework_child(
     spawn_return_ms: u128,
     mut log: FrameworkChildLog,
     _registration: ProcessGroupRegistration,
+    snapshot_writer: Option<JoinHandle<std::result::Result<(), String>>>,
     stdout_observer: Option<StdoutLineObserver>,
 ) -> Result<SpawnResult> {
     let (tx, mut rx) = mpsc::unbounded_channel();
@@ -297,6 +402,13 @@ async fn wait_for_framework_child(
         let _ = reader.await;
     }
     let _ = waiter.await;
+    if let Some(writer) = snapshot_writer {
+        match writer.await {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) => log.write_line(&format!("CATALOG_SNAPSHOT_WRITE_ERROR={err}")),
+            Err(err) => log.write_line(&format!("CATALOG_SNAPSHOT_WRITE_ERROR={err}")),
+        }
+    }
     drain_framework_events(
         &mut rx,
         &mut output,
@@ -532,6 +644,65 @@ fn filename_timestamp() -> String {
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    #[tokio::test]
+    async fn concurrent_framework_children_receive_shared_catalog_promptly() {
+        let temp = tempfile::tempdir().unwrap();
+        let binary = temp.path().join("fkst-framework");
+        std::fs::write(
+            &binary,
+            "#!/bin/sh\nbytes=$(wc -c)\nprintf '%s\\n' \"$bytes\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let lua = temp.path().join("dept.lua");
+        std::fs::write(&lua, "return {}\n").unwrap();
+        let logs = temp.path().join("logs");
+        let snapshot = Arc::<[u8]>::from(vec![b'x'; 512 * 1024]);
+        let process_groups = ProcessGroupRegistry::default();
+        let mut children = Vec::new();
+
+        for index in 0..12 {
+            let binary = binary.clone();
+            let lua = lua.clone();
+            let root = temp.path().to_path_buf();
+            let logs = logs.clone();
+            let snapshot = Arc::clone(&snapshot);
+            let process_groups = process_groups.clone();
+            children.push(tokio::spawn(async move {
+                spawn_framework_with_catalog_and_stdout_observer(
+                    &binary,
+                    &lua,
+                    &root,
+                    std::slice::from_ref(&root),
+                    "pkg",
+                    "{}",
+                    1,
+                    &format!("worker-{index}"),
+                    &logs,
+                    process_groups,
+                    None,
+                    false,
+                    snapshot,
+                    None,
+                )
+                .await
+            }));
+        }
+
+        for child in children {
+            let result = tokio::time::timeout(Duration::from_secs(10), child)
+                .await
+                .expect("concurrent catalog delivery exceeded readiness budget")
+                .unwrap()
+                .unwrap();
+            assert_eq!(result.exit_code, 0);
+            assert_eq!(result.stdout.trim(), (512 * 1024).to_string());
+            let log = std::fs::read_to_string(result.log_path.unwrap()).unwrap();
+            assert!(log.contains("--catalog-stdin"), "{log}");
+            assert!(log.contains("CATALOG_SNAPSHOT_BYTES=524288"), "{log}");
+        }
+    }
 
     #[tokio::test]
     async fn replay_scratch_bypass_is_private_child_process_metadata() {
