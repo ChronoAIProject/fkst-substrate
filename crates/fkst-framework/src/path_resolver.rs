@@ -5,13 +5,19 @@ use crate::manifest_external::{
     local_source_roots_for_package_roots, validate_locked_local_sources, Lockfile,
 };
 use anyhow::{bail, Context, Result};
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
+use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 pub(crate) const PACKAGE_ROOT_ENV: &str = "FKST_PACKAGE_ROOT";
 pub(crate) const PACKAGE_ROOTS_ENV: &str = "FKST_PACKAGE_ROOTS";
 pub(crate) const HOST_NAMESPACE: &str = "host";
+
+const CATALOG_SNAPSHOT_SCHEMA: &str = "fkst.package-roots-catalog.v1";
+const MAX_CATALOG_SNAPSHOT_BYTES: u64 = 64 * 1024 * 1024;
 
 const REJECTED_PACKAGE_ROOT_ENVS: &[&str] = &[
     "FKST_STDLIB_ROOT",
@@ -19,7 +25,7 @@ const REJECTED_PACKAGE_ROOT_ENVS: &[&str] = &[
     "FKST_GRAPH_ROOTS",
 ];
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub(crate) struct PackageRoots {
     package_roots: Vec<PathBuf>,
     host_root: PathBuf,
@@ -28,6 +34,8 @@ pub(crate) struct PackageRoots {
     catalog: Option<UnitCatalog>,
     external_catalogs: BTreeMap<PathBuf, UnitCatalog>,
     external_package_catalog_roots: BTreeMap<PathBuf, PathBuf>,
+    #[serde(skip)]
+    catalog_snapshot: Option<Arc<[u8]>>,
 }
 
 impl PackageRoots {
@@ -78,6 +86,89 @@ impl PackageRoots {
         let run_host_owner = package_roots.roots.len() > 1
             && package_roots.roots.iter().any(|root| root == &host_root);
         Self::from_canonical(host_root, package_roots, run_host_owner)
+    }
+
+    pub(crate) fn prepare_catalog_snapshot(&mut self) -> Result<()> {
+        if self.catalog_snapshot.is_none() {
+            self.catalog_snapshot = Some(self.serialize_catalog_snapshot()?.into());
+        }
+        Ok(())
+    }
+
+    pub(crate) fn catalog_snapshot(&self) -> Result<Arc<[u8]>> {
+        match self.catalog_snapshot.as_ref() {
+            Some(snapshot) => Ok(Arc::clone(snapshot)),
+            None => Ok(self.serialize_catalog_snapshot()?.into()),
+        }
+    }
+
+    fn serialize_catalog_snapshot(&self) -> Result<Vec<u8>> {
+        serde_json::to_vec(&CatalogSnapshot {
+            schema: CATALOG_SNAPSHOT_SCHEMA,
+            roots: self,
+        })
+        .context("serialize package catalog snapshot")
+    }
+
+    pub(crate) fn resolve_run_snapshot(
+        host_root: impl AsRef<Path>,
+        explicit_package_roots: Vec<PathBuf>,
+        reader: impl Read,
+    ) -> Result<Self> {
+        reject_removed_package_root_envs()?;
+        if std::env::var_os(PACKAGE_ROOTS_ENV).is_some() {
+            bail!("{PACKAGE_ROOTS_ENV} is not valid for `run`; pass one --package-root");
+        }
+        if explicit_package_roots.is_empty() {
+            bail!("--catalog-stdin requires at least one --package-root");
+        }
+        let host_root = canonical_dir(host_root.as_ref(), "--project-root")?;
+        let package_roots = canonical_dirs(explicit_package_roots, "--package-root")?;
+        let mut bytes = Vec::new();
+        reader
+            .take(MAX_CATALOG_SNAPSHOT_BYTES + 1)
+            .read_to_end(&mut bytes)
+            .context("read package catalog snapshot from stdin")?;
+        if bytes.len() as u64 > MAX_CATALOG_SNAPSHOT_BYTES {
+            bail!(
+                "package catalog snapshot exceeds {} bytes",
+                MAX_CATALOG_SNAPSHOT_BYTES
+            );
+        }
+        let snapshot: OwnedCatalogSnapshot =
+            serde_json::from_slice(&bytes).context("decode package catalog snapshot from stdin")?;
+        if snapshot.schema != CATALOG_SNAPSHOT_SCHEMA {
+            bail!(
+                "unsupported package catalog snapshot schema `{}`",
+                snapshot.schema
+            );
+        }
+        snapshot
+            .roots
+            .validate_snapshot_binding(&host_root, &package_roots)?;
+        Ok(snapshot.roots)
+    }
+
+    fn validate_snapshot_binding(&self, host_root: &Path, package_roots: &[PathBuf]) -> Result<()> {
+        if self.host_root != host_root || self.package_roots != package_roots {
+            bail!("package catalog snapshot roots do not match run arguments");
+        }
+        let run_host_owner =
+            package_roots.len() > 1 && package_roots.iter().any(|root| root == host_root);
+        let package_namespaces = package_namespaces(host_root, package_roots, run_host_owner)?;
+        if self.run_host_owner != run_host_owner || self.package_namespaces != package_namespaces {
+            bail!("package catalog snapshot namespace binding is invalid");
+        }
+        for package_root in package_roots {
+            let catalog = self.catalog_for_owner_root(package_root)?;
+            if catalog.unit_name_for_root(package_root)?.is_none() {
+                bail!(
+                    "package catalog snapshot has no manifest unit for owner root {}",
+                    package_root.display()
+                );
+            }
+        }
+        Ok(())
     }
 
     pub(crate) fn package_roots(&self) -> &[PathBuf] {
@@ -186,6 +277,7 @@ impl PackageRoots {
             catalog,
             external_catalogs,
             external_package_catalog_roots,
+            catalog_snapshot: None,
         })
     }
 
@@ -318,6 +410,20 @@ impl PackageRoots {
         }
         roots.into_values().collect()
     }
+}
+
+#[derive(Serialize)]
+#[serde(deny_unknown_fields)]
+struct CatalogSnapshot<'a> {
+    schema: &'static str,
+    roots: &'a PackageRoots,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OwnedCatalogSnapshot {
+    schema: String,
+    roots: PackageRoots,
 }
 
 struct PackageRootInput {
@@ -795,6 +901,7 @@ root = "."
             catalog: Some(catalog),
             external_catalogs: BTreeMap::new(),
             external_package_catalog_roots: BTreeMap::new(),
+            catalog_snapshot: None,
         }
     }
 
@@ -864,6 +971,65 @@ tree_sha256 = "sha256-{tree_hash}"
     }
 
     #[test]
+    fn catalog_snapshot_reuses_indexes_and_resolves_current_package_bytes() {
+        let temp = tempfile::tempdir().unwrap();
+        write_workspace_with_units(temp.path(), &["."]);
+        write_package_unit_manifest(temp.path(), "package");
+        let helper = temp.path().join("helper.lua");
+        write(&helper, "return { value = 'before' }\n");
+        let mut roots =
+            PackageRoots::resolve(temp.path(), vec![temp.path().to_path_buf()]).unwrap();
+
+        roots.prepare_catalog_snapshot().unwrap();
+        let first = roots.catalog_snapshot().unwrap();
+        let second = roots.catalog_snapshot().unwrap();
+        assert!(Arc::ptr_eq(&first, &second));
+
+        write(&helper, "return { value = 'after' }\n");
+        std::fs::remove_file(temp.path().join("fkst.workspace.toml")).unwrap();
+        std::fs::remove_file(temp.path().join("fkst.toml")).unwrap();
+        let restored = PackageRoots::resolve_run_snapshot(
+            temp.path(),
+            vec![temp.path().to_path_buf()],
+            first.as_ref(),
+        )
+        .unwrap();
+        let owner_root = temp.path().canonicalize().unwrap();
+        let catalog = restored
+            .catalog_for_owner_root(&owner_root)
+            .unwrap()
+            .clone();
+        let scope = catalog.require_scope_for_root(&owner_root).unwrap();
+        let resolved_helper = scope.resolve("helper").unwrap();
+
+        assert_eq!(resolved_helper, helper.canonicalize().unwrap());
+        assert_eq!(
+            std::fs::read_to_string(resolved_helper).unwrap(),
+            "return { value = 'after' }\n"
+        );
+    }
+
+    #[test]
+    fn catalog_snapshot_rejects_different_run_roots() {
+        let temp = tempfile::tempdir().unwrap();
+        let other = temp.path().join("other");
+        std::fs::create_dir_all(&other).unwrap();
+        write_workspace_with_units(temp.path(), &["."]);
+        write_package_unit_manifest(temp.path(), "package");
+        let roots = PackageRoots::resolve(temp.path(), vec![temp.path().to_path_buf()]).unwrap();
+        let snapshot = roots.catalog_snapshot().unwrap();
+
+        let err = PackageRoots::resolve_run_snapshot(temp.path(), vec![other], snapshot.as_ref())
+            .unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("package catalog snapshot roots do not match run arguments"),
+            "{err:#}"
+        );
+    }
+
+    #[test]
     fn missing_workspace_manifest_fails_closed() {
         let temp = tempfile::tempdir().unwrap();
         let err = PackageRoots::resolve(temp.path(), vec![temp.path().to_path_buf()]).unwrap_err();
@@ -889,6 +1055,18 @@ tree_sha256 = "sha256-{tree_hash}"
         assert!(roots.unit_catalog().is_none());
         assert_eq!(
             roots.unit_name_for_owner_root(&package).unwrap().as_deref(),
+            Some("package")
+        );
+
+        let snapshot = roots.catalog_snapshot().unwrap();
+        let restored =
+            PackageRoots::resolve_run_snapshot(&host, vec![package.clone()], snapshot.as_ref())
+                .unwrap();
+        assert_eq!(
+            restored
+                .unit_name_for_owner_root(&package)
+                .unwrap()
+                .as_deref(),
             Some("package")
         );
     }
