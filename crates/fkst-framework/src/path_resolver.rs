@@ -971,14 +971,12 @@ tree_sha256 = "sha256-{tree_hash}"
     }
 
     #[test]
-    fn catalog_snapshot_reuses_indexes_and_loads_current_package_bytes() {
+    fn catalog_snapshot_reuses_indexes_and_resolves_current_package_bytes() {
         let temp = tempfile::tempdir().unwrap();
         write_workspace_with_units(temp.path(), &["."]);
         write_package_unit_manifest(temp.path(), "package");
         let helper = temp.path().join("helper.lua");
-        let entry = temp.path().join("entry.lua");
         write(&helper, "return { value = 'before' }\n");
-        write(&entry, "return require('helper').value\n");
         let mut roots =
             PackageRoots::resolve(temp.path(), vec![temp.path().to_path_buf()]).unwrap();
 
@@ -1001,23 +999,14 @@ tree_sha256 = "sha256-{tree_hash}"
             .catalog_for_owner_root(&owner_root)
             .unwrap()
             .clone();
-        let owner_unit = catalog.unit_name_for_root(&owner_root).unwrap().unwrap();
-        let lua = crate::mlua_init::new_lua();
+        let scope = catalog.require_scope_for_root(&owner_root).unwrap();
+        let resolved_helper = scope.resolve("helper").unwrap();
 
-        let value = crate::lua_require::load_unit_chunk(
-            &lua,
-            Arc::new(catalog),
-            &owner_unit,
-            &entry,
-            "@entry.lua",
-            None,
-        )
-        .unwrap();
-
-        let mlua::Value::String(value) = value else {
-            panic!("entry chunk did not return a string");
-        };
-        assert_eq!(value.to_str().unwrap(), "after");
+        assert_eq!(resolved_helper, helper.canonicalize().unwrap());
+        assert_eq!(
+            std::fs::read_to_string(resolved_helper).unwrap(),
+            "return { value = 'after' }\n"
+        );
     }
 
     #[test]

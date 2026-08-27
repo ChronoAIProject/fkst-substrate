@@ -42,7 +42,6 @@ mod manifest;
 mod manifest_composed_deps;
 mod manifest_external;
 mod manifest_hash;
-mod manifest_modules;
 mod mlua_init;
 mod observe;
 mod path_resolver;
